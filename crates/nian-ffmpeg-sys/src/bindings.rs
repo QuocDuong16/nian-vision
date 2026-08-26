@@ -3,6 +3,7 @@
 pub const AV_TIME_BASE: u32 = 1000000;
 pub const AV_ERROR_MAX_STRING_SIZE: u32 = 64;
 pub const LIBAVUTIL_VERSION_MAJOR: u32 = 60;
+pub const AV_LOG_QUIET: i32 = -8;
 pub const LIBAVCODEC_VERSION_MAJOR: u32 = 62;
 pub const AV_DICT_MATCH_CASE: u32 = 1;
 pub const AV_DICT_APPEND: u32 = 32;
@@ -91,6 +92,14 @@ unsafe extern "C" {
 #[derive(Debug, Copy, Clone)]
 pub struct AVClass {
     pub _bindgen_opaque_blob: [u64; 10usize],
+}
+unsafe extern "C" {
+    #[doc = " Get the current log level\n\n @see lavu_log_constants\n\n @return Current log level"]
+    pub fn av_log_get_level() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    #[doc = " Set the log level\n\n @see lavu_log_constants\n\n @param level Logging level"]
+    pub fn av_log_set_level(level: ::std::os::raw::c_int);
 }
 pub const AVCOL_PRI_RESERVED0: AVColorPrimaries = 0;
 #[doc = "< also ITU-R BT1361 / IEC 61966-2-4 / SMPTE RP 177 Annex B"]
@@ -1214,6 +1223,16 @@ unsafe extern "C" {
         s: *mut *mut AVIOContext,
         url: *const ::std::os::raw::c_char,
         flags: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    #[doc = " Create and initialize a AVIOContext for accessing the\n resource indicated by url.\n @note When the resource indicated by url has been opened in\n read+write mode, the AVIOContext can be used only for writing.\n\n @param s Used to return the pointer to the created AVIOContext.\n In case of failure the pointed to value is set to NULL.\n @param url resource to access\n @param flags flags which control how the resource indicated by url\n is to be opened\n @param int_cb an interrupt callback to be used at the protocols level\n @param options  A dictionary filled with protocol-private options. On return\n this parameter will be destroyed and replaced with a dict containing options\n that were not found. May be NULL.\n @return >= 0 in case of success, a negative value corresponding to an\n AVERROR code in case of failure"]
+    pub fn avio_open2(
+        s: *mut *mut AVIOContext,
+        url: *const ::std::os::raw::c_char,
+        flags: ::std::os::raw::c_int,
+        int_cb: *const AVIOInterruptCB,
+        options: *mut *mut AVDictionary,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

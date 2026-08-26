@@ -59,7 +59,7 @@ apps/nian-media-worker   media process (probe CLI, IPC loop)
 crates/                  workspace library crates (see docs/architecture.md)
 tools/bindgen-gen        one-time FFmpeg binding generator (libclang needed)
 ui/                      React + TypeScript + Vite frontend
-thirdparty/ffmpeg        vendored FFmpeg 8.0.1 headers (unmodified)
+thirdparty/ffmpeg        vendored FFmpeg 8.0.3 headers (unmodified)
 scripts/                 setup/fixture/icon helper scripts
 docs/                    architecture, ADRs, guides
 ```

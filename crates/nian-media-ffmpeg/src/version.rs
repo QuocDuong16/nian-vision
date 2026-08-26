@@ -5,6 +5,8 @@ use std::sync::OnceLock;
 use nian_ffmpeg_sys as sys;
 use nian_media::MediaError;
 
+use crate::logging;
+
 /// Library majors this build was generated against (from vendored headers).
 pub const EXPECTED_AVFORMAT_MAJOR: u32 = sys::LIBAVFORMAT_VERSION_MAJOR;
 pub const EXPECTED_AVCODEC_MAJOR: u32 = sys::LIBAVCODEC_VERSION_MAJOR;
@@ -56,28 +58,46 @@ pub fn check_runtime_abi() -> Result<RuntimeVersions, MediaError> {
     Ok(found)
 }
 
-/// Runs [`check_runtime_abi`] and `avformat_network_init` once per process
-/// (racing threads may run the idempotent init twice; the result is shared).
-/// Every backend entry point calls this first.
+/// Performs the actual one-time initialization. Split from [`global_init`] so
+/// tests can inject a failing ABI check and assert the structured error is
+/// preserved verbatim.
+fn perform_init<F>(abi_check: F) -> Result<(), MediaError>
+where
+    F: FnOnce() -> Result<RuntimeVersions, MediaError>,
+{
+    // Propagated verbatim — an ABI mismatch must never be stringified into
+    // `InitFailed`, or the host could not tell "wrong runtime" (operator
+    // action required) apart from a transient init failure.
+    abi_check()?;
+
+    logging::install_production_policy();
+
+    // SAFETY: avformat_network_init initializes internal network state; it
+    // is documented as idempotent and thread-safe.
+    let code = unsafe { sys::avformat_network_init() };
+    if code < 0 {
+        return Err(MediaError::InitFailed {
+            message: super::error_util::averr_to_string(code),
+        });
+    }
+    Ok(())
+}
+
+/// Runs [`check_runtime_abi`], the native-log policy and
+/// `avformat_network_init` once per process. Every backend entry point calls
+/// this first.
+///
+/// The stored result keeps the structured error: a failed init replays the
+/// original [`MediaError::AbiMismatch`] (not a lossy string) to every caller.
+/// Racing first callers may execute the idempotent body twice; whichever
+/// result wins is identical because every step is deterministic and
+/// side-effect-free for equal inputs.
 pub fn global_init() -> Result<(), MediaError> {
-    static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    static RESULT: OnceLock<Result<(), MediaError>> = OnceLock::new();
 
     RESULT
-        .get_or_init(|| {
-            if let Err(error) = check_runtime_abi() {
-                return Err(error.to_string());
-            }
-
-            // SAFETY: avformat_network_init initializes internal network
-            // state; it is documented as idempotent and thread-safe.
-            let code = unsafe { sys::avformat_network_init() };
-            if code < 0 {
-                return Err(super::error_util::averr_to_string(code));
-            }
-            Ok(())
-        })
+        .get_or_init(|| perform_init(check_runtime_abi))
         .clone()
-        .map_err(|message| MediaError::InitFailed { message })
 }
 
 /// Returns the runtime versions if (and only if) startup validation ran.
@@ -86,4 +106,28 @@ pub fn global_init() -> Result<(), MediaError> {
 /// first media operation.
 pub fn runtime_versions() -> Option<RuntimeVersions> {
     check_runtime_abi().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_preserves_structured_abi_mismatch() {
+        let original = MediaError::AbiMismatch {
+            library: "libavformat",
+            expected: 62,
+            found: 63,
+        };
+        let result = perform_init(|| Err(original.clone()));
+        // Must round-trip as the same variant, not be collapsed into
+        // InitFailed { message }.
+        assert_eq!(result.unwrap_err(), original);
+    }
+
+    #[test]
+    fn repeated_global_init_is_idempotent_and_structured() {
+        assert!(global_init().is_ok());
+        assert!(global_init().is_ok());
+    }
 }

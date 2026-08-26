@@ -1,8 +1,8 @@
 # Vendored FFmpeg headers
 
 These are the **unmodified public header files** of
-[FFmpeg 8.0.1](https://ffmpeg.org/releases/ffmpeg-8.0.1.tar.xz)
-(sha256 `05ee0b03119b45c0bdb4df654b96802e909e0a752f72e4fe3794f487229e5a41`),
+[FFmpeg 8.0.3](https://ffmpeg.org/releases/ffmpeg-8.0.3.tar.xz)
+(sha256 `6136812ea6d4e68bdba27e33c2a94382711cdf4f8602ffef056ff792bd6f9818`),
 restricted to the transitive `#include` closure of the public API headers used
 by `nian-ffmpeg-sys` (`libavutil`, `libavcodec`, `libavformat`).
 

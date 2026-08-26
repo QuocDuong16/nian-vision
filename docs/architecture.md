@@ -55,7 +55,7 @@ Key properties:
 | `nian-ipc` | NDJSON protocol + serve loop | versioned envelopes, size-capped framing |
 | `nian-media` | backend-agnostic facade | `Probe`, `MediaSource`, `MediaPacket` |
 | `nian-media-ffmpeg` | safe FFmpeg wrapper | input/muxer/interrupt/ABI guard |
-| `nian-ffmpeg-sys` | raw FFI (generated) | committed bindings from vendored 8.0.1 headers |
+| `nian-ffmpeg-sys` | raw FFI (generated) | committed bindings from vendored 8.0.3 headers |
 | `apps/nian-desktop` | Tauri 2 host | window + commands |
 | `apps/nian-media-worker` | media process | `probe` CLI + `run` IPC loop |
 | `tools/bindgen-gen` | one-shot binding generator | requires libclang, run manually |
@@ -68,8 +68,8 @@ RTSP (H.264)
   → compressed packets (stream copy, no decode/re-encode)
   → timestamp rescale (av_packet_rescale_ts)
   → Matroska segment writer (MatroskaMuxer)
-  → <storage_root>/<camera>/<Y>/<M>/<D>/HH-MM-SS.partial.mkv
-  → av_write_trailer → atomic rename → HH-MM-SS.mkv
+  → <storage_root>/<camera>/<Y>/<M>/<D>/HH-MM-SS[-N].partial.mkv
+  → av_write_trailer → atomic rename → HH-MM-SS[-N].mkv
 ```
 
 Rotation happens at the first keyframe at/after the configured target

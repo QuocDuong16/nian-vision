@@ -1,5 +1,7 @@
 //! Storage-layer errors.
 
+use std::path::PathBuf;
+
 /// Errors raised while building or interpreting storage paths.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -22,5 +24,15 @@ pub enum StorageError {
     UnrecognizedSegmentName {
         /// The offending file name.
         name: String,
+    },
+
+    /// Listing a recordings directory failed during segment allocation or
+    /// reconciliation (other than "does not exist yet", which is handled).
+    #[error("cannot list recordings directory {path:?}: {source}")]
+    Io {
+        /// The directory that could not be read.
+        path: PathBuf,
+        /// Underlying OS error.
+        source: std::io::Error,
     },
 }

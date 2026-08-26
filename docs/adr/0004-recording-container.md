@@ -26,10 +26,13 @@ re-encode), typically H.264 from RTSP cameras like the Tapo C200.
   (`nian-application::SegmentTargetDuration`), so every segment starts on a
   keyframe and is independently playable.
 * Durability pattern (master spec §9): segments are written as
-  `HH-MM-SS.partial.mkv`, then atomically renamed to `HH-MM-SS.mkv` after
-  `av_write_trailer`. The mechanism is already implemented and tested in
-  `nian-media-ffmpeg::MatroskaMuxer` (finalize path); the partial-file
-  naming lives in `nian-storage`.
+  `HH-MM-SS[-N].partial.mkv`, then atomically renamed to `HH-MM-SS[-N].mkv`
+  after `av_write_trailer` **and** a successful final I/O flush/close — a
+  failed close is reported as a write failure and the file stays eligible
+  for partial-file recovery, never counted as completed. The `-N`
+  disambiguator (allocated by `nian-storage`) keeps segments starting in
+  the same second collision-free. The mechanism is implemented and tested
+  in `nian-media-ffmpeg::MatroskaMuxer`; the naming lives in `nian-storage`.
 
 ## Consequences
 

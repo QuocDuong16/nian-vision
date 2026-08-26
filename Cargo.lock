@@ -2033,6 +2033,7 @@ name = "nian-media-worker"
 version = "0.1.0"
 dependencies = [
  "nian-domain",
+ "nian-ffmpeg-sys",
  "nian-ipc",
  "nian-media",
  "nian-media-ffmpeg",

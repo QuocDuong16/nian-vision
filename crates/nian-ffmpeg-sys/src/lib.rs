@@ -5,7 +5,7 @@
 //! `nian-media-ffmpeg`.
 //!
 //! The declarations in [`bindings`] are **generated** from the vendored
-//! FFmpeg 8.0.1 headers under `thirdparty/ffmpeg` by `cargo run
+//! FFmpeg 8.0.3 headers under `thirdparty/ffmpeg` by `cargo run
 //! -p bindgen-gen`, and are committed so that normal builds never need clang.
 //! They target the FFmpeg 8 ABI (`libavformat` major 62); consumers must
 //! verify the loaded runtime matches before calling anything (see

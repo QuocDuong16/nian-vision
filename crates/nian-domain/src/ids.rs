@@ -9,8 +9,9 @@ use crate::error::DomainError;
 
 /// Stable identifier for a camera.
 ///
-/// The value is restricted to `[a-z0-9_][a-z0-9_-]{0,63}` so it can be used
-/// directly as a directory name without further escaping. Camera display
+/// The value matches `[a-z0-9][a-z0-9_-]{0,63}` (first character must be a
+/// lowercase ASCII letter or digit; at most 64 bytes in total) so it can be
+/// used directly as a directory name without further escaping. Camera display
 /// names must never be used for paths; use this identifier instead.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CameraId(String);
@@ -42,7 +43,7 @@ impl CameraId {
 
         if !first_ok || !rest_ok {
             return Err(DomainError::InvalidCameraId {
-                reason: "must match [a-z0-9][a-z0-9_-]*".to_owned(),
+                reason: "must match [a-z0-9][a-z0-9_-]{0,63}".to_owned(),
             });
         }
 

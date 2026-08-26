@@ -8,8 +8,8 @@
 # Usage: scripts/fetch-ffmpeg-headers.sh
 set -Eeuo pipefail
 
-FFMPEG_VERSION="8.0.1"
-FFMPEG_TARBALL_SHA256="05ee0b03119b45c0bdb4df654b96802e909e0a752f72e4fe3794f487229e5a41"
+FFMPEG_VERSION="8.0.3"
+FFMPEG_TARBALL_SHA256="6136812ea6d4e68bdba27e33c2a94382711cdf4f8602ffef056ff792bd6f9818"
 BASE_URL="https://ffmpeg.org/releases"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

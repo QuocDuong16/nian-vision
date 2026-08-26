@@ -28,14 +28,15 @@ small audited `unsafe` surface.
 
 ### Version: FFmpeg 8.x (ABI 62), distribution pins an exact 8.0.x build
 
-The development reference runtime is FFmpeg 8.0.1 (Ubuntu package,
-`libavformat.so.62`), which is what every test in this repository actually
-runs against. 9.0.1 is two weeks old at decision time; no environment in
-this project (Linux CI image, Windows packaging, maintainer machines) is
-verified against ABI 63 yet. Per the master spec's "verify before pinning"
-rule we pin the ABI we can prove, and treat 9.x as a planned upgrade:
+The development reference runtime is FFmpeg 8.0.3 (sha256-pinned upstream
+release, `libavformat.so.62`), which every test in this repository runs
+against (locally via `scripts/ci-install-ffmpeg.sh` and in CI). 9.0.1 is two
+weeks old at decision time; no environment in this project (Linux CI image,
+Windows packaging, maintainer machines) is verified against ABI 63 yet. Per
+the master spec's "verify before pinning" rule we pin the ABI we can prove,
+and treat 9.x as a planned upgrade:
 
-* bindings are generated from the **8.0.1** headers (vendored under
+* bindings are generated from the **8.0.3** headers (vendored under
   `thirdparty/ffmpeg`, sha256-pinned tarball);
 * `nian-media-ffmpeg` refuses to start when the loaded runtime's
   `libavformat`/`libavcodec`/`libavutil` majors differ from the compiled-in
@@ -89,3 +90,12 @@ We do **not** depend on `ffmpeg-sys-next`/`ffmpeg-the-third`:
   extending the whitelist and regenerating — a feature (review) and a cost
   (a few minutes per capability).
 * FFmpeg 9.x adoption is a bounded, planned task, not an emergency.
+
+## Amendments
+
+* 2026-08-26 (remediation review): exact pin advanced 8.0.1 → 8.0.3 within
+  the same ABI 62 line (headers diff: micro-version bumps only; bindings
+  byte-identical apart from newly allowlisted symbols). Also recorded here:
+  startup init preserves the structured `AbiMismatch` error, and the native
+  log level is forced to `AV_LOG_QUIET` at init as the RTSP credential
+  secret boundary (see `docs/ffmpeg.md`).

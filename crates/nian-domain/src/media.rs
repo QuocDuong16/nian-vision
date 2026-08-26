@@ -62,8 +62,10 @@ impl MediaRational {
         Ok(Self { num, den })
     }
 
-    /// Converts a duration in these units to [`Duration`], saturating on
-    /// overflow. Returns `None` when the denominator is non-positive.
+    /// Converts a duration in these units to [`Duration`].
+    ///
+    /// Returns `None` when the denominator is non-positive or the conversion
+    /// overflows the representable range (no saturating, no panic).
     pub fn duration_of(&self, units: i64) -> Option<Duration> {
         if self.den <= 0 {
             return None;
@@ -151,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn duration_conversion_saturates_instead_of_panicking() {
+    fn duration_conversion_returns_none_on_overflow_or_negative_denominator() {
         let tb = MediaRational::new(1, 1).unwrap();
         assert_eq!(tb.duration_of(i64::MAX), None);
         let tb_neg = MediaRational::new(1, -2).unwrap();

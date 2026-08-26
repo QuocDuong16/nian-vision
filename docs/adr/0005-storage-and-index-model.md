@@ -16,7 +16,7 @@ the only place a recording's existence is known.
 Layout (master spec §10), implemented in `nian-storage::RecordingsLayout`:
 
 ```text
-<storage_root>/<camera-id>/<year>/<month>/<day>/HH-MM-SS.mkv
+<storage_root>/<camera-id>/<year>/<month>/<day>/HH-MM-SS[-N].mkv
 ```
 
 * `<camera-id>` is a validated `CameraId` (`[a-z0-9][a-z0-9_-]{0,63}`) —
@@ -24,6 +24,11 @@ Layout (master spec §10), implemented in `nian-storage::RecordingsLayout`:
   component passes a traversal check (`checked_component`) that rejects
   separators, control characters, `.` and `..`.
 * Open segments carry `.partial.mkv`; finalization is an atomic rename.
+* The optional `-N` suffix (from `-2` on) disambiguates segments that start
+  within the same second (rapid reconnect/restart). `allocate_segment`
+  picks the smallest sequence with no existing partial or finalized file,
+  so an existing recording is never truncated or overwritten; the parser
+  accepts exactly the canonical forms the allocator emits.
 * Startup reconciliation (M4) scans the tree and repairs the index:
   * DB entry without file → mark `missing`, then delete entry;
   * `.partial.mkv` file → inspect, mark `recovering`/`corrupted`;

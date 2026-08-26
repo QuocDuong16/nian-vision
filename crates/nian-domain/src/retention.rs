@@ -6,8 +6,9 @@ use crate::error::DomainError;
 
 /// Deletion policy for old recordings.
 ///
-/// Both limits are optional and combined with AND semantics when both are
-/// set: material is eligible for deletion once it violates either limit.
+/// Both limits are optional and combined with OR semantics when both are
+/// set: material becomes eligible for deletion as soon as it exceeds
+/// **either** limit (too old OR too much total storage).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RetentionPolicy {
     /// Delete recordings older than this many days.

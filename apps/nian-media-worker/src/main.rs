@@ -150,6 +150,14 @@ fn print_report(report: &nian_domain::MediaProbeReport) {
 }
 
 fn cmd_run() -> Result<(), String> {
+    // Fail fast (ADR-0002): a worker that cannot prove its FFmpeg runtime
+    // must exit non-zero instead of serving IPC traffic. Serving anyway would
+    // make `hello`/`describe` report `ffmpeg: null` and every later call fail
+    // mid-session, hiding an installation problem that is knowable up front.
+    FfmpegBackend::new().map_err(|error| format!("ffmpeg startup validation failed: {error}"))?;
+
+    // Init succeeded above, so the ABI check behind this is guaranteed to
+    // report the loaded versions.
     let versions = nian_media_ffmpeg::runtime_versions();
     let hello = json!({
         "worker": "nian-media-worker",
