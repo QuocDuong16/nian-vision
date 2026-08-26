@@ -10,12 +10,17 @@
 // Tests exercise failure paths directly; panicking asserts are idiomatic there.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+// Note: there is deliberately no `packet` module here. The lossy
+// `MediaPacket { metadata, Vec<u8> }` type was removed: packets travel as
+// `nian_media_ffmpeg::FfmpegPacket`, which carries the complete underlying
+// FFmpeg packet (side data, all flags, refcounted payload). Reconstructing
+// packets from payload bytes plus a handful of fields is a regression the
+// media path must never take again.
+
 pub mod error;
-pub mod packet;
 pub mod probe;
 pub mod source;
 
 pub use error::MediaError;
-pub use packet::MediaPacket;
 pub use probe::Probe;
 pub use source::{MediaSource, RtspUrl};

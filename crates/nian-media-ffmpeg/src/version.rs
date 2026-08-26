@@ -90,11 +90,14 @@ where
 /// The stored result keeps the structured error: a failed init replays the
 /// original [`MediaError::AbiMismatch`] (not a lossy string) to every caller.
 ///
-/// Concurrency: `OnceLock` stores exactly one result. Racing first callers
-/// may redundantly execute the body, which is harmless because every step is
-/// idempotent (`check_runtime_abi` is a pure read, `av_log_set_level`
-/// overwrites one global integer, `avformat_network_init` is documented as
-/// idempotent and thread-safe) — all racers observe an equivalent result.
+/// Concurrency: `OnceLock::get_or_init` guarantees that only one initializer
+/// runs to completion as long as it does not panic; racing callers block
+/// until that initializer returns and then all observe the same stored
+/// result. Only a panicking initializer unlocks the cell for another
+/// caller's retry — and every step here is idempotent anyway
+/// (`check_runtime_abi` is a pure read, `av_log_set_level` overwrites one
+/// global integer, `avformat_network_init` is documented as idempotent and
+/// thread-safe), so even the retry path converges on an equivalent result.
 pub fn global_init() -> Result<(), MediaError> {
     static RESULT: OnceLock<Result<(), MediaError>> = OnceLock::new();
 

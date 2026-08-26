@@ -7,10 +7,16 @@
 //! ```
 //!
 //! All names are derived from validated [`CameraId`] values and formatted
-//! timestamps — user-provided strings never reach a path directly. The crate
-//! forbids `unsafe` and performs no I/O beyond what future milestones add.
+//! timestamps — user-provided strings never reach a path directly.
+//!
+//! `unsafe` policy: this crate contains exactly one sanctioned unsafe block,
+//! the Windows no-replace publication primitive (`MoveFileExW`, see
+//! `paths::publish_no_replace`); it is gated to `cfg(windows)` and each call
+//! site documents its invariants. Every other platform builds with
+//! `#![forbid(unsafe_code)]`.
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(windows), forbid(unsafe_code))]
+#![deny(unsafe_code)]
 // Tests exercise failure paths directly; panicking asserts are idiomatic there.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 

@@ -12,6 +12,19 @@ chrono = { workspace = true }
 nian-domain = { workspace = true }
 thiserror = { workspace = true }
 
+# Atomic no-replace publication (`publish_no_replace`). On Unix this is
+# `renameat2(RENAME_NOREPLACE)` behind rustix's safe API (macOS maps the flag
+# onto `renamex_np(RENAME_EXCL)`); Windows uses `MoveFileExW` without
+# `MOVEFILE_REPLACE_EXISTING` via `windows-sys`.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.4", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

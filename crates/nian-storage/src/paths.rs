@@ -198,7 +198,7 @@ pub struct ClaimedSegment {
     /// Claim token; kept private so callers cannot accidentally close it
     /// while still treating the slot as theirs. Rust opens files with
     /// FILE_SHARE_READ|WRITE|DELETE on Windows, so holding this handle does
-    /// not block the hard-link/unlink publication step.
+    /// not block the no-replace publication step.
     _partial_file: std::fs::File,
 }
 
@@ -217,18 +217,123 @@ impl ClaimedSegment {
 /// Publishes finalized content at its final name **atomically and without
 /// ever replacing an existing file**.
 ///
-/// Implemented as hard-link + unlink: `hard_link` fails with "already
-/// exists" when the destination exists on every platform we target (this is
-/// the no-replace guarantee; a plain `rename` would silently replace on
-/// Unix), so the instant the final name appears it already references the
-/// complete content. Removing the source link afterwards completes the
-/// logical move.
+/// Platform strategy (ADR-0005):
 ///
-/// Both paths must live on the same volume, which the recordings layout
-/// guarantees. If only the unlink fails, the segment is already durably
-/// published under its final name; the returned error tells reconciliation
-/// to sweep the stale `.partial` link.
+/// * **Unix** — `renameat2(…, RENAME_NOREPLACE)` through `rustix`'s safe
+///   API: a single syscall whose kernel-side existence check makes the
+///   collision refusal race-free (macOS maps the flag onto
+///   `renamex_np(RENAME_EXCL)`). Supported by the usual local filesystems;
+///   when the kernel or filesystem cannot provide it (`ENOSYS`, `EINVAL`,
+///   `EOPNOTSUPP`), the hard-link fallback below takes over.
+/// * **Windows** — `MoveFileExW` *without* `MOVEFILE_REPLACE_EXISTING`:
+///   the native same-volume no-replace move. Unlike hard links it works on
+///   every filesystem a user may select for recordings (NTFS, FAT/exFAT),
+///   and the existence check happens inside the move operation, so there is
+///   no scan-then-move window either. The call must stay within one volume,
+///   which the recordings layout guarantees (partial and final share the
+///   day directory); `MOVEFILE_WRITE_THROUGH` keeps the rename durable.
+/// * **Fallback** — hard-link + unlink for platforms/filesystems without an
+///   atomic no-replace rename. `hard_link` never replaces either, so this
+///   stays collision-safe; it needs link support (absent e.g. on FAT) and
+///   surfaces a plain error there instead of silently degrading to an
+///   overwrite-capable rename.
+///
+/// In every case the instant the final name appears it already references
+/// the complete content, and [`StorageError::DestinationExists`] is returned
+/// on collision. If only the source unlink fails after a successful link,
+/// the segment is already durably published under its final name; the
+/// returned error tells reconciliation to sweep the stale `.partial` link.
 pub fn publish_no_replace(from: &Path, to: &Path) -> Result<(), StorageError> {
+    #[cfg(unix)]
+    {
+        unix_publish_no_replace(from, to)
+    }
+    #[cfg(windows)]
+    {
+        windows_publish_no_replace(from, to)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (from, to);
+        unimplemented!("publication is implemented for Unix and Windows targets")
+    }
+}
+
+/// Unix path of [`publish_no_replace`]: atomic no-replace rename with a
+/// collision-safe fallback where the platform lacks it.
+#[cfg(unix)]
+fn unix_publish_no_replace(from: &Path, to: &Path) -> Result<(), StorageError> {
+    use rustix::fs::{CWD, RenameFlags};
+    use rustix::io::Errno;
+
+    match rustix::fs::renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(Errno::EXIST) => Err(StorageError::DestinationExists {
+            destination: to.to_path_buf(),
+        }),
+        // ENOSYS: kernel without renameat2 (<3.15). EINVAL/EOPNOTSUPP:
+        // filesystem that rejects RENAME_NOREPLACE (some network/stacked
+        // filesystems). All three mean "atomic no-replace unavailable" —
+        // fall back while keeping the no-replace guarantee; anything else
+        // is a real error.
+        Err(Errno::NOSYS | Errno::INVAL | Errno::OPNOTSUPP) => hard_link_fallback(from, to),
+        Err(error) => Err(StorageError::Io {
+            path: to.to_path_buf(),
+            source: std::io::Error::from(error),
+        }),
+    }
+}
+
+/// Windows path of [`publish_no_replace`]: `MoveFileExW` with no replace
+/// flag. This is the crate's single sanctioned unsafe block.
+#[cfg(windows)]
+#[allow(unsafe_code)] // sanctioned exception; see the crate-level policy
+fn windows_publish_no_replace(from: &Path, to: &Path) -> Result<(), StorageError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    fn wide(path: &Path) -> Vec<u16> {
+        let mut buffer: Vec<u16> = path.as_os_str().encode_wide().collect();
+        buffer.push(0); // NUL terminator
+        buffer
+    }
+
+    let from_wide = wide(from);
+    let to_wide = wide(to);
+
+    // SAFETY: both arguments are valid NUL-terminated UTF-16 strings that
+    // outlive the call; MoveFileExW only reads them and returns 0 on
+    // failure with GetLastError set. The flags deliberately omit
+    // MOVEFILE_REPLACE_EXISTING — the kernel then refuses an existing
+    // destination (ERROR_FILE_EXISTS/ERROR_ALREADY_EXISTS) inside the move
+    // operation itself, which is the no-replace guarantee.
+    let succeeded =
+        unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if succeeded != 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == ERROR_FILE_EXISTS as i32 || code == ERROR_ALREADY_EXISTS as i32 => {
+            Err(StorageError::DestinationExists {
+                destination: to.to_path_buf(),
+            })
+        }
+        _ => Err(StorageError::Io {
+            path: to.to_path_buf(),
+            source: error,
+        }),
+    }
+}
+
+/// Collision-safe publication without atomic no-replace rename support:
+/// link the content under its final name (never replaces) and drop the
+/// partial link afterwards.
+#[allow(dead_code)] // reached only via the cfg-dispatched fallback paths
+fn hard_link_fallback(from: &Path, to: &Path) -> Result<(), StorageError> {
     if let Err(source) = std::fs::hard_link(from, to) {
         return Err(if source.kind() == std::io::ErrorKind::AlreadyExists {
             StorageError::DestinationExists {
@@ -259,10 +364,16 @@ pub struct AllocatedSegmentPaths {
 
 /// Picks the smallest segment sequence for `started_at` that collides with
 /// no existing file in `day_dir`. See [`RecordingsLayout::allocate_segment`].
+///
+/// Comparison happens at **whole-second granularity**: segment names encode
+/// hours/minutes/seconds only, while a live clock carries nanoseconds —
+/// comparing raw `NaiveTime`s would make `17:12:00.877` miss the existing
+/// `17-12-00.mkv` and hand out sequence 1 twice.
 pub fn allocate_segment_sequence(
     day_dir: &Path,
     started_at: NaiveTime,
 ) -> Result<u32, StorageError> {
+    let started_at = whole_seconds(started_at);
     let entries = match std::fs::read_dir(day_dir) {
         Ok(entries) => entries,
         // No directory yet: nothing can collide, use the bare name.
@@ -303,6 +414,12 @@ pub fn allocate_segment_sequence(
         })?;
     }
     Ok(sequence)
+}
+
+/// Drops sub-second components so live-clock timestamps compare equal to
+/// the second-granular names the allocator emits.
+fn whole_seconds(time: NaiveTime) -> NaiveTime {
+    NaiveTime::from_hms_opt(time.hour(), time.minute(), time.second()).unwrap_or(time)
 }
 
 /// Formats the final segment file name for a start time (`08-30-00.mkv`).
@@ -661,6 +778,31 @@ mod tests {
     }
 
     #[test]
+    fn subsecond_claim_timestamps_do_not_reuse_taken_sequences() {
+        // Regression: segment names encode whole seconds only, while a live
+        // clock carries nanoseconds. Occupancy matching must therefore be
+        // second-granular — an existing 08-30-00.mkv must push a claim made
+        // at 08:30:00.877 on to sequence 2.
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(day_dir.join("08-30-00.mkv"), b"published").unwrap();
+
+        let subsecond_start = sample_start()
+            .with_nanosecond(877_000_000)
+            .expect("valid subsecond time");
+        let claim = layout.claim_segment(&camera, subsecond_start).unwrap();
+        assert_eq!(
+            claim.final_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00-2.mkv",
+            "sequence 1 is occupied despite the subsecond mismatch"
+        );
+    }
+
+    #[test]
     fn claims_in_same_second_are_distinct_and_exclusive() {
         let temp = tempfile::tempdir().unwrap();
         let layout = layout_in(temp.path());
@@ -745,6 +887,50 @@ mod tests {
             b"segment-bytes",
             "existing finalized segment must never be replaced"
         );
+    }
+
+    #[test]
+    fn refused_publication_leaves_abandoned_partial_recoverable() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+
+        let first = layout.claim_segment(&camera, sample_start()).unwrap();
+        std::fs::write(first.partial_path(), b"first-content").unwrap();
+        publish_no_replace(first.partial_path(), first.final_path()).unwrap();
+
+        let second = layout.claim_segment(&camera, sample_start()).unwrap();
+        std::fs::write(second.partial_path(), b"second-content").unwrap();
+
+        // Force a collision: second's final name differs from first's, so
+        // publish second's content onto FIRST's final path to emulate a
+        // reconciliation race with an already-published segment.
+        match publish_no_replace(second.partial_path(), first.final_path()) {
+            Err(StorageError::DestinationExists { .. }) => {}
+            other => panic!("expected DestinationExists, got {other:?}"),
+        }
+
+        // The abandoned partial is exactly where recovery expects it: same
+        // path, original bytes, canonical `.partial` name.
+        let path = second.partial_path();
+        assert!(path.is_file(), "abandoned partial must remain on disk");
+        assert_eq!(std::fs::read(path).unwrap(), b"second-content");
+        let parsed = parse_segment_file_name(path.file_name().unwrap().to_str().unwrap())
+            .expect("abandoned partial keeps its canonical name");
+        assert!(parsed.is_partial);
+        assert_eq!(parsed.started_at, sample_start().time());
+
+        // And the colliding final was not modified by the failed attempt.
+        assert_eq!(std::fs::read(first.final_path()).unwrap(), b"first-content");
+
+        // Publishing to the correct (free) final name still works after the
+        // refusal — the failure did not poison the slot.
+        publish_no_replace(second.partial_path(), second.final_path()).unwrap();
+        assert_eq!(
+            std::fs::read(second.final_path()).unwrap(),
+            b"second-content"
+        );
+        assert!(!second.partial_path().exists());
     }
 
     #[test]

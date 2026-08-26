@@ -4,10 +4,11 @@
 //! compressed packets go in untouched — no decode, no re-encode — with
 //! timestamps rescaled from the input stream time base to the output stream
 //! time base by `av_packet_rescale_ts`. Writing is **packet-faithful**:
-//! [`MatroskaMuxer::write_packet`] consumes an owned [`FfmpegPacket`] and
+//! [`MatroskaMuxer::write_packet`] borrows the caller's [`FfmpegPacket`] and
 //! writes a new reference to that exact packet, so side data (new extradata,
 //! parameter changes, …) and every flag survive the copy; only the payload
-//! buffer is shared by refcount, never re-encoded or byte-copied.
+//! buffer is shared by refcount, never re-encoded or byte-copied. The
+//! caller's packet itself is neither mutated nor consumed.
 //!
 //! # Destination-path contract
 //!

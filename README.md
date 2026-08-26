@@ -4,8 +4,12 @@ Local-first desktop NVR (network video recorder) for IP cameras. The first
 supported camera is the TP-Link Tapo C200 over RTSP, with a camera-agnostic
 domain so other RTSP/ONVIF cameras can follow.
 
-**Status**: milestones M0 (foundation) and M1 (FFmpeg FFI media spike) are
-implemented and under review. Recording (M2) has not been started.
+**Status**: milestone **M2 (recorder)** is implemented and ready for
+review: a continuous segmented recording pipeline that turns one healthy
+input into durable, independently playable Matroska segments —
+keyframe-aware rotation, exclusive segment claiming and atomic no-replace
+publication, deterministic fixture-based integration tests. M0 (foundation)
+and M1 (FFmpeg FFI media spike) passed architecture/media review.
 
 ## What it does today
 
@@ -15,12 +19,19 @@ implemented and under review. Recording (M2) has not been started.
   * `nian-media-worker probe <file|credential-free-rtsp-url>` prints stream
     information (codec, resolution, duration);
   * `nian-media-worker run` serves a versioned NDJSON IPC protocol on
-    stdin/stdout (ping/describe/shutdown).
-* Stream-copy remux into Matroska (the exact mechanism the recorder will
-  use), covered by integration tests against a deterministic fixture.
-* Clean crate boundaries with `unsafe` confined to the FFmpeg layers, a
-  versioned storage layout, credential redaction, and a full quality-gate
-  setup (fmt/clippy/tests, ESLint/tsc/vitest/vite build).
+    stdin/stdout (ping/describe/shutdown);
+  * `nian-media-worker record --storage <DIR> --camera <ID> ...` is the
+    manual smoke path that records from `NIAN_VISION_RTSP_URL` or a file
+    into rotating `.mkv` segments (development only; never in CI).
+* A real recording pipeline (`nian-recorder`): packets are copied
+  faithfully (side data and flags preserved), segments start on video
+  keyframes, rotation waits for keyframes after the media-time target,
+  finalization is durable before the no-replace publish, and failed or
+  empty segments stay recoverable partials — never fake recordings.
+* Clean crate boundaries with `unsafe` confined to the FFmpeg layers (plus
+  one audited Windows publication primitive), a race-safe storage layout,
+  credential redaction, and a full quality-gate setup (fmt/clippy/tests,
+  ESLint/tsc/vitest/vite build).
 
 ## Architecture
 

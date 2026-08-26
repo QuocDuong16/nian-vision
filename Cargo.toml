@@ -9,6 +9,7 @@ members = [
     "crates/nian-ipc",
     "crates/nian-media",
     "crates/nian-media-ffmpeg",
+    "crates/nian-recorder",
     "crates/nian-storage",
     "tools/bindgen-gen",
 ]
@@ -23,6 +24,7 @@ default-members = [
     "crates/nian-ipc",
     "crates/nian-media",
     "crates/nian-media-ffmpeg",
+    "crates/nian-recorder",
     "crates/nian-storage",
 ]
 
@@ -49,6 +51,7 @@ nian-ffmpeg-sys = { path = "crates/nian-ffmpeg-sys" }
 nian-ipc = { path = "crates/nian-ipc" }
 nian-media = { path = "crates/nian-media" }
 nian-media-ffmpeg = { path = "crates/nian-media-ffmpeg" }
+nian-recorder = { path = "crates/nian-recorder" }
 nian-storage = { path = "crates/nian-storage" }
 
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }

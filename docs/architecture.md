@@ -41,8 +41,10 @@ Key properties:
   worker (ADR-0003).
 * Application code never sees FFmpeg types; `nian-media` is the seam
   (ADR-0001).
-* `unsafe` exists only inside `nian-media-ffmpeg` (safe public API) and
-  `nian-ffmpeg-sys` (raw declarations). Every other crate has
+* `unsafe` exists inside `nian-media-ffmpeg` (safe public API) and
+  `nian-ffmpeg-sys` (raw declarations), plus one audited exception:
+  `nian-storage`'s Windows no-replace publication primitive (`MoveFileExW`,
+  compiled only on Windows targets). Every other crate has
   `#![forbid(unsafe_code)]`.
 
 ## Crate map
@@ -51,29 +53,34 @@ Key properties:
 |---|---|---|
 | `nian-domain` | Camera/Recording/Media vocabulary | path-safe IDs, redacted credentials, backoff schedule |
 | `nian-application` | config validation, policies | `AppConfig`, `SegmentTargetDuration` |
-| `nian-storage` | recordings layout, path safety | pure path logic, traversal-proof |
+| `nian-storage` | recordings layout, claiming, publication | traversal-proof paths, race-safe `claim_segment`, atomic no-replace publish |
 | `nian-ipc` | NDJSON protocol + serve loop | versioned envelopes, size-capped framing |
-| `nian-media` | backend-agnostic facade | `Probe`, `MediaSource`, `MediaPacket` |
-| `nian-media-ffmpeg` | safe FFmpeg wrapper | input/muxer/interrupt/ABI guard |
+| `nian-media` | backend-agnostic facade | `Probe`, `MediaSource`; packets travel as backend-owned types (`FfmpegPacket`) |
+| `nian-media-ffmpeg` | safe FFmpeg wrapper | input/muxer/packet/interrupt/ABI guard |
+| `nian-recorder` | segmented recording engine | keyframe-aware rotation, startup alignment, durable finalize + publish |
 | `nian-ffmpeg-sys` | raw FFI (generated) | committed bindings from vendored 8.0.3 headers |
 | `apps/nian-desktop` | Tauri 2 host | window + commands |
-| `apps/nian-media-worker` | media process | `probe` CLI + `run` IPC loop |
+| `apps/nian-media-worker` | media process | `probe` CLI, `run` IPC loop, manual `record` smoke command |
 | `tools/bindgen-gen` | one-shot binding generator | requires libclang, run manually |
 
-## Recording data flow (M2 target)
+## Recording data flow (M2, implemented)
 
 ```text
-RTSP (H.264)
-  → libavformat demux (interrupt-bounded reads)
-  → compressed packets (stream copy, no decode/re-encode)
-  → timestamp rescale (av_packet_rescale_ts)
-  → Matroska segment writer (MatroskaMuxer)
-  → <storage_root>/<camera>/<Y>/<M>/<D>/HH-MM-SS[-N].partial.mkv
-  → av_write_trailer → atomic rename → HH-MM-SS[-N].mkv
+RTSP (H.264) / local container
+  → MediaInput demux (interrupt-bounded reads)
+  → FfmpegPacket (packet-faithful: side data + flags preserved)
+  → Recorder (nian-recorder): discard until first video keyframe,
+    rotate at the first keyframe after the media-time target
+  → claim_segment → HH-MM-SS[-N].partial.mkv
+  → MatroskaMuxer stream copy (av_packet_rescale_ts only)
+  → av_write_trailer + final flush/close (both must succeed)
+  → publish_no_replace (renameat2 NOREPLACE / MoveFileExW / hard-link)
+  → HH-MM-SS[-N].mkv
 ```
 
-Rotation happens at the first keyframe at/after the configured target
-(~5 minutes), so every segment starts on a keyframe (ADR-0004).
+Rotation is driven by packet DTS in the validated video time base — never
+by wall clock alone; wall clock only names segments. Timestamps are
+preserved from the source across segment boundaries (ADR-0004).
 
 ## Failure model
 

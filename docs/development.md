@@ -51,6 +51,31 @@ cargo run -p nian-media-worker -- probe crates/nian-media-ffmpeg/tests/fixtures/
 cargo run -p nian-media-worker -- run   # NDJSON IPC on stdio
 ```
 
+## Manual recording smoke test (M2)
+
+Records a real source into the recordings layout with the production
+recorder pipeline. Not run in CI.
+
+```bash
+# From a local file:
+cargo run -p nian-media-worker -- record \
+  --storage /tmp/nian-recordings --camera cam-1 --segment-target 300 \
+  crates/nian-media-ffmpeg/tests/fixtures/session_av.mkv
+
+# From a real camera (credentials only via the environment):
+NIAN_VISION_RTSP_URL='rtsp://user:pass@192.168.1.42:554/stream1' \
+  cargo run -p nian-media-worker -- record \
+  --storage /tmp/nian-recordings --camera tapo-1 --until-stdin-eof --rtsp-from-env
+```
+
+* Stop conditions: `--duration <SECONDS>`, `--until-stdin-eof` (pipe close /
+  Ctrl+D), or Ctrl+C — on Ctrl+C the process dies and the active segment
+  stays behind as a recoverable `.partial.mkv` by design.
+* `--no-audio` records video only; `--segment-target` is in seconds
+  (default 300).
+* The URL never appears in argv, stdout/stderr, or logs; native FFmpeg
+  logging stays silenced (`AV_LOG_QUIET`) for the same reason.
+
 ## Layout
 
 ```text
@@ -67,7 +92,8 @@ docs/                    architecture, ADRs, guides
 ## Conventions
 
 * Rust 2024 edition; `#![forbid(unsafe_code)]` everywhere except
-  `nian-media-ffmpeg` (safe API) and `nian-ffmpeg-sys` (raw FFI).
+  `nian-media-ffmpeg` (safe API), `nian-ffmpeg-sys` (raw FFI) and
+  nian-storage's single Windows-only publication primitive.
 * Clippy lints `unwrap_used`/`expect_used`/`panic` are denied via CI;
   tests re-enable them locally. Production code uses explicit errors.
 * Dependency versions are pinned exactly (`=x.y.z`) and lockfiles are

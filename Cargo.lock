@@ -2037,9 +2037,24 @@ dependencies = [
  "nian-ipc",
  "nian-media",
  "nian-media-ffmpeg",
+ "nian-recorder",
+ "nian-storage",
  "serde_json",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "nian-recorder"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "nian-domain",
+ "nian-media",
+ "nian-media-ffmpeg",
+ "nian-storage",
+ "tempfile",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2048,8 +2063,10 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "nian-domain",
+ "rustix",
  "tempfile",
  "thiserror 2.0.20",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
