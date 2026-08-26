@@ -1,0 +1,158 @@
+name: OpenWiki Update
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * *"
+      timezone: Asia/Ho_Chi_Minh
+
+concurrency:
+  group: openwiki-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: docker
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.OPENWIKI_FORGEJO_TOKEN }}
+          persist-credentials: true
+
+      - name: Set up Node.js
+        uses: https://data.forgejo.org/actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Install OpenWiki
+        run: |
+          npm install --global \
+            openwiki@0.2.3 \
+            mermaid@11.16.0 \
+            jsdom@29.1.1
+
+      - name: Run OpenWiki
+        run: openwiki code --update --print
+        env:
+          OPENWIKI_PROVIDER: openai-compatible
+          OPENAI_COMPATIBLE_BASE_URL: https://opencode.ai/zen/go/v1
+          OPENAI_COMPATIBLE_API_KEY: ${{ secrets.OPENAI_COMPATIBLE_API_KEY }}
+          OPENWIKI_MODEL_ID: mimo-v2.5
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGCHAIN_PROJECT: openwiki
+          LANGCHAIN_TRACING_V2: "true"
+          OPENWIKI_TELEMETRY_DISABLED: "1"
+
+      - name: Publish OpenWiki pull request
+        env:
+          FORGEJO_TOKEN: ${{ secrets.OPENWIKI_FORGEJO_TOKEN }}
+          API_URL: ${{ forgejo.api_url }}
+          REPOSITORY: ${{ forgejo.repository }}
+          UPDATE_BRANCH: openwiki/update
+          BASE_BRANCH: main
+        run: |
+          set -Eeuo pipefail
+
+          changed="$(
+            git status --porcelain -- \
+              openwiki \
+              AGENTS.md \
+              CLAUDE.md \
+              .forgejo/workflows/openwiki-update.yml
+          )"
+
+          if [ -z "$changed" ]; then
+            echo "No OpenWiki changes to publish."
+            exit 0
+          fi
+
+          git config user.name "openwiki-bot"
+          git config user.email \
+            "openwiki-bot@users.noreply.git.niand.io.vn"
+
+          # Luôn tạo branch mới từ commit main vừa checkout.
+          git switch -C "$UPDATE_BRANCH"
+
+          git add \
+            openwiki \
+            AGENTS.md \
+            CLAUDE.md \
+            .forgejo/workflows/openwiki-update.yml
+
+          git commit -m "docs: update OpenWiki"
+
+          # Branch có thể đã tồn tại từ lần chạy trước.
+          git push \
+            --force \
+            origin \
+            "HEAD:refs/heads/${UPDATE_BRANCH}"
+
+          echo "Checking existing pull requests..."
+
+          pulls="$(
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --header "Authorization: token ${FORGEJO_TOKEN}" \
+              --header "Accept: application/json" \
+              "${API_URL}/repos/${REPOSITORY}/pulls?state=open&limit=50"
+          )"
+
+          existing_pr="$(
+            printf '%s' "$pulls" |
+              jq -r \
+                --arg head "$UPDATE_BRANCH" \
+                --arg base "$BASE_BRANCH" \
+                '
+                  [
+                    .[]
+                    | select(
+                        .head.ref == $head
+                        and .base.ref == $base
+                      )
+                  ][0].number // empty
+                '
+          )"
+
+          if [ -n "$existing_pr" ]; then
+            echo "Updated existing pull request #${existing_pr}."
+            exit 0
+          fi
+
+          payload="$(
+            jq -nc \
+              --arg head "$UPDATE_BRANCH" \
+              --arg base "$BASE_BRANCH" \
+              --arg title "docs: update OpenWiki" \
+              --arg body "Automated OpenWiki documentation update." \
+              '{
+                head: $head,
+                base: $base,
+                title: $title,
+                body: $body
+              }'
+          )"
+
+          response="$(
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --request POST \
+              --header "Authorization: token ${FORGEJO_TOKEN}" \
+              --header "Content-Type: application/json" \
+              --data "$payload" \
+              "${API_URL}/repos/${REPOSITORY}/pulls"
+          )"
+
+          pr_number="$(
+            printf '%s' "$response" |
+              jq -r '.number'
+          )"
+
+          echo "Created pull request #${pr_number}."
