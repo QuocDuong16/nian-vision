@@ -2,16 +2,11 @@ name: Quality
 
 on:
   push:
-    branches: [main]
   pull_request:
-
-concurrency:
-  group: quality-${{ forgejo.ref }}
-  cancel-in-progress: true
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_VERSION: "1.98.0"
   CARGO_DENY_VERSION: "0.20.2"
 
 jobs:
@@ -23,20 +18,51 @@ jobs:
       image: rust:1.98.0-bookworm
 
     steps:
-      - name: Install system packages
+      # The runner container ships without Node.js, which node-based actions
+      # (checkout included) require. Install a pinned runtime first — same
+      # pattern as nian-pass.
+      - name: Install Node.js runtime for actions
         run: |
           set -Eeuo pipefail
-          apt-get update
-          # webkit/gtk: Tauri desktop shell build; xz: ffmpeg tarball;
-          # curl: pinned downloads.
-          apt-get install -y --no-install-recommends \
-            build-essential pkg-config xz-utils curl \
-            libwebkit2gtk-4.1-dev libgtk-3-dev
+          node_version="26.7.0"
+          case "$(uname -m)" in
+            x86_64)
+              node_arch="x64"
+              node_checksum="982aa24dd8be4c889c6a8ab337ddff3b0896645b20f4239356e80552c16277ee"
+              ;;
+            aarch64)
+              node_arch="arm64"
+              node_checksum="afc7a004018485092ac8985b817b0d5684472bd9472e0b57d2ab88737e50090d"
+              ;;
+            *)
+              echo "Unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          node_archive="node-v${node_version}-linux-${node_arch}.tar.xz"
+          curl --fail --silent --show-error --location \
+            --output "/tmp/${node_archive}" \
+            "https://nodejs.org/dist/v${node_version}/${node_archive}"
+          echo "${node_checksum}  /tmp/${node_archive}" | sha256sum --check -
+          tar --extract --xz --file "/tmp/${node_archive}" \
+            --directory /usr/local --strip-components=1
 
       - name: Check out repository
         uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      - name: Install desktop build prerequisites
+        run: |
+          set -Eeuo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            build-essential \
+            pkg-config \
+            xz-utils \
+            curl \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev
 
       - name: Build pinned FFmpeg 8.0.1 (ABI 62)
         run: scripts/ci-install-ffmpeg.sh
@@ -45,16 +71,18 @@ jobs:
         run: cargo fmt --all --check
 
       - name: cargo clippy
-        env:
-          NIAN_FFMPEG_LIB_DIR: ${{ github.workspace }}/ffmpeg-dist/lib
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ffmpeg-dist/lib
-        run: cargo clippy --all-targets -- -D warnings
+        run: |
+          set -Eeuo pipefail
+          export NIAN_FFMPEG_LIB_DIR="$PWD/ffmpeg-dist/lib"
+          export LD_LIBRARY_PATH="$PWD/ffmpeg-dist/lib"
+          cargo clippy --all-targets -- -D warnings
 
       - name: cargo test
-        env:
-          NIAN_FFMPEG_LIB_DIR: ${{ github.workspace }}/ffmpeg-dist/lib
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ffmpeg-dist/lib
-        run: cargo test --workspace
+        run: |
+          set -Eeuo pipefail
+          export NIAN_FFMPEG_LIB_DIR="$PWD/ffmpeg-dist/lib"
+          export LD_LIBRARY_PATH="$PWD/ffmpeg-dist/lib"
+          cargo test --workspace
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
@@ -66,18 +94,21 @@ jobs:
     name: Frontend (lint, typecheck, test, build)
     runs-on: docker
     timeout-minutes: 30
+    container:
+      image: node:26.7.0-bookworm
 
     steps:
       - name: Check out repository
         uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Node.js
-        uses: https://data.forgejo.org/actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-
-      - name: Install pinned pnpm
-        run: npm install --global pnpm@11.22.0
+      - name: Install and activate pinned pnpm
+        run: |
+          set -Eeuo pipefail
+          npm install --global corepack@0.35.0
+          corepack enable
+          corepack install --global pnpm@11.22.0
+          corepack --version
+          pnpm --version
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
