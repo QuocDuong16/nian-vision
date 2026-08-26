@@ -1,0 +1,30 @@
+# Rust / Cargo
+/target/
+
+# Node / pnpm
+node_modules/
+*.tsbuildinfo
+
+# Vite
+ui/dist/
+
+# Tauri
+apps/nian-desktop/gen/schemas/
+
+# Local FFmpeg: link shims (scripts/setup-ffmpeg-linux.sh) and minimal
+# builds (scripts/ci-install-ffmpeg.sh)
+/.ffmpeg-lib/
+/ffmpeg-dist/
+
+# Environment / secrets — never commit credentials
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp

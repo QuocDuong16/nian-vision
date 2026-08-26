@@ -1,0 +1,15 @@
+[package]
+name = "nian-media"
+description = "Safe media facade decoupling the application from FFmpeg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+nian-domain = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

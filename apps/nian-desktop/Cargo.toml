@@ -1,0 +1,25 @@
+[package]
+name = "nian-desktop"
+description = "Nian Vision desktop shell (Tauri 2 host process)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+nian-application = { workspace = true }
+serde = { workspace = true }
+tauri = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lib]
+name = "nian_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[lints]
+workspace = true

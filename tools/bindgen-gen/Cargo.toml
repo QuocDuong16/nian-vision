@@ -1,0 +1,15 @@
+[package]
+name = "bindgen-gen"
+description = "One-shot generator that produces committed FFmpeg FFI bindings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bindgen = "=0.72.1"
+
+[lints]
+workspace = true

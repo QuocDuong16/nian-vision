@@ -1,0 +1,68 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/nian-desktop",
+    "apps/nian-media-worker",
+    "crates/nian-application",
+    "crates/nian-domain",
+    "crates/nian-ffmpeg-sys",
+    "crates/nian-ipc",
+    "crates/nian-media",
+    "crates/nian-media-ffmpeg",
+    "crates/nian-storage",
+    "tools/bindgen-gen",
+]
+# tools/bindgen-gen needs libclang and is only built explicitly:
+#   cargo run -p bindgen-gen
+default-members = [
+    "apps/nian-desktop",
+    "apps/nian-media-worker",
+    "crates/nian-application",
+    "crates/nian-domain",
+    "crates/nian-ffmpeg-sys",
+    "crates/nian-ipc",
+    "crates/nian-media",
+    "crates/nian-media-ffmpeg",
+    "crates/nian-storage",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.0"
+authors = ["Nian Vision contributors"]
+license = "LicenseRef-Proprietary"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[workspace.dependencies]
+nian-application = { path = "crates/nian-application" }
+nian-domain = { path = "crates/nian-domain" }
+nian-ffmpeg-sys = { path = "crates/nian-ffmpeg-sys" }
+nian-ipc = { path = "crates/nian-ipc" }
+nian-media = { path = "crates/nian-media" }
+nian-media-ffmpeg = { path = "crates/nian-media-ffmpeg" }
+nian-storage = { path = "crates/nian-storage" }
+
+chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+tempfile = "=3.27.0"
+thiserror = "=2.0.20"
+tokio = { version = "=1.53.1", features = ["full"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+
+tauri = "=2.11.5"
+tauri-build = { version = "=2.6.3", features = [] }
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"

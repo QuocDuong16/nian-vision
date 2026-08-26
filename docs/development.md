@@ -1,0 +1,77 @@
+# Development guide
+
+## Prerequisites
+
+| Tool | Version | Managed by |
+|---|---|---|
+| Rust | 1.98.0 (pinned) | rustup via `rust-toolchain.toml`; mise via `.mise.toml` |
+| Node | 26.x | mise (`.mise.toml`) |
+| pnpm | 11.22.0 | recorded in root `package.json` |
+| FFmpeg | 8.x runtime (ABI 62) | system packages or installer |
+
+Linux build of the desktop shell additionally needs WebKit2GTK/GTK dev
+packages (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, ...) — the standard Tauri
+Linux prerequisites. The media worker and all library crates build without
+them.
+
+## First-time setup
+
+```bash
+mise install                 # node/rust per .mise.toml
+pnpm install                 # frontend dependencies
+scripts/setup-ffmpeg-linux.sh  # only if FFmpeg -dev packages are absent
+cargo build                  # workspace (default members)
+```
+
+If FFmpeg libraries cannot be found, see `docs/ffmpeg.md` for
+`NIAN_FFMPEG_LIB_DIR` and pkg-config options.
+
+## Daily commands
+
+```bash
+cargo fmt --all                       # format Rust
+cargo clippy --all-targets -- -D warnings
+cargo test --workspace
+pnpm --filter nian-ui lint
+pnpm --filter nian-ui typecheck
+pnpm --filter nian-ui test
+pnpm --filter nian-ui build
+```
+
+Run the desktop shell (requires a display):
+
+```bash
+cargo run -p nian-desktop            # expects `pnpm --filter nian-ui dev` or a built ui/dist
+```
+
+Run the media worker standalone:
+
+```bash
+cargo run -p nian-media-worker -- probe crates/nian-media-ffmpeg/tests/fixtures/sample.mkv
+cargo run -p nian-media-worker -- run   # NDJSON IPC on stdio
+```
+
+## Layout
+
+```text
+apps/nian-desktop        Tauri 2 host (window, commands)
+apps/nian-media-worker   media process (probe CLI, IPC loop)
+crates/                  workspace library crates (see docs/architecture.md)
+tools/bindgen-gen        one-time FFmpeg binding generator (libclang needed)
+ui/                      React + TypeScript + Vite frontend
+thirdparty/ffmpeg        vendored FFmpeg 8.0.1 headers (unmodified)
+scripts/                 setup/fixture/icon helper scripts
+docs/                    architecture, ADRs, guides
+```
+
+## Conventions
+
+* Rust 2024 edition; `#![forbid(unsafe_code)]` everywhere except
+  `nian-media-ffmpeg` (safe API) and `nian-ffmpeg-sys` (raw FFI).
+* Clippy lints `unwrap_used`/`expect_used`/`panic` are denied via CI;
+  tests re-enable them locally. Production code uses explicit errors.
+* Dependency versions are pinned exactly (`=x.y.z`) and lockfiles are
+  committed.
+* Secrets (camera passwords) never appear in logs, argv, or fixtures —
+  credential types in `nian-domain` redact `Debug`/`Display` output.
+* OpenWiki pages under `openwiki/` are generated; do not hand-edit them.

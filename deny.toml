@@ -1,0 +1,63 @@
+# cargo-deny configuration — run via `cargo deny check` (CI: quality workflow).
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+# LicenseRef-Proprietary covers this repository's own crates.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+  "LicenseRef-Proprietary",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+# "warn" rather than "deny": workspace path dependencies (`workspace = true`)
+# carry no version and are flagged as wildcards; they are intentional.
+wildcards = "warn"
+highlight = "all"
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  # The gtk-rs GTK3 binding family is unmaintained upstream, but Tauri 2
+  # itself depends on it for its Linux shell (gtk/atk/gdk/gdkx11/
+  # webkit2gtk via tao/wry/muda). Not a vulnerability; no fixed versions
+  # exist. Re-evaluate whenever Tauri ships a GTK4-based stack.
+  "RUSTSEC-2024-0411",
+  "RUSTSEC-2024-0412",
+  "RUSTSEC-2024-0413",
+  "RUSTSEC-2024-0414",
+  "RUSTSEC-2024-0415",
+  "RUSTSEC-2024-0416",
+  "RUSTSEC-2024-0417",
+  "RUSTSEC-2024-0418",
+  "RUSTSEC-2024-0419",
+  "RUSTSEC-2024-0420",
+  # The unic-* family (incl. proc-macro-error, RUSTSEC-2024-0370) is
+  # unmaintained; pulled in by urlpattern via tauri-utils and by Tauri's
+  # macro stack. No vulnerabilities, no fixed versions.
+  "RUSTSEC-2024-0370",
+  "RUSTSEC-2025-0075",
+  "RUSTSEC-2025-0080",
+  "RUSTSEC-2025-0081",
+  "RUSTSEC-2025-0098",
+  "RUSTSEC-2025-0100",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

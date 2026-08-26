@@ -1,0 +1,22 @@
+[package]
+name = "nian-media-ffmpeg"
+description = "FFmpeg-backed implementation of the safe media facade"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+nian-domain = { workspace = true }
+nian-ffmpeg-sys = { workspace = true }
+nian-media = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+nian-ffmpeg-sys = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

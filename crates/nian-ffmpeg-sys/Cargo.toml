@@ -1,0 +1,18 @@
+[package]
+name = "nian-ffmpeg-sys"
+description = "Raw FFmpeg FFI declarations (raw surface, no safety guarantees)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+# The generated bindings carry FFmpeg's C documentation, whose formulas and
+# lists are not Rust doctests.
+doctest = false
+
+[build-dependencies]
+
+[lints]
+workspace = true
