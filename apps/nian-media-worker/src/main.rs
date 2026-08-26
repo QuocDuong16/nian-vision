@@ -162,7 +162,7 @@ fn cmd_run() -> Result<(), String> {
     let hello = json!({
         "worker": "nian-media-worker",
         "protocol": nian_ipc::PROTOCOL_VERSION,
-        "ffmpeg": versions.map(versions_json),
+        "ffmpeg": versions.clone().ok().map(versions_json),
     });
 
     // Hello goes out before the serve loop takes over stdout.
@@ -174,7 +174,9 @@ fn cmd_run() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
 
-    let mut handler = WorkerHandler { versions };
+    let mut handler = WorkerHandler {
+        versions: versions.ok(),
+    };
     serve(std::io::stdin().lock(), stdout.lock(), &mut handler).map_err(|error| error.to_string())
 }
 

@@ -105,13 +105,16 @@ fn reading_packets_yields_keyframed_monotonic_video() {
     let mut first_is_keyframe = None;
 
     while let Some(packet) = input.next_packet().unwrap() {
-        assert!(!packet.data.is_empty(), "packet payload must not be empty");
-        if packet.metadata.stream_index == 0 {
+        assert!(
+            !packet.data().is_empty(),
+            "packet payload must not be empty"
+        );
+        if packet.metadata().stream_index == 0 {
             video_packets += 1;
             if first_is_keyframe.is_none() {
-                first_is_keyframe = Some(packet.metadata.keyframe);
+                first_is_keyframe = Some(packet.metadata().keyframe);
             }
-            let dts = packet.metadata.dts.expect("mpeg4 dts present");
+            let dts = packet.metadata().dts.expect("mpeg4 dts present");
             if let Some(previous) = last_dts {
                 assert!(
                     dts > previous,
@@ -247,7 +250,7 @@ fn unselected_stream_packets_are_skipped_deliberately() {
     // (index 1) are deliberately skipped by write_packet.
     let mut fed_audio_packets = 0;
     while let Some(packet) = input.next_packet().unwrap() {
-        if packet.metadata.stream_index == 1 {
+        if packet.metadata().stream_index == 1 {
             fed_audio_packets += 1;
         }
         muxer.write_packet(&packet).unwrap();
@@ -359,6 +362,38 @@ fn dropping_without_finalize_leaves_partial_file_for_recovery() {
 
     let file = std::fs::read(&output_path).expect("partial file stays on disk");
     assert!(!file.is_empty(), "dropped segment keeps its written bytes");
+}
+
+#[test]
+fn remux_preserves_per_packet_keyframe_pattern() {
+    // Packet-faithfulness at the flag level: the keyframe pattern of every
+    // packet must be identical before and after the stream-copy round trip
+    // (the pre-remediation reconstruction path only preserved payload and a
+    // handful of fields; this pins that the full packet is what travels).
+    let interrupt = InterruptHandle::new();
+    let mut input = MediaInput::open(&fixture_source(), &interrupt).unwrap();
+
+    let mut input_pattern = Vec::new();
+    let output_dir = tempfile::tempdir().unwrap();
+    let output_path = output_dir.path().join("flag-pattern.mkv");
+    let mut muxer = MatroskaMuxer::create(&mut input, &output_path, &interrupt).unwrap();
+    while let Some(packet) = input.next_packet().unwrap() {
+        input_pattern.push((packet.metadata().stream_index, packet.metadata().keyframe));
+        muxer.write_packet(&packet).unwrap();
+    }
+    muxer.finalize().unwrap();
+    assert!(input_pattern.len() >= 20);
+    assert!(
+        input_pattern.iter().any(|(_, keyframe)| *keyframe),
+        "fixture must contain keyframes"
+    );
+
+    let mut output = MediaInput::open(&MediaSource::file(&output_path), &interrupt).unwrap();
+    let mut output_pattern = Vec::new();
+    while let Some(packet) = output.next_packet().unwrap() {
+        output_pattern.push((packet.metadata().stream_index, packet.metadata().keyframe));
+    }
+    assert_eq!(input_pattern, output_pattern, "keyframe pattern changed");
 }
 
 #[test]

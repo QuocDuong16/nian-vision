@@ -5,7 +5,7 @@
 | Tool | Version | Managed by |
 |---|---|---|
 | Rust | 1.98.0 (pinned) | rustup via `rust-toolchain.toml`; mise via `.mise.toml` |
-| Node | 26.x | mise (`.mise.toml`) |
+| Node | 26.7.0 (exact) | mise (`.mise.toml`); same version pinned in CI |
 | pnpm | 11.22.0 | recorded in root `package.json` |
 | FFmpeg | 8.x runtime (ABI 62) | system packages or installer |
 

@@ -40,7 +40,7 @@ model).
 
 * Rust 1.98.0 (pinned in `rust-toolchain.toml`; mise users get it from
   `.mise.toml`)
-* Node 26 + pnpm 11.22.0
+* Node 26.7.0 + pnpm 11.22.0 (exact pins, mirrored by CI)
 * FFmpeg 8.x runtime libraries (ABI 62). Development packages are optional —
   see `docs/ffmpeg.md` for the no-`-dev` setup (`scripts/setup-ffmpeg-linux.sh`).
 * Linux desktop shell builds additionally need the Tauri Linux prerequisites

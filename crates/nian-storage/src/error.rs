@@ -35,4 +35,13 @@ pub enum StorageError {
         /// Underlying OS error.
         source: std::io::Error,
     },
+
+    /// Publishing a finalized segment failed because the destination name
+    /// already exists. The finalized content is never allowed to replace an
+    /// existing recording.
+    #[error("recording destination already exists: {destination:?}")]
+    DestinationExists {
+        /// The colliding final path.
+        destination: PathBuf,
+    },
 }

@@ -89,9 +89,12 @@ where
 ///
 /// The stored result keeps the structured error: a failed init replays the
 /// original [`MediaError::AbiMismatch`] (not a lossy string) to every caller.
-/// Racing first callers may execute the idempotent body twice; whichever
-/// result wins is identical because every step is deterministic and
-/// side-effect-free for equal inputs.
+///
+/// Concurrency: `OnceLock` stores exactly one result. Racing first callers
+/// may redundantly execute the body, which is harmless because every step is
+/// idempotent (`check_runtime_abi` is a pure read, `av_log_set_level`
+/// overwrites one global integer, `avformat_network_init` is documented as
+/// idempotent and thread-safe) — all racers observe an equivalent result.
 pub fn global_init() -> Result<(), MediaError> {
     static RESULT: OnceLock<Result<(), MediaError>> = OnceLock::new();
 
@@ -100,12 +103,18 @@ pub fn global_init() -> Result<(), MediaError> {
         .clone()
 }
 
-/// Returns the runtime versions if (and only if) startup validation ran.
+/// Reads the runtime library majors and verifies them against the ABI this
+/// build was generated for.
 ///
-/// Used by the worker's `describe` IPC method; returns `None` before the
-/// first media operation.
-pub fn runtime_versions() -> Option<RuntimeVersions> {
-    check_runtime_abi().ok()
+/// This is a live check, independent of [`global_init`]: it can be called at
+/// any time and reports the currently loaded libraries. The error is exactly
+/// [`MediaError::AbiMismatch`] when the loaded runtime does not match this
+/// build — never a stringified stand-in.
+///
+/// Used by the worker's startup/hello/describe capability reporting; after a
+/// successful worker startup it is guaranteed to succeed.
+pub fn runtime_versions() -> Result<RuntimeVersions, MediaError> {
+    check_runtime_abi()
 }
 
 #[cfg(test)]

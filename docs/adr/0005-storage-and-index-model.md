@@ -29,6 +29,18 @@ Layout (master spec §10), implemented in `nian-storage::RecordingsLayout`:
   picks the smallest sequence with no existing partial or finalized file,
   so an existing recording is never truncated or overwritten; the parser
   accepts exactly the canonical forms the allocator emits.
+* Segment acquisition is race-safe, not scan-then-open: the recorder claims
+  a slot with `claim_segment`, which creates the partial file with
+  exclusive semantics (`create_new`/O_EXCL) and rescans on a lost race, so
+  duplicate workers can never share or truncate each other's segments. The
+  open file handle is the claim token.
+* Finalization publishes atomically **without replacement**:
+  `publish_no_replace` (hard-link + unlink) makes the final name appear
+  only when it already references the complete content and refuses any
+  collision (`DestinationExists`) — unlike a plain rename, which silently
+  replaces on Unix. `MatroskaMuxer::create` must receive the already
+  claimed partial path (open-after-claim is safe; claim-after-open would
+  be a TOCTOU bug).
 * Startup reconciliation (M4) scans the tree and repairs the index:
   * DB entry without file → mark `missing`, then delete entry;
   * `.partial.mkv` file → inspect, mark `recovering`/`corrupted`;

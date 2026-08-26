@@ -4,5 +4,5 @@
 # invocations that bypass mise (editors, CI containers).
 
 [tools]
-node = "26"
+node = "26.7.0"
 rust = "1.98.0"

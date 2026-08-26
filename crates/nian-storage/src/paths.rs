@@ -78,18 +78,15 @@ impl RecordingsLayout {
         .expect("formatted date components are always path-safe")
     }
 
-    /// Allocates the paths for a new segment starting at `started_at`.
+    /// Computes the paths for a new segment starting at `started_at` as if
+    /// nothing else existed yet (sequence 1 when the day directory is
+    /// missing).
     ///
-    /// Collision-safe by construction: the day directory is scanned and the
-    /// smallest sequence whose *neither* partial nor finalized form exists is
-    /// chosen, so an existing recording is never silently truncated or
-    /// overwritten even when several segments start within the same second.
-    /// A missing day directory yields sequence 1.
-    ///
-    /// Allocation alone does not win filesystem races: the recorder must
-    /// create the returned `partial_path` with exclusive semantics
-    /// (`create_new`, O_EXCL) and may treat `final_path` purely as the rename
-    /// target after a successful finalize.
+    /// Collision-aware but **scan-only**: this is a dry-run naming helper
+    /// for diagnostics and tests, not an acquisition primitive — between
+    /// scanning and file creation another writer could take the name. The
+    /// recorder must use [`RecordingsLayout::claim_segment`], which closes
+    /// that TOCTOU window with exclusive creation.
     ///
     /// The names stay deterministic and parseable
     /// ([`parse_segment_file_name`]) so reconciliation can classify disk
@@ -115,6 +112,139 @@ impl RecordingsLayout {
         }
         Ok(path)
     }
+
+    /// Exclusively claims the next free segment slot for `started_at`.
+    ///
+    /// This is the race-safe primitive M2 must use instead of
+    /// [`RecordingsLayout::allocate_segment`] (whose scan-then-open shape is
+    /// only a dry-run naming helper): the day directory is created if needed,
+    /// then the partial file is created with exclusive semantics
+    /// (`create_new`, O_EXCL). If another worker won the same name between
+    /// scan and create, the claim retries with the next sequence, so two
+    /// workers racing in the same second always end up with distinct files
+    /// and an existing recording is never truncated or replaced.
+    ///
+    /// The returned [`ClaimedSegment`] documents the finalize contract
+    /// (write into `partial_path`, publish to `final_path` with
+    /// [`publish_no_replace`]).
+    pub fn claim_segment(
+        &self,
+        camera: &CameraId,
+        started_at: NaiveDateTime,
+    ) -> Result<ClaimedSegment, StorageError> {
+        let day_dir = self.day_dir(camera, started_at.date());
+        std::fs::create_dir_all(&day_dir).map_err(|source| StorageError::Io {
+            path: day_dir.clone(),
+            source,
+        })?;
+
+        loop {
+            let sequence = allocate_segment_sequence(&day_dir, started_at.time())?;
+            let partial_path =
+                day_dir.join(partial_file_name_with_sequence(started_at.time(), sequence));
+            let final_path =
+                day_dir.join(segment_file_name_with_sequence(started_at.time(), sequence));
+
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&partial_path)
+            {
+                Ok(partial_file) => {
+                    return Ok(ClaimedSegment {
+                        partial_path,
+                        final_path,
+                        _partial_file: partial_file,
+                    });
+                }
+                // Lost the race for this name (another writer created it
+                // first): rescan and try the next sequence.
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(StorageError::Io {
+                        path: partial_path,
+                        source,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// An **exclusively claimed** segment slot — the race-safe acquisition M2
+/// must build on.
+///
+/// The partial file was created with `O_EXCL` semantics (`create_new`), so
+/// at acquisition time no other writer on the system held this name. The
+/// open file handle is retained as the claim token: while it is alive,
+/// another process's `create_new` on the same name fails and its
+/// [`RecordingsLayout::claim_segment`] rescan moves to the next sequence.
+/// Duplicate workers therefore never share (or truncate) a segment.
+///
+/// Dropping the claim closes the handle but deliberately keeps the (empty or
+/// partial) file: an abandoned claim is indistinguishable from a crash and
+/// stays eligible for startup reconciliation.
+///
+/// Finalize flow for the owner:
+/// 1. write the segment through `MatroskaMuxer::create(partial_path)` —
+///    safe because the claimed file exists and is owned by this process;
+/// 2. publish with [`publish_no_replace`] from `partial_path` to
+///    `final_path`: atomic on every supported platform and never replaces an
+///    existing recording ([`StorageError::DestinationExists`] on collision).
+#[derive(Debug)]
+pub struct ClaimedSegment {
+    partial_path: PathBuf,
+    final_path: PathBuf,
+    /// Claim token; kept private so callers cannot accidentally close it
+    /// while still treating the slot as theirs. Rust opens files with
+    /// FILE_SHARE_READ|WRITE|DELETE on Windows, so holding this handle does
+    /// not block the hard-link/unlink publication step.
+    _partial_file: std::fs::File,
+}
+
+impl ClaimedSegment {
+    /// File the recorder writes into (already created, empty).
+    pub fn partial_path(&self) -> &Path {
+        &self.partial_path
+    }
+
+    /// No-replace publication target after successful finalization.
+    pub fn final_path(&self) -> &Path {
+        &self.final_path
+    }
+}
+
+/// Publishes finalized content at its final name **atomically and without
+/// ever replacing an existing file**.
+///
+/// Implemented as hard-link + unlink: `hard_link` fails with "already
+/// exists" when the destination exists on every platform we target (this is
+/// the no-replace guarantee; a plain `rename` would silently replace on
+/// Unix), so the instant the final name appears it already references the
+/// complete content. Removing the source link afterwards completes the
+/// logical move.
+///
+/// Both paths must live on the same volume, which the recordings layout
+/// guarantees. If only the unlink fails, the segment is already durably
+/// published under its final name; the returned error tells reconciliation
+/// to sweep the stale `.partial` link.
+pub fn publish_no_replace(from: &Path, to: &Path) -> Result<(), StorageError> {
+    if let Err(source) = std::fs::hard_link(from, to) {
+        return Err(if source.kind() == std::io::ErrorKind::AlreadyExists {
+            StorageError::DestinationExists {
+                destination: to.to_path_buf(),
+            }
+        } else {
+            StorageError::Io {
+                path: to.to_path_buf(),
+                source,
+            }
+        });
+    }
+    std::fs::remove_file(from).map_err(|source| StorageError::Io {
+        path: from.to_path_buf(),
+        source,
+    })
 }
 
 /// Partial and final paths for one freshly allocated segment, sharing the
@@ -527,6 +657,93 @@ mod tests {
                 .unwrap()
                 .to_string_lossy(),
             "08-30-00.partial.mkv"
+        );
+    }
+
+    #[test]
+    fn claims_in_same_second_are_distinct_and_exclusive() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+
+        let first = layout.claim_segment(&camera, sample_start()).unwrap();
+        assert_eq!(
+            first.partial_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00.partial.mkv"
+        );
+
+        // While the first claim is alive, a second claim for the same second
+        // must land on the next sequence — never the same file.
+        let second = layout.claim_segment(&camera, sample_start()).unwrap();
+        assert_eq!(
+            second.partial_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00-2.partial.mkv"
+        );
+        assert_ne!(first.partial_path(), second.partial_path());
+        assert!(first.partial_path().is_file());
+        assert!(second.partial_path().is_file());
+
+        // Dropping a claim keeps the file (crash-recovery semantics).
+        drop(second);
+        let day_dir = first.partial_path().parent().unwrap().to_path_buf();
+        assert!(day_dir.join("08-30-00-2.partial.mkv").is_file());
+    }
+
+    #[test]
+    fn claim_skips_existing_files_without_overwriting_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+
+        // Pre-existing content of both forms must survive untouched.
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(day_dir.join("08-30-00.mkv"), b"finalized").unwrap();
+        std::fs::write(day_dir.join("08-30-00-2.partial.mkv"), b"partial").unwrap();
+
+        let claim = layout.claim_segment(&camera, sample_start()).unwrap();
+        assert_eq!(
+            claim.final_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00-3.mkv"
+        );
+        assert_eq!(
+            std::fs::read(day_dir.join("08-30-00.mkv")).unwrap(),
+            b"finalized"
+        );
+        assert_eq!(
+            std::fs::read(day_dir.join("08-30-00-2.partial.mkv")).unwrap(),
+            b"partial"
+        );
+    }
+
+    #[test]
+    fn publish_no_replace_moves_content_and_refuses_collisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+
+        let claim = layout.claim_segment(&camera, sample_start()).unwrap();
+        std::fs::write(claim.partial_path(), b"segment-bytes").unwrap();
+
+        publish_no_replace(claim.partial_path(), claim.final_path()).unwrap();
+        assert!(!claim.partial_path().exists(), "partial link must be gone");
+        assert_eq!(std::fs::read(claim.final_path()).unwrap(), b"segment-bytes");
+
+        // Publishing another segment's content onto the now-existing final
+        // name is refused and the existing recording stays byte-identical.
+        let other = layout.claim_segment(&camera, sample_start()).unwrap();
+        assert_ne!(other.final_path(), claim.final_path());
+        std::fs::write(other.partial_path(), b"other").unwrap();
+        match publish_no_replace(other.partial_path(), claim.final_path()) {
+            Err(StorageError::DestinationExists { destination }) => {
+                assert_eq!(destination, claim.final_path().to_path_buf());
+            }
+            other => panic!("expected DestinationExists, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(claim.final_path()).unwrap(),
+            b"segment-bytes",
+            "existing finalized segment must never be replaced"
         );
     }
 

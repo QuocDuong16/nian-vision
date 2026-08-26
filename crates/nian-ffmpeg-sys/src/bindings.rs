@@ -1082,11 +1082,10 @@ pub const AV_PKT_DATA_NB: AVPacketSideDataType = 40;
 pub type AVPacketSideDataType = ::std::os::raw::c_uint;
 #[doc = " This structure stores auxiliary information for decoding, presenting, or\n otherwise processing the coded stream. It is typically exported by demuxers\n and encoders and can be fed to decoders and muxers either in a per packet\n basis, or as global side data (applying to the entire coded stream).\n\n Global side data is handled as follows:\n - During demuxing, it may be exported through\n   @ref AVCodecParameters.coded_side_data \"AVStream's codec parameters\", which can\n   then be passed as input to decoders through the\n   @ref AVCodecContext.coded_side_data \"decoder context's side data\", for\n   initialization.\n - For muxing, it can be fed through @ref AVCodecParameters.coded_side_data\n   \"AVStream's codec parameters\", typically  the output of encoders through\n   the @ref AVCodecContext.coded_side_data \"encoder context's side data\", for\n   initialization.\n\n Packet specific side data is handled as follows:\n - During demuxing, it may be exported through @ref AVPacket.side_data\n   \"AVPacket's side data\", which can then be passed as input to decoders.\n - For muxing, it can be fed through @ref AVPacket.side_data \"AVPacket's\n   side data\", typically the output of encoders.\n\n Different modules may accept or export different types of side data\n depending on media type and codec. Refer to @ref AVPacketSideDataType for a\n list of defined types and where they may be found or used."]
 #[repr(C)]
+#[repr(align(8))]
 #[derive(Debug, Copy, Clone)]
 pub struct AVPacketSideData {
-    pub data: *mut u8,
-    pub size: usize,
-    pub type_: AVPacketSideDataType,
+    pub _bindgen_opaque_blob: [u64; 3usize],
 }
 #[doc = " This structure stores compressed data. It is typically exported by demuxers\n and then passed as input to decoders, or received as output from encoders and\n then passed to muxers.\n\n For video, it should typically contain one compressed frame. For audio it may\n contain several compressed frames. Encoders are allowed to output empty\n packets, with no compressed data, containing only side data\n (e.g. to update some stream parameters at the end of encoding).\n\n The semantics of data ownership depends on the buf field.\n If it is set, the packet data is dynamically allocated and is\n valid indefinitely until a call to av_packet_unref() reduces the\n reference count to 0.\n\n If the buf field is not set av_packet_ref() would make a copy instead\n of increasing the reference count.\n\n The side data is always allocated with av_malloc(), copied by\n av_packet_ref() and freed by av_packet_unref().\n\n sizeof(AVPacket) being a part of the public ABI is deprecated. once\n av_init_packet() is removed, new packets will only be able to be allocated\n with av_packet_alloc(), and new fields may be added to the end of the struct\n with a minor bump.\n\n @see av_packet_alloc\n @see av_packet_ref\n @see av_packet_unref"]
 #[repr(C)]
@@ -1124,6 +1123,26 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Free the packet, if the packet is reference counted, it will be\n unreferenced first.\n\n @param pkt packet to be freed. The pointer will be set to NULL.\n @note passing NULL is a no-op."]
     pub fn av_packet_free(pkt: *mut *mut AVPacket);
+}
+unsafe extern "C" {
+    #[doc = " Allocate new information of a packet.\n\n @param pkt packet\n @param type side information type\n @param size side information size\n @return pointer to fresh allocated data or NULL otherwise"]
+    pub fn av_packet_new_side_data(
+        pkt: *mut AVPacket,
+        type_: AVPacketSideDataType,
+        size: usize,
+    ) -> *mut u8;
+}
+unsafe extern "C" {
+    #[doc = " Get side information from packet.\n\n @param pkt packet\n @param type desired side information type\n @param size If supplied, *size will be set to the size of the side data\n             or to zero if the desired side data is not present.\n @return pointer to data if present or NULL otherwise"]
+    pub fn av_packet_get_side_data(
+        pkt: *const AVPacket,
+        type_: AVPacketSideDataType,
+        size: *mut usize,
+    ) -> *mut u8;
+}
+unsafe extern "C" {
+    #[doc = " Setup a new reference to the data described by a given packet\n\n If src is reference-counted, setup dst as a new reference to the\n buffer in src. Otherwise allocate a new buffer in dst and copy the\n data from src into it.\n\n All the other fields are copied from src.\n\n @see av_packet_unref\n\n @param dst Destination packet. Will be completely overwritten.\n @param src Source packet\n\n @return 0 on success, a negative AVERROR on error. On error, dst\n         will be blank (as if returned by av_packet_alloc())."]
+    pub fn av_packet_ref(dst: *mut AVPacket, src: *const AVPacket) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     #[doc = " Wipe the packet.\n\n Unreference the buffer referenced by the packet and reset the\n remaining packet fields to their default values.\n\n @param pkt The packet to be unreferenced."]

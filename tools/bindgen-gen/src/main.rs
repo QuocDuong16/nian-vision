@@ -52,7 +52,10 @@ const ALLOWLISTED_FUNCTIONS: &[&str] = &[
     "av_packet_alloc",
     "av_packet_free",
     "av_packet_unref",
+    "av_packet_ref",
     "av_packet_rescale_ts",
+    "av_packet_new_side_data",
+    "av_packet_get_side_data",
     "avcodec_parameters_copy",
     "avcodec_get_name",
     "avcodec_version",
@@ -74,6 +77,7 @@ const ALLOWLISTED_TYPES: &[&str] = &[
     "AVInputFormat",
     "AVCodecParameters",
     "AVPacket",
+    "AVPacketSideData",
     "AVDictionary",
     "AVDictionaryEntry",
     "AVRational",
@@ -84,6 +88,7 @@ const ALLOWLISTED_TYPES: &[&str] = &[
     "AVCodecID",
     "AVColorRange",
     "AVRounding",
+    "AVPacketSideDataType",
 ];
 
 const ALLOWLISTED_VARS: &[&str] = &[
@@ -156,10 +161,12 @@ fn main() -> ExitCode {
         .opaque_type("AVOutputFormat")
         .opaque_type("AVCodec")
         .opaque_type("AVClass")
+        .opaque_type("AVPacketSideData")
         .constified_enum("AVMediaType")
         .constified_enum("AVCodecID")
         .constified_enum("AVRounding")
         .constified_enum("AVColorRange")
+        .constified_enum("AVPacketSideDataType")
         .layout_tests(false)
         .default_enum_style(bindgen::EnumVariation::Consts)
         .prepend_enum_name(false);

@@ -11,7 +11,10 @@ use crate::error::DomainError;
 ///
 /// The value matches `[a-z0-9][a-z0-9_-]{0,63}` (first character must be a
 /// lowercase ASCII letter or digit; at most 64 bytes in total) so it can be
-/// used directly as a directory name without further escaping. Camera display
+/// used directly as a directory name without further escaping. Windows
+/// reserved device names (CON, PRN, AUX, NUL, COM1–9, LPT1–9) are rejected
+/// case-insensitively because Windows is the primary target and these names
+/// are special in path resolution regardless of directory. Camera display
 /// names must never be used for paths; use this identifier instead.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CameraId(String);
@@ -44,6 +47,18 @@ impl CameraId {
         if !first_ok || !rest_ok {
             return Err(DomainError::InvalidCameraId {
                 reason: "must match [a-z0-9][a-z0-9_-]{0,63}".to_owned(),
+            });
+        }
+
+        // Windows reserves these device names in path resolution
+        // case-insensitively (and historically even with extensions); reject
+        // them outright so a camera id can never collide with a device.
+        if WINDOWS_RESERVED_DEVICE_NAMES
+            .iter()
+            .any(|reserved| value.eq_ignore_ascii_case(reserved))
+        {
+            return Err(DomainError::InvalidCameraId {
+                reason: format!("{value:?} is a Windows reserved device name"),
             });
         }
 
@@ -104,6 +119,14 @@ impl fmt::Display for RecordingId {
     }
 }
 
+/// Windows reserved device names, rejected case-insensitively for
+/// [`CameraId`] (Windows is the primary target and resolves these as
+/// devices in any directory).
+const WINDOWS_RESERVED_DEVICE_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +154,38 @@ mod tests {
             assert!(
                 CameraId::parse(invalid).is_err(),
                 "expected rejection of {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_windows_reserved_device_names_case_insensitively() {
+        for reserved in [
+            "con", "CON", "Con", "prn", "aux", "nul", "com1", "com9", "lpt1", "lpt9", "Com4",
+            "LPT7",
+        ] {
+            assert!(
+                CameraId::parse(reserved).is_err(),
+                "expected rejection of Windows reserved name {reserved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_names_merely_containing_reserved_prefixes() {
+        // Only exact matches are reserved; these are safe directory names.
+        for valid in [
+            "console",
+            "com10",
+            "com0",
+            "nullify",
+            "auxiliary",
+            "lpt10",
+            "control",
+        ] {
+            assert!(
+                CameraId::parse(valid).is_ok(),
+                "expected acceptance of {valid:?}"
             );
         }
     }

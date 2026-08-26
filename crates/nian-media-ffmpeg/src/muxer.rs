@@ -3,7 +3,20 @@
 //! This is the exact mechanism the M2 recorder will use for segment writing:
 //! compressed packets go in untouched — no decode, no re-encode — with
 //! timestamps rescaled from the input stream time base to the output stream
-//! time base by `av_packet_rescale_ts`.
+//! time base by `av_packet_rescale_ts`. Writing is **packet-faithful**:
+//! [`MatroskaMuxer::write_packet`] consumes an owned [`FfmpegPacket`] and
+//! writes a new reference to that exact packet, so side data (new extradata,
+//! parameter changes, …) and every flag survive the copy; only the payload
+//! buffer is shared by refcount, never re-encoded or byte-copied.
+//!
+//! # Destination-path contract
+//!
+//! `create` opens the output through FFmpeg by path. The recorder must pass a
+//! path it already **exclusively claimed**
+//! ([`nian_storage::RecordingsLayout::claim_segment`] creates the partial
+//! file with O_EXCL): opening an existing, empty claimed file is safe because
+//! the name is owned at that point. Claiming *after* opening would be a
+//! TOCTOU bug and must never be introduced.
 //!
 //! # Stream mapping
 //!
@@ -14,6 +27,8 @@
 //! through that mapping. Streams can be left unselected
 //! ([`MatroskaMuxer::create_with_selection`]); packets belonging to unselected
 //! streams are skipped deliberately (see [`MatroskaMuxer::write_packet`]).
+//! A selected stream without a usable time base fails segment creation
+//! outright — guessing one would silently corrupt timestamps.
 //!
 //! # Interrupt ownership invariant
 //!
@@ -30,11 +45,12 @@ use std::path::{Path, PathBuf};
 
 use nian_domain::MediaRational;
 use nian_ffmpeg_sys as sys;
-use nian_media::{MediaError, MediaPacket};
+use nian_media::MediaError;
 
 use crate::error_util::{ErrorKind, error_for};
 use crate::input::MediaInput;
 use crate::interrupt::InterruptHandle;
+use crate::packet::FfmpegPacket;
 
 /// Translation table entry for one copied stream, ordered by output index.
 #[derive(Debug, Clone)]
@@ -92,6 +108,38 @@ impl MatroskaMuxer {
     {
         crate::version::global_init()?;
 
+        // Validate the selection before allocating anything: a selected
+        // stream without a usable time base cannot be timestamped correctly,
+        // and guessing one (the former 1/90000 fallback) silently produces
+        // wrong playback speed/seeking. Failing the segment explicitly is the
+        // only safe behavior for a recording pipeline.
+        let selected: Vec<nian_domain::MediaStreamInfo> = input
+            .streams()
+            .into_iter()
+            .filter(|info| selector(info))
+            .collect();
+        if selected.is_empty() {
+            return Err(MediaError::WriteFailed {
+                message: "stream selection matched no input streams".to_owned(),
+            });
+        }
+        let mut stream_map = Vec::with_capacity(selected.len());
+        for info in &selected {
+            let Some(time_base) = info.time_base else {
+                return Err(MediaError::WriteFailed {
+                    message: format!(
+                        "selected input stream {} reports no usable time base; \
+                         refusing to guess timestamps",
+                        info.stream_index
+                    ),
+                });
+            };
+            stream_map.push(StreamMapping {
+                input_stream_index: info.stream_index,
+                input_time_base: time_base,
+            });
+        }
+
         let path_text = output_path.to_string_lossy().into_owned();
         let path_c = CString::new(path_text.clone()).map_err(|_| MediaError::WriteFailed {
             message: "output path contains interior NUL bytes".to_owned(),
@@ -121,12 +169,9 @@ impl MatroskaMuxer {
         // owning clone stored in `Self` provides exactly that guarantee.
         interrupt.install_on(context);
 
-        let mut stream_map = Vec::new();
-        for info in input.streams() {
-            if !selector(&info) {
-                continue;
-            }
-
+        // Output stream creation order matches the mapping order: output
+        // index i corresponds to selected[i] / stream_map[i].
+        for info in &selected {
             // SAFETY: context is valid; avformat_new_stream returns NULL on
             // failure, checked below.
             let out_stream = unsafe { sys::avformat_new_stream(context, std::ptr::null()) };
@@ -158,22 +203,10 @@ impl MatroskaMuxer {
                 // SAFETY: codecpar is valid.
                 unsafe { (*(*out_stream).codecpar).codec_tag = 0 };
             }
-
-            stream_map.push(StreamMapping {
-                input_stream_index: info.stream_index,
-                input_time_base: info
-                    .time_base
-                    .unwrap_or(MediaRational { num: 1, den: 90000 }),
-            });
         }
 
-        if stream_map.is_empty() {
-            // SAFETY: context is valid and owned by us; no file was opened.
-            unsafe { sys::avformat_free_context(context) };
-            return Err(MediaError::WriteFailed {
-                message: "stream selection matched no input streams".to_owned(),
-            });
-        }
+        // (stream_map is guaranteed non-empty and fully time-base-validated
+        // before the context was allocated above.)
 
         // SAFETY: context is valid; pb is NULL before this call and owned by
         // us afterwards. avio_open2 copies `context.interrupt_callback` into
@@ -254,24 +287,37 @@ impl MatroskaMuxer {
 
     /// Writes one packet with timestamp rescaling into the output streams.
     ///
+    /// The write is **packet-faithful**: a new reference to the caller's
+    /// [`FfmpegPacket`] is taken via `av_packet_ref`, which shares the
+    /// refcounted payload buffer (no byte copy for reference-counted packets)
+    /// and duplicates every other field — side data such as new extradata or
+    /// parameter changes, and all flags — onto the muxer's scratch packet.
+    /// Only that scratch reference is modified: the mapped output stream
+    /// index and rescaled timestamps are applied to it, then handed to
+    /// `av_interleaved_write_frame`. Per its FFmpeg 8.0.3 contract the call
+    /// takes ownership of our reference and blanks the scratch packet **even
+    /// on error**, so nothing leaks and the caller's packet is never mutated
+    /// or consumed.
+    ///
     /// Packets whose stream was not selected are **skipped deliberately**
     /// (returns `Ok(())`): the recorder feeds the full demuxed packet stream
     /// while recording only the selected subset, and an unexpected extra
     /// stream must degrade gracefully instead of failing a healthy segment.
     /// Use [`MatroskaMuxer::mapped_input_stream_indices`] to account for
     /// skipped packets.
-    pub fn write_packet(&mut self, packet: &MediaPacket) -> Result<(), MediaError> {
+    pub fn write_packet(&mut self, packet: &FfmpegPacket) -> Result<(), MediaError> {
         if self.interrupt.state().should_abort() {
             return Err(MediaError::Interrupted {
                 operation: "write packet",
             });
         }
 
+        let metadata = packet.metadata();
         let Some((output_index, input_time_base)) = self
             .stream_map
             .iter()
             .enumerate()
-            .find(|(_, mapping)| mapping.input_stream_index == packet.metadata.stream_index)
+            .find(|(_, mapping)| mapping.input_stream_index == metadata.stream_index)
             .map(|(index, mapping)| (index, mapping.input_time_base))
         else {
             return Ok(()); // deliberate skip, documented above
@@ -282,37 +328,47 @@ impl MatroskaMuxer {
         };
 
         // SAFETY: streams array is valid and `output_index` is below
-        // nb_streams because `stream_map.len()` output streams were created.
+        // nb_streams because exactly `stream_map.len()` output streams were
+        // created in mapping order.
         let out_time_base = unsafe {
             let out_stream = *(*self.context).streams.add(output_index);
             (*out_stream).time_base
         };
 
-        // SAFETY: scratch is a valid packet owned by self. The field writes
-        // prepare a non-reference-counted packet; av_interleaved_write_frame
-        // copies non-reference-counted data, so `packet.data` stays valid and
-        // owned by the caller.
+        // SAFETY: scratch is a valid packet owned by self; any reference it
+        // held from the previous iteration was consumed by
+        // av_interleaved_write_frame (which blanks it even on error), so
+        // unref merely resets it to blank.
+        unsafe { sys::av_packet_unref(self.scratch) };
+
+        // SAFETY: both packets are valid. On success `self.scratch` shares
+        // the payload buffer of `packet` and carries copies of all other
+        // fields (side data included); on failure the scratch stays blank.
+        // The caller's packet keeps sole ownership of its own reference.
+        let code = unsafe { sys::av_packet_ref(self.scratch, packet.as_raw()) };
+        if code < 0 {
+            return Err(error_for(
+                code,
+                "copy packet reference",
+                ErrorKind::Write,
+                false,
+            ));
+        }
+
+        // SAFETY: field edits apply to OUR reference only — the caller's
+        // packet still reports the input stream index and input-side
+        // timestamps. The output context knows this packet under the MAPPED
+        // output index; timestamps are rescaled from the mapped input time
+        // base to this output stream's time base.
         unsafe {
-            let scratch = &mut *self.scratch;
-            sys::av_packet_unref(self.scratch);
-            scratch.data = packet.data.as_ptr() as *mut u8;
-            scratch.size = packet.data.len() as c_int;
-            // The output context knows this packet under the MAPPED output
-            // index, not the input one.
-            scratch.stream_index = output_index as c_int;
-            scratch.pts = packet.metadata.pts.unwrap_or(sys::NIAN_AV_NOPTS_VALUE);
-            scratch.dts = packet.metadata.dts.unwrap_or(sys::NIAN_AV_NOPTS_VALUE);
-            scratch.duration = packet.metadata.duration.unwrap_or(0);
-            scratch.flags = if packet.metadata.keyframe {
-                sys::AV_PKT_FLAG_KEY as c_int
-            } else {
-                0
-            };
+            (*self.scratch).stream_index = output_index as c_int;
             sys::av_packet_rescale_ts(self.scratch, input_time_base, out_time_base);
         }
 
-        // SAFETY: context + scratch are valid; the call consumes the packet
-        // contents (unref'd at the top of the next write or in Drop).
+        // SAFETY: context + scratch are valid. The call consumes the scratch
+        // reference and blanks the packet even on error, so Drop's
+        // av_packet_free always sees an unreferenced-or-blank packet and no
+        // payload byte is double-freed.
         let code = unsafe { sys::av_interleaved_write_frame(self.context, self.scratch) };
         if code < 0 {
             return Err(error_for(code, "write packet", ErrorKind::Write, false));

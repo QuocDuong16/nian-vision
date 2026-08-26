@@ -7,9 +7,13 @@
 //! Ownership model:
 //!
 //! * `MediaInput` owns an `AVFormatContext` + scratch `AVPacket` and frees
-//!   them in `Drop` via `avformat_close_input` / `av_packet_free`;
+//!   them in `Drop` via `avformat_close_input` / `av_packet_free`; each
+//!   demuxed packet is handed out as an owned, refcounted `FfmpegPacket`
+//!   sharing the payload buffer;
 //! * `MatroskaMuxer` owns an output `AVFormatContext` (+ `AVIOContext`) and
 //!   frees it in `Drop` via `avio_closep` / `avformat_free_context`;
+//!   `write_packet` refs the caller's packet into an internal scratch packet
+//!   whose reference `av_interleaved_write_frame` consumes;
 //! * interrupt callbacks receive a `Arc::as_ptr` to an `InterruptState` that
 //!   the owning wrapper keeps alive for the entire context lifetime;
 //! * contexts are not thread-safe: neither wrapper is `Send`/`Sync`
@@ -26,6 +30,7 @@ mod input;
 mod interrupt;
 mod logging;
 mod muxer;
+mod packet;
 mod version;
 
 pub use backend::FfmpegBackend;
@@ -33,4 +38,5 @@ pub use input::MediaInput;
 pub use interrupt::InterruptHandle;
 pub use logging::native_logging_quiet;
 pub use muxer::MatroskaMuxer;
+pub use packet::FfmpegPacket;
 pub use version::{RuntimeVersions, runtime_versions};

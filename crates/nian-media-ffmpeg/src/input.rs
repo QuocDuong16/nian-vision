@@ -1,14 +1,15 @@
 //! Safe ownership of an FFmpeg input (`AVFormatContext`) for reading.
 
-use std::ffi::{CString, c_int};
+use std::ffi::CString;
 use std::time::Duration;
 
-use nian_domain::{MediaPacketMetadata, MediaRational, MediaStreamInfo, MediaType};
+use nian_domain::{MediaRational, MediaStreamInfo, MediaType};
 use nian_ffmpeg_sys as sys;
-use nian_media::{MediaError, MediaPacket, MediaSource};
+use nian_media::{MediaError, MediaSource};
 
 use crate::error_util::{ErrorKind, error_for};
 use crate::interrupt::InterruptHandle;
+use crate::packet::FfmpegPacket;
 
 /// An opened media source: local container file or live RTSP stream.
 ///
@@ -166,9 +167,13 @@ impl MediaInput {
 
     /// Reads the next compressed packet.
     ///
+    /// Returns an owned [`FfmpegPacket`] that shares the demuxer's
+    /// refcounted payload buffer and preserves the complete packet — side
+    /// data and all flags included — for packet-faithful stream copy.
+    ///
     /// Returns `Ok(None)` on clean end-of-stream and
     /// [`MediaError::Interrupted`] when the interrupt handle fired.
-    pub fn next_packet(&mut self) -> Result<Option<MediaPacket>, MediaError> {
+    pub fn next_packet(&mut self) -> Result<Option<FfmpegPacket>, MediaError> {
         // SAFETY: packet is our valid scratch packet; unref is always safe.
         unsafe { sys::av_packet_unref(self.packet) };
 
@@ -186,29 +191,44 @@ impl MediaInput {
             ));
         }
 
-        // SAFETY: av_read_frame just populated the packet fields; `data`
-        // points to `size` readable bytes owned by the packet until unref.
-        let metadata = unsafe {
-            let packet_ref = &*self.packet;
-            MediaPacketMetadata {
-                stream_index: u32::try_from(packet_ref.stream_index).unwrap_or(u32::MAX),
-                pts: optional_pts(packet_ref.pts),
-                dts: optional_pts(packet_ref.dts),
-                duration: optional_pts(packet_ref.duration),
-                keyframe: packet_ref.flags & sys::AV_PKT_FLAG_KEY as c_int != 0,
+        // Hand the read result to the caller as a separate owned reference
+        // instead of copying bytes out of the scratch packet.
+        //
+        // SAFETY: av_packet_alloc has no preconditions; NULL checked below.
+        let owned = unsafe { sys::av_packet_alloc() };
+        if owned.is_null() {
+            // Drop the data we cannot hand over so the next call starts
+            // from a blank scratch packet.
+            // SAFETY: self.packet is our valid scratch packet.
+            unsafe { sys::av_packet_unref(self.packet) };
+            return Err(MediaError::ReadFailed {
+                message: "out of memory allocating output packet".to_owned(),
+            });
+        }
+        // SAFETY: both packets are valid. Per the FFmpeg 8.0.3 contract,
+        // success makes `owned` share the payload buffer (or deep-copy it
+        // once for non-refcounted sources) and copies every other field,
+        // side data included; failure leaves `owned` blank.
+        let code = unsafe { sys::av_packet_ref(owned, self.packet) };
+        if code < 0 {
+            // SAFETY: both packets are ours. The scratch packet stays with
+            // the struct (freed in Drop); only the failed allocation is
+            // released, and the scratch reference is dropped so the next
+            // call starts from a blank packet.
+            unsafe {
+                sys::av_packet_unref(self.packet);
+                let mut failed = owned;
+                sys::av_packet_free(&mut failed);
             }
-        };
-        let data = unsafe {
-            let packet_ref = &*self.packet;
-            let size = usize::try_from(packet_ref.size).unwrap_or(0);
-            if packet_ref.data.is_null() || size == 0 {
-                Vec::new()
-            } else {
-                std::slice::from_raw_parts(packet_ref.data, size).to_vec()
-            }
-        };
+            return Err(error_for(
+                code,
+                "reference packet",
+                ErrorKind::Read,
+                self.interrupt.state().should_abort(),
+            ));
+        }
 
-        Ok(Some(MediaPacket { metadata, data }))
+        Ok(Some(FfmpegPacket::from_owned(owned)))
     }
 
     /// Codec parameters of stream `index` for stream-copy muxing.
@@ -268,10 +288,6 @@ unsafe fn cstr_to_string(pointer: *const std::ffi::c_char) -> String {
             .to_string_lossy()
             .into_owned()
     }
-}
-
-fn optional_pts(value: i64) -> Option<i64> {
-    (value != sys::NIAN_AV_NOPTS_VALUE).then_some(value)
 }
 
 /// # SAFETY
