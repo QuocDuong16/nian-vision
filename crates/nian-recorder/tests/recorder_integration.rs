@@ -91,6 +91,64 @@ fn partial_files(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Final paths in publication order, taken from `SegmentFinalized` events.
+/// `(pts_seconds, dts_seconds, keyframe)` for every primary-video packet —
+/// the full view needed for B-frame reordering assertions. Timestamps are
+/// optional because streams with B-frames legitimately start with packets
+/// whose DTS cannot be computed yet (`AV_NOPTS_VALUE`).
+fn video_timeline_full(source: &MediaSource) -> Vec<(Option<f64>, Option<f64>, bool)> {
+    let interrupt = InterruptHandle::new();
+    let mut input = MediaInput::open(source, &interrupt).expect("container opens");
+    let streams = input.streams();
+    let video = streams
+        .iter()
+        .find(|stream| stream.media_type == MediaType::Video)
+        .expect("video stream exists");
+    let video_index = video.stream_index;
+    let time_base = video.time_base.expect("video time base");
+    // Signed conversion: streams with B-frames can start with negative
+    // DTS (the demuxer derives them from the codec delay), which
+    // `MediaRational::duration_of` correctly refuses as a *duration* but
+    // that are perfectly valid *timestamps*.
+    let secs = |value: i64| value as f64 * f64::from(time_base.num) / f64::from(time_base.den);
+
+    let mut timeline = Vec::new();
+    while let Some(packet) = input.next_packet().unwrap() {
+        let metadata = packet.metadata();
+        if metadata.stream_index != video_index {
+            continue;
+        }
+        // Spans are computed from DTS because decode order is what
+        // rotation and muxing follow; missing values are preserved as such
+        // so source/recorded comparisons stay exact.
+        let dts = metadata.dts.map(secs);
+        let pts = metadata.pts.map(secs);
+        timeline.push((pts, dts, metadata.keyframe));
+    }
+    timeline
+}
+
+/// First/last committed primary-video DTS (seconds) plus packet count of a
+/// stored segment — the packet-derived view of its actual content.
+fn video_span(path: &Path) -> (f64, f64, usize) {
+    let timeline = video_timeline_full(&MediaSource::File(path.to_path_buf()));
+    assert!(!timeline.is_empty(), "{path:?} carries video");
+    let stamps: Vec<f64> = timeline.iter().filter_map(|(_, dts, _)| *dts).collect();
+    let first = *stamps.first().expect("segment carries decoded timestamps");
+    let last = *stamps.last().unwrap_or(&first);
+    (first, last, timeline.len())
+}
+
+/// `SegmentFinalized.media_duration` values in publication order.
+fn media_durations_for(events: &[RecordingEvent]) -> Vec<Option<Duration>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            RecordingEvent::SegmentFinalized { media_duration, .. } => Some(*media_duration),
+            _ => None,
+        })
+        .collect()
+}
+
 fn finalized_paths(events: &[RecordingEvent]) -> Vec<PathBuf> {
     events
         .iter()
@@ -114,6 +172,10 @@ fn video_timeline(source: &MediaSource) -> Vec<(f64, bool)> {
     let video_index = video.stream_index;
     let time_base = video.time_base.expect("video time base");
 
+    // Signed conversion (see video_timeline_full): timestamps may be
+    // negative even though durations may not.
+    let secs = |value: i64| value as f64 * f64::from(time_base.num) / f64::from(time_base.den);
+
     let mut timeline = Vec::new();
     while let Some(packet) = input.next_packet().unwrap() {
         let metadata = packet.metadata();
@@ -123,8 +185,7 @@ fn video_timeline(source: &MediaSource) -> Vec<(f64, bool)> {
         let seconds = metadata
             .pts
             .or(metadata.dts)
-            .and_then(|value| time_base.duration_of(value))
-            .map(|duration| duration.as_secs_f64())
+            .map(secs)
             .expect("fixture timestamps are present");
         timeline.push((seconds, metadata.keyframe));
     }
@@ -214,13 +275,7 @@ fn continuous_input_rotates_into_multiple_independent_segments() {
 
     // Rotation timing: every rotated segment's media duration lands within
     // [target, target + GOP]; the EOF-closed trailing segment may be short.
-    let mut media_durations: Vec<Option<Duration>> = events
-        .iter()
-        .filter_map(|event| match event {
-            RecordingEvent::SegmentFinalized { media_duration, .. } => Some(*media_duration),
-            _ => None,
-        })
-        .collect();
+    let mut media_durations: Vec<Option<Duration>> = media_durations_for(&events);
     assert_eq!(media_durations.len(), summary.finalized_segments);
     let trailing = media_durations.pop().expect("at least one segment");
     for (index, duration) in media_durations.into_iter().enumerate() {
@@ -236,6 +291,38 @@ fn continuous_input_rotates_into_multiple_independent_segments() {
     }
     assert!(trailing.is_some_and(|d| d > Duration::ZERO));
 
+    // Finding #3: validate ACTUAL segment content through the safe packet
+    // API instead of trusting the same bookkeeping that produced the
+    // events. For every rotated segment: packet-derived span inside the
+    // target/GOP window, and `SegmentFinalized.media_duration` equal to it
+    // within one frame duration.
+    let paths = finalized_paths(&events);
+    for (index, path) in paths.iter().enumerate() {
+        let (first, last, count) = video_span(path);
+        let span = last - first;
+        assert!(count >= 10, "segment {index} suspiciously empty");
+
+        let is_last = index + 1 == paths.len();
+        if !is_last {
+            assert!(
+                span >= 4.8,
+                "rotated segment {index} shorter than target by packets: {span}"
+            );
+            assert!(
+                span <= 5.0 + SESSION_GOP.as_secs_f64() + 0.3,
+                "rotated segment {index} longer than target+GOP by packets: {span}"
+            );
+        }
+
+        let reported = media_durations_for(&events)[index]
+            .map(|duration| duration.as_secs_f64())
+            .expect("reported duration known");
+        assert!(
+            (reported - span).abs() <= 0.15,
+            "reported {reported}s vs packet-derived {span}s (segment {index})"
+        );
+    }
+
     // Event stream tells the same story and ends with RecordingStopped.
     assert!(matches!(
         events.first(),
@@ -244,7 +331,7 @@ fn continuous_input_rotates_into_multiple_independent_segments() {
     assert_eq!(finalized_paths(&events).len(), summary.finalized_segments);
     assert!(matches!(
         events.last(),
-        Some(RecordingEvent::RecordingStopped { finalized_segments })
+        Some(RecordingEvent::RecordingStopped { finalized_segments, completed: true, .. })
             if *finalized_segments == summary.finalized_segments
     ));
 }
@@ -343,7 +430,6 @@ fn startup_alignment_discards_until_first_video_keyframe() {
     let mut events = Vec::new();
     let session = RecordingSession::from_input(
         input,
-        interrupt,
         layout_in(temp.path()),
         // A short target so the post-alignment remainder still rotates.
         RecorderConfig::new(camera())
@@ -548,20 +634,20 @@ fn audio_only_source_is_rejected_before_any_recording() {
 
 #[test]
 fn forced_cancellation_abandons_partials_and_never_publishes() {
-    let interrupt = InterruptHandle::new();
     let temp = tempfile::tempdir().unwrap();
+    let interrupt = InterruptHandle::new();
     let input = MediaInput::open(&fixture("session_av.mkv"), &interrupt).unwrap();
     let session = RecordingSession::from_input(
         input,
-        interrupt.clone(),
         layout_in(temp.path()),
         RecorderConfig::new(camera()).with_audio(AudioPolicy::Exclude),
     )
     .unwrap();
 
-    // Forced cancellation once the session is live: blocking reads abort,
-    // and the active segment must be abandoned — never finalized/published.
-    interrupt.cancel();
+    // The session's handle IS the input's handle; cancelling it once the
+    // session is live aborts blocking reads, and the active segment must
+    // be abandoned — never finalized/published.
+    session.interrupt_handle().cancel();
     let outcome = session.run(&mut |_| {});
     match &outcome {
         Err(RecordingError::Media(media)) => assert!(
@@ -600,10 +686,92 @@ fn stop_before_the_first_keyframe_creates_no_segments_at_all() {
     assert_eq!(summary.finalized_segments, 0);
     assert!(matches!(
         events.last(),
-        Some(RecordingEvent::RecordingStopped { finalized_segments }) if *finalized_segments == 0
+        Some(RecordingEvent::RecordingStopped { finalized_segments, completed: true, .. })
+            if *finalized_segments == 0
     ));
     assert!(
         all_files(temp.path()).is_empty(),
         "no slot was ever claimed"
     );
+}
+
+#[test]
+fn bframe_source_rotates_on_decode_order_without_loss_or_duplication() {
+    // Precondition: the fixture really reorders presentation timestamps
+    // relative to decoding timestamps (explicit -bf 2 MPEG-4).
+    let source_packets = video_timeline_full(&fixture("bframes_av.mkv"));
+    assert!(
+        source_packets.iter().any(
+            |(pts, dts, _)| matches!((pts, dts), (Some(pts), Some(dts)) if (pts - dts).abs() > 1e-6)
+        ),
+        "fixture must contain PTS/DTS reordering"
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut events = Vec::new();
+    let summary = RecordingSession::open(
+        &fixture("bframes_av.mkv"),
+        layout_in(temp.path()),
+        RecorderConfig::new(camera()).with_segment_target(Duration::from_secs(5)),
+    )
+    .unwrap()
+    .run(&mut |event| events.push(event))
+    .unwrap();
+    assert_eq!(summary.end_reason, RecordingEndReason::EndOfStream);
+    assert!(
+        summary.finalized_segments >= 2,
+        "12 s at 5 s target rotates"
+    );
+
+    // The concatenated decode stream must reproduce the source exactly:
+    // timestamps are preserved across segment boundaries (ADR-0004), so
+    // element-wise equality proves nothing was lost or duplicated, and the
+    // present-DTS subsequence stays strictly monotonic — the muxer's
+    // requirement.
+    let mut concatenated = Vec::new();
+    for path in finalized_paths(&events) {
+        let timeline = video_timeline_full(&MediaSource::File(path));
+        assert!(timeline[0].2, "every segment starts on a keyframe");
+        concatenated.extend(timeline);
+    }
+    assert_eq!(
+        concatenated.len(),
+        source_packets.len(),
+        "no packet lost or duplicated across boundaries"
+    );
+    let mut previous_dts: Option<f64> = None;
+    for (recorded, source) in concatenated.iter().zip(source_packets.iter()) {
+        match (recorded.1, source.1) {
+            (None, None) => {}
+            (Some(value), Some(expected)) => {
+                assert!((value - expected).abs() <= 1e-6, "DTS diverged");
+                if let Some(previous) = previous_dts {
+                    assert!(value > previous, "DTS must strictly increase");
+                }
+                previous_dts = Some(value);
+            }
+            _ => panic!("DTS presence diverged from the source"),
+        }
+        assert_eq!(recorded.2, source.2, "keyframe pattern diverged");
+    }
+
+    // PTS oscillation did not corrupt rotation: packet-derived spans of
+    // rotated segments respect the target/GOP window.
+    let paths = finalized_paths(&events);
+    for (index, path) in paths.iter().enumerate() {
+        let (first, last, _) = video_span(path);
+        let span = last - first;
+        let is_last = index + 1 == paths.len();
+        if !is_last {
+            assert!(
+                span >= 4.8 && span <= 5.0 + SESSION_GOP.as_secs_f64() + 0.3,
+                "B-frame rotation span out of window: {span}"
+            );
+        }
+        // Independently readable through the probe.
+        let backend = FfmpegBackend::new().unwrap();
+        let report = backend.probe(&MediaSource::File(path.clone())).unwrap();
+        assert_eq!(report.video_stream().unwrap().codec_name, "mpeg4");
+    }
+    assert!(partial_files(temp.path()).is_empty());
 }

@@ -1,11 +1,26 @@
 //! The recording engine: one media input, one active segment at a time.
 //!
 //! Ownership and lifetime order (milestone requirement §1): a
-//! [`RecordingSession`] owns the [`MediaInput`], its [`InterruptHandle`]
-//! and the shared [`StopFlag`]; each open segment owns its
+//! [`RecordingSession`] owns the [`MediaInput`] and derives its single
+//! [`InterruptHandle`] from that input *by construction*, so the read
+//! callback, every muxer's output callback and session cancellation always
+//! share one interrupt state. Each open segment owns its
 //! [`ClaimedSegment`] (the exclusive claim token) and the
 //! [`MatroskaMuxer`] writing into it. A segment is finalized and published
 //! before the next claim is taken; nothing outlives its owner.
+//!
+//! # Failure semantics (invariant)
+//!
+//! * `MatroskaMuxer` write failures poison the active segment: it is
+//!   abandoned as a recoverable `.partial.mkv`, never published, and the
+//!   original error is returned. A succeeding trailer after a failed write
+//!   is NOT evidence that the segment is valid.
+//! * Input read failures allow salvaging the healthy prefix: the active
+//!   segment is finalized and published if finalization succeeds.
+//! * Forced cancellation abandons the active segment, never publishes.
+//! * Publication is the final infallible transition: everything that can
+//!   fail (trailer, flush/close, pre-publication size lookup) happens
+//!   while the content is still a `.partial.mkv`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +29,7 @@ use std::time::Duration;
 use chrono::{Local, NaiveDateTime};
 use nian_domain::{MediaPacketMetadata, MediaRational, MediaStreamInfo, MediaType};
 use nian_media::MediaSource;
-use nian_media_ffmpeg::{FfmpegPacket, InterruptHandle, MatroskaMuxer, MediaInput};
+use nian_media_ffmpeg::{InterruptHandle, MatroskaMuxer, MediaInput};
 use nian_storage::paths::{ClaimedSegment, publish_no_replace};
 use nian_storage::{RecordingsLayout, StorageError};
 
@@ -30,7 +45,9 @@ use crate::{
 /// deliberately separate from the FFmpeg [`InterruptHandle`]: cancellation
 /// aborts blocking I/O mid-flight and therefore forces an *abandon* of the
 /// active segment, while a stop request still lets trailer + flush +
-/// publish run to completion.
+/// publish run to completion. A stop request cannot wake a read that is
+/// already blocked inside FFmpeg; bounding blocked reads (deadlines,
+/// reconnect policy) belongs to M3.
 #[derive(Clone, Debug, Default)]
 pub struct StopFlag(Arc<AtomicBool>);
 
@@ -51,55 +68,97 @@ impl StopFlag {
     }
 }
 
-/// One open segment: an exclusively claimed slot plus the muxer writing
-/// into it, with the media-time bookkeeping that drives rotation.
-struct Segment {
-    claim: ClaimedSegment,
-    muxer: MatroskaMuxer,
-    started_wall: NaiveDateTime,
+/// Media-time bookkeeping for one open segment.
+///
+/// Kept separate from the I/O half of [`Segment`] so the rotation decision
+/// can be computed read-only and commits can be made strictly transactional
+/// with successful writes: a packet that fails to write never touches this
+/// state, and a boundary keyframe never touches the OLD segment's clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MediaClock {
     /// Validated time base of the primary video stream.
     video_time_base: MediaRational,
-    /// Segment target converted into video time-base ticks.
+    /// Segment target converted (ceiling) into video time-base ticks.
     target_ticks: i64,
-    /// DTS (fallback PTS) of the first timestamped video packet — the zero
-    /// point of this segment's media clock. `None` until such a packet
-    /// arrives; no timestamp is ever invented for it.
+    /// DTS (fallback PTS) of the first timestamped video packet actually
+    /// written to this segment — the zero point of its media clock.
     start_media: Option<i64>,
-    /// Most recent video timestamp seen, for duration reporting.
+    /// Most recent video timestamp committed to this segment.
     last_media: Option<i64>,
     /// Video packets successfully handed to the muxer (including the
     /// opening keyframe). A segment below one never publishes.
     video_packets: u64,
-    /// Set once elapsed media time reached the target: the *next* selected
-    /// video keyframe closes this segment.
-    rotation_pending: bool,
 }
 
-impl Segment {
-    /// Feeds a video packet's timestamps into the segment's media clock.
+impl MediaClock {
+    /// Elapsed media time a timestamp would contribute, relative to the
+    /// committed zero point (which it establishes if absent).
+    fn elapsed_of(&self, timestamp: i64) -> i64 {
+        timestamp
+            .saturating_sub(self.start_media.unwrap_or(timestamp))
+            .max(0)
+    }
+
+    /// Read-only rotation decision (§4): only elapsed MEDIA time arms the
+    /// boundary and only a selected VIDEO keyframe fires it. Never mutates
+    /// the clock, so evaluating it for the boundary keyframe cannot leak
+    /// that keyframe's timestamp into the old segment.
     ///
     /// DTS is preferred over PTS because stream copy writes packets in
     /// decode order; with B-frames, PTS oscillates around DTS and would
     /// mis-measure elapsed time. Packets carrying neither timestamp
-    /// (`AV_NOPTS_VALUE`) contribute content but not time — nothing is
-    /// invented. Backward jumps are clamped so a discontinuity can only
-    /// delay rotation, never rewind it.
-    fn observe_video(&mut self, metadata: &MediaPacketMetadata) {
-        let Some(timestamp) = metadata.dts.or(metadata.pts) else {
-            return;
-        };
-        let start = *self.start_media.get_or_insert(timestamp);
-        self.last_media = Some(timestamp);
-        let elapsed = timestamp.saturating_sub(start).max(0);
-        if !self.rotation_pending && elapsed >= self.target_ticks {
-            self.rotation_pending = true;
+    /// contribute content but never time — nothing is invented. Backward
+    /// jumps clamp to zero, so a discontinuity can delay rotation but
+    /// never rewind it.
+    fn rotation_due(&self, metadata: &MediaPacketMetadata) -> bool {
+        if !metadata.keyframe {
+            return false;
         }
+        metadata
+            .dts
+            .or(metadata.pts)
+            .is_some_and(|timestamp| self.elapsed_of(timestamp) >= self.target_ticks)
     }
 
-    /// Durably finishes the segment: trailer → flush/close → no-replace
-    /// publish → `SegmentFinalized`. Any failure keeps the partial file in
-    /// recovery shape, announces the abandonment through `events`, and
-    /// propagates the error. Returns the published size in bytes.
+    /// Commits a successfully written primary-video packet: timestamps and
+    /// count become part of the segment's durable bookkeeping only here.
+    fn commit_video(&mut self, metadata: &MediaPacketMetadata) {
+        if let Some(timestamp) = metadata.dts.or(metadata.pts) {
+            self.start_media.get_or_insert(timestamp);
+            self.last_media = Some(timestamp);
+        }
+        self.video_packets += 1;
+    }
+
+    /// Media duration between the segment's first and last committed video
+    /// timestamps; `None` when either end carried no timestamp (never
+    /// guessed).
+    fn media_duration(&self) -> Option<Duration> {
+        let last = self.last_media?;
+        let start = self.start_media?;
+        self.video_time_base
+            .duration_of(last.saturating_sub(start).max(0))
+    }
+}
+
+/// One open segment: an exclusively claimed slot plus the muxer writing
+/// into it, with the transactional media-time bookkeeping.
+struct Segment {
+    claim: ClaimedSegment,
+    muxer: MatroskaMuxer,
+    started_wall: NaiveDateTime,
+    clock: MediaClock,
+}
+
+impl Segment {
+    /// Durably finishes the segment: trailer → flush/close → size lookup
+    /// on the still-partial file → no-replace publish → `SegmentFinalized`.
+    ///
+    /// Everything fallible happens BEFORE publication; once the final name
+    /// appears, no remaining operation can turn this segment back into an
+    /// application-level failure. Any earlier failure keeps the file as a
+    /// recoverable `.partial.mkv`, announces the abandonment through
+    /// `events`, and propagates the error. Returns the published size.
     ///
     /// Empty/tiny-segment rule (§12): a segment that never received a
     /// video packet is never published — it is abandoned exactly like a
@@ -113,16 +172,12 @@ impl Segment {
             claim,
             muxer,
             started_wall,
-            video_time_base,
-            start_media,
-            last_media,
-            video_packets,
-            ..
+            clock,
         } = self;
         let partial_path = claim.partial_path().to_path_buf();
         let final_path = claim.final_path().to_path_buf();
 
-        if video_packets == 0 {
+        if clock.video_packets == 0 {
             drop(muxer); // crash-shaped partial stays on disk, unpublished
             events(RecordingEvent::SegmentAbandoned {
                 partial_path,
@@ -131,7 +186,7 @@ impl Segment {
             return Ok(0);
         }
 
-        let media_duration = media_duration_of(video_time_base, start_media, last_media);
+        let media_duration = clock.media_duration();
 
         // Trailer AND final flush/close must succeed before anything is
         // published (§9); on failure the partial stays recovery-eligible.
@@ -143,7 +198,22 @@ impl Segment {
             return Err(error.into());
         }
 
-        // Atomic, never-replacing publication.
+        // Size lookup happens while the content is still the partial file;
+        // doing it after publication could fail with the final .mkv already
+        // visible but unreported.
+        let size_bytes = match std::fs::metadata(&partial_path) {
+            Ok(metadata) => metadata.len(),
+            Err(source) => {
+                let path = partial_path.clone();
+                events(RecordingEvent::SegmentAbandoned {
+                    partial_path,
+                    reason: format!("size lookup failed before publication: {source}"),
+                });
+                return Err(RecordingError::Storage(StorageError::Io { path, source }));
+            }
+        };
+
+        // Atomic, never-replacing publication — the final transition.
         if let Err(error) = publish_no_replace(&partial_path, &final_path) {
             // The media content is complete at this point but keeps the
             // `.partial` name — reconciliation may still recover it; it is
@@ -154,15 +224,6 @@ impl Segment {
             });
             return Err(error.into());
         }
-
-        let size_bytes = std::fs::metadata(&final_path)
-            .map_err(|source| {
-                RecordingError::Storage(StorageError::Io {
-                    path: final_path.clone(),
-                    source,
-                })
-            })?
-            .len();
 
         events(RecordingEvent::SegmentFinalized {
             final_path,
@@ -184,16 +245,36 @@ impl Segment {
     }
 }
 
-/// Media duration between the segment's first and last video timestamps;
-/// `None` when either end carried no timestamp (never guessed).
-fn media_duration_of(
-    time_base: MediaRational,
-    start_media: Option<i64>,
-    last_media: Option<i64>,
-) -> Option<Duration> {
-    let elapsed = last_media?.saturating_sub(start_media?).max(0);
-    time_base.duration_of(elapsed)
+/// What teardown should do with the still-open segment.
+///
+/// Pure policy so the invariant "never publish after a mux/output write
+/// failure" is explicit and unit-testable: only a healthy prefix written
+/// without mux errors (and without cancellation) may be salvaged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeardownDecision {
+    /// Finalize and publish the healthy prefix.
+    PublishSalvage,
+    /// Leave the partial in place; never publish.
+    Abandon,
 }
+
+fn teardown_decision(cancelled: bool, mux_write_failed: bool) -> TeardownDecision {
+    if cancelled || mux_write_failed {
+        TeardownDecision::Abandon
+    } else {
+        TeardownDecision::PublishSalvage
+    }
+}
+
+/// Test-only hook that can fail packet writes at the mux boundary.
+#[cfg(test)]
+type WriteFaultHook = Box<
+    dyn FnMut(&nian_media_ffmpeg::FfmpegPacket) -> Result<(), nian_media::MediaError> + 'static,
+>;
+
+/// Test-only hook that can fail demux reads.
+#[cfg(test)]
+type ReadFaultHook = Box<dyn FnMut() -> Option<nian_media::MediaError> + 'static>;
 
 /// Result payload returned by [`RecordingSession::run`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,21 +291,40 @@ pub struct RecordingSummary {
 }
 
 /// A running recorder bound to one source and one recordings layout.
-#[derive(Debug)]
 pub struct RecordingSession {
     input: MediaInput,
+    /// Derived from `input.interrupt_handle()` by construction: one shared
+    /// interrupt state for reads, muxer writes and forced cancellation.
     interrupt: InterruptHandle,
     layout: RecordingsLayout,
     config: RecorderConfig,
     plan: StreamPlan,
     stop: StopFlag,
+
+    /// Deterministic fault injection at the I/O boundaries, used only by
+    /// in-crate tests; compiled out of production builds entirely. No fake
+    /// media logic exists outside `#[cfg(test)]`.
+    #[cfg(test)]
+    write_fault: Option<WriteFaultHook>,
+    #[cfg(test)]
+    read_fault: Option<ReadFaultHook>,
+}
+
+impl std::fmt::Debug for RecordingSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordingSession")
+            .field("input", &self.input)
+            .field("interrupt", &self.interrupt)
+            .field("layout", &self.layout)
+            .field("config", &self.config)
+            .field("plan", &self.plan)
+            .field("stop", &self.stop)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RecordingSession {
     /// Opens `source` and validates that a recordable stream plan exists.
-    ///
-    /// Equivalent to [`RecordingSession::from_input`] with a fresh
-    /// interrupt handle owned by the session.
     pub fn open(
         source: &MediaSource,
         layout: RecordingsLayout,
@@ -232,17 +332,22 @@ impl RecordingSession {
     ) -> Result<Self, RecordingError> {
         let interrupt = InterruptHandle::new();
         let input = MediaInput::open(source, &interrupt)?;
-        Self::from_input(input, interrupt, layout, config)
+        Self::from_input(input, layout, config)
     }
 
     /// Builds a session on top of an already-opened input.
     ///
-    /// Tests use this to pre-drain a fixture past its first GOP before the
-    /// startup-alignment logic takes over; production callers normally use
-    /// [`RecordingSession::open`].
+    /// The session's interrupt handle IS the input's handle
+    /// (`input.interrupt_handle()`), so the read callback installed inside
+    /// the demuxer, the callback every segment muxer installs, and
+    /// [`RecordingSession::interrupt_handle`] all refer to one interrupt
+    /// state — sharing different handles between reader and writer would
+    /// let a cancellation stop reads but not writes, or vice versa.
+    ///
+    /// Tests use this constructor to pre-drain a fixture past its first GOP
+    /// before the startup-alignment logic takes over.
     pub fn from_input(
         input: MediaInput,
-        interrupt: InterruptHandle,
         layout: RecordingsLayout,
         config: RecorderConfig,
     ) -> Result<Self, RecordingError> {
@@ -253,6 +358,7 @@ impl RecordingSession {
         }
         let streams = input.streams();
         let plan = plan_selection(&streams, config.audio)?;
+        let interrupt = input.interrupt_handle().clone();
 
         Ok(Self {
             input,
@@ -261,6 +367,10 @@ impl RecordingSession {
             config,
             plan,
             stop: StopFlag::new(),
+            #[cfg(test)]
+            write_fault: None,
+            #[cfg(test)]
+            read_fault: None,
         })
     }
 
@@ -282,16 +392,19 @@ impl RecordingSession {
         self.stop.clone()
     }
 
-    /// Interrupt handle backing every blocking FFmpeg call of this
-    /// session. Cancelling it forces an abort: blocking operations fail
-    /// and the active segment is abandoned as a recoverable partial
-    /// instead of being finalized.
+    /// The single interrupt handle shared by input reads, every segment
+    /// muxer's writes and forced cancellation. Cancelling it aborts
+    /// blocking operations; the active segment is abandoned as a
+    /// recoverable partial instead of being finalized.
     pub fn interrupt_handle(&self) -> &InterruptHandle {
         &self.interrupt
     }
 
     /// Runs the recording until a stop is requested, the source ends, or
-    /// an error occurs. Events are emitted synchronously through `events`.
+    /// an error occurs. Events are emitted synchronously through `events`;
+    /// [`RecordingEvent::RecordingStopped`] is emitted exactly once for
+    /// every started session — including failed ones — before `Err` is
+    /// returned.
     pub fn run(
         mut self,
         events: &mut dyn FnMut(RecordingEvent),
@@ -305,8 +418,12 @@ impl RecordingSession {
         let mut discarded_startup_packets: u64 = 0;
         // `None` while waiting for the opening keyframe.
         let mut active: Option<Segment> = None;
-        let mut end_reason = RecordingEndReason::StopRequested;
+        let mut end_reason;
         let mut failure: Option<RecordingError> = None;
+        // Set when a MUX/output write fails: the active segment is then
+        // poisoned and MUST NOT be published even if a trailer would
+        // succeed afterwards.
+        let mut mux_write_failed = false;
 
         'run: loop {
             // Graceful stop takes effect between packets: the previous
@@ -320,6 +437,16 @@ impl RecordingSession {
 
             match self.input.next_packet() {
                 Ok(Some(packet)) => {
+                    // Test-only injection of a demux-side read failure.
+                    #[cfg(test)]
+                    if let Some(hook) = &mut self.read_fault
+                        && let Some(error) = hook()
+                    {
+                        end_reason = RecordingEndReason::SourceError;
+                        failure = Some(error.into());
+                        break 'run;
+                    }
+
                     let metadata = packet.metadata();
                     let is_primary_video = metadata.stream_index == self.plan.primary_video;
 
@@ -329,10 +456,28 @@ impl RecordingSession {
                         // is dropped rather than synchronized; inter-frame
                         // video cannot start a decodable segment.
                         if is_primary_video && metadata.keyframe {
-                            match self.open_segment(&packet, events) {
-                                Ok(segment) => active = Some(segment),
+                            let mut segment = match self.begin_segment(events) {
+                                Ok(segment) => segment,
                                 Err(error) => {
+                                    end_reason = RecordingEndReason::SourceError;
                                     failure = Some(error);
+                                    break 'run;
+                                }
+                            };
+                            match segment.muxer.write_packet(&packet) {
+                                Ok(()) => {
+                                    // Commit only after the write succeeded.
+                                    segment.clock.commit_video(&metadata);
+                                    active = Some(segment);
+                                }
+                                Err(error) => {
+                                    mux_write_failed = true;
+                                    end_reason = RecordingEndReason::SourceError;
+                                    segment.abandon(
+                                        events,
+                                        format!("opening keyframe write failed: {error}"),
+                                    );
+                                    failure = Some(error.into());
                                     break 'run;
                                 }
                             }
@@ -342,17 +487,13 @@ impl RecordingSession {
                         continue 'run;
                     }
 
-                    // Rotation decision (§4): only elapsed MEDIA time arms
-                    // the boundary; only a selected VIDEO keyframe fires
-                    // it. Audio boundaries never rotate a segment.
-                    // (Short-circuit keeps non-video packets from touching
-                    // the media clock.)
+                    // Rotation decision (§4): computed READ-ONLY against
+                    // the committed clock, so the boundary keyframe never
+                    // becomes the old segment's `last_media` (its commit
+                    // lands in the NEW segment below).
                     let boundary_keyframe = is_primary_video
-                        && match active.as_mut() {
-                            Some(segment) => {
-                                segment.observe_video(&metadata);
-                                segment.rotation_pending && metadata.keyframe
-                            }
+                        && match active.as_ref() {
+                            Some(segment) => segment.clock.rotation_due(&metadata),
                             None => false, // unreachable: handled above
                         };
 
@@ -365,30 +506,71 @@ impl RecordingSession {
                                     finalized_segments += 1;
                                 }
                                 Err(error) => {
+                                    end_reason = RecordingEndReason::SourceError;
                                     failure = Some(error);
                                     break 'run;
                                 }
                             }
                         }
-                        // …and write the boundary keyframe as the FIRST
-                        // packet of the NEW segment.
-                        match self.open_segment(&packet, events) {
-                            Ok(segment) => active = Some(segment),
+                        // …open the NEW segment…
+                        let mut segment = match self.begin_segment(events) {
+                            Ok(segment) => segment,
                             Err(error) => {
+                                end_reason = RecordingEndReason::SourceError;
                                 failure = Some(error);
                                 break 'run;
                             }
+                        };
+                        // …and write the boundary keyframe as its FIRST
+                        // packet, committing it only on success.
+                        match segment.muxer.write_packet(&packet) {
+                            Ok(()) => {
+                                segment.clock.commit_video(&metadata);
+                                active = Some(segment);
+                            }
+                            Err(error) => {
+                                mux_write_failed = true;
+                                end_reason = RecordingEndReason::SourceError;
+                                segment.abandon(
+                                    events,
+                                    format!("opening keyframe write failed: {error}"),
+                                );
+                                failure = Some(error.into());
+                                break 'run;
+                            }
                         }
-                    } else if let Some(segment) = active.as_mut() {
-                        // Unselected streams reach the muxer too and are
-                        // skipped deliberately there; exact accounting is
-                        // kept for the primary video only.
-                        if let Err(error) = segment.muxer.write_packet(&packet) {
+                    } else {
+                        let Some(segment) = active.as_mut() else {
+                            discarded_startup_packets += 1;
+                            continue 'run;
+                        };
+
+                        // Test-only injection of a mux-side write failure.
+                        #[cfg(test)]
+                        if let Some(hook) = &mut self.write_fault
+                            && let Err(error) = hook(&packet)
+                        {
+                            mux_write_failed = true;
+                            end_reason = RecordingEndReason::SourceError;
                             failure = Some(error.into());
                             break 'run;
                         }
-                        if is_primary_video {
-                            segment.video_packets += 1;
+
+                        // Unselected streams reach the muxer too and are
+                        // skipped deliberately there; exact accounting is
+                        // kept for the primary video only.
+                        match segment.muxer.write_packet(&packet) {
+                            Ok(()) => {
+                                if is_primary_video {
+                                    segment.clock.commit_video(&metadata);
+                                }
+                            }
+                            Err(error) => {
+                                mux_write_failed = true;
+                                end_reason = RecordingEndReason::SourceError;
+                                failure = Some(error.into());
+                                break 'run;
+                            }
                         }
                     }
                 }
@@ -406,10 +588,10 @@ impl RecordingSession {
 
         // ---- Teardown ---------------------------------------------------
         //
-        // Forced cancellation must not attempt finalization: the interrupt
-        // fired because blocking I/O had to stop, so trailer/flush would
-        // fail identically. Everything else gets a best-effort durable
-        // finalize of whatever healthy content the active segment holds.
+        // Policy (explicit, see `teardown_decision`): forced cancellation
+        // and mux/output write failures abandon the open segment — a
+        // succeeding trailer after a failed write proves nothing. Only a
+        // healthy prefix written without mux errors may be salvaged.
         let cancelled = self.interrupt.is_cancelled()
             || matches!(
                 &failure,
@@ -417,53 +599,69 @@ impl RecordingSession {
             );
 
         if let Some(segment) = active.take() {
-            if cancelled {
-                segment.abandon(
+            match teardown_decision(cancelled, mux_write_failed) {
+                TeardownDecision::Abandon => segment.abandon(
                     events,
-                    "forced cancellation: partial left for recovery".to_owned(),
-                );
-            } else {
-                match segment.finalize_and_publish(events) {
-                    Ok(bytes) => {
-                        bytes_written += bytes;
-                        finalized_segments += 1;
-                    }
-                    Err(close_error) => {
-                        // finalize_and_publish announced the abandonment;
-                        // the close failure becomes the reported error only
-                        // when there was no original cause.
-                        if failure.is_none() {
-                            failure = Some(close_error);
+                    if cancelled {
+                        "forced cancellation: partial left for recovery".to_owned()
+                    } else {
+                        "segment write failed: partial left for recovery, never published"
+                            .to_owned()
+                    },
+                ),
+                TeardownDecision::PublishSalvage => {
+                    match segment.finalize_and_publish(events) {
+                        Ok(bytes) => {
+                            bytes_written += bytes;
+                            finalized_segments += 1;
+                        }
+                        Err(close_error) => {
+                            // finalize_and_publish announced the abandonment;
+                            // the close failure becomes the reported error
+                            // only when there was no original cause.
+                            end_reason = RecordingEndReason::SourceError;
+                            if failure.is_none() {
+                                failure = Some(close_error);
+                            }
                         }
                     }
                 }
             }
         }
 
-        if let Some(error) = failure {
-            return Err(error);
-        }
-
-        events(RecordingEvent::RecordingStopped { finalized_segments });
-        Ok(RecordingSummary {
-            end_reason,
+        // Terminal event: emitted exactly once per started session, on the
+        // failure path too — the fields carry enough state for a future
+        // supervisor/UI to reconcile with the returned Result.
+        let completed = failure.is_none();
+        events(RecordingEvent::RecordingStopped {
             finalized_segments,
-            bytes_written,
-            discarded_startup_packets,
-        })
+            end_reason,
+            completed,
+        });
+
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(RecordingSummary {
+                end_reason,
+                finalized_segments,
+                bytes_written,
+                discarded_startup_packets,
+            }),
+        }
     }
 
-    /// Claims a slot, opens the muxer on the claimed partial, and writes
-    /// `first_packet` (always a selected video keyframe) as its first
-    /// packet.
+    /// Claims a slot and opens the muxer on the claimed partial, emitting
+    /// `SegmentStarted`. Does NOT write anything yet: the caller writes the
+    /// opening keyframe and commits it to the clock only on success, so a
+    /// failed write leaves a header-only recoverable partial and no
+    /// bookkeeping lies about it.
     ///
     /// Failure modes follow the recovery contract: a failed *claim*
     /// creates nothing and propagates; a failure after the claim leaves
     /// the (empty or header-only) `.partial.mkv` in place — recoverable,
     /// never publishable — and announces the abandonment.
-    fn open_segment(
+    fn begin_segment(
         &mut self,
-        first_packet: &FfmpegPacket,
         events: &mut dyn FnMut(RecordingEvent),
     ) -> Result<Segment, RecordingError> {
         let started_wall = local_now();
@@ -500,34 +698,21 @@ impl RecordingSession {
             started_at: started_wall,
         });
 
-        let mut segment = Segment {
+        Ok(Segment {
             claim,
             muxer,
             started_wall,
-            video_time_base: self.plan.video_time_base,
-            target_ticks: target_ticks_in(self.config.segment_target, self.plan.video_time_base),
-            start_media: None,
-            last_media: None,
-            video_packets: 0,
-            rotation_pending: false,
-        };
-
-        // The startup/boundary keyframe belongs to THIS segment (§4).
-        let metadata = first_packet.metadata();
-        segment.observe_video(&metadata);
-        if let Err(error) = segment.muxer.write_packet(first_packet) {
-            let reason = format!("opening keyframe write failed: {error}");
-            let partial_path = segment.claim.partial_path().to_path_buf();
-            drop(segment);
-            events(RecordingEvent::SegmentAbandoned {
-                partial_path,
-                reason,
-            });
-            return Err(error.into());
-        }
-        segment.video_packets = 1;
-
-        Ok(segment)
+            clock: MediaClock {
+                video_time_base: self.plan.video_time_base,
+                target_ticks: target_ticks_in(
+                    self.config.segment_target,
+                    self.plan.video_time_base,
+                ),
+                start_media: None,
+                last_media: None,
+                video_packets: 0,
+            },
+        })
     }
 }
 
@@ -573,11 +758,15 @@ fn plan_selection(
     })
 }
 
-/// Segment target expressed in video time-base ticks (i128 intermediate;
-/// saturates instead of overflowing).
+/// Segment target expressed in video time-base ticks using CEILING
+/// division: the arming threshold is the first tick at or after the
+/// requested duration. Rounding down would rotate before the operator's
+/// target was reached. Saturates instead of overflowing or panicking.
 fn target_ticks_in(target: Duration, time_base: MediaRational) -> i64 {
     let micros = i128::try_from(target.as_micros()).unwrap_or(i128::MAX);
-    let ticks = micros * i128::from(time_base.den) / (1_000_000 * i128::from(time_base.num.max(1)));
+    let numerator = micros.saturating_mul(i128::from(time_base.den));
+    let denominator = 1_000_000_i128.saturating_mul(i128::from(time_base.num.max(1)));
+    let ticks = numerator.saturating_add(denominator - 1) / denominator;
     i64::try_from(ticks).unwrap_or(i64::MAX)
 }
 
@@ -587,8 +776,13 @@ fn local_now() -> NaiveDateTime {
 
 #[cfg(test)]
 mod tests {
+    //! Unit tests for the pure decision/bookkeeping layer plus
+    //! fault-injection runs over the real pipeline (real FFmpeg, real
+    //! files — only the injected faults are synthetic).
+
     use super::*;
-    use nian_domain::MediaStreamInfo;
+    use nian_domain::{CameraId, MediaStreamInfo};
+    use nian_media::MediaError;
 
     fn stream(
         index: u32,
@@ -663,43 +857,324 @@ mod tests {
     }
 
     #[test]
-    fn segment_target_converts_into_stream_ticks_and_saturates() {
-        let ticks = target_ticks_in(Duration::from_secs(5), MediaRational::new(1, 1000).unwrap());
-        assert_eq!(ticks, 5_000);
+    fn segment_target_converts_into_stream_ticks_with_ceiling() {
+        // Exact conversions stay exact.
+        assert_eq!(
+            target_ticks_in(Duration::from_secs(5), MediaRational::new(1, 1000).unwrap()),
+            5_000
+        );
 
-        // Extreme time bases saturate instead of overflowing or panicking.
+        // Non-integral time base (tick = 1001/30000 s ≈ 33.367 ms) where
+        // floor and ceiling differ: 1 s is exactly 30000/1001 ≈ 29.97
+        // ticks — flooring to 29 would arm BELOW the requested target.
+        let ntsc_like = MediaRational {
+            num: 1001,
+            den: 30000,
+        };
+        assert_eq!(target_ticks_in(Duration::from_secs(1), ntsc_like), 30);
+        assert_eq!(target_ticks_in(Duration::from_millis(500), ntsc_like), 15);
+        assert_eq!(target_ticks_in(Duration::from_millis(100), ntsc_like), 3);
+
+        // Extreme inputs saturate instead of overflowing or panicking.
         let huge = target_ticks_in(
             Duration::from_secs(u64::from(u32::MAX)),
             MediaRational::new(1, 1).unwrap(),
         );
         assert!(huge > 0);
-        let precise = target_ticks_in(
-            Duration::from_millis(1500),
-            MediaRational::new(1, 30_000).unwrap(),
-        );
-        assert_eq!(precise, 45_000);
-        // A sub-tick target degenerates to zero ticks (rotation armed at
-        // the first timestamp) instead of inventing resolution.
+        // A sub-tick target rounds UP to the first tick (never to zero —
+        // zero would arm rotation on the very first timestamp).
         let sub_tick = target_ticks_in(
             Duration::from_millis(1),
             MediaRational::new(1000, 1).unwrap(),
         );
-        assert_eq!(sub_tick, 0);
+        assert_eq!(sub_tick, 1);
+    }
+
+    fn sample_clock() -> MediaClock {
+        MediaClock {
+            video_time_base: MediaRational::new(1, 1000).unwrap(),
+            target_ticks: 5_000,
+            start_media: None,
+            last_media: None,
+            video_packets: 0,
+        }
+    }
+
+    fn metadata(dts: Option<i64>, pts: Option<i64>, keyframe: bool) -> MediaPacketMetadata {
+        MediaPacketMetadata {
+            stream_index: 0,
+            dts,
+            pts,
+            duration: None,
+            keyframe,
+        }
+    }
+
+    #[test]
+    fn rotation_is_read_only_and_never_consumes_the_boundary_timestamp() {
+        let mut clock = sample_clock();
+        // First committed packet establishes the zero point.
+        clock.commit_video(&metadata(Some(1_000), Some(1_000), true));
+        let before = clock.clone();
+
+        // Evaluating a boundary keyframe (elapsed >= target) must leave the
+        // committed clock untouched: the boundary belongs to the NEXT
+        // segment, so the old segment's last_media/count/duration must not
+        // include it.
+        assert!(clock.rotation_due(&metadata(Some(6_000), Some(6_000), true)));
+        assert_eq!(clock, before, "rotation_due mutated committed state");
+        assert_eq!(clock.last_media, Some(1_000));
+        assert_eq!(clock.video_packets, 1);
+        assert_eq!(clock.media_duration(), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn rotation_uses_decode_order_and_ignores_pts_oscillation() {
+        // B-frame pattern: PTS oscillates around DTS. Rotation decisions go
+        // through DTS, so a PTS dip can neither trigger nor postpone a
+        // boundary. Zero point established at dts 1000, target 5000 ticks.
+        let mut clock = sample_clock();
+        clock.commit_video(&metadata(Some(1_000), Some(1_200), false));
+
+        // Non-keyframe at/after the target never rotates on its own.
+        assert!(!clock.rotation_due(&metadata(Some(6_000), Some(6_000), false)));
+        // Keyframe whose DTS reaches the target rotates even though its PTS
+        // sits below it.
+        assert!(clock.rotation_due(&metadata(Some(6_100), Some(5_800), true)));
+        // Keyframe whose DTS is short of the target does not — even though
+        // its PTS would cross it (PTS is simply not consulted).
+        assert!(!clock.rotation_due(&metadata(Some(5_900), Some(6_200), true)));
+
+        // Packets without any timestamp contribute nothing to timing.
+        assert!(!clock.rotation_due(&metadata(None, None, true)));
+    }
+
+    #[test]
+    fn commit_is_transactional_with_successful_writes_by_construction() {
+        // The loop only calls commit_video after a successful write; these
+        // assertions pin what a commit means so a regression cannot quietly
+        // move it before the write again.
+        let mut clock = sample_clock();
+        clock.commit_video(&metadata(Some(1_000), Some(1_000), true));
+        clock.commit_video(&metadata(Some(3_000), Some(3_100), false));
+        assert_eq!(clock.video_packets, 2);
+        assert_eq!(clock.start_media, Some(1_000));
+        assert_eq!(clock.last_media, Some(3_000));
+        assert_eq!(clock.media_duration(), Some(Duration::from_millis(2_000)));
+
+        // A failed write simply never calls commit: simulate by NOT calling
+        // it — state stays at the last success.
+        let snapshot = clock.clone();
+        assert_eq!(clock, snapshot);
     }
 
     #[test]
     fn media_duration_requires_both_ends_of_the_segment_clock() {
-        let time_base = MediaRational::new(1, 1000).unwrap();
-        assert_eq!(media_duration_of(time_base, None, Some(5_000)), None);
-        assert_eq!(media_duration_of(time_base, Some(1_000), None), None);
+        let mut clock = sample_clock();
+        assert_eq!(clock.media_duration(), None);
+        clock.commit_video(&metadata(Some(1_000), None, true));
+        // One end known: the span is well-defined but zero so far.
+        assert_eq!(clock.media_duration(), Some(Duration::ZERO));
+        clock.commit_video(&metadata(Some(6_000), None, false));
+        assert_eq!(clock.media_duration(), Some(Duration::from_secs(5)));
+        // Backward jump lowers last_media; the span shrinks but can never
+        // go negative (saturating subtraction).
+        clock.commit_video(&metadata(Some(2_000), None, false));
+        assert_eq!(clock.media_duration(), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn teardown_policy_aborts_publication_on_poison_or_cancellation() {
+        // Healthy prefix + no cancellation → salvage.
         assert_eq!(
-            media_duration_of(time_base, Some(1_000), Some(6_000)),
-            Some(Duration::from_secs(5))
+            teardown_decision(false, false),
+            TeardownDecision::PublishSalvage
         );
-        // Backward jump never produces a negative duration.
+        // Any mux/output write failure poisons the segment.
+        assert_eq!(teardown_decision(false, true), TeardownDecision::Abandon);
+        // Cancellation always abandons.
+        assert_eq!(teardown_decision(true, false), TeardownDecision::Abandon);
+        assert_eq!(teardown_decision(true, true), TeardownDecision::Abandon);
+    }
+
+    // ---- Fault-injection runs over the REAL pipeline --------------------
+
+    fn fixtures_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/nian-media-ffmpeg/tests/fixtures")
+    }
+
+    fn files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    found.push(path);
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    fn finals_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        files_under(root)
+            .into_iter()
+            .filter(|p| {
+                p.extension().is_some_and(|ext| ext == "mkv")
+                    && !p.to_string_lossy().contains(".partial.")
+            })
+            .collect()
+    }
+
+    fn partials_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        files_under(root)
+            .into_iter()
+            .filter(|p| p.to_string_lossy().contains(".partial."))
+            .collect()
+    }
+
+    /// Records the long fixture with a mux-side write fault injected right
+    /// after the Nth packet was handed to the active segment.
+    #[test]
+    fn mux_write_failure_poisons_the_segment_and_never_publishes_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = fixtures_dir().join("session_av.mkv");
+        let interrupt = InterruptHandle::new();
+        let input = MediaInput::open(&MediaSource::File(source.clone()), &interrupt).unwrap();
+        let mut session = RecordingSession::from_input(
+            input,
+            RecordingsLayout::new(temp.path().join("recordings")).unwrap(),
+            RecorderConfig::new(CameraId::parse("rec-test").unwrap())
+                .with_segment_target(Duration::from_secs(5)),
+        )
+        .unwrap();
+
+        const FAIL_AFTER_PACKETS: usize = 40;
+        let mut seen = 0_usize;
+        session.write_fault = Some(Box::new(move |_packet| {
+            seen += 1;
+            if seen > FAIL_AFTER_PACKETS {
+                return Err(MediaError::WriteFailed {
+                    message: "injected mux failure".to_owned(),
+                });
+            }
+            Ok(())
+        }));
+
+        let mut events = Vec::new();
+        let outcome = session.run(&mut |event| events.push(event));
+        let error = outcome.expect_err("injected mux failure must fail the run");
+        assert!(
+            matches!(&error, RecordingError::Media(MediaError::WriteFailed { message }) if message.contains("injected")),
+            "original write error must be returned verbatim, got {error:?}"
+        );
+
+        // The poisoned segment is a recoverable partial, NEVER a final.
+        let finals = finals_under(temp.path());
+        assert!(
+            finals.is_empty(),
+            "a poisoned segment must never be published, found {finals:?}"
+        );
+        let partials = partials_under(temp.path());
+        assert_eq!(partials.len(), 1, "exactly the poisoned partial remains");
+        let bytes = std::fs::read(&partials[0]).unwrap();
+        assert!(!bytes.is_empty(), "healthy prefix stayed on disk");
+
+        // Event story: abandonment announced, no SegmentFinalized, and the
+        // terminal RecordingStopped still emitted exactly once with the
+        // failure marked.
+        assert!(matches!(
+            events.last(),
+            Some(RecordingEvent::RecordingStopped {
+                completed: false,
+                ..
+            })
+        ));
         assert_eq!(
-            media_duration_of(time_base, Some(6_000), Some(1_000)),
-            Some(Duration::ZERO)
+            events
+                .iter()
+                .filter(|event| matches!(event, RecordingEvent::SegmentFinalized { .. }))
+                .count(),
+            0
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RecordingEvent::SegmentAbandoned { .. }))
+        );
+    }
+
+    /// A DEMUX-side read failure may salvage the healthy prefix: the
+    /// already-written content is finalized and published when the trailer
+    /// succeeds.
+    #[test]
+    fn read_failure_salvages_the_healthy_prefix_when_finalization_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = fixtures_dir().join("session_av.mkv");
+        let interrupt = InterruptHandle::new();
+        let input = MediaInput::open(&MediaSource::File(source.clone()), &interrupt).unwrap();
+        let mut session = RecordingSession::from_input(
+            input,
+            RecordingsLayout::new(temp.path().join("recordings")).unwrap(),
+            RecorderConfig::new(CameraId::parse("rec-test").unwrap())
+                .with_segment_target(Duration::from_secs(30)), // no rotation: ONE segment
+        )
+        .unwrap();
+
+        const FAIL_AFTER_READS: usize = 120;
+        let mut reads = 0_usize;
+        session.read_fault = Some(Box::new(move || {
+            reads += 1;
+            if reads > FAIL_AFTER_READS {
+                Some(MediaError::ReadFailed {
+                    message: "injected read failure".to_owned(),
+                })
+            } else {
+                None
+            }
+        }));
+
+        let mut events = Vec::new();
+        let outcome = session.run(&mut |event| events.push(event));
+        match &outcome {
+            Err(RecordingError::Media(MediaError::ReadFailed { message })) => {
+                assert!(message.contains("injected"), "{message}");
+            }
+            other => panic!("expected the original read error, got {other:?}"),
+        }
+
+        // The healthy prefix became a real published recording.
+        let finals = finals_under(temp.path());
+        assert_eq!(finals.len(), 1, "salvaged prefix published once");
+        assert!(partials_under(temp.path()).is_empty());
+
+        // Terminal event still fired exactly once, marking the failure.
+        let stopped: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event, RecordingEvent::RecordingStopped { .. }))
+            .collect();
+        assert_eq!(stopped.len(), 1);
+        assert!(matches!(
+            stopped[0],
+            RecordingEvent::RecordingStopped {
+                completed: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RecordingEvent::SegmentFinalized { .. }))
+                .count(),
+            1
         );
     }
 }

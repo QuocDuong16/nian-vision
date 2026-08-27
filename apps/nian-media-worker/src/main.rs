@@ -296,6 +296,33 @@ fn cmd_record(args: &[String]) -> Result<(), String> {
     let session =
         RecordingSession::open(&source, layout, config).map_err(|error| error.to_string())?;
 
+    // Two-stage Ctrl+C (M2 review §9): the first press requests a graceful
+    // stop; a second press forces interrupt cancellation. The graceful flag
+    // alone takes effect between packets and cannot wake an indefinitely
+    // blocked network read — read deadlines/reconnect policy belong to M3.
+    let signal_presses = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let signal_stop = session.stop_flag();
+    let signal_cancel = session.interrupt_handle().clone();
+    let handler_presses = std::sync::Arc::clone(&signal_presses);
+    ctrlc::set_handler(move || {
+        use std::sync::atomic::Ordering;
+        match handler_presses.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                eprintln!("Ctrl+C: stopping gracefully (press again to force-cancel)");
+                signal_stop.request();
+            }
+            1 => {
+                eprintln!("Ctrl+C: forcing cancellation of blocking media I/O");
+                signal_cancel.cancel();
+            }
+            _ => {
+                // Further presses are ignored; SIGKILL remains the operator's
+                // hard exit, leaving recoverable partials behind.
+            }
+        }
+    })
+    .map_err(|error| format!("cannot install Ctrl+C handler: {error}"))?;
+
     // The stop trigger runs on its own thread so blocking FFmpeg reads do
     // not starve it; the graceful flag takes effect between packets only.
     let stop_flag = session.stop_flag();

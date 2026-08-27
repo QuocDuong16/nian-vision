@@ -14,7 +14,7 @@ Testing is part of the definition of done for every milestone (master spec
 | `nian-storage` | recordings layout, partial/final naming round-trip, traversal rejection, exclusive claims (incl. sub-second clock regression), no-replace publication (success, collision refusal, recoverable abandoned partials) |
 | `nian-ipc` | envelope round-trips, framing limits (1 MiB cap, CRLF, truncation), dispatch loop (ping/describe/shutdown/unknown), protocol version guard |
 | `nian-media` | RTSP URL redaction invariants |
-| `nian-recorder` | stream-plan selection (first video stream, audio policy, unusable time-base rejection), target-to-ticks conversion, segment duration math |
+| `nian-recorder` | stream-plan selection (first video stream, audio policy, unusable time-base rejection), ceiling target-to-ticks conversion, read-only rotation decision + transactional clock commits, segment duration math, teardown policy (poison/cancel ⇒ never publish) |
 
 ### Media integration tests (`nian-media-ffmpeg/tests/`)
 
@@ -55,7 +55,18 @@ camera in CI. Segments are inspected through the safe packet/probe API:
 * an audio-only source is rejected (`NoVideoStream`); a reordered source is
   recorded from video stream index 1 (index 0 never assumed);
 * forced cancellation abandons partials and never publishes a completed
-  recording.
+  recording;
+* fault injection at the I/O boundaries (in-crate unit runs over the real
+  pipeline): a mux/output write failure poisons the segment — abandoned,
+  never published, original error returned — while a demux read failure
+  salvages and publishes the healthy prefix when finalization succeeds;
+* segment durations are validated from the stored packets themselves
+  (first/last video DTS via the segment time base), not only from the
+  recorder's own event bookkeeping;
+* an explicit `-bf 2` MPEG-4 fixture proves decode-order progression:
+  PTS reordering neither triggers nor blocks rotation, DTS stays monotonic
+  across boundaries with no packet lost or duplicated, and every segment
+  opens on a keyframe.
 
 ### CLI/IPC smoke checks (manual, seconds)
 

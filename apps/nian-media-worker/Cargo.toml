@@ -12,6 +12,8 @@ name = "nian-media-worker"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { workspace = true }
+ctrlc = { workspace = true }
 nian-domain = { workspace = true }
 nian-ipc = { workspace = true }
 nian-media = { workspace = true }

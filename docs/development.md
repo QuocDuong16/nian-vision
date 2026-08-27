@@ -69,8 +69,13 @@ NIAN_VISION_RTSP_URL='rtsp://user:pass@192.168.1.42:554/stream1' \
 ```
 
 * Stop conditions: `--duration <SECONDS>`, `--until-stdin-eof` (pipe close /
-  Ctrl+D), or Ctrl+C — on Ctrl+C the process dies and the active segment
-  stays behind as a recoverable `.partial.mkv` by design.
+  Ctrl+D), or Ctrl+C. Ctrl+C is two-stage: the first press requests a
+  graceful stop; a second press force-cancels blocking media I/O; further
+  presses are ignored (`SIGKILL` remains the hard exit). The graceful flag
+  takes effect between packets and cannot wake an already-blocked network
+  read — read deadlines and reconnect policy arrive with M3. A forced
+  cancellation leaves the active segment as a recoverable `.partial.mkv`
+  by design.
 * `--no-audio` records video only; `--segment-target` is in seconds
   (default 300).
 * The URL never appears in argv, stdout/stderr, or logs; native FFmpeg

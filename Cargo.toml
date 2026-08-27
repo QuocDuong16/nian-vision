@@ -55,6 +55,8 @@ nian-recorder = { path = "crates/nian-recorder" }
 nian-storage = { path = "crates/nian-storage" }
 
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
+# Two-stage Ctrl+C handling for the manual recording smoke command.
+ctrlc = "=3.5.2"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 tempfile = "=3.27.0"

@@ -197,11 +197,20 @@ pub enum RecordingEvent {
         /// Human-readable cause.
         reason: String,
     },
-    /// The recording loop ended (graceful stop, end of stream or error —
-    /// see [`RecordingSummary::end_reason`]).
+    /// The recording loop ended. Emitted **exactly once for every started
+    /// session** — on the failure path too, after every segment has reached
+    /// its terminal state (published or abandoned). `completed` mirrors
+    /// whether `run` returns `Ok`; `end_reason` says what ended the loop,
+    /// giving a future supervisor/UI enough state to reconcile without a
+    /// second event channel.
     RecordingStopped {
         /// Number of segments published during the session.
         finalized_segments: usize,
+        /// What ended the loop.
+        end_reason: RecordingEndReason,
+        /// Whether the session finished without an error (`run` returns
+        /// `Ok` exactly when this is `true`).
+        completed: bool,
     },
 }
 
