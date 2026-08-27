@@ -11,6 +11,21 @@ use crate::error_util::{ErrorKind, error_for};
 use crate::interrupt::InterruptHandle;
 use crate::packet::FfmpegPacket;
 
+/// Default deadline for opening a source (connect + RTSP handshake).
+///
+/// Applies only when the caller has not installed its own deadline; the
+/// recorder installs [`crate::backend::SOURCE_OPEN_TIMEOUT`] explicitly.
+const OPEN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Default deadline for `avformat_find_stream_info` (stream analysis/probe).
+const STREAM_INFO_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Default stall deadline for single packet reads when the caller has armed
+/// none. Live sources (RTSP over TCP) must surface "camera stopped talking"
+/// instead of blocking the worker forever; local files read fast enough that
+/// this never fires in practice but still bounds pathological media.
+const READ_STALL_DEADLINE: Duration = Duration::from_secs(15);
+
 /// An opened media source: local container file or live RTSP stream.
 ///
 /// Not `Send`/`Sync` (raw FFI context); use it from the thread that opened
@@ -66,7 +81,13 @@ impl MediaInput {
             // packets on Wi-Fi and punches holes we do not need.
             set_option(&mut options, "rtsp_transport", "tcp");
         }
-
+        // Operation-scoped deadline (M3 §5): the open/connect phase is
+        // bounded by `OPEN_DEADLINE` UNLESS the caller armed its own deadline
+        // (the recorder installs a source-specific timeout). The guard
+        // clears the deadline on every exit path, so later operations never
+        // inherit this one's budget.
+        let caller_armed = interrupt.installed_deadline().is_some();
+        let _open_guard = (!caller_armed).then(|| interrupt.scoped_deadline(OPEN_DEADLINE));
         // SAFETY: `context` is a valid context pointer (avformat_open_input
         // takes ownership even on failure and nulls it), `url` is a valid
         // NUL-terminated C string, no custom demuxer, options dict is ours.
@@ -80,12 +101,23 @@ impl MediaInput {
                 code,
                 "open media source",
                 ErrorKind::Open,
-                interrupt.state().should_abort(),
+                Some(interrupt),
             ));
         }
 
+        drop(_open_guard);
+
+        // Stream analysis gets its own budget for the same reason: a camera
+        // that accepts the TCP handshake but then trickles must not pin the
+        // worker here either.
+        let _info_guard = if caller_armed {
+            None
+        } else {
+            Some(interrupt.scoped_deadline(STREAM_INFO_DEADLINE))
+        };
         // SAFETY: context is a successfully opened context.
         let code = unsafe { sys::avformat_find_stream_info(context, std::ptr::null_mut()) };
+        drop(_info_guard);
         if code < 0 {
             // avformat_close_input frees the context on all paths below.
             // SAFETY: context is a valid opened context.
@@ -94,7 +126,7 @@ impl MediaInput {
                 code,
                 "analyze media streams",
                 ErrorKind::Open,
-                interrupt.state().should_abort(),
+                Some(interrupt),
             ));
         }
 
@@ -171,14 +203,35 @@ impl MediaInput {
     /// refcounted payload buffer and preserves the complete packet — side
     /// data and all flags included — for packet-faithful stream copy.
     ///
-    /// Returns `Ok(None)` on clean end-of-stream and
-    /// [`MediaError::Interrupted`] when the interrupt handle fired.
+    /// The read is bounded by a stall deadline (M3 §5): when the caller
+    /// armed a deadline on the shared interrupt handle (the recorder arms
+    /// its per-read stall budget), that deadline aborts the read; without a
+    /// caller-armed deadline the built-in [`READ_STALL_DEADLINE`] applies.
+    /// In both cases the read aborts with [`MediaError::TimedOut`],
+    /// distinguishable from operator cancellation
+    /// ([`MediaError::Interrupted`]) so supervisors can decide between
+    /// reconnect and stop. Local files finish far inside the budget; for
+    /// live sources this is what turns "camera stopped talking" into a
+    /// retryable failure instead of an infinitely blocked worker.
+    ///
+    /// Returns `Ok(None)` on clean end-of-stream.
     pub fn next_packet(&mut self) -> Result<Option<FfmpegPacket>, MediaError> {
+        // The stall guard is scoped to exactly this read; it clears the
+        // deadline on every exit path so later mux writes/finalization run
+        // without an inherited (possibly already expired) deadline.
+        let caller_armed = self.interrupt.installed_deadline().is_some();
+        let _stall_guard = if caller_armed {
+            None
+        } else {
+            Some(self.interrupt.scoped_deadline(READ_STALL_DEADLINE))
+        };
+
         // SAFETY: packet is our valid scratch packet; unref is always safe.
         unsafe { sys::av_packet_unref(self.packet) };
 
         // SAFETY: context and packet are valid and owned by self.
         let code = unsafe { sys::av_read_frame(self.context, self.packet) };
+        drop(_stall_guard);
         if code < 0 {
             if code == sys::NIAN_AVERROR_EOF {
                 return Ok(None);
@@ -187,7 +240,7 @@ impl MediaInput {
                 code,
                 "read packet",
                 ErrorKind::Read,
-                self.interrupt.state().should_abort(),
+                Some(&self.interrupt),
             ));
         }
 
@@ -224,7 +277,7 @@ impl MediaInput {
                 code,
                 "reference packet",
                 ErrorKind::Read,
-                self.interrupt.state().should_abort(),
+                Some(&self.interrupt),
             ));
         }
 

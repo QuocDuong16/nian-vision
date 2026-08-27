@@ -48,7 +48,7 @@ use nian_domain::MediaRational;
 use nian_ffmpeg_sys as sys;
 use nian_media::MediaError;
 
-use crate::error_util::{ErrorKind, error_for};
+use crate::error_util::{ErrorKind, error_for, interrupt_error};
 use crate::input::MediaInput;
 use crate::interrupt::InterruptHandle;
 use crate::packet::FfmpegPacket;
@@ -162,7 +162,7 @@ impl MatroskaMuxer {
                 code,
                 "create matroska output",
                 ErrorKind::Write,
-                false,
+                Some(interrupt),
             ));
         }
         // The callback installed here is backed by `interrupt`'s Arc. From
@@ -196,7 +196,7 @@ impl MatroskaMuxer {
                         code,
                         "copy stream parameters",
                         ErrorKind::Write,
-                        false,
+                        Some(interrupt),
                     ));
                 }
                 // The codec tag comes from the source container; Matroska
@@ -229,7 +229,7 @@ impl MatroskaMuxer {
                 code,
                 "open output file",
                 ErrorKind::Write,
-                interrupt.state().should_abort(),
+                Some(interrupt),
             ));
         }
 
@@ -249,7 +249,7 @@ impl MatroskaMuxer {
                 code,
                 "write matroska header",
                 ErrorKind::Write,
-                interrupt.state().should_abort(),
+                Some(interrupt),
             ));
         }
 
@@ -307,10 +307,8 @@ impl MatroskaMuxer {
     /// Use [`MatroskaMuxer::mapped_input_stream_indices`] to account for
     /// skipped packets.
     pub fn write_packet(&mut self, packet: &FfmpegPacket) -> Result<(), MediaError> {
-        if self.interrupt.state().should_abort() {
-            return Err(MediaError::Interrupted {
-                operation: "write packet",
-            });
+        if let Some(error) = interrupt_error(&self.interrupt, "write packet") {
+            return Err(error);
         }
 
         let metadata = packet.metadata();
@@ -348,11 +346,13 @@ impl MatroskaMuxer {
         // The caller's packet keeps sole ownership of its own reference.
         let code = unsafe { sys::av_packet_ref(self.scratch, packet.as_raw()) };
         if code < 0 {
+            // A failed refcount cannot be an interrupt (no blocking I/O);
+            // the interrupt state is deliberately not consulted here.
             return Err(error_for(
                 code,
                 "copy packet reference",
                 ErrorKind::Write,
-                false,
+                None,
             ));
         }
 
@@ -372,7 +372,22 @@ impl MatroskaMuxer {
         // payload byte is double-freed.
         let code = unsafe { sys::av_interleaved_write_frame(self.context, self.scratch) };
         if code < 0 {
-            return Err(error_for(code, "write packet", ErrorKind::Write, false));
+            // M3 regression guard: `av_interleaved_write_frame` can block on
+            // I/O (interleave queue flushes), and its interrupt callback CAN
+            // fire while blocked. The interrupt state — not the FFmpeg error
+            // code — decides the classification: operator cancellation maps
+            // to `Interrupted`, an expired deadline to `TimedOut`; only
+            // everything else is a plain `WriteFailed`. Passing a constant
+            // `interrupted = false` here used to misreport cancelled writes.
+            //
+            // Note: local segment output normally never blocks long enough,
+            // but the mapping must not silently depend on that assumption.
+            return Err(error_for(
+                code,
+                "write packet",
+                ErrorKind::Write,
+                Some(&self.interrupt),
+            ));
         }
         Ok(())
     }
@@ -395,7 +410,7 @@ impl MatroskaMuxer {
                 trailer_code,
                 "write matroska trailer",
                 ErrorKind::Write,
-                self.interrupt.state().should_abort(),
+                Some(&self.interrupt),
             ));
         }
 
@@ -413,7 +428,7 @@ impl MatroskaMuxer {
                 close_code,
                 "close matroska output",
                 ErrorKind::Write,
-                self.interrupt.state().should_abort(),
+                Some(&self.interrupt),
             ));
         }
 

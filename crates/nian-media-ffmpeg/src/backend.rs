@@ -31,7 +31,8 @@ impl FfmpegBackend {
 impl Probe for FfmpegBackend {
     fn probe(&self, source: &MediaSource) -> Result<MediaProbeReport, MediaError> {
         let interrupt = InterruptHandle::new();
-        interrupt.set_deadline_from_now(PROBE_DEADLINE);
+        // RAII-scoped so the deadline cannot outlive the probe (M3 §5).
+        let _deadline = interrupt.scoped_deadline(PROBE_DEADLINE);
 
         let input = MediaInput::open(source, &interrupt)?;
         let format_name = input.format_name();

@@ -28,10 +28,27 @@ pub enum MediaError {
         message: String,
     },
 
-    /// A blocking media operation was cancelled or exceeded its deadline.
-    #[error("{operation} was interrupted (cancelled or deadline exceeded)")]
+    /// A blocking media operation was cancelled by the operator.
+    ///
+    /// This is *pure cancellation* — since M3 it never covers deadline
+    /// expiry, which has its own [`MediaError::TimedOut`] variant. The
+    /// distinction is load-bearing: cancellation means "stop everything",
+    /// while a timeout means "the source stalled; salvage what is healthy
+    /// and reconnect" (M3 §6).
+    #[error("{operation} was cancelled")]
     Interrupted {
         /// Which operation was in flight, e.g. `open media source`.
+        operation: &'static str,
+    },
+
+    /// A blocking media operation exceeded its operation-scoped deadline.
+    ///
+    /// For a packet read this typically means the live source stopped
+    /// delivering data (stall/network loss). It is retryable: callers may
+    /// salvage the healthy segment prefix and reconnect.
+    #[error("{operation} timed out (operation deadline exceeded)")]
+    TimedOut {
+        /// Which operation was in flight, e.g. `read packet`.
         operation: &'static str,
     },
 
@@ -57,9 +74,18 @@ pub enum MediaError {
 }
 
 impl MediaError {
-    /// Returns `true` when the error was caused by cancellation or a
-    /// deadline, which callers treat as normal control flow.
+    /// Returns `true` when the error was caused by explicit cancellation,
+    /// which callers treat as normal control flow ("stop requested").
+    ///
+    /// Deliberately `false` for [`MediaError::TimedOut`]: a deadline expiry
+    /// is a retryable source failure, not a stop request.
     pub fn is_interrupted(&self) -> bool {
         matches!(self, Self::Interrupted { .. })
+    }
+
+    /// Returns `true` when the error was caused by an operation-scoped
+    /// deadline rather than cancellation.
+    pub fn is_timed_out(&self) -> bool {
+        matches!(self, Self::TimedOut { .. })
     }
 }

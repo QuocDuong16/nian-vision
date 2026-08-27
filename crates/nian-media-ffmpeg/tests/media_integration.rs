@@ -416,10 +416,11 @@ fn deadline_aborts_open() {
 
     let result = MediaInput::open(&fixture_source(), &interrupt);
     match result {
-        // The abort surfaces either as Interrupted or as a plain open error
-        // carrying the interrupt flag, depending on where FFmpeg checks the
-        // callback first; both are acceptable, a hang is not.
-        Err(MediaError::Interrupted { .. }) => {}
+        // Since M3 an expired deadline is TimedOut — distinct from operator
+        // cancellation. Depending on where FFmpeg checks the callback first,
+        // a plain open error carrying no interrupt classification may also
+        // surface; both are acceptable, a hang is not.
+        Err(MediaError::TimedOut { .. }) => {}
         Err(MediaError::OpenFailed { .. }) => {}
         Err(other) => panic!("unexpected error {other:?}"),
         Ok(_) => panic!("open must fail with an expired deadline"),

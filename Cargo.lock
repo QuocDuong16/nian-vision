@@ -1988,7 +1988,11 @@ name = "nian-application"
 version = "0.1.0"
 dependencies = [
  "nian-domain",
+ "nian-ipc",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
@@ -2058,6 +2062,7 @@ dependencies = [
  "nian-media-ffmpeg",
  "nian-recorder",
  "nian-storage",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",

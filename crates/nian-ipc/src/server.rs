@@ -32,21 +32,38 @@ impl RpcFailure {
 }
 
 /// Application logic behind the protocol methods.
-pub trait Handler {
+///
+/// The handler receives `&mut FramedWriter` so long-running methods can push
+/// EVENT envelopes on the same protocol channel while (or before) their
+/// reply is written — this is how `recording.start` streams supervisor
+/// events without a second connection. Events must remain well-formed
+/// envelopes; interleaving them with a response is safe because each frame
+/// is one newline-terminated line read by an NDP-JSON parser on the host
+/// side that demultiplexes responses and events by envelope type.
+pub trait Handler<W> {
     /// Handles one request. Unknown methods should map to
     /// [`RpcFailure::new`] with code `"method_not_found"`.
-    fn handle(&mut self, method_name: &str, params: &serde_json::Value) -> Dispatch;
+    fn handle(
+        &mut self,
+        method_name: &str,
+        params: &serde_json::Value,
+        writer: &mut FramedWriter<W>,
+    ) -> Dispatch
+    where
+        W: std::io::Write;
 }
 
 /// Reads requests until shutdown or EOF, writing exactly one response each.
 ///
-/// Events are not produced here; workers push them through their own
-/// [`FramedWriter`] when needed.
+/// Events are emitted only through the writer handed to
+/// [`Handler::handle`]; nothing is pushed between requests because the loop
+/// blocks on input — which matches the worker's job model (one recording
+/// process does its reporting while its start request is in flight).
 pub fn serve<R, W, H>(reader: R, writer: W, handler: &mut H) -> Result<(), IpcError>
 where
     R: BufRead,
     W: std::io::Write,
-    H: Handler,
+    H: Handler<W>,
 {
     let mut reader = FramedReader::new(reader);
     let mut writer = FramedWriter::new(writer);
@@ -72,7 +89,7 @@ where
         };
 
         debug!(%id, %name, "handling request");
-        match handler.handle(&name, &params) {
+        match handler.handle(&name, &params, &mut writer) {
             Dispatch::Reply(outcome) => {
                 writer.send(&response(id, outcome))?;
             }
@@ -100,18 +117,42 @@ mod tests {
     use serde_json::json;
     use std::io::Cursor;
 
-    struct TestHandler {
-        served_requests: usize,
-    }
+    struct TestHandler;
 
-    impl Handler for TestHandler {
-        fn handle(&mut self, method_name: &str, _params: &Value) -> Dispatch {
-            self.served_requests += 1;
+    impl<W: std::io::Write> Handler<W> for TestHandler {
+        fn handle(
+            &mut self,
+            method_name: &str,
+            _params: &Value,
+            _writer: &mut FramedWriter<W>,
+        ) -> Dispatch {
             match method_name {
                 method::PING => Dispatch::Reply(Ok(json!("pong"))),
                 method::SHUTDOWN => Dispatch::ShutdownReply(Ok(json!({"bye": true}))),
                 _ => Dispatch::Reply(Err(RpcFailure::new("method_not_found"))),
             }
+        }
+    }
+
+    /// Proves the trait contract that handlers MAY emit events through the
+    /// provided writer before replying.
+    struct EventfulHandler;
+
+    impl<W: std::io::Write> Handler<W> for EventfulHandler {
+        fn handle(
+            &mut self,
+            method_name: &str,
+            params: &Value,
+            writer: &mut FramedWriter<W>,
+        ) -> Dispatch {
+            if method_name == method::DESCRIBE {
+                let _ = writer.send(&Envelope::event(
+                    "recording.status",
+                    json!({"state": "connecting"}),
+                ));
+                return Dispatch::Reply(Ok(json!({"described": true})));
+            }
+            TestHandler.handle(method_name, params, writer)
         }
     }
 
@@ -121,17 +162,6 @@ mod tests {
         )
     }
 
-    fn run(input: String) -> Vec<Value> {
-        let mut handler = TestHandler { served_requests: 0 };
-        let mut output = Vec::new();
-        serve(Cursor::new(input.into_bytes()), &mut output, &mut handler).unwrap();
-
-        let text = String::from_utf8(output).unwrap();
-        text.lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
-    }
-
     #[test]
     fn answers_ping_then_shuts_down_on_request() {
         let input = format!(
@@ -139,8 +169,15 @@ mod tests {
             request_line(1, method::PING),
             request_line(2, method::SHUTDOWN)
         );
-        let responses = run(input);
+        let mut output = Vec::new();
+        serve(
+            Cursor::new(input.into_bytes()),
+            &mut output,
+            &mut TestHandler,
+        )
+        .unwrap();
 
+        let responses = decode_all(output);
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["id"], 1);
         assert_eq!(responses[0]["ok"], true);
@@ -149,8 +186,34 @@ mod tests {
     }
 
     #[test]
+    fn handler_can_emit_events_through_the_writer_before_replying() {
+        let input = request_line(5, method::DESCRIBE);
+        let mut output = Vec::new();
+        serve(
+            Cursor::new(input.into_bytes()),
+            &mut output,
+            &mut EventfulHandler,
+        )
+        .unwrap();
+
+        let messages = decode_all(output);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["type"], "event");
+        assert_eq!(messages[0]["name"], "recording.status");
+        assert_eq!(messages[1]["type"], "response");
+        assert_eq!(messages[1]["id"], 5);
+    }
+
+    #[test]
     fn unknown_methods_fail_with_stable_code() {
-        let responses = run(request_line(3, "teleport"));
+        let mut output = Vec::new();
+        serve(
+            Cursor::new(request_line(3, "teleport").into_bytes()),
+            &mut output,
+            &mut TestHandler,
+        )
+        .unwrap();
+        let responses = decode_all(output);
         assert_eq!(responses[0]["ok"], false);
         assert_eq!(responses[0]["error_code"], "method_not_found");
     }
@@ -161,14 +224,35 @@ mod tests {
             "{{\"type\":\"event\",\"v\":{PROTOCOL_VERSION},\"name\":\"hello\",\"data\":null}}\n{}",
             request_line(4, method::PING)
         );
-        let responses = run(input);
+        let mut output = Vec::new();
+        serve(
+            Cursor::new(input.into_bytes()),
+            &mut output,
+            &mut TestHandler,
+        )
+        .unwrap();
+        let responses = decode_all(output);
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0]["id"], 4);
     }
 
     #[test]
     fn eof_ends_the_loop_cleanly() {
-        let responses = run(String::new());
-        assert!(responses.is_empty());
+        let mut output = Vec::new();
+        serve(
+            Cursor::new(String::new().into_bytes()),
+            &mut output,
+            &mut TestHandler,
+        )
+        .unwrap();
+        assert!(decode_all(output).is_empty());
+    }
+
+    fn decode_all(bytes: Vec<u8>) -> Vec<Value> {
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 }

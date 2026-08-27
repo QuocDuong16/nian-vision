@@ -22,6 +22,8 @@
 
 pub mod error;
 pub mod paths;
+pub mod recovery;
 
 pub use error::StorageError;
 pub use paths::{RecordingsLayout, SEGMENT_EXTENSION, SEGMENT_PARTIAL_SUFFIX};
+pub use recovery::{PartialDisposition, PartialFile, scan_camera_partials};

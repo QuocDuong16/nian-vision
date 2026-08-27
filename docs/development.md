@@ -51,10 +51,11 @@ cargo run -p nian-media-worker -- probe crates/nian-media-ffmpeg/tests/fixtures/
 cargo run -p nian-media-worker -- run   # NDJSON IPC on stdio
 ```
 
-## Manual recording smoke test (M2)
+## Manual recording smoke test (M2, stop modes explicit in M3)
 
 Records a real source into the recordings layout with the production
-recorder pipeline. Not run in CI.
+recorder pipeline. Not run in CI. Stop modes are now EXPLICIT and mutually
+exclusive:
 
 ```bash
 # From a local file:
@@ -68,18 +69,48 @@ NIAN_VISION_RTSP_URL='rtsp://user:pass@192.168.1.42:554/stream1' \
   --storage /tmp/nian-recordings --camera tapo-1 --until-stdin-eof --rtsp-from-env
 ```
 
-* Stop conditions: `--duration <SECONDS>`, `--until-stdin-eof` (pipe close /
-  Ctrl+D), or Ctrl+C. Ctrl+C is two-stage: the first press requests a
-  graceful stop; a second press force-cancels blocking media I/O; further
-  presses are ignored (`SIGKILL` remains the hard exit). The graceful flag
-  takes effect between packets and cannot wake an already-blocked network
-  read — read deadlines and reconnect policy arrive with M3. A forced
-  cancellation leaves the active segment as a recoverable `.partial.mkv`
-  by design.
+* Stop modes: NEITHER flag → Ctrl+C is the only stop; `--duration N` →
+  automatic timer stop OR Ctrl+C; `--until-stdin-eof` → stdin EOF (pipe
+  close / Ctrl+D) OR Ctrl+C. The two flags are mutually exclusive —
+  passing both is a usage error.
+* Ctrl+C remains two-stage: the first press requests a graceful stop; a
+  second press force-cancels blocking media I/O; further presses are
+  ignored (`SIGKILL` remains the hard exit). The graceful flag takes
+  effect between packets; since M3 a blocked read additionally has its
+  own stall deadline (`SourceTimeouts::read`, default 15 s) and the open/
+  connect phase has its own budget (`open`, default 15 s), so a dead
+  camera or stalled network can never wedge the process indefinitely.
+* A forced cancellation leaves the active segment as a recoverable
+  `.partial.mkv` by design; startup reconciliation salvages it (see below).
 * `--no-audio` records video only; `--segment-target` is in seconds
   (default 300).
 * The URL never appears in argv, stdout/stderr, or logs; native FFmpeg
   logging stays silenced (`AV_LOG_QUIET`) for the same reason.
+
+## Supervised recording via IPC (M3)
+
+The worker's IPC `run` mode hosts ONE supervised recording job per
+process with the `recording.*` namespace (see ADR-0007). Useful smoke
+shape (each line one NDJSON request on stdin):
+
+* `recording.start` — `{"camera":"cam-1","storage":"/tmp/r",
+  "source":{"kind":"file","path":"…"} | {"kind":"rtsp","url":"…"},
+  "segment_target_secs":300,"copy_audio":true}`; RTSP URLs ride the
+  private stdin channel only, never argv;
+* `recording.status` — live snapshot (`state`: connecting/backoff/recording,
+  retry attempt, published segment count);
+* `recording.stop` — first press graceful, second press forces cancellation
+  of blocking I/O.
+
+Reconnect behavior lives above single sessions
+(`CameraRecordingSupervisor`): transient source failures back off through
+2s→5s→10s→30s→60s (+ jitter) and reconnect into fresh sessions; successful
+reconnects that survive ≥ 30 s of recorded media reset the schedule.
+Permanent failures (storage, output-write, invalid configuration) end
+supervision instead of looping. Partial-file recovery runs at job start:
+leftover `.partial.mkv` files from crashes are classified conservatively,
+readable content remuxed keyframe-aligned into new no-replace published
+segments, originals removed only after durable publication.
 
 ## Layout
 

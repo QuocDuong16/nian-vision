@@ -22,6 +22,8 @@
 // by writing logs through `tracing` instead.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod job;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -37,7 +39,12 @@ const USAGE: &str = "usage: nian-media-worker probe <path|credential-free-rtsp-u
        nian-media-worker record --storage <DIR> --camera <ID>
                                 [--segment-target <SECONDS>] [--no-audio]
                                 [--duration <SECONDS> | --until-stdin-eof]
-                                (--rtsp-from-env | <path|credential-free-rtsp-url>)";
+                                (--rtsp-from-env | <path|credential-free-rtsp-url>)
+
+record stop modes (mutually exclusive, at most one):
+  neither flag        Ctrl+C only (--duration/--until-stdin-eof omitted)
+  --duration N        stop automatically after N seconds, or Ctrl+C
+  --until-stdin-eof   stop when stdin reaches EOF, or Ctrl+C";
 
 /// Environment variable holding a credential-bearing RTSP URL for manual
 /// smoke tests; never committed, never logged.
@@ -189,8 +196,20 @@ fn cmd_run() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
 
-    let mut handler = WorkerHandler { versions };
-    serve(std::io::stdin().lock(), stdout.lock(), &mut handler).map_err(|error| error.to_string())
+    let mut handler = WorkerHandler {
+        versions,
+        jobs: job::RecordingJobManager::new(),
+    };
+    serve(std::io::stdin().lock(), stdout.lock(), &mut handler)
+        .map_err(|error| error.to_string())?;
+
+    // A job thread may still be finishing its final segment publication
+    // after a shutdown request: give it a bounded grace period so segments
+    // are never torn mid-publish when the process exits normally.
+    if !handler.jobs.is_finished() {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+    Ok(())
 }
 
 fn versions_json(versions: RuntimeVersions) -> serde_json::Value {
@@ -201,11 +220,18 @@ fn versions_json(versions: RuntimeVersions) -> serde_json::Value {
     })
 }
 
-/// Manual development command (M2 §15): record from a local file or
-/// `NIAN_VISION_RTSP_URL` into the recordings layout for a bounded duration
-/// or until stdin closes. Ctrl+C kills the process and leaves the active
-/// `.partial.mkv` recoverable — by design, that is what reconciliation is
-/// for. Never run in CI; there is no physical camera there.
+/// Manual development command (M2 §15, stop modes made explicit in M3):
+/// record from a local file or `NIAN_VISION_RTSP_URL` into the recordings
+/// layout. Stop modes are mutually exclusive and explicit:
+///
+/// * no `--duration` / no `--until-stdin-eof`: Ctrl+C is the only stop;
+/// * `--duration N`: automatic timer stop OR Ctrl+C;
+/// * `--until-stdin-eof`: stdin EOF (pipe close / Ctrl+D) OR Ctrl+C.
+///
+/// Ctrl+C itself is two-stage (first press graceful, second force-cancel).
+/// A killed process leaves the active `.partial.mkv` recoverable — by
+/// design, that is what reconciliation is for. Never run in CI; there is no
+/// physical camera there.
 ///
 /// Credential handling matches `probe`: argv sources must be
 /// credential-free, the env route carries credentials and is never echoed.
@@ -215,12 +241,24 @@ fn cmd_record(args: &[String]) -> Result<(), String> {
     use nian_storage::RecordingsLayout;
     use std::time::Duration as StdDuration;
 
+    /// Explicit stop-mode selection; parsed from exactly one of the three
+    /// shapes above. Before M3 this was implicit (`--until-stdin-eof` was
+    /// accepted but any duration-less run also started the stdin watcher).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum StopMode {
+        /// Run until Ctrl+C; no watcher thread at all.
+        SignalOnly,
+        /// Request a graceful stop after this much wall-clock time.
+        AfterDuration(StdDuration),
+        /// Request a graceful stop when stdin reaches EOF.
+        OnStdinEof,
+    }
+
     let mut storage: Option<PathBuf> = None;
     let mut camera_name: Option<String> = None;
     let mut segment_target = nian_recorder::DEFAULT_SEGMENT_TARGET;
     let mut audio = AudioPolicy::CopyAll;
-    let mut stop_after: Option<StdDuration> = None;
-    let mut until_stdin_eof = false;
+    let mut stop_mode: Option<StopMode> = None;
     let mut source: Option<MediaSource> = None;
 
     let mut rest = args;
@@ -247,15 +285,27 @@ fn cmd_record(args: &[String]) -> Result<(), String> {
                 shift = 2;
             }
             "--duration" => {
+                if stop_mode.is_some() {
+                    return Err(
+                        "--duration and --until-stdin-eof are mutually exclusive".to_owned()
+                    );
+                }
                 let value = rest.get(1).ok_or("--duration needs seconds")?;
                 let seconds: u64 = value
                     .parse()
                     .map_err(|_| "--duration must be a number of seconds")?;
-                stop_after = Some(StdDuration::from_secs(seconds));
+                stop_mode = Some(StopMode::AfterDuration(StdDuration::from_secs(seconds)));
                 shift = 2;
             }
             "--no-audio" => audio = AudioPolicy::Exclude,
-            "--until-stdin-eof" => until_stdin_eof = true,
+            "--until-stdin-eof" => {
+                if stop_mode.is_some() {
+                    return Err(
+                        "--duration and --until-stdin-eof are mutually exclusive".to_owned()
+                    );
+                }
+                stop_mode = Some(StopMode::OnStdinEof);
+            }
             "--rtsp-from-env" => {
                 let url = std::env::var(RTSP_URL_ENV).map_err(|_| {
                     format!("{RTSP_URL_ENV} is not set; it must hold the full rtsp:// URL")
@@ -278,9 +328,8 @@ fn cmd_record(args: &[String]) -> Result<(), String> {
     let Some(camera_name) = camera_name else {
         return Err("--camera <ID> is required".to_owned());
     };
-    if stop_after.is_some() && until_stdin_eof {
-        return Err("--duration and --until-stdin-eof are mutually exclusive".to_owned());
-    }
+    // Absent flags are a deliberate mode, not a default alias: signal-only.
+    let stop_mode = stop_mode.unwrap_or(StopMode::SignalOnly);
     let Some(source) = source else {
         return Err(
             "a source is required: --rtsp-from-env or a path / credential-free rtsp url".to_owned(),
@@ -298,8 +347,9 @@ fn cmd_record(args: &[String]) -> Result<(), String> {
 
     // Two-stage Ctrl+C (M2 review §9): the first press requests a graceful
     // stop; a second press forces interrupt cancellation. The graceful flag
-    // alone takes effect between packets and cannot wake an indefinitely
-    // blocked network read — read deadlines/reconnect policy belong to M3.
+    // alone takes effect between packets; since M3 a blocked read also has
+    // its own stall deadline, but the force-cancel path remains for the
+    // operator who will not wait that long.
     let signal_presses = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let signal_stop = session.stop_flag();
     let signal_cancel = session.interrupt_handle().clone();
@@ -324,21 +374,28 @@ fn cmd_record(args: &[String]) -> Result<(), String> {
     .map_err(|error| format!("cannot install Ctrl+C handler: {error}"))?;
 
     // The stop trigger runs on its own thread so blocking FFmpeg reads do
-    // not starve it; the graceful flag takes effect between packets only.
-    let stop_flag = session.stop_flag();
-    std::thread::spawn(move || match stop_after {
-        Some(duration) => {
-            std::thread::sleep(duration);
-            stop_flag.request();
+    // not starve it. Only the EXPLICIT modes spawn one — signal-only runs
+    // have no automatic stop by definition.
+    match stop_mode {
+        StopMode::SignalOnly => {}
+        StopMode::AfterDuration(duration) => {
+            let stop_flag = session.stop_flag();
+            std::thread::spawn(move || {
+                std::thread::sleep(duration);
+                stop_flag.request();
+            });
         }
-        None => {
-            // Read stdin to EOF: piping/closing the input or Ctrl+D stops
-            // recording gracefully.
-            let mut stdin = std::io::stdin().lock();
-            let _ = std::io::copy(&mut stdin, &mut std::io::sink());
-            stop_flag.request();
+        StopMode::OnStdinEof => {
+            let stop_flag = session.stop_flag();
+            std::thread::spawn(move || {
+                // Read stdin to EOF: piping/closing the input or Ctrl+D
+                // stops recording gracefully.
+                let mut stdin = std::io::stdin().lock();
+                let _ = std::io::copy(&mut stdin, &mut std::io::sink());
+                stop_flag.request();
+            });
         }
-    });
+    }
 
     eprintln!("recording started");
     let summary = session
@@ -388,12 +445,31 @@ fn print_recording_event(event: &nian_recorder::RecordingEvent) {
 /// `versions` is held directly (not as `Option`): the run command validated
 /// startup and versions before serving, so capability reporting can never
 /// degrade to `ffmpeg: null` mid-session.
+///
+/// Since M3 the handler owns the single recording job
+/// ([`job::RecordingJobManager`]) and serves the `recording.*` namespace:
+/// `recording.start` validates and spawns the supervised job (streaming a
+/// `recording.status` event through `writer` before replying), while
+/// `recording.stop` escalates gracefully→forced across two presses.
 struct WorkerHandler {
     versions: RuntimeVersions,
+    jobs: job::RecordingJobManager,
 }
 
-impl nian_ipc::Handler for WorkerHandler {
-    fn handle(&mut self, method_name: &str, _params: &serde_json::Value) -> nian_ipc::Dispatch {
+/// Names served by the recording namespace (kept next to their payloads).
+pub mod recording_method {
+    pub const START: &str = "recording.start";
+    pub const STOP: &str = "recording.stop";
+    pub const STATUS: &str = "recording.status";
+}
+
+impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
+    fn handle(
+        &mut self,
+        method_name: &str,
+        params: &serde_json::Value,
+        writer: &mut FramedWriter<W>,
+    ) -> nian_ipc::Dispatch {
         match method_name {
             method::PING => nian_ipc::Dispatch::Reply(Ok(json!({
                 "pong": true,
@@ -402,9 +478,57 @@ impl nian_ipc::Handler for WorkerHandler {
                 "worker": "nian-media-worker",
                 "protocol": nian_ipc::PROTOCOL_VERSION,
                 "ffmpeg": versions_json(self.versions),
+                "recording": {
+                    "one_job_per_worker": true,
+                    "reconnect_supervised": true,
+                },
             }))),
-            method::SHUTDOWN => nian_ipc::Dispatch::ShutdownReply(Ok(json!({"bye": true}))),
+            recording_method::START => match job::JobSpec::from_params(params) {
+                Err(reason) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(
+                    with_reason(job::code::INVALID_PARAMS, reason),
+                ))),
+                Ok(spec) => match self.jobs.start(spec) {
+                    Ok(()) => {
+                        // Immediate progress signal: the supervised job is
+                        // connecting; further updates ride status requests
+                        // and the finished event below.
+                        let _ = writer.send(&Envelope::event(
+                            "recording.status",
+                            self.jobs.status().to_json(),
+                        ));
+                        nian_ipc::Dispatch::Reply(Ok(json!({
+                            "started": true,
+                        })))
+                    }
+                    Err(code) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(code))),
+                },
+            },
+            recording_method::STOP => match self.jobs.stop() {
+                Ok(presses) => nian_ipc::Dispatch::Reply(Ok(json!({
+                    "stop_presses": presses,
+                    "graceful": presses == 1,
+                }))),
+                Err(code) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(code))),
+            },
+            recording_method::STATUS => nian_ipc::Dispatch::Reply(Ok(json!({
+                "status": self.jobs.status().to_json(),
+            }))),
+            method::SHUTDOWN => {
+                // A running job must not survive a protocol shutdown: first
+                // press stops it gracefully; the shutdown reply only leaves
+                // the loop, and run() waits for the thread to finish below.
+                if !self.jobs.is_finished() && self.jobs.status().state != "idle" {
+                    let _ = self.jobs.stop();
+                }
+                nian_ipc::Dispatch::ShutdownReply(Ok(json!({"bye": true})))
+            }
             _ => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new("method_not_found"))),
         }
     }
+}
+
+/// Combines a stable error code with a short, secret-free reason so hosts
+/// can display WHY validation failed without parsing payloads ad hoc.
+fn with_reason(code: &str, reason: &str) -> String {
+    format!("{code}:{reason}")
 }

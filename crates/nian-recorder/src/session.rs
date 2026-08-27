@@ -325,13 +325,21 @@ impl std::fmt::Debug for RecordingSession {
 
 impl RecordingSession {
     /// Opens `source` and validates that a recordable stream plan exists.
+    ///
+    /// The open/connect phase is bounded by `config.timeouts.open` (M3 §5):
+    /// a camera that never completes its handshake fails with a retryable
+    /// timeout instead of blocking forever. The deadline is armed only for
+    /// this operation; after `from_input` builds the session, no deadline
+    /// remains installed.
     pub fn open(
         source: &MediaSource,
         layout: RecordingsLayout,
         config: RecorderConfig,
     ) -> Result<Self, RecordingError> {
         let interrupt = InterruptHandle::new();
+        let _open_deadline = interrupt.scoped_deadline(config.timeouts.open);
         let input = MediaInput::open(source, &interrupt)?;
+        drop(_open_deadline);
         Self::from_input(input, layout, config)
     }
 
@@ -435,7 +443,16 @@ impl RecordingSession {
                 break 'run;
             }
 
-            match self.input.next_packet() {
+            // Per-read stall deadline (M3 §5): armed for exactly this read,
+            // cleared on drop before any mux write/finalization runs. If the
+            // read blocks longer than `timeouts.read`, FFmpeg aborts with a
+            // deadline cause, which surfaces below as the retryable
+            // TimedOut error — never as cancellation.
+            let _read_deadline = self.interrupt.scoped_deadline(self.config.timeouts.read);
+            let read_result = self.input.next_packet();
+            drop(_read_deadline);
+
+            match read_result {
                 Ok(Some(packet)) => {
                     // Test-only injection of a demux-side read failure.
                     #[cfg(test)]
@@ -592,11 +609,17 @@ impl RecordingSession {
         // and mux/output write failures abandon the open segment — a
         // succeeding trailer after a failed write proves nothing. Only a
         // healthy prefix written without mux errors may be salvaged.
-        let cancelled = self.interrupt.is_cancelled()
+        //
+        // A read TIMEOUT (M3 §6) is deliberately NOT cancellation: the
+        // source stalled, but everything already written is healthy, so the
+        // prefix follows normal salvage semantics and the supervisor
+        // reconnects afterwards. True operator cancellation still abandons.
+        let interrupted = self.interrupt.is_cancelled()
             || matches!(
                 &failure,
                 Some(RecordingError::Media(media)) if media.is_interrupted()
             );
+        let cancelled = interrupted;
 
         if let Some(segment) = active.take() {
             match teardown_decision(cancelled, mux_write_failed) {

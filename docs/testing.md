@@ -10,11 +10,14 @@ Testing is part of the definition of done for every milestone (master spec
 | Crate | Covers |
 |---|---|
 | `nian-domain` | camera-id path safety, credential redaction, URL encoding, retention validation, quota watermarks, backoff schedule, time-base math |
-| `nian-application` | config validation bounds, UI-safe error messages |
+| `nian-application` | config validation bounds, UI-safe error messages (transient vs permanent worker failures) |
 | `nian-storage` | recordings layout, partial/final naming round-trip, traversal rejection, exclusive claims (incl. sub-second clock regression), no-replace publication (success, collision refusal, recoverable abandoned partials) |
-| `nian-ipc` | envelope round-trips, framing limits (1 MiB cap, CRLF, truncation), dispatch loop (ping/describe/shutdown/unknown), protocol version guard |
+| `nian-storage` (M3) | partial-file classification: empty/header-only, truncated media, finalized-but-unpublished sniffing; canonical-only scanning; foreign names ignored; deterministic ordering |
+| `nian-ipc` | envelope round-trips, framing limits (1 MiB cap, CRLF, truncation), dispatch loop (ping/describe/shutdown/unknown), protocol version guard, handler event emission through the writer before replies (M3) |
 | `nian-media` | RTSP URL redaction invariants |
-| `nian-recorder` | stream-plan selection (first video stream, audio policy, unusable time-base rejection), ceiling target-to-ticks conversion, read-only rotation decision + transactional clock commits, segment duration math, teardown policy (poison/cancel ⇒ never publish) |
+| `nian-media` errors (M3) | timeout vs cancellation category matrix: every error maps to exactly one typed `FailureCategory`; retryability is exactly the source-side set; local output/storage/config never loops |
+| `nian-recorder` | stream-plan selection, ceiling target-to-ticks conversion, read-only rotation decision + transactional clock commits, teardown policy (poison/cancel ⇒ never publish); fault injection runs over the real pipeline |
+| `nian-recorder` supervisor (M3) | full state machine over scripted sessions with a VIRTUAL waiter (never sleeps the real 60 s tail): file EOF completes without backoff, RTSP EOF means connection-lost and reconnects, retryable failures follow the exact schedule 2s/5s/10s/30s, cancellation skips reconnects, output-write failures fail supervision immediately, permanent open failures fail without retry, timeout classification, ordered StateChanged chains, seeded jitter stays within ±half deterministically, saturating jitter composition |
 
 ### Media integration tests (`nian-media-ffmpeg/tests/`)
 
@@ -26,13 +29,15 @@ encoders, synthetic lavfi sources):
   layer;
 * `session_av.mkv` (30 s, keyframe every 2 s, video+AAC) as the recorder's
   segmentation source;
-* `reordered_av.mkv` (audio listed before video) and `audio_only.mkv`.
+* `reordered_av.mkv` (audio listed before video), `bframes_av.mkv`
+  (`-bf 2` decode-order coverage) and `audio_only.mkv`.
 
 Covered: runtime ABI matches compiled bindings; probe reports
 format/streams/duration; packet reads are keyframe-first with monotonic DTS;
 stream-copy remux produces independently probeable files; per-packet
-keyframe patterns and side data survive the copy; interrupt/deadline
-cancellation aborts open.
+keyframe patterns and side data survive the copy; cancellation aborts open
+as `Interrupted`; an expired deadline aborts open as `TimedOut` — distinct
+typed causes (M3).
 
 ### Recorder integration tests (`nian-recorder/tests/`)
 
@@ -46,27 +51,53 @@ camera in CI. Segments are inspected through the safe packet/probe API:
   belongs to the new segment; a full session reproduces the source video
   stream exactly once;
 * rotation timing respects the target within one GOP (measured via
-  DTS-derived `media_duration`, not the container duration element — see
-  ADR-0004);
+  DTS-derived spans AND cross-checked against `SegmentFinalized`
+  bookkeeping within packet-duration tolerance);
 * startup alignment discards exactly the packets before the next video
   keyframe (pre-drained input) and drops leading audio;
 * graceful stop finalizes the mid-GOP tail without waiting for a keyframe;
   stopping before any keyframe claims nothing;
 * an audio-only source is rejected (`NoVideoStream`); a reordered source is
   recorded from video stream index 1 (index 0 never assumed);
-* forced cancellation abandons partials and never publishes a completed
-  recording;
-* fault injection at the I/O boundaries (in-crate unit runs over the real
-  pipeline): a mux/output write failure poisons the segment — abandoned,
+* forced cancellation abandons partials and never publishes;
+* fault injection at the I/O boundaries (in-crate runs over the real
+  pipeline): mux/output write failure poisons the segment — abandoned,
   never published, original error returned — while a demux read failure
   salvages and publishes the healthy prefix when finalization succeeds;
 * segment durations are validated from the stored packets themselves
-  (first/last video DTS via the segment time base), not only from the
-  recorder's own event bookkeeping;
-* an explicit `-bf 2` MPEG-4 fixture proves decode-order progression:
-  PTS reordering neither triggers nor blocks rotation, DTS stays monotonic
-  across boundaries with no packet lost or duplicated, and every segment
-  opens on a keyframe.
+  (first/last video DTS via the segment time base);
+* B-frame fixture proves decode-order progression: PTS reordering neither
+  triggers nor blocks rotation, DTS stays monotonic across boundaries with
+  no packet lost or duplicated.
+
+### Recovery integration tests (`nian-recorder/tests/recovery_integration.rs`, M3 §12)
+
+Real FFmpeg, committed fixtures copied into temp trees (never corrupted in
+place): zero-byte partials quarantined untouched; header-only/garbage
+payloads refused by demux but preserved; truncated-but-readable crash
+partials remuxed into independently probeable recordings (original removed
+only after durable publication); finalized content stuck under `.partial`
+names recovered without fakery; pre-existing finals survive byte-identical;
+a mixed-class run handles each class without cross-contamination; claim
+failures preserve originals; non-canonical subtrees/names are invisible to
+recovery.
+
+### Supervisor integration tests
+
+* **Real-pipeline camera supervision** (`nian-recorder/tests/
+  supervisor_integration.rs`): the camera supervisor above REAL FFmpeg
+  sessions survives an injected connect failure through Backoff and then
+  records a full multi-segment session, ending as operator stop during the
+  post-EOF backoff. Exact expected state-chain asserted.
+* **Process-level crash/restart** (`nian-application/tests/
+  worker_supervision_integration.rs`, M3 §15): parent supervisor spawns the
+  REAL `nian-media-worker` binary, verifies hello, sends
+  `recording.start` for a file source, hard-kills the child mid-recording
+  (deterministic killer thread), observes the crash episode, restarts the
+  worker with bounded waiting, re-handshakes, restores desired recording
+  state, and only then delivers protocol shutdown once disk-visible
+  progress exists. No sleep-of-faith: shutdown armament is driven by
+  published finals appearing on disk.
 
 ### CLI/IPC smoke checks (manual, seconds)
 
@@ -76,23 +107,26 @@ printf '{"type":"request","v":1,"id":1,"method":"ping","params":null}\n' \
   | ./target/debug/nian-media-worker run
 ```
 
+The `recording.*` IPC namespace can be smoke-driven interactively:
+`recording.start` (file source) → poll `recording.status` → second start
+must refuse `job_already_active` → `shutdown` after segments appear.
+
 ### Frontend (`ui/`)
 
 Vitest + Testing Library: navigation shell renders honest empty states and
-switches screens; formatting utilities. Lint (`eslint`) and `tsc
---noEmit` gate everything.
+switches screens; formatting utilities. Lint (`eslint`) and `tsc --noEmit`
+gate everything.
 
 ## Planned per milestone
 
-* **M3**: fault injection — worker kill/restart, disconnect storms,
-  partial-file recovery, reconnect orchestration.
 * **M4**: retention engine property tests, reconciliation against a seeded
-  tree, disk-full behavior.
+  tree, disk-full behavior, quarantine cleanup policies.
 * **Hardware/manual** (never in CI): real Tapo C200 via
   `NIAN_VISION_RTSP_URL` with
-  `nian-media-worker record --rtsp-from-env ...` (see development.md);
-  checklist in the master spec §17 (unplug, reboot, sleep/wake, disk
-  near-full, corrupt files).
+  `nian-media-worker record --rtsp-from-env ...` and/or an IPC-driven
+  supervised job (see development.md); checklist in the master spec §17
+  (unplug, reboot, sleep/wake, disk near-full, corrupt files). Windows
+  run of the MoveFileExW publication path remains manually validated.
 
 ## Environment variables
 
@@ -100,4 +134,5 @@ switches screens; formatting utilities. Lint (`eslint`) and `tsc
 |---|---|
 | `NIAN_VISION_RTSP_URL` | credential-bearing RTSP URL for manual smoke tests; never logged, never committed |
 | `NIAN_FFMPEG_LIB_DIR` | build-time FFmpeg library directory override |
+| `NIAN_WORKER_BIN` | optional explicit worker binary path for the process-supervision integration test |
 | `RUST_LOG` | tracing filter (worker/desktop default `info`) |

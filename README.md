@@ -4,12 +4,18 @@ Local-first desktop NVR (network video recorder) for IP cameras. The first
 supported camera is the TP-Link Tapo C200 over RTSP, with a camera-agnostic
 domain so other RTSP/ONVIF cameras can follow.
 
-**Status**: milestone **M2 (recorder)** is implemented and ready for
-review: a continuous segmented recording pipeline that turns one healthy
-input into durable, independently playable Matroska segments —
-keyframe-aware rotation, exclusive segment claiming and atomic no-replace
-publication, deterministic fixture-based integration tests. M0 (foundation)
-and M1 (FFmpeg FFI media spike) passed architecture/media review.
+**Status**: milestone **M3 (resilience and supervision)** is implemented
+and ready for review on top of M0–M2: recordings now survive camera/
+network failures (typed timeout-vs-cancellation, operation-scoped read and
+connect deadlines, a reconnect supervisor reusing the 2s→60s backoff with
+stability-gated resets) and worker process crashes (parent-side
+supervision with handshake verification, bounded restart backoff and
+desired-state restoration). Crash-leftover `.partial.mkv` files are
+recovered conservatively: classified from filesystem facts, remuxed
+keyframe-aligned into fresh no-replace published segments — originals kept
+whenever recoverability cannot be proven. M2 delivered the segmented
+recording pipeline itself (keyframe-aware rotation, exclusive claiming,
+durable finalize + atomic no-replace publication).
 
 ## What it does today
 
@@ -19,15 +25,24 @@ and M1 (FFmpeg FFI media spike) passed architecture/media review.
   * `nian-media-worker probe <file|credential-free-rtsp-url>` prints stream
     information (codec, resolution, duration);
   * `nian-media-worker run` serves a versioned NDJSON IPC protocol on
-    stdin/stdout (ping/describe/shutdown);
+    stdin/stdout with the `recording.*` namespace (one supervised job per
+    worker; start/stop/status plus typed reconnect events);
   * `nian-media-worker record --storage <DIR> --camera <ID> ...` is the
-    manual smoke path that records from `NIAN_VISION_RTSP_URL` or a file
-    into rotating `.mkv` segments (development only; never in CI).
+    manual smoke path with explicit stop modes (`--duration N`,
+    `--until-stdin-eof`, or Ctrl+C-only) recording from
+    `NIAN_VISION_RTSP_URL` or a file into rotating `.mkv` segments
+    (development only; never in CI).
 * A real recording pipeline (`nian-recorder`): packets are copied
   faithfully (side data and flags preserved), segments start on video
   keyframes, rotation waits for keyframes after the media-time target,
   finalization is durable before the no-replace publish, and failed or
   empty segments stay recoverable partials — never fake recordings.
+* Resilience: deadlines bound every blocking FFmpeg operation (RAII-scoped
+  so they can never leak into unrelated operations), failures are
+  classified centrally into typed categories (retryable = source-side
+  only), partial recovery proves readability through the real demuxer, and
+  `nian-application`'s `WorkerSupervisor` restarts crashed workers without
+  ever putting credentials in argv.
 * Clean crate boundaries with `unsafe` confined to the FFmpeg layers (plus
   one audited Windows publication primitive), a race-safe storage layout,
   credential redaction, and a full quality-gate setup (fmt/clippy/tests,
