@@ -203,13 +203,21 @@ fn cmd_run() -> Result<(), String> {
     serve(std::io::stdin().lock(), stdout.lock(), &mut handler)
         .map_err(|error| error.to_string())?;
 
-    // A job thread may still be finishing its final segment publication
-    // after a shutdown request: give it a bounded grace period so segments
-    // are never torn mid-publish when the process exits normally.
-    if !handler.jobs.is_finished() {
-        std::thread::sleep(std::time::Duration::from_secs(5));
+    // M3 remediation §8: a REAL shutdown lifecycle replaces the old fixed
+    // 5-second sleep. Graceful stop → bounded grace join (larger than any
+    // normal bounded read + finalization headroom) → force-cancel only if
+    // grace expires → absolute-bound join. Only the pathological forced
+    // path may leave an active output partial — explicit, never a sleep.
+    match handler.jobs.shutdown() {
+        job::ShutdownDisposition::CleanExit => Ok(()),
+        job::ShutdownDisposition::ForcedCancellationSurvived => {
+            eprintln!("shutdown required forced cancellation of blocking media I/O");
+            Ok(())
+        }
+        job::ShutdownDisposition::UnsafeTermination => {
+            Err("forced-shutdown bound expired; active output left partial for recovery".to_owned())
+        }
     }
-    Ok(())
 }
 
 fn versions_json(versions: RuntimeVersions) -> serde_json::Value {

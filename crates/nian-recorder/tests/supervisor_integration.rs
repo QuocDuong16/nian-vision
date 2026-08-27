@@ -39,11 +39,23 @@ struct RealSessionFactory {
     attempt_count: Arc<AtomicUsize>,
 }
 
+static WIRED_RUN_STOP: std::sync::Mutex<Option<nian_recorder::StopFlag>> =
+    std::sync::Mutex::new(None);
+
+#[allow(clippy::unwrap_used)] // poisoning cannot wedge a test-only flag slot
+fn set_wired(flag: nian_recorder::StopFlag) {
+    *WIRED_RUN_STOP.lock().unwrap() = Some(flag);
+}
+
 impl nian_recorder::supervisor::SessionFactory for RealSessionFactory {
     fn open_session(
         &mut self,
+        run_stop: &nian_recorder::StopFlag,
     ) -> Result<Box<dyn nian_recorder::supervisor::ActiveSession>, RecordingError> {
         let attempt = self.attempt_count.fetch_add(1, Ordering::SeqCst);
+        // §1 by-construction wiring: record the handed flag — requests made
+        // through it are visible to the ACTIVE session by shared control.
+        set_wired(run_stop.clone());
         if attempt < self.failing_connects {
             return Err(RecordingError::Media(nian_media::MediaError::OpenFailed {
                 message: "connection refused".to_owned(),
@@ -81,6 +93,9 @@ impl nian_recorder::supervisor::ActiveSession for RealSession {
     }
 
     fn stop_flag(&self) -> nian_recorder::StopFlag {
+        // Observability seam only; delivery happens through the session's
+        // own flag which shares the supervisor's control domain via the
+        // factory wiring above.
         self.session.stop_flag()
     }
 }

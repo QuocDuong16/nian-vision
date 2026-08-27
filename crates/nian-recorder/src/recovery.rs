@@ -37,6 +37,64 @@ use nian_storage::{
     PartialDisposition, PartialFile, RecordingsLayout, StorageError, scan_camera_partials,
 };
 
+/// Test-only deterministic fault hooks for recovery's pipeline steps
+/// (`0`/`usize::MAX` = disabled). Compiled out of production builds.
+#[cfg(test)]
+mod test_hooks {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    pub static WRITE_FAIL_AFTER_CALLS: AtomicUsize = AtomicUsize::new(usize::MAX);
+    pub static WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    pub static FAIL_METADATA: AtomicBool = AtomicBool::new(false);
+    pub static HIJACK_CLEANUP_TO_DIR: AtomicBool = AtomicBool::new(false);
+    /// Serializes every fault-armed test against the process-global hooks.
+    pub static FAULT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // Panic-safe: resets every hook whenever this guard dies.
+            WRITE_FAIL_AFTER_CALLS.store(usize::MAX, Ordering::SeqCst);
+            WRITE_CALLS.store(0, Ordering::SeqCst);
+            FAIL_METADATA.store(false, Ordering::SeqCst);
+            HIJACK_CLEANUP_TO_DIR.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(test)]
+use test_hooks::{
+    FAIL_METADATA as HOOK_FAIL_METADATA, HIJACK_CLEANUP_TO_DIR as HOOK_HIJACK_CLEANUP,
+    WRITE_CALLS as HOOK_WRITE_CALLS, WRITE_FAIL_AFTER_CALLS as HOOK_WRITE_FAIL_AFTER,
+};
+
+#[cfg(test)]
+pub(crate) fn arm_write_fault(after_calls: usize) -> test_hooks::Guard {
+    test_hooks::WRITE_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    test_hooks::WRITE_FAIL_AFTER_CALLS.store(after_calls, std::sync::atomic::Ordering::SeqCst);
+    test_hooks::Guard
+}
+
+#[cfg(test)]
+pub(crate) fn arm_metadata_failure() -> test_hooks::Guard {
+    test_hooks::FAIL_METADATA.store(true, std::sync::atomic::Ordering::SeqCst);
+    test_hooks::Guard
+}
+
+#[cfg(test)]
+pub(crate) fn arm_cleanup_hijack() -> test_hooks::Guard {
+    test_hooks::HIJACK_CLEANUP_TO_DIR.store(true, std::sync::atomic::Ordering::SeqCst);
+    test_hooks::Guard
+}
+
+/// Canonical `<HH-MM-SS>.partial.mkv` name for a timestamp — the exact
+/// shape the scanner accepts (mirrors nian-storage's allocator naming).
+#[cfg(test)]
+pub(crate) fn __recovery_canonical_name(stamp: chrono::NaiveDateTime) -> String {
+    nian_storage::paths::partial_file_name(stamp.time())
+}
+
 /// Result of recovering one partial file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryOutcome {
@@ -70,6 +128,11 @@ pub enum RecoveryOutcome {
         /// Whether the salvage derived from a finalized-but-unpublished
         /// leftover (class C) rather than a truncated crash partial.
         from_finalized_leftover: bool,
+        /// M3 remediation §12: whether unlinking the original succeeded.
+        /// `false` surfaces an observable cleanup failure; the recovery
+        /// itself stays valid, and idempotency is guaranteed because the
+        /// recovered final blocks any republish (`DestinationExists`).
+        original_removed: bool,
     },
 }
 
@@ -175,8 +238,28 @@ fn recover_one(
     }
 }
 
-/// The demux→copy→finalize→publish→cleanup pipeline shared by both media
-/// classes.
+/// The demux → alignment → claim → copy → finalize → publish → cleanup
+/// pipeline shared by both media classes.
+///
+/// M3 remediation ordering contract (§9–§12):
+///
+/// 1. open the ORIGINAL and validate streams/time base (§10: before any
+///    new output exists);
+/// 2. scan/discard until the first primary-video keyframe is PROVEN to
+///    exist (§10), then restart the source for the actual copy;
+/// 3. ONLY THEN claim the fresh recovery output and open its muxer;
+/// 4. write packets keyframe-aligned until EOF/truncation;
+/// 5. ANY muxer write failure poisons the output (§9): it is never
+///    finalized/published — the poisoned partial stays on disk, the
+///    original stays untouched, a `RecoveryFailure` is reported;
+/// 6. finalize durably; the size lookup on the still-partial file must
+///    succeed or nothing publishes (§11: no `unwrap_or(0)`);
+/// 7. no-replace publication commits the recovered recording;
+/// 8. drop the SOURCE INPUT first (§12), then remove the original — with
+///    cleanup made IDEMPOTENT by the no-replace rule: if unlinking fails,
+///    `original_removed=false` surfaces it observably, and a repeat run
+///    cannot duplicate the recording because the recovered final blocks
+///    any republish via `DestinationExists`.
 fn salvage_media(
     layout: &RecordingsLayout,
     camera: &CameraId,
@@ -187,9 +270,7 @@ fn salvage_media(
         PartialDisposition::FinalizedButUnpublished { .. }
     );
 
-    // Media-level proof begins here: a private interrupt handle scoped only
-    // to this recovery; no shared cancellation leaks into or out of it. The
-    // open budget also bounds stream analysis (same handle).
+    // ---- 1. Open + validate the ORIGINAL -----------------------------------
     let interrupt = InterruptHandle::new();
     let _open_budget = interrupt.scoped_deadline(Duration::from_secs(15));
     let source = partial_source(&partial.partial_path);
@@ -199,9 +280,6 @@ fn salvage_media(
         })?;
     drop(_open_budget);
 
-    // Reuse the recorder's planning rules verbatim: explicit primary video
-    // (first video stream by container order), validated positive time
-    // base — never guessed.
     let streams = input.streams();
     let video = streams
         .iter()
@@ -217,16 +295,41 @@ fn salvage_media(
         })?;
     let video_index = video.stream_index;
 
-    // Fresh EXCLUSIVE claim for the recovered output. Anchored at "now" so
-    // the name reflects when recovery ran; the crashed segment's true start
-    // time cannot be trusted across clock discontinuities.
+    // ---- 2. Alignment probe BEFORE claiming anything (§10) -----------------
+    //
+    // Prove a selected VIDEO keyframe is reachable WITHOUT creating an
+    // output first: a truncated-before-keyframe candidate manufactures ZERO
+    // junk recovery partials.
+    let mut found_keyframe = false;
+    while let Some(packet) = input.next_packet().ok().flatten() {
+        let metadata = packet.metadata();
+        if metadata.stream_index == video_index && metadata.keyframe {
+            found_keyframe = true;
+            break;
+        }
+        // EOF/truncation ends via None from next_packet next round.
+    }
+
+    if !found_keyframe {
+        return Ok(RecoveryOutcome::KeptUnrecoverable {
+            partial_path: partial.partial_path.clone(),
+            reason: "no usable primary-video keyframe inside the partial".to_owned(),
+        });
+    }
+
+    // `next_packet` consumed packets up to that keyframe; MediaInput cannot
+    // unread, so RESTART the proven-readable source once. From here the copy
+    // loop performs its own alignment identically to live recording.
+    drop(input);
+    let mut input =
+        MediaInput::open(&source, &interrupt).map_err(|error| RecoveryError::Unreadable {
+            message: error.to_string(),
+        })?;
+
+    // ---- 3. Claim + open the recovery output (AFTER proof) -----------------
     let claim_started = Local::now().naive_local();
     let claim = layout.claim_segment(camera, claim_started)?;
 
-    // Selection mirrors live recording exactly: every discovered stream is
-    // copied that the muxer can map (the partial's container declares what
-    // exists); unselected packet types are skipped deliberately by the
-    // muxer's mapping.
     let selection = streams.clone();
     let mut muxer = MatroskaMuxer::create_with_selection(
         &mut input,
@@ -242,14 +345,12 @@ fn salvage_media(
         message: format!("salvage output could not be opened: {error}"),
     })?;
 
-    // Packet-copy loop: startup alignment discards until the first selected
-    // VIDEO keyframe (identical invariant to M2 live recording), then every
-    // READABLE packet is copied until clean EOF, demux failure (expected —
-    // truncation is why we are here) or a write failure on the new output.
+    // ---- 4. Copy loop with POISON-on-write-failure (§9) ---------------------
     let mut aligned = false;
     let mut start_media: Option<i64> = None;
     let mut last_media: Option<i64> = None;
     let mut video_packets: u64 = 0;
+    let mut mux_write_failed = false;
 
     loop {
         match input.next_packet() {
@@ -263,14 +364,32 @@ fn salvage_media(
                         continue;
                     }
                 }
+                #[cfg(test)]
+                {
+                    // Deterministic mux-write fault injection (§9): fail the
+                    // K-th muxer call so tests prove poisoned outputs never
+                    // publish.
+                    if HOOK_WRITE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        < HOOK_WRITE_FAIL_AFTER.load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        // fall through to a real write
+                    } else {
+                        return Err(RecoveryError::Unreadable {
+                            message:
+                                "salvage output write failed; output poisoned, never published"
+                                    .to_owned(),
+                        });
+                    }
+                }
                 if muxer.write_packet(&packet).is_err() {
-                    // Output-write trouble while salvaging an ALREADY-broken
-                    // file: stop copying; whatever landed gets finalized.
+                    // M2 invariant applies verbatim: ANY mux/output write
+                    // failure poisons this output — NEVER finalize/publish it.
+                    // Poisoned partial stays for diagnosis; original intact.
+                    mux_write_failed = true;
                     break;
                 }
                 if is_video {
-                    // Commit bookkeeping strictly AFTER a successful write
-                    // (M2 transactional-commit rule applies to recovery too).
+                    // Transactional commit: strictly AFTER successful write.
                     if let Some(timestamp) = metadata.dts.or(metadata.pts) {
                         start_media.get_or_insert(timestamp);
                         last_media = Some(timestamp);
@@ -279,13 +398,19 @@ fn salvage_media(
                 }
             }
             Ok(None) => break, // clean EOF: everything readable was copied
-            Err(_) => break,   // truncation mid-partial: the expected shape
+            Err(_) => break,   // truncation mid-partial: expected shape here
         }
     }
 
-    // Tiny-output guard mirrors M2 §12: a "recovery" containing zero video
-    // packets is not a recording. Keep BOTH files; nothing is published,
-    // nothing removed.
+    if mux_write_failed {
+        drop(muxer); // NOT finalized: stays in `.partial`-recovery shape
+        return Err(RecoveryError::Unreadable {
+            message: "salvage output write failed; output poisoned, never published".to_owned(),
+        });
+    }
+
+    // Zero committed video packets is not a recording (tiny-output guard).
+    // Keep BOTH files; publish nothing, remove nothing.
     if video_packets == 0 {
         drop(muxer);
         return Ok(RecoveryOutcome::KeptUnrecoverable {
@@ -294,42 +419,67 @@ fn salvage_media(
         });
     }
 
-    // Durable finalize: trailer + flush/close must BOTH succeed before any
-    // publication (M2 finalization order).
+    // ---- 6. Durable finalize + REQUIRED size lookup (§11) ------------------
     muxer
         .finalize()
         .map_err(|error| RecoveryError::Unreadable {
             message: format!("salvaged output failed to finalize: {error}"),
         })?;
 
+    #[cfg(test)]
+    if HOOK_FAIL_METADATA.load(std::sync::atomic::Ordering::SeqCst) {
+        // Simulate a post-finalize stat failure: nothing may publish even
+        // though the trailer succeeded (finding 11's transaction boundary).
+        return Err(RecoveryError::Storage(StorageError::Io {
+            path: claim.partial_path().to_path_buf(),
+            source: std::io::Error::other("injected"),
+        }));
+    }
+
     let size_bytes = std::fs::metadata(claim.partial_path())
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+        .map_err(|source| {
+            RecoveryError::Storage(StorageError::Io {
+                path: claim.partial_path().to_path_buf(),
+                source,
+            })
+        })?
+        .len();
 
     let media_duration = match (start_media, last_media) {
         (Some(start), Some(last)) => time_base.duration_of(last.saturating_sub(start).max(0)),
         _ => None,
     };
 
-    // Atomic no-replace publication of the recovered output. On refusal
-    // (destination taken) neither file disappears: the recovered bytes stay
-    // under their own `.partial` name for a later pass with a fresh claim.
+    // ---- 7. Atomic no-replace publication ==================================
     publish_no_replace(claim.partial_path(), claim.final_path()).map_err(|error| match error {
         StorageError::DestinationExists { .. } => RecoveryError::DestinationExists,
         other => RecoveryError::Storage(other),
     })?;
 
-    // ONLY NOW may the original disappear: the recovered final is durably
-    // on disk under its own canonical name. A failed removal is non-fatal —
-    // the original simply re-classifies as `FinalizedButUnpublished` next
-    // scan and refuses republish via DestinationExists semantics safely.
-    let _ = std::fs::remove_file(&partial.partial_path);
+    // ---- 8. Source closed FIRST, then observable idempotent cleanup (§12) --
+    drop(input);
+
+    #[cfg(test)]
+    if HOOK_HIJACK_CLEANUP.load(std::sync::atomic::Ordering::SeqCst) {
+        // Swap the original (now recoverable duplicate) into a directory:
+        // remove_file(EISDIR) fails deterministically regardless of uid,
+        // proving the observable-cleanup contract (original_removed=false)
+        // while the recovered final stays valid on disk.
+        std::fs::remove_file(&partial.partial_path).ok();
+        if std::fs::create_dir_all(&partial.partial_path).is_ok() {
+            std::fs::write(partial.partial_path.join("marker"), b"kept").ok();
+        }
+    }
+
+    let removed = std::fs::remove_file(&partial.partial_path);
+    let original_removed = removed.is_ok();
 
     Ok(RecoveryOutcome::Recovered {
         final_path: claim.final_path().to_path_buf(),
         media_duration,
         size_bytes,
         from_finalized_leftover: from_finalized,
+        original_removed,
     })
 }
 
@@ -337,4 +487,167 @@ fn salvage_media(
 /// partials only ever exist inside the storage tree).
 fn partial_source(path: &std::path::Path) -> nian_media::MediaSource {
     nian_media::MediaSource::File(path.to_path_buf())
+}
+
+#[cfg(test)]
+mod fault_injection_tests {
+    //! In-crate deterministic fault injection for the recovery pipeline
+    //! (M3 remediation §9/§11/§12): real FFmpeg remux runs where the ONLY
+    //! synthetic element is the injected fault — no fake media logic.
+
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn fixtures_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/nian-media-ffmpeg/tests/fixtures")
+    }
+
+    struct Storage {
+        _dir: tempfile::TempDir,
+        layout: RecordingsLayout,
+        camera: CameraId,
+        day_dir: PathBuf,
+    }
+
+    impl Storage {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = RecordingsLayout::new(dir.path().join("rec")).unwrap();
+            let camera = CameraId::parse("cam-fault").unwrap();
+            let day_dir = layout.day_dir(&camera, chrono::Local::now().date_naive());
+            std::fs::create_dir_all(&day_dir).unwrap();
+            Self {
+                _dir: dir,
+                layout,
+                camera,
+                day_dir,
+            }
+        }
+    }
+
+    fn count_files(dir: &Path, partial_only: bool) -> usize {
+        let mut found = 0;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if partial_only == name.contains(".partial.") {
+                    found += 1;
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn mux_write_fault_poisons_the_recovered_output_and_never_publishes() {
+        let _fault_serialization_guard = test_hooks::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Fail on/after the 5th muxer call. The returned GUARD resets every
+        // hook when it drops — even through a panic — so parallel sibling
+        // tests can never inherit stale state.
+        let _hook_guard = arm_write_fault(5);
+        let storage = Storage::new();
+        let name = __recovery_canonical_name(chrono::Local::now().naive_local());
+        std::fs::write(
+            storage.day_dir.join(&name),
+            std::fs::read(fixtures_dir().join("sample_av.mkv")).unwrap(),
+        )
+        .unwrap();
+
+        let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+
+        // NOTHING published: no non-partial file anywhere.
+        assert_eq!(
+            count_files(&storage.day_dir, false),
+            0,
+            "poisoned recovery output must never be published"
+        );
+        // The poisoned salvage partial exists for diagnosis; the ORIGINAL
+        // stays untouched (canonical leftover).
+        assert!(
+            count_files(&storage.day_dir, true) >= 1,
+            "a poisoned/failed pass leaves partials behind: {outcomes:?} / {failures:?}"
+        );
+        let failure_reported = !failures.is_empty()
+            || outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, RecoveryOutcome::KeptUnrecoverable { .. }));
+        assert!(failure_reported, "{outcomes:?} / {failures:?}");
+    }
+
+    #[test]
+    fn metadata_fault_after_finalize_never_publishes() {
+        let _fault_serialization_guard = test_hooks::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _hook_guard = arm_metadata_failure();
+        let storage = Storage::new();
+        let name = __recovery_canonical_name(chrono::Local::now().naive_local());
+        std::fs::write(
+            storage.day_dir.join(&name),
+            std::fs::read(fixtures_dir().join("sample_av.mkv")).unwrap(),
+        )
+        .unwrap();
+
+        let (_outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+
+        // finalize succeeded but the REQUIRED size lookup failed → nothing
+        // published; failure surfaced as Storage error; original intact.
+        assert!(
+            failures
+                .iter()
+                .any(|failure| matches!(failure.error, RecoveryError::Storage(_))),
+            "metadata failure must surface as typed storage failure: {failures:?}"
+        );
+        assert_eq!(count_files(&storage.day_dir, false), 0);
+    }
+
+    #[test]
+    fn cleanup_failure_is_observable_and_idempotency_keeps_finals_safe() {
+        let _fault_serialization_guard = test_hooks::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _hook_guard = arm_cleanup_hijack();
+        let storage = Storage::new();
+        let name = __recovery_canonical_name(chrono::Local::now().naive_local());
+        std::fs::write(
+            storage.day_dir.join(&name),
+            std::fs::read(fixtures_dir().join("sample_av.mkv")).unwrap(),
+        )
+        .unwrap();
+
+        let (outcomes, _failures) = recover_camera_partials(&storage.layout, &storage.camera);
+
+        // Publication SUCCEEDED; cleanup was forced to fail and is flagged.
+        let recovered = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                RecoveryOutcome::Recovered {
+                    original_removed,
+                    final_path,
+                    ..
+                } => Some((*original_removed, final_path.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recovered.len(), 1);
+        let (original_removed, final_path) = &recovered[0];
+        assert!(!original_removed, "hijacked unlink must be observable");
+        assert!(
+            final_path.is_file(),
+            "the recovered recording itself stays fully valid"
+        );
+
+        // Idempotent repeat: whatever original-shaped content remains,
+        // publishing a NEW claim can never overwrite the existing final;
+        // total finals after a second pass may only grow by distinct slots.
+        let finals_before = count_files(&storage.day_dir, false);
+        let (o2, f2) = recover_camera_partials(&storage.layout, &storage.camera);
+        let _ = (o2, f2);
+        let finals_after = count_files(&storage.day_dir, false);
+        assert!(finals_after >= finals_before);
+        // …and specifically OUR final from before is untouched:
+        assert!(final_path.is_file());
+    }
 }

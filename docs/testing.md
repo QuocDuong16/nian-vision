@@ -10,14 +10,15 @@ Testing is part of the definition of done for every milestone (master spec
 | Crate | Covers |
 |---|---|
 | `nian-domain` | camera-id path safety, credential redaction, URL encoding, retention validation, quota watermarks, backoff schedule, time-base math |
-| `nian-application` | config validation bounds, UI-safe error messages (transient vs permanent worker failures) |
+| `nian-application` | config validation bounds, UI-safe error messages; stub-worker supervision matrix: crash-before-hello retryable, wedged-hello deadline-bounded, version mismatch permanent, transient refusal retries, configuration refusal stops, failed-job-observed-while-alive, shutdown interrupts backoff waits |
 | `nian-storage` | recordings layout, partial/final naming round-trip, traversal rejection, exclusive claims (incl. sub-second clock regression), no-replace publication (success, collision refusal, recoverable abandoned partials) |
 | `nian-storage` (M3) | partial-file classification: empty/header-only, truncated media, finalized-but-unpublished sniffing; canonical-only scanning; foreign names ignored; deterministic ordering |
 | `nian-ipc` | envelope round-trips, framing limits (1 MiB cap, CRLF, truncation), dispatch loop (ping/describe/shutdown/unknown), protocol version guard, handler event emission through the writer before replies (M3) |
 | `nian-media` | RTSP URL redaction invariants |
 | `nian-media` errors (M3) | timeout vs cancellation category matrix: every error maps to exactly one typed `FailureCategory`; retryability is exactly the source-side set; local output/storage/config never loops |
 | `nian-recorder` | stream-plan selection, ceiling target-to-ticks conversion, read-only rotation decision + transactional clock commits, teardown policy (poison/cancel ⇒ never publish); fault injection runs over the real pipeline |
-| `nian-recorder` supervisor (M3) | full state machine over scripted sessions with a VIRTUAL waiter (never sleeps the real 60 s tail): file EOF completes without backoff, RTSP EOF means connection-lost and reconnects, retryable failures follow the exact schedule 2s/5s/10s/30s, cancellation skips reconnects, output-write failures fail supervision immediately, permanent open failures fail without retry, timeout classification, ordered StateChanged chains, seeded jitter stays within ±half deterministically, saturating jitter composition |
+| `nian-recorder` stop wiring (M3 rem.) | stop flag handed to every open_session and baked into fresh sessions by construction; race tests: stop during recording/connecting/backoff/concurrent failure — one graceful press suffices |
+| `nian-recorder` matrix (M3 rem.) | source-kind-aware retryability: RTSP open/read/timeout retry, file rows permanent; SegmentFinalized events are the authoritative cross-attempt counter (failed attempts still count) | (never sleeps the real 60 s tail): file EOF completes without backoff, RTSP EOF means connection-lost and reconnects, retryable failures follow the exact schedule 2s/5s/10s/30s, cancellation skips reconnects, output-write failures fail supervision immediately, permanent open failures fail without retry, timeout classification, ordered StateChanged chains, seeded jitter stays within ±half deterministically, saturating jitter composition |
 
 ### Media integration tests (`nian-media-ffmpeg/tests/`)
 

@@ -161,3 +161,80 @@ snapshots carry labels/counters only.
 * **Deleting unreadable partials during scan** — rejected: reporting beats
   deletion for a system whose brand promise is "recoverable"; cleanup policy
   belongs to retention (M4+).
+
+---
+
+## Amendment (M3 review remediation, 2026-08-27)
+
+### Stop/cancellation control domain
+
+The supervisor's run-level stop flag is handed to EVERY `open_session` call
+and baked into the fresh session via `RecordingSession::from_input_with_stop`.
+Stop-while-Recording reaches the active session BY CONSTRUCTION — one shared
+`Arc<AtomicBool>` behind supervisor and session; no relay thread, no flag
+splicing. One graceful press always suffices (race tests cover stop during
+Recording / Connecting / Backoff / concurrent-with-failure).
+
+### Source-kind-aware retry matrix
+
+Retryability now depends on the source kind, not only on the error category:
+
+| Failure | RTSP | File |
+|---|---|---|
+| open failed | retry | **permanent** |
+| read failed | retry | **permanent** |
+| read timeout | retry | **permanent** |
+| clean EOF | retry (connection lost) | completed |
+| output write fail | permanent | permanent |
+| storage fail | permanent | permanent |
+| config invalid | permanent | permanent |
+| operator stop/cancel | stop | stop |
+
+A local file neither heals nor changes under us — looping over it forever was
+a latent infinite-retry bug.
+
+### Authoritative segment accounting
+
+`SegmentFinalized` events are THE authoritative cross-attempt counter. An
+attempt that publishes 3 segments and then dies contributes 3, whether its
+`Result` is `Ok` or `Err`. Summaries are never added on top (no double-count).
+
+### Worker process supervision rebuild
+
+* Dedicated stdout READER thread → channel: the coordinator's event loop is
+  `recv_timeout`-driven, so shutdown intent is observed without ANY incoming
+  worker frame, and death is observed in every phase.
+* Dedicated stdin WRITER thread: one owner, no unsynchronized writes.
+* Injected `SupervisorDeadlines` bound hello / start-ack / shutdown-ack;
+  tests use milliseconds. A silent-but-alive worker = unhealthy episode →
+  restart policy, never an indefinite block.
+* Crash/restart applies to ALL phases (before/during hello, awaiting start
+  ack, while recording, while shutting down). Protocol-version mismatch and
+  malformed frames stay PERMANENT; transient start refusals flow through the
+  backoff instead of ending supervision; configuration-shaped refusals stay
+  permanent. Episodes ending with a still-alive worker force-kill + reap so
+  nothing blocks or leaks.
+* The coordinator polls `recording.status`; terminal job states (`stopped`,
+  `completed`, `failed:<category>`) are observable at the parent while the
+  PROCESS stays alive — worker-alive ≠ recording-healthy. Backoff waits are
+  shutdown-sliced like camera backoff.
+
+### Recovery pipeline hardening
+
+Order fixed to open-original → validate → PROVE a primary-video keyframe
+exists → then claim/open/copy; a keyframe-less candidate manufactures ZERO
+junk partials. Any mux write failure POISONS the recovery output (never
+finalized/published; original kept; failure reported). Size lookup after
+finalize is required — no `unwrap_or(0)`; metadata failure aborts before
+publication. Cleanup of the original happens after dropping the source input
+and is OBSERVABLE (`RecoveryOutcome::Recovered.original_removed`) rather than
+silently ignored; idempotency rests on no-replace publication plus
+non-canonical leftovers being invisible to the scanner.
+
+### Worker exit semantics
+
+`cmd_run` replaces its fixed 5 s sleep with a real shutdown lifecycle:
+graceful job stop → grace join (> any bounded read + finalize headroom) →
+force-cancel if needed → absolute-bound join; expiry is an explicit forced-
+shutdown path that leaves the partial recoverable and exits non-zero. Job
+stop presses are per-manager state (fresh job ⇒ zero presses).

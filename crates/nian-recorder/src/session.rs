@@ -66,6 +66,13 @@ impl StopFlag {
     pub fn is_requested(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
+
+    /// Whether `other` refers to the SAME control domain — clones of one
+    /// original flag share their inner atomic, so a request through either
+    /// is visible to both. Supervisor wiring relies on this identity.
+    pub fn shares_control_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// Media-time bookkeeping for one open segment.
@@ -355,6 +362,34 @@ impl RecordingSession {
     /// Tests use this constructor to pre-drain a fixture past its first GOP
     /// before the startup-alignment logic takes over.
     pub fn from_input(
+        input: MediaInput,
+        layout: RecordingsLayout,
+        config: RecorderConfig,
+    ) -> Result<Self, RecordingError> {
+        Self::from_input_with_stop(input, layout, config, StopFlag::new())
+    }
+
+    /// Like [`Self::from_input`], but the session's graceful-stop flag is
+    /// SHARED with an external supervisor control domain instead of being a
+    /// fresh private one.
+    ///
+    /// M3 remediation §1: reconnect supervisors hand their run-level flag
+    /// to every factory call and factories build sessions through THIS
+    /// constructor — stop-while-Recording reaches the active session by
+    /// construction (one `Arc<AtomicBool>` behind both sides), never via a
+    /// relay thread or after-the-fact flag splicing.
+    pub fn from_input_with_stop(
+        input: MediaInput,
+        layout: RecordingsLayout,
+        config: RecorderConfig,
+        run_stop: StopFlag,
+    ) -> Result<Self, RecordingError> {
+        let mut session = Self::from_input_internal(input, layout, config)?;
+        session.stop = run_stop;
+        Ok(session)
+    }
+
+    fn from_input_internal(
         input: MediaInput,
         layout: RecordingsLayout,
         config: RecorderConfig,

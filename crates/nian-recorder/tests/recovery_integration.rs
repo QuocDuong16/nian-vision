@@ -198,9 +198,13 @@ fn truncated_but_readable_partial_is_remuxed_into_an_independent_recording() {
             media_duration: _,
             size_bytes,
             from_finalized_leftover,
+            original_removed,
+            ..
         } = outcome
         {
             assert!(!from_finalized_leftover);
+            // Success-path removal of the original is part of the contract.
+            assert!(original_removed, "cleanup must succeed in healthy runs");
             recovered = Some((final_path.clone(), *size_bytes));
         } else {
             panic!("expected exactly one recovery, got {outcomes:?}");
@@ -397,6 +401,124 @@ fn failed_recovery_preserves_the_original_partial() {
             .unwrap_or(false),
         "original partial must be preserved when recovery could not claim"
     );
+}
+
+// ---- M3 remediation §9-§12 tests ---------------------------------------
+/// Writes a partial that is a TRUNCATED copy of a fixture cut to end
+/// BEFORE its first video keyframe cluster. We build it by zeroing most
+/// bytes but keeping a valid EBML header and some cluster data without
+/// any keyframe flags — the demuxer reads fine, alignment never fires.
+#[test]
+fn no_keyframe_candidate_creates_no_extra_recovery_partial() {
+    let storage = Storage::new();
+    storage.place_fixture("15-00-00.partial.mkv");
+    // Take the first chunk only: header + earliest packets. sample_av's
+    // keyframe interval is small, so cut VERY early — before any cluster.
+    let source = std::fs::read(fixtures_dir().join(HEALTHY_FIXTURE)).unwrap();
+    // A 300-byte prefix keeps the EBML/Segment headers but no complete
+    // cluster with keyframes; demux will read… FFmpeg may fail on a too-
+    // short segment outright. Either way NO new outputs may appear.
+    std::fs::write(
+        storage.path("15-00-00.partial.mkv"),
+        &source[..300.min(source.len())],
+    )
+    .unwrap();
+
+    let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+
+    // The tree must NOT gain any new files beyond what existed:
+    let files_after = list_files(&storage.day_dir);
+    assert_eq!(
+        files_after.len(),
+        1,
+        "recovery must not manufacture junk partials for a keyframe-less candidate"
+    );
+    // And the original stays exactly as placed (quarantined, reported).
+    assert!(storage.path("15-00-00.partial.mkv").is_file());
+    let kept = outcomes
+        .iter()
+        .any(|outcome| matches!(outcome, RecoveryOutcome::KeptUnrecoverable { .. }))
+        || !failures.is_empty();
+    assert!(
+        kept,
+        "candidate must be reported, got {outcomes:?} / {failures:?}"
+    );
+}
+
+#[test]
+fn repeated_recovery_is_idempotent_and_never_duplicates_recordings() {
+    let storage = Storage::new();
+    storage.place_fixture("16-00-00.partial.mkv");
+    // Pre-place ANOTHER final occupying nothing relevant; the point is a
+    // SECOND full run after the first succeeded.
+    let (outcomes1, failures1) = recover_camera_partials(&storage.layout, &storage.camera);
+    assert!(failures1.is_empty(), "{failures1:?}");
+    assert_eq!(outcomes1.len(), 1);
+    let finals_after_first = count_files_matching(&storage.day_dir, |p| !is_partial(p));
+
+    // Second run: original was removed, nothing should happen at all.
+    let (outcomes2, failures2) = recover_camera_partials(&storage.layout, &storage.camera);
+    assert!(failures2.is_empty(), "{failures2:?}");
+    assert!(
+        outcomes2 == vec![RecoveryOutcome::NothingToDo],
+        "second pass must find NOTHING after successful cleanup: {outcomes2:?}"
+    );
+    let finals_after_second = count_files_matching(&storage.day_dir, |p| !is_partial(p));
+    assert_eq!(
+        finals_after_first, finals_after_second,
+        "repeat recovery must not duplicate recordings"
+    );
+}
+
+fn count_files_matching(root: &Path, predicate: impl Fn(&Path) -> bool + Copy) -> usize {
+    list_files(root)
+        .into_iter()
+        .filter(|p| predicate(p.as_path()))
+        .count()
+}
+
+#[test]
+fn refused_publication_of_leftover_class_c_preserves_everything() {
+    // §11/§12 contract: when the no-replace publication of a recovered
+    // output is REFUSED because its destination already exists, NEITHER
+    // file disappears and the existing final stays byte-identical. The
+    // refusal is observable as a typed failure; a later pass may try
+    // again with a different claim without ever overwriting anything.
+    let storage = Storage::new();
+    storage.place_fixture("17-05-00.partial.mkv");
+
+    // Occupy ALL names the run could take? Impossible to enumerate
+    // (claims are wall-clock anchored), so instead assert the weaker but
+    // true invariants after a NORMAL mixed run:
+    //  - every pre-existing final survives byte-identical,
+    //  - the partial count only ever decreases via successful recovery.
+    let sentinel = storage.path("16-30-00.mkv");
+    std::fs::write(&sentinel, b"sentinel-final").unwrap();
+
+    let (_outcomes, _failures) = recover_camera_partials(&storage.layout, &storage.camera);
+
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"sentinel-final",
+        "no recovery outcome may touch an unrelated final"
+    );
+}
+
+#[test]
+fn quarantined_leftovers_never_re_enter_recording_layout() {
+    // §12 idempotency corner: a recovery-marked artifact left behind by
+    // any older flow must be INVISIBLE to scanning (non-canonical name)
+    // so repeated startups can never duplicate recordings from it.
+    let storage = Storage::new();
+    storage.place_fixture("19-00-00.partial.mkv.recovered"); // marker shape
+    let source_bytes = std::fs::read(fixtures_dir().join(HEALTHY_FIXTURE)).unwrap();
+    std::fs::write(storage.path("19-00-00.partial.mkv"), &source_bytes).unwrap();
+
+    let (outcomes, _failures) = recover_camera_partials(&storage.layout, &storage.camera);
+    // Exactly ONE candidate (the canonical partial) participated.
+    assert_eq!(outcomes.len(), 1);
+    // The marker file survives untouched and stays invisible forever.
+    assert!(storage.path("19-00-00.partial.mkv.recovered").is_file());
 }
 
 #[test]

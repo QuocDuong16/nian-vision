@@ -17,5 +17,6 @@ pub mod supervisor;
 pub use config::{AppConfig, SegmentTargetDuration};
 pub use error::ApplicationError;
 pub use supervisor::{
-    BinaryLauncher, DesiredRecording, WorkerEnd, WorkerLauncher, WorkerSupervisor,
+    BinaryLauncher, DesiredRecording, JobTerminal, SupervisorDeadlines, WorkerEnd, WorkerLauncher,
+    WorkerSupervisor,
 };
