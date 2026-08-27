@@ -343,8 +343,14 @@ fn mixed_recovery_run_handles_each_class_without_cross_contamination() {
 #[test]
 fn failed_recovery_preserves_the_original_partial() {
     // Exercise the pipeline's failure containment end-to-end via a source
-    // that fails AT CLAIM TIME: make the camera root read-only so the
+    // that fails AT CLAIM TIME: make the day directory read-only so the
     // exclusive claim of the recovery output cannot succeed.
+    //
+    // Permission bits only block UNPRIVILEGED writers: as root they are
+    // bypassed entirely (CI containers run tests as root). A write probe
+    // decides which contract to assert — containment when claiming truly
+    // fails, plain success (which legitimately removes the original) when
+    // nothing could block it.
     let storage = Storage::new();
     storage.place_fixture("14-00-00.partial.mkv");
 
@@ -352,6 +358,9 @@ fn failed_recovery_preserves_the_original_partial() {
     #[allow(clippy::permissions_set_readonly_false)] // one direction per branch
     std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o500); // r-x
     std::fs::set_permissions(&storage.day_dir, permissions).unwrap();
+
+    let probe_path = storage.path("claim-probe.tmp");
+    let claims_blocked = std::fs::File::create(&probe_path).is_err();
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         recover_camera_partials(&storage.layout, &storage.camera)
@@ -362,12 +371,25 @@ fn failed_recovery_preserves_the_original_partial() {
     #[allow(clippy::permissions_set_readonly_false)]
     std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
     std::fs::set_permissions(&storage.day_dir, permissions).unwrap();
+    let _ = std::fs::remove_file(&probe_path);
 
     let (outcomes, failures) = result.expect("recovery must not panic on claim failure");
-    // Claim failure is reported and the ORIGINAL SURVIVES.
+    if !claims_blocked {
+        // Privileged runner: recovery legitimately succeeded and removed the
+        // original after durable publication — assert THAT contract instead.
+        assert!(
+            matches!(outcomes.as_slice(), [RecoveryOutcome::Recovered { .. }])
+                || !failures.is_empty(),
+            "privileged run must recover fully or report cleanly: \
+             outcomes={outcomes:?} failures={failures:?}"
+        );
+        return;
+    }
+
+    // Containment: claim failure is reported and the ORIGINAL SURVIVES.
     assert!(
-        !failures.is_empty() || matches!(outcomes.as_slice(), [] | [_]),
-        "unexpected shape"
+        !failures.is_empty(),
+        "blocked claim must surface as failure"
     );
     assert!(
         std::fs::read(storage.path("14-00-00.partial.mkv"))
