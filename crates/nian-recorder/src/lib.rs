@@ -74,6 +74,11 @@ pub use recovery::{
     RecoveryError, RecoveryFailure, RecoveryOutcome, recover_camera_partials,
     recover_camera_partials_with_interrupt,
 };
+#[cfg(any(test, feature = "test-hooks"))]
+pub use recovery::{
+    arm_cleanup_hijack, arm_metadata_failure, arm_publish_barrier, arm_recovery_delay,
+    arm_write_fault, test_hooks,
+};
 pub use session::{RecordingSession, RecordingSummary, StopFlag};
 pub use supervisor::{
     AttemptOutcome, CameraRecordingSupervisor, EofInterpretation, Jitter, NoJitter, SeededJitter,

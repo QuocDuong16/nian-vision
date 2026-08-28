@@ -18,5 +18,10 @@ thiserror = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 
+# Deterministic recovery pipeline hooks for cross-crate TESTS only (the
+# media worker's test target arms them); production builds never enable it.
+[features]
+test-hooks = []
+
 [lints]
 workspace = true

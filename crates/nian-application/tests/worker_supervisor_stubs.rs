@@ -105,6 +105,14 @@ fn failed_status_json(category: &str) -> String {
     )
 }
 
+/// Canonical terminal JobStatus for ANY end kind (final correctness
+/// remediation §3 fixtures: completed / stopped / failed).
+fn terminal_status_json(end_kind: &str, category: &str) -> String {
+    format!(
+        r#"{{"camera_id":"cam-z","state":"{end_kind}","retry_attempt":0,"finalized_segments":2,"finished":true,"end_kind":"{end_kind}","failure_category":"{category}","recovery":null}}"#
+    )
+}
+
 fn response(id: u64, result_json: &str) -> String {
     format!(r#"{{"type":"response","v":1,"id":{id},"ok":true,"result":{result_json}}}"#)
 }
@@ -374,4 +382,150 @@ fn run_forever_backoff_wait_is_interrupted_by_shutdown() {
         WorkerEnd::RequestedShutdown => {}
         other => panic!("shutdown during backoff must win: got {other:?}"),
     }
+}
+#[test]
+fn terminal_completed_authoritative_even_when_shutdown_ack_is_lost() {
+    // Final correctness remediation §3: the worker answers ONE status poll
+    // with a terminal COMPLETED JobStatus and then NEVER acknowledges its
+    // cleanup shutdown (alive but wedged). The parent must kill/reap the
+    // process and STILL return JobCompletedCleanly — never reinterpret the
+    // recording as an unhealthy retryable episode. run_forever must not
+    // spawn a second worker.
+    let temp = tempfile::tempdir().unwrap();
+    let completed = response(3, &terminal_status_json("completed", ""));
+    let body = format!(
+        "printf '%s\n' '{HELLO_OK}'\n\
+         first=1\n\
+         while read -r req; do\n\
+           case \"$req\" in\n\
+             *'\"id\":1,'*) printf '%s\n' '{START_ACK}' ;;\n\
+             *) if [ \"$first\" = 1 ]; then first=0; printf '%s\n' '{completed}'; else sleep 60; fi ;;\n\
+           esac\n\
+         done\n"
+    );
+    let prog = script(temp.path(), "completed-no-ack", &body);
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let mut supervisor = WorkerSupervisor::with_deadlines(
+        CountingLauncher {
+            inner: ScriptLauncher { program: prog },
+            spawns: Arc::clone(&spawns),
+        },
+        fixture_deadlines(),
+    );
+    supervisor.set_desired_recording(desired("cam-term-completed"));
+    match supervisor.run_forever(&|| false, &|_| {}) {
+        Ok(WorkerEnd::JobCompletedCleanly) => {}
+        other => panic!("terminal Completed must stay authoritative, got {other:?}"),
+    }
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        1,
+        "a completed job must never be restarted regardless of cleanup outcome"
+    );
+}
+
+#[test]
+fn terminal_failed_authoritative_even_when_shutdown_ack_is_lost() {
+    // Final correctness remediation §3: terminal FAILED + lost shutdown ack
+    // must remain PermanentRecordingFailure — never a retryable episode.
+    let temp = tempfile::tempdir().unwrap();
+    let failed = response(3, &terminal_status_json("failed", "storage_failed"));
+    let body = format!(
+        "printf '%s\n' '{HELLO_OK}'\n\
+         first=1\n\
+         while read -r req; do\n\
+           case \"$req\" in\n\
+             *'\"id\":1,'*) printf '%s\n' '{START_ACK}' ;;\n\
+             *) if [ \"$first\" = 1 ]; then first=0; printf '%s\n' '{failed}'; else sleep 60; fi ;;\n\
+           esac\n\
+         done\n"
+    );
+    let prog = script(temp.path(), "failed-no-ack", &body);
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let mut supervisor = WorkerSupervisor::with_deadlines(
+        CountingLauncher {
+            inner: ScriptLauncher { program: prog },
+            spawns: Arc::clone(&spawns),
+        },
+        fixture_deadlines(),
+    );
+    supervisor.set_desired_recording(desired("cam-term-failed"));
+    match supervisor.run_forever(&|| false, &|_| {}) {
+        Err(ApplicationError::PermanentRecordingFailure { category }) => {
+            assert_eq!(category, "storage_failed");
+        }
+        other => panic!("terminal Failed must stay permanent, got {other:?}"),
+    }
+    assert_eq!(spawns.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn terminal_stopped_authoritative_even_when_shutdown_ack_is_lost() {
+    // Final correctness remediation §3: terminal STOPPED + lost shutdown
+    // ack remains RequestedShutdown — no retryable reinterpretation.
+    let temp = tempfile::tempdir().unwrap();
+    let stopped = response(3, &terminal_status_json("stopped", ""));
+    let body = format!(
+        "printf '%s\n' '{HELLO_OK}'\n\
+         first=1\n\
+         while read -r req; do\n\
+           case \"$req\" in\n\
+             *'\"id\":1,'*) printf '%s\n' '{START_ACK}' ;;\n\
+             *) if [ \"$first\" = 1 ]; then first=0; printf '%s\n' '{stopped}'; else sleep 60; fi ;;\n\
+           esac\n\
+         done\n"
+    );
+    let prog = script(temp.path(), "stopped-no-ack", &body);
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let mut supervisor = WorkerSupervisor::with_deadlines(
+        CountingLauncher {
+            inner: ScriptLauncher { program: prog },
+            spawns: Arc::clone(&spawns),
+        },
+        fixture_deadlines(),
+    );
+    supervisor.set_desired_recording(desired("cam-term-stopped"));
+    match supervisor.run_forever(&|| false, &|_| {}) {
+        Ok(WorkerEnd::RequestedShutdown) => {}
+        other => panic!("terminal Stopped must stay RequestedShutdown, got {other:?}"),
+    }
+    assert_eq!(spawns.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn late_status_response_cannot_satisfy_a_newer_poll() {
+    // Final correctness remediation §4: poll 1 (id 3) is answered LATE
+    // (400 ms, after its response window already expired); poll 2 (id 4, a
+    // DIFFERENT id) is never answered. The late id-3 response arrives
+    // during poll 2's window and MUST be ignored — the missed-response
+    // policy stays correct and the episode becomes Unresponsive{monitor}
+    // within its bound instead of being pacified by stale frames.
+    let temp = tempfile::tempdir().unwrap();
+    let running_status = r#"{"camera_id":"cam-late","state":"recording","retry_attempt":0,"finalized_segments":0,"finished":false,"end_kind":"","failure_category":"","recovery":null}"#;
+    let running = response(3, running_status);
+    let body = format!(
+        "printf '%s\n' '{HELLO_OK}'\n\
+         first=1\n\
+         while read -r req; do\n\
+           case \"$req\" in\n\
+             *'\"id\":1,'*) printf '%s\n' '{START_ACK}' ;;\n\
+             *) if [ \"$first\" = 1 ]; then first=0; sleep 0.4; printf '%s\n' '{running}'; else sleep 60; fi ;;\n\
+           esac\n\
+         done\n"
+    );
+    let prog = script(temp.path(), "late-response", &body);
+    let mut deadlines = fixture_deadlines();
+    deadlines.status_response = Duration::from_millis(150);
+    let mut supervisor =
+        WorkerSupervisor::with_deadlines(ScriptLauncher { program: prog }, deadlines);
+    supervisor.set_desired_recording(desired("cam-late"));
+    let started = std::time::Instant::now();
+    match supervisor.run_one_episode(&|| false).unwrap() {
+        WorkerEnd::RetryableEpisode => {}
+        other => panic!("unanswered newer poll must stay Unresponsive, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the missed-response bound must hold, took {started:?}"
+    );
 }

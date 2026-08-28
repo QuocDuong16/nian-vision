@@ -66,17 +66,41 @@ impl RecordingsLayout {
             .expect("validated CameraId is always path-safe")
     }
 
-    /// Creates the camera directory if missing, so a failing call is a
-    /// CHEAP, genuine storage-infrastructure signal (final remediation §7/§8):
-    /// the worker refuses `recording.start` with `storage_unavailable` only
-    /// when safe storage operation is impossible — never for per-file
-    /// content problems, which recovery quarantines instead.
+    /// Creates the camera directory if missing AND proves it accepts NEW
+    /// file writes (final correctness remediation §8): `create_dir_all`
+    /// succeeding says nothing when the directory already exists, so a
+    /// cheap no-overwrite probe file (reserved non-recording name) is
+    /// created, closed and removed. The probe never overwrites user data
+    /// (`create_new`), never parses as a segment/recording/artifact name,
+    /// and is cleaned up immediately (a leftover probe is harmless and
+    /// classifies as `Unknown`). Failure surfaces a genuine storage error
+    /// — the worker's start pre-flight maps it to the permanent
+    /// `storage_unavailable` refusal.
     pub fn ensure_camera_dir(&self, camera: &CameraId) -> Result<PathBuf, StorageError> {
         let dir = self.camera_dir(camera);
         std::fs::create_dir_all(&dir).map_err(|source| StorageError::Io {
             path: dir.clone(),
             source,
         })?;
+
+        static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let probe_serial = PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let probe = dir.join(format!(
+            ".nian-write-probe-{}-{probe_serial}.tmp",
+            std::process::id()
+        ));
+        let probe_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .map_err(|source| StorageError::Io {
+                path: probe.clone(),
+                source,
+            })?;
+        drop(probe_file);
+        // The writeability proof is complete; cleanup is best-effort — a
+        // failed unlink must not mask the positive probe result.
+        let _ = std::fs::remove_file(&probe);
         Ok(dir)
     }
 
@@ -955,5 +979,59 @@ mod tests {
                 "accepted component {evil:?}"
             );
         }
+    }
+
+    #[test]
+    fn camera_dir_preflight_proves_writeability_and_cleans_up() {
+        // Final correctness remediation §8: the pre-flight must succeed on
+        // a writable tree, must NOT overwrite anything, and must leave no
+        // probe file behind. The probe file's reserved name never
+        // classifies as a recording, partial or recovery artifact.
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-preflight").unwrap();
+
+        let dir = layout.ensure_camera_dir(&camera).unwrap();
+        assert!(dir.is_dir());
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the probe must clean up after itself: {leftovers:?}"
+        );
+
+        // Calling twice (directory already exists) still succeeds — this
+        // is exactly the case where create_dir_all alone proves nothing.
+        layout.ensure_camera_dir(&camera).unwrap();
+        assert!(
+            crate::classification::classify_recording_file_name(".nian-write-probe-1-0.tmp")
+                == crate::classification::RecordingFileKind::Unknown
+        );
+    }
+
+    #[test]
+    fn camera_dir_preflight_fails_when_the_target_is_not_a_directory() {
+        // A genuine infrastructure failure: the camera path is occupied by
+        // a file, so neither the directory nor any new recording file can
+        // exist there — regardless of privileges.
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-blocked").unwrap();
+        let camera_path = layout.camera_dir(&camera);
+        std::fs::create_dir_all(camera_path.parent().unwrap()).unwrap();
+        std::fs::write(&camera_path, b"occupied").unwrap();
+
+        assert!(
+            layout.ensure_camera_dir(&camera).is_err(),
+            "a file occupying the camera path must fail the writeability pre-flight"
+        );
+        assert_eq!(
+            std::fs::read(&camera_path).unwrap(),
+            b"occupied",
+            "user data must never be overwritten by the pre-flight"
+        );
     }
 }

@@ -28,6 +28,10 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 nian-ffmpeg-sys = { workspace = true }
 tempfile = { workspace = true }
+# Test-only recovery hooks (deterministic delay/fault seams) so the job
+# lifecycle tests can hold asynchronous recovery at known checkpoints.
+# Production builds never enable the feature.
+nian-recorder = { path = "../../crates/nian-recorder", features = ["test-hooks"] }
 
 [lints]
 workspace = true

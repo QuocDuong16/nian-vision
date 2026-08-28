@@ -632,14 +632,22 @@ impl<L: WorkerLauncher> WorkerSupervisor<L> {
         // `Unresponsive { phase: "monitor" }` instead of polling forever.
         // Any valid expected status response resets the missed counter.
         let mut missed_status_responses: u32 = 0;
+        // Final correctness remediation §4: episode-local MONOTONIC request
+        // ids. A late response to poll N can never be accepted as the
+        // response to poll N+1 because only the freshly allocated id marks
+        // a poll answered; hello (event) / start (id 1) / shutdown (id 2)
+        // stay non-conflicting.
+        let mut next_request_id: u64 = 3;
         loop {
             if shutdown_requested() {
                 return self.request_shutdown(pipes, shutdown_requested);
             }
 
+            let poll_id = next_request_id;
+            next_request_id += 1;
             if send_request(
                 &pipes.stdin_tx,
-                3,
+                poll_id,
                 "recording.status",
                 serde_json::Value::Null,
             )
@@ -663,37 +671,46 @@ impl<L: WorkerLauncher> WorkerSupervisor<L> {
                             result,
                             ..
                         } = *envelope
-                            && reply_id == 3
+                            && reply_id == poll_id
                         {
                             if let Some(terminal) = JobTerminal::parse(&result) {
                                 self.mark_job_terminal(terminal.clone());
-                                // A COMPLETED/STOPPED job leaves the worker's
-                                // serve loop alive and idle (final remediation
-                                // §1's clean-completion row): end the episode
-                                // CLEANLY by delivering a bounded protocol
-                                // shutdown instead of waiting forever on a
-                                // process that will never exit on its own.
-                                return Ok(
-                                    match self.request_shutdown(pipes, shutdown_requested)? {
-                                        Flow::ShutdownAcked | Flow::EofAfterShutdownRequest => {
-                                            match terminal {
-                                                JobTerminal::Completed => Flow::JobCompleted,
-                                                JobTerminal::Stopped => Flow::ShutdownAcked,
-                                                JobTerminal::Failed(_) => {
-                                                    Flow::JobFailedObservation
-                                                }
-                                            }
-                                        }
-                                        // Wedged shutdown after a healthy job:
-                                        // still an unhealthy episode (bounded).
-                                        other => other,
-                                    },
-                                );
+                                // Final correctness remediation §3: the
+                                // recording-job terminal state is AUTHORITATIVE.
+                                // The worker cleanup shutdown below is
+                                // best-effort process hygiene — its outcome
+                                // (acked, lost, wedged, or errored) never
+                                // reinterprets the recording result.
+                                let authoritative = match terminal {
+                                    JobTerminal::Completed => Flow::JobCompleted,
+                                    JobTerminal::Stopped => Flow::ShutdownAcked,
+                                    JobTerminal::Failed(_) => Flow::JobFailedObservation,
+                                };
+                                // A terminal job state leaves the worker's
+                                // serve loop alive and idle: end the episode
+                                // with a bounded cleanup shutdown, and if the
+                                // worker fails to exit cleanly, force-terminate
+                                // so reaping can never block on a wedged
+                                // process. Anomaly is logged; the outcome is
+                                // already known.
+                                let cleanup = self.request_shutdown(pipes, shutdown_requested);
+                                if !matches!(
+                                    cleanup,
+                                    Ok(Flow::ShutdownAcked | Flow::EofAfterShutdownRequest)
+                                ) {
+                                    tracing::warn!(
+                                        "worker cleanup shutdown after a terminal job state did                                          not complete; force-terminating (recording outcome kept)"
+                                    );
+                                    let _ = pipes.stdin_tx.send(WriterCommand::Close);
+                                    let _ = pipes.child.kill();
+                                }
+                                return Ok(authoritative);
                             }
                             answered = true; // running normally
                         }
-                        // Stray other-id replies/events: keep waiting for
-                        // OUR response within the same deadline.
+                        // Stray other-id replies (including LATE replies to
+                        // older polls) and events: keep waiting for OUR
+                        // response within the same deadline.
                     }
                     Recv::Eof => return Ok(Flow::ChildDied),
                     Recv::DecodeError(text) => {

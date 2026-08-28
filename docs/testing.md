@@ -126,7 +126,7 @@ permanent (spawn-count proves no second worker); terminal
 `Unresponsive{phase:"monitor"}` within the missed-poll bound, then
 restartable; backoff waits interrupted by operator shutdown.
 
-### Recovery idempotency + classification (final remediation §5/§7)
+### Recovery idempotency + classification (final rem. §5/§7 + final correctness §1/§2/§5/§7)
 
 * Deterministic recovery identity tests (`nian-recorder`): a surviving
   original whose deterministic final already exists is reported
@@ -140,6 +140,39 @@ restartable; backoff waits interrupted by operator shutdown.
   occupied by a file) surfaces `RecoveryError::Storage` with
   `is_infrastructure()==true` — the worker-level permanent-job signal —
   while content failures quarantine per file.
+* Concurrent recovery (final correctness §1): two process-shaped
+  attempts against the same original, synchronized at their publication
+  step by a deterministic barrier hook — unique per-attempt scratch
+  pathnames, exactly one recovered final, independently probeable, loser
+  reports AlreadyRecovered and removes only its own scratch.
+* Cooperative graceful stop in recovery (final correctness §2): the
+  run-level stop flag is observed at every safe boundary (before each
+  partial, before reopen, before scratch claim, between packets, before
+  finalize/publication); a pre-publication delay hook holds attempts
+  mid-flight so recorder- and worker-level tests prove ONE stop during
+  `recovering` ends bounded as `stopped` without a camera connection,
+  without publishing, and without a second press; protocol shutdown ends
+  recovery gracefully before its force-cancel grace.
+* AlreadyRecovered repair (final correctness §5): the recognition path
+  ensures the tombstone and retries the original's cleanup
+  (`original_removed` reported) — publish-succeeded + cleanup-failed
+  converges to final-exists/original-gone/tombstone-known.
+* Storage classification (final correctness §6/§7/§8): recovered MKV
+  classifies as a recording; scratch/tombstones as artifacts; unknown
+  names as Unknown; a stat failure on this attempt's finalized scratch is
+  a typed ARTIFACT failure that coexists with continued recording (worker
+  test) while scan/claim failures are INFRASTRUCTURE failures that fail
+  the job; the camera-dir pre-flight probes NEW-file writability with a
+  reserved no-overwrite probe file and fails on genuinely unwritable
+  targets.
+* Terminal authority (final correctness §3): terminal Completed/Failed/
+  Stopped statuses keep their outcomes (`JobCompletedCleanly` /
+  `PermanentRecordingFailure` / `RequestedShutdown`) even when the worker
+  never acknowledges its cleanup shutdown — spawn counters prove no
+  restart; the wedged worker is killed and reaped.
+* Poll ids (final correctness §4): a late response to poll N cannot
+  satisfy poll N+1 (episode-local monotonic ids); the missed-response
+  bound still classifies the episode Unresponsive.
 * Worker job lifecycle (`nian-media-worker` job tests): prompt
   `recording.start` ack with `recovering` state before any media work;
   async recovery accounted once per job; corrupt leftover quarantined

@@ -335,3 +335,99 @@ per-file content verdict (quarantine; recording continues), `Cancelled`
 is neither. The parent classifies `storage_unavailable` as a PERMANENT
 start refusal (no worker restart loop); `start_failed` (thread spawn) is
 the only transient refusal code.
+
+## Amendment (M3 final correctness remediation, 2026-08-28)
+
+### Unique per-attempt recovery scratch (review §1)
+
+The deterministic recovered FINAL and tombstone remain the idempotency
+anchor, but the recovery SCRATCH is now PER-ATTEMPT UNIQUE
+(`<base>.recovery-<pid>-<serial>-<nanos>.tmp`, created with atomic
+no-replace `create_new`). No attempt ever deletes a scratch it does not
+own — the previous shared-scratch design let two concurrent recovery
+processes unlink each other's active file (on Unix, orphaning a written
+inode while the other process owns the pathname). Concurrent recovery of
+one original is now arbitration-by-final: both attempts write distinct
+scratches, one no-replace publish commits, the loser observes
+`DestinationExists`, recognizes the deterministic final as already
+committed, removes ONLY its own scratch and reports `AlreadyRecovered`.
+A deterministic two-lane test (publication barrier hook) proves: exactly
+one final, distinct scratch pathnames, independently probeable final,
+loser = AlreadyRecovered, original never overwritten. Stale scratch
+cleanup is deferred to M4's janitor, which can classify them
+(`RecoveryScratch`) and delete only when ownership/staleness is provable.
+
+### Cooperative graceful stop during recovery (review §2)
+
+Recovery now observes BOTH stop domains: the InterruptHandle (force
+escalation) and the run-level StopFlag (the FIRST graceful press). At
+every safe boundary — before each partial, before the source reopen,
+before scratch acquisition, between packet operations, before finalize
+and before publication — a graceful stop abandons the attempt: private
+scratch removed, original untouched, nothing published unless the
+transaction already crossed its durable commit point, no further partial
+started, no camera connection. A pre-publication checkpoint hook (armed
+only by test builds) holds recovery mid-flight deterministically; worker
+tests prove start → `recovering` → ONE `recording.stop` → bounded
+`stopped` with no connection and no second press, and protocol shutdown
+ending recovery gracefully before its force-cancel grace.
+
+### Terminal job state is authoritative (review §3)
+
+When the parent observes a terminal `recording.status`, that outcome is
+recorded FIRST and returned REGARDLESS of what the worker cleanup
+shutdown does. The cleanup shutdown is best-effort process hygiene: if it
+fails to complete, the worker is force-terminated and reaped, the anomaly
+is logged, and the already-known outcome is returned — Completed stays
+`JobCompletedCleanly`, Failed stays `PermanentRecordingFailure`, Stopped
+stays `RequestedShutdown`. A wedged cleanup can never reinterpret the
+recording into a retryable episode, and `run_forever` tests with spawn
+counters prove no restart for any of the three terminal kinds when the
+shutdown ack is lost.
+
+### Episode-local monotonic status-poll ids (review §4)
+
+Status polls allocate fresh, monotonically increasing request ids (from
+3; start stays 1, shutdown 2). Only the freshly allocated id can mark a
+poll answered and reset the missed-response counter; a late reply to an
+older poll is ignored. A stub test proves a late id-3 response arriving
+during poll 2's window does not satisfy it — the episode still becomes
+`Unresponsive{phase:"monitor"}` within the missed-poll bound.
+
+### AlreadyRecovered repairs the transaction (review §5)
+
+The already-recovered recognition path now also verifies/creates the
+tombstone and RETRIES the original's cleanup, reporting
+`original_removed` on the outcome. Convergence: publish-succeeded +
+cleanup-failed eventually becomes "final exists, original gone, tombstone
+in known state" instead of re-scanning the same leftover forever; if
+cleanup still fails the original stays safe and a later startup retries.
+
+### Recording-tree file classification (review §6)
+
+`nian_storage::classify_recording_file_name` defines the M4-facing
+contract: `NormalRecording`, `RecoveredRecording` (`.recovered.mkv` is a
+FIRST-CLASS recording — M4 reconciliation enumerates it, retention
+accounts/deletes it), `ActiveOrCrashPartial`, `RecoveryScratch`,
+`RecoveryTombstone`, `Unknown`. Scratch and tombstones are never
+recordings.
+
+### Infrastructure vs artifact storage failures (review §7)
+
+`RecoveryError::Storage` is split: `Infrastructure { operation, source }`
+(scan failure, scratch-claim failure — the storage target is unsafe for
+new recording → the worker fails the job permanently, regardless of other
+files' successes) and `Artifact { operation, source }` (stat of this
+attempt's finalized scratch, non-collision publish failure — coexists
+with continued recording). No OS-error-string parsing anywhere; the
+worker's summary exposes `infrastructure_failures` strictly from the
+Infrastructure kind.
+
+### Writeability pre-flight (review §8)
+
+`ensure_camera_dir` now proves NEW-file writability, not just directory
+existence: after `create_dir_all`, a uniquely-named probe file
+(`.nian-write-probe-<pid>-<n>.tmp`, reserved non-recording name,
+classify-`Unknown`) is created with `create_new`, closed, and removed.
+It never overwrites user data; creation failure surfaces a genuine
+storage error (the worker's permanent `storage_unavailable` refusal).

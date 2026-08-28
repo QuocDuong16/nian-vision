@@ -20,10 +20,14 @@
 // Tests exercise failure paths directly; panicking asserts are idiomatic there.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod classification;
 pub mod error;
 pub mod paths;
 pub mod recovery;
 
+pub use classification::{
+    RecordingFileKind, classify_recording_file, classify_recording_file_name,
+};
 pub use error::StorageError;
 pub use paths::{RecordingsLayout, SEGMENT_EXTENSION, SEGMENT_PARTIAL_SUFFIX};
 pub use recovery::{PartialDisposition, PartialFile, scan_camera_partials};
