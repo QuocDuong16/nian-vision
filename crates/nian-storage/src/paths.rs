@@ -1,12 +1,31 @@
 //! Deterministic recordings directory layout with traversal-safe names.
 
 use std::collections::HashSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use nian_domain::CameraId;
 
 use crate::error::StorageError;
+
+#[cfg(test)]
+/// Test-only fault seam: the FIRST probe create reports a collision so the
+/// fresh-identity retry path is deterministically exercised.
+static PROBE_FIRST_CREATE_COLLIDES: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+/// Test-only fault seam: marks the injected collision as consumed.
+static PROBE_FIRST_CREATE_DONE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+/// Test-only fault seam: the probe removal fails deterministically.
+static PROBE_REMOVE_FAILS: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+/// Serializes fault-armed pre-flight tests against the process-global seams
+/// (parallel unit tests share these statics).
+static PREFLIGHT_FAULT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// File extension used for finalized recording segments.
 pub const SEGMENT_EXTENSION: &str = "mkv";
@@ -66,16 +85,26 @@ impl RecordingsLayout {
             .expect("validated CameraId is always path-safe")
     }
 
-    /// Creates the camera directory if missing AND proves it accepts NEW
-    /// file writes (final correctness remediation §8): `create_dir_all`
-    /// succeeding says nothing when the directory already exists, so a
-    /// cheap no-overwrite probe file (reserved non-recording name) is
-    /// created, closed and removed. The probe never overwrites user data
-    /// (`create_new`), never parses as a segment/recording/artifact name,
-    /// and is cleaned up immediately (a leftover probe is harmless and
-    /// classifies as `Unknown`). Failure surfaces a genuine storage error
-    /// — the worker's start pre-flight maps it to the permanent
-    /// `storage_unavailable` refusal.
+    /// Creates the camera directory if missing AND proves it is healthy
+    /// enough for Nian Vision's recording/retention lifecycle (final
+    /// correctness remediation §8, final safety remediation §4). The
+    /// pre-flight proves, in order:
+    ///
+    /// * the camera directory can be created/accessed;
+    /// * a FRESH file can be EXCLUSIVELY created (`create_new`);
+    /// * bytes can actually be written and flushed (`sync_all`);
+    /// * the probe can be closed;
+    /// * the probe can be REMOVED — a directory that accepts files but
+    ///   cannot delete them cannot host the retention lifecycle, so
+    ///   cleanup failure is surfaced, never silently ignored.
+    ///
+    /// Probe naming is collision-safe (pid + monotonic serial + clock
+    /// nanos): an `AlreadyExists` from a survived old probe retries with a
+    /// FRESH probe identity instead of condemning the storage root. The
+    /// reserved probe name never parses as a segment/recording/recovery
+    /// name (always classifies `Unknown`). Failure surfaces a genuine
+    /// storage error — the worker's start pre-flight maps it to the
+    /// permanent `storage_unavailable` refusal.
     pub fn ensure_camera_dir(&self, camera: &CameraId) -> Result<PathBuf, StorageError> {
         let dir = self.camera_dir(camera);
         std::fs::create_dir_all(&dir).map_err(|source| StorageError::Io {
@@ -84,24 +113,84 @@ impl RecordingsLayout {
         })?;
 
         static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let probe_serial = PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let probe = dir.join(format!(
-            ".nian-write-probe-{}-{probe_serial}.tmp",
-            std::process::id()
-        ));
-        let probe_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe)
-            .map_err(|source| StorageError::Io {
-                path: probe.clone(),
+        let mut last_collision: Option<StorageError> = None;
+        for _ in 0..8 {
+            let serial = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let probe = dir.join(format!(
+                ".nian-write-probe-{}-{serial}-{nanos}.tmp",
+                std::process::id()
+            ));
+            // Test-only seam: a deterministic first-attempt collision.
+            #[cfg(test)]
+            if PROBE_FIRST_CREATE_COLLIDES.load(Ordering::SeqCst)
+                && !PROBE_FIRST_CREATE_DONE.swap(true, Ordering::SeqCst)
+            {
+                last_collision = Some(StorageError::Io {
+                    path: probe,
+                    source: std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+                });
+                continue;
+            }
+            let mut probe_file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+            {
+                Ok(file) => file,
+                // A survived old probe (or an exotic collision): retry with
+                // another unique probe identity — the storage root is NOT
+                // classified unavailable for this.
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last_collision = Some(StorageError::Io {
+                        path: probe,
+                        source,
+                    });
+                    continue;
+                }
+                Err(source) => {
+                    return Err(StorageError::Io {
+                        path: probe,
+                        source,
+                    });
+                }
+            };
+            // Exclusive creation succeeded; prove bytes actually land and
+            // the handle closes cleanly.
+            let write_result = probe_file
+                .write_all(b"nian-vision write probe")
+                .and_then(|()| probe_file.sync_all());
+            drop(probe_file);
+            if let Err(source) = write_result {
+                let _ = std::fs::remove_file(&probe);
+                return Err(StorageError::Io {
+                    path: probe,
+                    source,
+                });
+            }
+            // The writeability proof is complete only when the probe can
+            // ALSO be removed (final safety remediation §4): cleanup
+            // failure is a genuine health finding, never ignored.
+            #[cfg(test)]
+            if PROBE_REMOVE_FAILS.load(Ordering::SeqCst) {
+                return Err(StorageError::Io {
+                    path: probe,
+                    source: std::io::Error::other("injected probe removal failure"),
+                });
+            }
+            std::fs::remove_file(&probe).map_err(|source| StorageError::Io {
+                path: probe,
                 source,
             })?;
-        drop(probe_file);
-        // The writeability proof is complete; cleanup is best-effort — a
-        // failed unlink must not mask the positive probe result.
-        let _ = std::fs::remove_file(&probe);
-        Ok(dir)
+            return Ok(dir);
+        }
+        Err(last_collision.unwrap_or_else(|| StorageError::Io {
+            path: dir,
+            source: std::io::Error::other("writeability probe exhausted collision retries"),
+        }))
     }
 
     /// `<root>/<camera-id>/<year>/<month>/<day>`
@@ -983,10 +1072,14 @@ mod tests {
 
     #[test]
     fn camera_dir_preflight_proves_writeability_and_cleans_up() {
-        // Final correctness remediation §8: the pre-flight must succeed on
-        // a writable tree, must NOT overwrite anything, and must leave no
-        // probe file behind. The probe file's reserved name never
-        // classifies as a recording, partial or recovery artifact.
+        // Final correctness remediation §8 + final safety remediation §4:
+        // the pre-flight must succeed on a writable tree, must NOT
+        // overwrite anything, and must leave no probe file behind. The
+        // probe file's reserved name never classifies as a recording,
+        // partial or recovery artifact.
+        let _fault_serialization = PREFLIGHT_FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = tempfile::tempdir().unwrap();
         let layout = layout_in(temp.path());
         let camera = CameraId::parse("cam-preflight").unwrap();
@@ -1007,8 +1100,63 @@ mod tests {
         // is exactly the case where create_dir_all alone proves nothing.
         layout.ensure_camera_dir(&camera).unwrap();
         assert!(
-            crate::classification::classify_recording_file_name(".nian-write-probe-1-0.tmp")
+            crate::classification::classify_recording_file_name(".nian-write-probe-1-0-42.tmp")
                 == crate::classification::RecordingFileKind::Unknown
+        );
+    }
+
+    #[test]
+    fn preflight_retries_with_a_fresh_probe_identity_on_collision() {
+        // Final safety remediation §4: an AlreadyExists from a survived old
+        // probe retries with another unique probe identity instead of
+        // classifying the storage root unavailable — and still leaves no
+        // probe behind.
+        let _fault_serialization = PREFLIGHT_FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        PROBE_FIRST_CREATE_COLLIDES.store(true, Ordering::SeqCst);
+        PROBE_FIRST_CREATE_DONE.store(false, Ordering::SeqCst);
+        PROBE_REMOVE_FAILS.store(false, Ordering::SeqCst);
+
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-collision").unwrap();
+
+        let dir = layout.ensure_camera_dir(&camera);
+        PROBE_FIRST_CREATE_COLLIDES.store(false, Ordering::SeqCst);
+        let dir = dir.expect("a probe collision must retry, not fail the pre-flight");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no probe may survive the pre-flight: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn preflight_surfaces_probe_removal_failure() {
+        // Final safety remediation §4: a directory where files can be
+        // created but NOT removed is not healthy enough for the
+        // recording/retention lifecycle — cleanup failure is surfaced as a
+        // genuine storage error, never silently ignored.
+        let _fault_serialization = PREFLIGHT_FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        PROBE_FIRST_CREATE_COLLIDES.store(false, Ordering::SeqCst);
+        PROBE_REMOVE_FAILS.store(true, Ordering::SeqCst);
+
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-undeletable").unwrap();
+
+        let outcome = layout.ensure_camera_dir(&camera);
+        PROBE_REMOVE_FAILS.store(false, Ordering::SeqCst);
+        assert!(
+            outcome.is_err(),
+            "a non-removable probe must fail the pre-flight"
         );
     }
 
@@ -1017,6 +1165,9 @@ mod tests {
         // A genuine infrastructure failure: the camera path is occupied by
         // a file, so neither the directory nor any new recording file can
         // exist there — regardless of privileges.
+        let _fault_serialization = PREFLIGHT_FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = tempfile::tempdir().unwrap();
         let layout = layout_in(temp.path());
         let camera = CameraId::parse("cam-blocked").unwrap();

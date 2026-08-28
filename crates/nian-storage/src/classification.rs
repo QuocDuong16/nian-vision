@@ -30,10 +30,11 @@ pub enum RecordingFileKind {
     /// A canonical crash partial: `<HH-MM-SS[-N]>.partial.mkv`. Neither a
     /// recording nor deletable without a recovery/retenion decision.
     ActiveOrCrashPartial,
-    /// One recovery attempt's private scratch (`<stem>.recovery-<unique
-    /// -attempt>.tmp`, plus the legacy single-scratch shape
-    /// `<stem>.recovered-tmp`). Never a recording; safe to delete only
-    /// when ownership/staleness is provable (M4 janitor's decision).
+    /// One recovery attempt's private scratch, matching the EXACT
+    /// production grammar `<canonical-stem>.recovery-<pid>-<serial>
+    /// -<nonce>.tmp` (final safety remediation §3). Never a recording;
+    /// safe to delete only when ownership/staleness is provable (M4
+    /// janitor's decision).
     RecoveryScratch,
     /// The post-publication transaction marker
     /// (`<stem>.recovered.mkv.done`). Never a recording.
@@ -51,9 +52,34 @@ const RECOVERED_NAME_SUFFIX: &str = ".recovered.mkv";
 const TOMBSTONE_NAME_SUFFIX: &str = ".done";
 /// Per-attempt recovery scratch infix (final correctness remediation §1).
 const SCRATCH_INFIX: &str = ".recovery-";
-/// Legacy single-scratch suffix from the first deterministic-identity
-/// round; still classified as scratch so old trees stay understandable.
-const LEGACY_SCRATCH_SUFFIX: &str = ".recovered-tmp";
+/// Per-attempt recovery scratch suffix (production generator shape).
+const SCRATCH_SUFFIX: &str = ".tmp";
+
+/// Matches ONLY the exact recovery-scratch grammar the production
+/// generator emits (final safety remediation §3):
+/// `<canonical-stem>.recovery-<pid>-<serial>-<nonce>.tmp` — the infix
+/// followed by exactly THREE non-empty all-numeric dash-separated
+/// components, then the `.tmp` suffix, on a canonical `<HH-MM-SS[-N]>`
+/// stem. Anything else (`.txt`/`.mkv` endings, missing or non-numeric
+/// components, foreign stems) classifies Unknown: the future M4 janitor
+/// must never be handed a broad matcher that could delete files Nian
+/// Vision does not own.
+fn is_recovery_scratch_name(name: &str) -> bool {
+    let Some(rest) = name.strip_suffix(SCRATCH_SUFFIX) else {
+        return false;
+    };
+    let Some((stem, tag)) = rest.split_once(SCRATCH_INFIX) else {
+        return false;
+    };
+    if !is_canonical_stem(stem) {
+        return false;
+    }
+    let components: Vec<&str> = tag.split('-').collect();
+    components.len() == 3
+        && components
+            .iter()
+            .all(|component| !component.is_empty() && component.bytes().all(|b| b.is_ascii_digit()))
+}
 
 /// Validates that `stem` has the canonical `<HH-MM-SS[-N]>` shape by
 /// parsing it as the stem of a canonical segment name.
@@ -91,12 +117,7 @@ pub fn classify_recording_file_name(name: &str) -> RecordingFileKind {
         };
     }
 
-    if name.ends_with(LEGACY_SCRATCH_SUFFIX)
-        || (name.contains(SCRATCH_INFIX)
-            && name
-                .rsplit_once(SCRATCH_INFIX)
-                .is_some_and(|(stem, _)| is_canonical_stem(stem)))
-    {
+    if is_recovery_scratch_name(name) {
         return RecordingFileKind::RecoveryScratch;
     }
 
@@ -161,14 +182,60 @@ mod tests {
             kind_of("08-30-00.recovered.mkv.done"),
             RecordingFileKind::RecoveryTombstone
         );
+        // The EXACT production scratch grammar: three numeric components.
         assert_eq!(
             kind_of("08-30-00.recovery-4194305-0-123456789.tmp"),
             RecordingFileKind::RecoveryScratch
         );
-        // Legacy single-scratch shape from the first identity round.
         assert_eq!(
-            kind_of("08-30-00.recovered-tmp"),
+            kind_of("08-30-00-3.recovery-1-42-999999999.tmp"),
             RecordingFileKind::RecoveryScratch
+        );
+    }
+
+    #[test]
+    fn scratch_classification_matches_only_the_exact_production_grammar() {
+        // Final safety remediation §3: RecoveryScratch must never hand the
+        // future M4 janitor a broad matcher. Every deviation from the
+        // generator's shape is Unknown.
+        assert_eq!(
+            kind_of("08-30-00.recovery-not-ours.txt"),
+            RecordingFileKind::Unknown
+        );
+        assert_eq!(
+            kind_of("08-30-00.recovery-123.mkv"),
+            RecordingFileKind::Unknown
+        );
+        assert_eq!(
+            kind_of("08-30-00.recovery-.tmp"),
+            RecordingFileKind::Unknown
+        );
+        // Wrong component counts / non-numeric components.
+        assert_eq!(
+            kind_of("08-30-00.recovery-123-456.tmp"),
+            RecordingFileKind::Unknown
+        );
+        assert_eq!(
+            kind_of("08-30-00.recovery-1-2-3-4.tmp"),
+            RecordingFileKind::Unknown
+        );
+        assert_eq!(
+            kind_of("08-30-00.recovery-12a-3-4.tmp"),
+            RecordingFileKind::Unknown
+        );
+        assert_eq!(
+            kind_of("08-30-00.recovery--1-2.tmp"),
+            RecordingFileKind::Unknown
+        );
+        // A non-canonical stem is foreign even with the right tail.
+        assert_eq!(
+            kind_of("holiday-video.recovery-1-2-3.tmp"),
+            RecordingFileKind::Unknown
+        );
+        // A second infix makes the tag non-numeric.
+        assert_eq!(
+            kind_of("08-30-00.recovery-1.recovery-2-3-4.tmp"),
+            RecordingFileKind::Unknown
         );
     }
 

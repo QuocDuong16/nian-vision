@@ -34,6 +34,6 @@ pub use camera::{CameraEndpoint, CameraState, Credentials};
 pub use error::DomainError;
 pub use ids::{CameraId, RecordingId};
 pub use media::{MediaPacketMetadata, MediaProbeReport, MediaRational, MediaStreamInfo, MediaType};
-pub use recording::RecordingState;
+pub use recording::{FailureCategory, RecordingState};
 pub use retention::{RetentionPolicy, StorageQuota};
 pub use secret::Secret;

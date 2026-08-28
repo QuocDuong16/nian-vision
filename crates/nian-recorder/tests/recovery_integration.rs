@@ -84,14 +84,20 @@ impl Storage {
     }
 }
 
-/// Recovery-owned artifacts (deterministic identity names, final remediation
-/// §5): never recordings, never crash partials, invisible to the scanner.
+/// Recovery-owned artifacts (scratch + tombstone, final safety remediation
+/// §1/§3): never recordings, never crash partials, invisible to the scanner.
+/// Classification goes through the SAME production classifier the M4 janitor
+/// will use — never a hand-rolled suffix list.
 fn is_recovery_artifact(path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    name.ends_with(".recovered-tmp") || name.ends_with(".done")
+    matches!(
+        nian_storage::classify_recording_file_name(name),
+        nian_storage::RecordingFileKind::RecoveryScratch
+            | nian_storage::RecordingFileKind::RecoveryTombstone
+    )
 }
 
 fn list_files(dir: &Path) -> Vec<PathBuf> {

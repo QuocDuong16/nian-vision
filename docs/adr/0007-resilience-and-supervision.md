@@ -431,3 +431,92 @@ existence: after `create_dir_all`, a uniquely-named probe file
 classify-`Unknown`) is created with `create_new`, closed, and removed.
 It never overwrites user data; creation failure surfaces a genuine
 storage error (the worker's permanent `storage_unavailable` refusal).
+
+## Amendment 4 — M3 final safety remediation (2026-08-28)
+
+### Tombstone transaction/conflict contract (review §1)
+
+A deterministic destination's mere EXISTENCE is never proof that the
+original was recovered: directories, zero-byte files, corrupt files,
+foreign files or unrelated valid media may sit at the deterministic
+pathname, and nothing may be deleted on name-based inference. The
+explicit contract:
+
+* **A** — final absent → normal recovery attempt;
+* **B** — final present AND a TRUSTED tombstone (magic line
+  `NIAN-RECOVERY-TOMBSTONE v1` + strict `original:`/`final:` name lines,
+  validated against THIS transaction) proves the pair →
+  `AlreadyRecovered` with a cleanup retry (`NotFound` counts as
+  converged);
+* **C** — final present WITHOUT trusted evidence → new
+  `RecoveryOutcome::RecoveryConflict`: original and destination both
+  preserved, no remux, no retroactive success tombstone, no deletion of
+  either file. Reported observably (`RecoverySummary.conflicts` on the
+  status wire).
+
+Publication order stays: `publish_no_replace` → tombstone (create_new +
+durable sync) → remove original LAST. A crash between publication and
+tombstone is a preserved conflict, never a guess. Concurrent races: the
+loser observing `DestinationExists` resolves it through the SAME
+contract; inside the winner's not-yet-tombstoned window the loser
+reports the pending conflict and NEVER deletes the original — the
+winner's own tombstone+cleanup converges the tree (deterministically
+tested via the post-publication hold seam).
+
+### Alignment probe observes graceful stop (review §2)
+
+The keyframe-alignment probe is an EXPLICIT loop: graceful stop and
+forced cancellation are checked before EVERY `next_packet`, and errors
+are classified deliberately (cancellation → `Cancelled`; media failure →
+per-file content quarantine). The old `while let Some(...) =
+next_packet().ok().flatten()` shape — which collapsed EOF, media errors,
+timeouts and cancellation into one silent path — is gone. Deterministic
+coverage parks an attempt INSIDE the alignment phase (recorder-level
+gate seam and a worker-level test: one stop ends the job without any
+camera connection).
+
+### Exact scratch grammar (review §3)
+
+`RecordingFileKind::RecoveryScratch` matches ONLY the production
+generator's shape `<canonical-stem>.recovery-<pid>-<serial>-<nonce>.tmp`
+(three non-empty all-numeric dash-separated components before `.tmp`).
+Wrong extensions, wrong component counts, non-numeric components and
+foreign stems all classify `Unknown` — the future M4 janitor never
+receives a broad matcher.
+
+### Hardened writeability pre-flight (review §4)
+
+`ensure_camera_dir` now proves, in order: directory create/access,
+exclusive file creation (`create_new`), actual byte write + `sync_all`,
+clean close, and probe REMOVAL. Probe-cleanup failure is surfaced as a
+genuine storage error (a tree that cannot delete files cannot host the
+retention lifecycle) — never silently ignored. Probe naming is
+collision-safe (pid + monotonic serial + clock nanos) with fresh-identity
+retries on `AlreadyExists`; probes keep classifying `Unknown`.
+
+### Output-side failure classification (review §5)
+
+Muxer open, write and finalize/trailer/flush failures on THIS attempt's
+own scratch are `RecoveryError::Artifact` (operations `open the recovery
+output`, `write the recovery output`, `finalize the recovery output`) —
+never `Unreadable`, which is reserved for content verdicts about the
+original. Invariant preserved: any output failure removes only this
+attempt's scratch and never publishes; the original stays untouched.
+`Infrastructure` remains reserved for mechanically justified storage-
+target unsafety (scan/claim); FFmpeg error strings are never parsed.
+
+### Scratch serial + protocol strictness (reviews §6/§7/§8)
+
+The scratch serial is a genuinely PROCESS-GLOBAL monotonic counter
+documented as such (pid + global serial + nanos, with `create_new` as
+the final arbiter). `JobTerminal::parse` is now strict: `finished=true`
+with an unknown/missing `end_kind`, or `failed` with a missing/invalid
+`failure_category`, is a PROTOCOL VIOLATION (`PermanentProtocol`, typed
+`TerminalParseError`) — never silently "still running", never an invented
+`Unknown` category. The category vocabulary itself moved to the
+FFmpeg-free `nian-domain` crate (`FailureCategory` re-exported by
+`nian-recorder`) so parent and worker validate the SAME strings.
+`SupervisorState` gained an explicit stable wire representation
+(`as_str`: `idle`/`connecting`/`recording`/`backoff`/`stopped`/`failed`),
+replacing the Debug-then-lowercase conversion in the worker's status
+fold.

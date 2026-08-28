@@ -14,37 +14,53 @@
 //! 3. anything that cannot be PROVEN recoverable keeps its partial file in
 //!    place untouched: no invented recordings, no blind renames to final.
 //!
-//! # Idempotency: deterministic FINAL, unique SCRATCH (final correctness
-//! remediation §1/§5)
+//! # Idempotency: deterministic FINAL, unique SCRATCH, TRUSTED tombstone
+//! (final correctness remediation §1/§5, final safety remediation §1)
 //!
 //! The recovered FINAL and the tombstone are DETERMINISTIC, derived from
 //! the original's canonical name ([`recovery_identity`]): the same
 //! surviving original always resolves to the same `<base>.recovered.mkv`
 //! and the same `<base>.recovered.mkv.done` marker no matter how many
-//! passes run. The final's mere existence is the authoritative
-//! "already recovered" signal — a repeat pass recognizes it BEFORE opening
-//! the demuxer and never remuxes again, so the same original can never
-//! produce a second recording.
+//! passes run. The final's MERE EXISTENCE IS NEVER PROOF (final safety
+//! remediation §1): a directory, zero-byte file, corrupt file, foreign
+//! file, or unrelated valid media file may sit at the deterministic
+//! pathname. Instead, an explicit transaction/conflict contract decides:
+//!
+//! * A. final absent → a normal recovery attempt;
+//! * B. final present AND a TRUSTED tombstone (magic version line + the
+//!   exact original/final names, strictly parsed) proves THIS
+//!   original→final transaction → `AlreadyRecovered` with a cleanup
+//!   retry — no remux, no duplicate;
+//! * C. final present WITHOUT trusted evidence → `RecoveryConflict`:
+//!   original and destination both preserved, no remux, no retroactive
+//!   success tombstone, no deletion of either file. No recording data is
+//!   ever deleted on name-based inference; crash-after-publication-before-
+//!   tombstone states are recoverable conflicts, and future repair tooling
+//!   may inspect them — M3 stays lossless first.
 //!
 //! The recovery SCRATCH is per-ATTEMPT UNIQUE
 //! (`<base>.recovery-<pid>-<serial>-<nanos>.tmp`, created with atomic
 //! no-replace `create_new` and never deleted unless THIS attempt owns it).
 //! Two concurrent recovery processes therefore write two different
 //! scratch pathnames; the deterministic final arbitrates: the winner's
-//! no-replace publish commits, the loser observes `DestinationExists`,
-//! recognizes the final as already committed, removes ONLY its own
-//! scratch and reports `AlreadyRecovered`. A scan-then-delete race over a
+//! no-replace publish commits, the winner THEN writes the trusted
+//! tombstone and removes the original, and the loser observes
+//! `DestinationExists` and resolves it through the SAME contract —
+//! potentially still inside the window where the winner has not yet
+//! written its tombstone. There the loser reports the pending conflict and
+//! leaves the original untouched; the winner's own tombstone+cleanup (or a
+//! later startup pass) converges the tree. A scan-then-delete race over a
 //! shared scratch name — where one process could unlink another's active
 //! scratch and keep writing an orphaned inode — cannot happen by
 //! construction.
 //!
 //! After publication, the tombstone sidecar (created with atomic
-//! no-replace `create_new`) records the transaction for observability. A
-//! crash anywhere leaves a state the next pass resolves correctly, and the
-//! already-recovered path REPAIRS the transaction (§5): ensure the
-//! tombstone, retry removing the original, report the cleanup result —
-//! convergence to "final exists, original gone, tombstone in known state"
-//! instead of re-scanning the same leftover forever.
+//! no-replace `create_new` and a durable sync) records the transaction as
+//! TRUSTED evidence. A crash anywhere leaves a state the next pass
+//! resolves correctly, and the already-recovered path REPAIRS the
+//! transaction (§5): retry removing the original, report the cleanup
+//! result — convergence to "final exists, original gone, tombstone
+//! trusted" instead of re-scanning the same leftover forever.
 //!
 //! All identity names (`<base>.recovered.mkv`, `…done`, the unique
 //! scratch) never parse as canonical segment names — see
@@ -60,30 +76,34 @@
 //! overwritten by recovery, and normal-recording names never collide with
 //! recovery identities.
 //!
-//! # Cooperative graceful stop (final correctness remediation §2)
+//! # Cooperative graceful stop (final correctness remediation §2, final
+//! safety remediation §2)
 //!
 //! Recovery observes BOTH stop domains: the [`InterruptHandle`] (force
 //! cancellation of blocked FFmpeg I/O — the escalation) and the run-level
 //! [`StopFlag`] (the FIRST graceful stop). At every safe boundary — before
 //! each partial, before the source reopen, before scratch acquisition,
-//! between packet operations, before finalize and before publication — a
-//! graceful stop request abandons the attempt: the attempt's private
-//! scratch is removed, the original stays safely recoverable, nothing
-//! publishes unless the transaction ALREADY crossed its durable
-//! publication commit point, and no further partial is started. The first
-//! `recording.stop` therefore never needs a second press merely because
-//! the job happens to be in `recovering`.
+//! before EVERY packet of the keyframe-alignment probe (an explicit loop,
+//! never a collapsed `while let`), between packet operations, before
+//! finalize and before publication — a graceful stop request abandons the
+//! attempt: the attempt's private scratch is removed, the original stays
+//! safely recoverable, nothing publishes unless the transaction ALREADY
+//! crossed its durable publication commit point, and no further partial is
+//! started. The first `recording.stop` therefore never needs a second
+//! press merely because the job happens to be in `recovering`.
 //!
-//! # Failure containment (final remediation §7 / final correctness §7)
+//! # Failure containment (final remediation §7 / final correctness §7 /
+//! final safety §5)
 //!
 //! Failures are TYPED, never string-classified. [`RecoveryError::
 //! Infrastructure`] means the storage TARGET is unsafe (the camera tree
 //! cannot be scanned, new files cannot be claimed where recovery must
 //! write) — the worker fails the recording job permanently when this
 //! occurs, regardless of other files' successes. [`RecoveryError::
-//! Artifact`] is a per-attempt storage problem on THIS attempt's own
-//! artifact (stat of the finalized scratch, a non-collision publish
-//! failure) — it coexists with continued recording. [`RecoveryError::
+//! Artifact`] is a per-attempt problem on THIS attempt's own artifact —
+//! including every OUTPUT-side failure (open, write, finalize/trailer/
+//! flush of the scratch), which is never evidence about the original's
+//! content — so it coexists with continued recording. [`RecoveryError::
 //! Unreadable`] quarantines one partial's content. [`RecoveryError::
 //! Cancelled`] is stop/shutdown, neither breakage nor a verdict. One
 //! partial's failure never aborts other files, and the source file always
@@ -123,12 +143,172 @@ pub mod test_hooks {
     /// armed attempts arrive — the deterministic concurrency seam for
     /// simultaneous recovery of one original.
     pub static PUBLISH_BARRIER: Mutex<Option<Arc<std::sync::Barrier>>> = Mutex::new(None);
+    /// When armed, the FIRST attempt to reach its post-publication
+    /// bookkeeping parks there (after `publish`, before the tombstone) until
+    /// released — the deterministic seam for the concurrent-loser window of
+    /// final safety remediation §1: a second attempt observes
+    /// `DestinationExists` while NO trusted tombstone exists yet.
+    pub static PUBLISH_HOLD: Mutex<Option<Arc<PublishHold>>> = Mutex::new(None);
+    /// When armed, an attempt parks INSIDE the keyframe-alignment probe
+    /// (before its first packet read) until released — the deterministic
+    /// seam proving graceful stop is observed during ALIGNMENT (final
+    /// safety remediation §2), not merely at the publication checkpoint.
+    pub static ALIGNMENT_GATE: Mutex<Option<Arc<AlignmentGate>>> = Mutex::new(None);
+    /// When armed, the attempt's muxer target is pointed at an
+    /// un-creatable location AFTER the scratch claim succeeded — the
+    /// deterministic output-OPEN failure seam (final safety remediation §5).
+    pub static BREAK_OUTPUT_OPEN: AtomicBool = AtomicBool::new(false);
+    /// When armed, the muxer finalize step fails deterministically (final
+    /// safety remediation §5).
+    pub static FAIL_FINALIZE: AtomicBool = AtomicBool::new(false);
     /// Every scratch path this process claimed, in claim order (uniqueness
     /// assertions for concurrent attempts).
     pub static CLAIMED_SCRATCHES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
     /// Serializes every fault-armed test against the process-global hooks.
     pub static FAULT_LOCK: Mutex<()> = Mutex::new(());
+
+    /// One-shot arrival/release gate parked at INSIDE the alignment probe.
+    pub struct AlignmentGate {
+        arrived: (Mutex<bool>, std::sync::Condvar),
+        released: (Mutex<bool>, std::sync::Condvar),
+    }
+
+    impl AlignmentGate {
+        pub(super) fn new() -> Self {
+            Self {
+                arrived: (Mutex::new(false), std::sync::Condvar::new()),
+                released: (Mutex::new(false), std::sync::Condvar::new()),
+            }
+        }
+
+        /// Blocks until the recovery attempt has parked at the alignment
+        /// probe (test-side wait).
+        pub fn wait_arrived(&self) {
+            let mut arrived = self
+                .arrived
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*arrived {
+                arrived = self
+                    .arrived
+                    .1
+                    .wait(arrived)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+
+        /// Parks the recovery attempt (pipeline-side): signals arrival, then
+        /// blocks until the test releases.
+        pub(super) fn park(&self) {
+            {
+                let mut arrived = self
+                    .arrived
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *arrived = true;
+            }
+            self.arrived.1.notify_all();
+            let mut released = self
+                .released
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = self
+                    .released
+                    .1
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+
+        /// Releases the parked attempt (test-side).
+        pub fn release(&self) {
+            {
+                let mut released = self
+                    .released
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *released = true;
+            }
+            self.released.1.notify_all();
+        }
+    }
+
+    /// One-shot arrival/release gate parked AFTER publication but BEFORE the
+    /// tombstone write — exactly the concurrent-loser window.
+    pub struct PublishHold {
+        arrived: (Mutex<bool>, std::sync::Condvar),
+        released: (Mutex<bool>, std::sync::Condvar),
+    }
+
+    impl PublishHold {
+        pub(super) fn new() -> Self {
+            Self {
+                arrived: (Mutex::new(false), std::sync::Condvar::new()),
+                released: (Mutex::new(false), std::sync::Condvar::new()),
+            }
+        }
+
+        /// Blocks until the winner has PUBLISHED and parked (test-side).
+        pub fn wait_arrived(&self) {
+            let mut arrived = self
+                .arrived
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*arrived {
+                arrived = self
+                    .arrived
+                    .1
+                    .wait(arrived)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+
+        /// Parks the winner (pipeline-side): signals arrival, then blocks
+        /// until the test releases.
+        pub(super) fn park(&self) {
+            {
+                let mut arrived = self
+                    .arrived
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *arrived = true;
+            }
+            self.arrived.1.notify_all();
+            let mut released = self
+                .released
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = self
+                    .released
+                    .1
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+
+        /// Releases the winner so its tombstone/cleanup complete (test-side).
+        pub fn release(&self) {
+            {
+                let mut released = self
+                    .released
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *released = true;
+            }
+            self.released.1.notify_all();
+        }
+    }
 
     pub struct Guard;
 
@@ -140,7 +320,15 @@ pub mod test_hooks {
             FAIL_METADATA.store(false, Ordering::SeqCst);
             HIJACK_CLEANUP_TO_DIR.store(false, Ordering::SeqCst);
             PRE_PUBLISH_DELAY_MS.store(0, Ordering::SeqCst);
+            FAIL_FINALIZE.store(false, Ordering::SeqCst);
+            BREAK_OUTPUT_OPEN.store(false, Ordering::SeqCst);
             *PUBLISH_BARRIER
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *PUBLISH_HOLD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *ALIGNMENT_GATE
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             CLAIMED_SCRATCHES
@@ -153,9 +341,11 @@ pub mod test_hooks {
 
 #[cfg(any(test, feature = "test-hooks"))]
 use test_hooks::{
-    CLAIMED_SCRATCHES as HOOK_SCRATCHES, FAIL_METADATA as HOOK_FAIL_METADATA,
-    HIJACK_CLEANUP_TO_DIR as HOOK_HIJACK_CLEANUP, PRE_PUBLISH_DELAY_MS as HOOK_DELAY_MS,
-    PUBLISH_BARRIER as HOOK_BARRIER, WRITE_CALLS as HOOK_WRITE_CALLS,
+    ALIGNMENT_GATE as HOOK_ALIGNMENT_GATE, BREAK_OUTPUT_OPEN as HOOK_BREAK_OUTPUT_OPEN,
+    CLAIMED_SCRATCHES as HOOK_SCRATCHES, FAIL_FINALIZE as HOOK_FAIL_FINALIZE,
+    FAIL_METADATA as HOOK_FAIL_METADATA, HIJACK_CLEANUP_TO_DIR as HOOK_HIJACK_CLEANUP,
+    PRE_PUBLISH_DELAY_MS as HOOK_DELAY_MS, PUBLISH_BARRIER as HOOK_BARRIER,
+    PUBLISH_HOLD as HOOK_PUBLISH_HOLD, WRITE_CALLS as HOOK_WRITE_CALLS,
     WRITE_FAIL_AFTER_CALLS as HOOK_WRITE_FAIL_AFTER,
 };
 
@@ -201,6 +391,46 @@ pub fn arm_publish_barrier(lanes: usize) -> test_hooks::Guard {
     test_hooks::Guard
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
+/// Arms the post-publication hold: the FIRST attempt to publish parks after
+/// `publish` but BEFORE the tombstone write, deterministically opening the
+/// concurrent-loser window of final safety remediation §1. Returns the guard
+/// plus the hold handle (`wait_arrived` / `release`).
+pub fn arm_publish_hold() -> (test_hooks::Guard, std::sync::Arc<test_hooks::PublishHold>) {
+    let hold = std::sync::Arc::new(test_hooks::PublishHold::new());
+    *test_hooks::PUBLISH_HOLD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::clone(&hold));
+    (test_hooks::Guard, hold)
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+/// Arms the alignment gate: the attempt parks INSIDE the keyframe-alignment
+/// probe before its first packet read. Returns the guard plus the gate
+/// handle (`wait_arrived` / `release`).
+pub fn arm_alignment_gate() -> (test_hooks::Guard, std::sync::Arc<test_hooks::AlignmentGate>) {
+    let gate = std::sync::Arc::new(test_hooks::AlignmentGate::new());
+    *test_hooks::ALIGNMENT_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::clone(&gate));
+    (test_hooks::Guard, gate)
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+/// Arms the deterministic finalize fault (final safety remediation §5).
+pub fn arm_finalize_failure() -> test_hooks::Guard {
+    test_hooks::FAIL_FINALIZE.store(true, Ordering::SeqCst);
+    test_hooks::Guard
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+/// Arms the deterministic output-OPEN fault: the muxer target is pointed at
+/// an un-creatable location AFTER a successful scratch claim.
+pub fn arm_output_open_fault() -> test_hooks::Guard {
+    test_hooks::BREAK_OUTPUT_OPEN.store(true, Ordering::SeqCst);
+    test_hooks::Guard
+}
+
 /// Canonical `<HH-MM-SS>.partial.mkv` name for a timestamp — the exact
 /// shape the scanner accepts (mirrors nian-storage's allocator naming).
 #[cfg(any(test, feature = "test-hooks"))]
@@ -225,21 +455,46 @@ pub enum RecoveryOutcome {
         reason: String,
     },
 
-    /// This original's deterministic recovered final ALREADY exists — an
-    /// earlier pass published it (possibly crashing before cleanup).
-    /// Recognized WITHOUT opening the demuxer, so the same surviving
-    /// original can never be remuxed (or duplicated) again. The path then
-    /// REPAIRS the transaction (final correctness remediation §5): ensure
-    /// the tombstone, retry removing the original, report the result.
+    /// This original's deterministic recovered final ALREADY exists AND a
+    /// TRUSTED tombstone proves this exact original→final transaction
+    /// (final safety remediation §1, case B). Recognized WITHOUT opening
+    /// the demuxer, so the same surviving original can never be remuxed (or
+    /// duplicated) again. The path then REPAIRS the transaction (final
+    /// correctness remediation §5): retry removing the original, report
+    /// the cleanup result.
     AlreadyRecovered {
         /// The surviving original partial.
         partial_path: PathBuf,
         /// The recording published by the earlier pass.
         final_path: PathBuf,
-        /// Whether the cleanup retry removed the original THIS pass.
-        /// `false` is observable: the original stays safely recoverable,
-        /// idempotency is unaffected, and a later startup retries.
+        /// Whether the cleanup retry removed the original THIS pass
+        /// (`true` also when it was already gone — the transaction has
+        /// converged). `false` is observable: the original stays safely
+        /// recoverable, idempotency is unaffected, and a later startup
+        /// retries.
         original_removed: bool,
+    },
+
+    /// The deterministic recovered destination ALREADY exists but carries
+    /// NO trusted transaction evidence for THIS original→final pair (final
+    /// safety remediation §1, case C): a directory, a zero-byte/foreign
+    /// file, a valid-but-unrelated media file, a crash between publication
+    /// and tombstone, or a concurrent winner that has not yet written its
+    /// tombstone. Both the original partial AND the destination are
+    /// preserved UNTOUCHED: no remux, no retroactive success tombstone, no
+    /// deletion of either file — pathname existence alone is never proof,
+    /// and no recording data may be deleted on name-based inference.
+    /// Future repair tooling may inspect such conflicts; M3 stays
+    /// lossless-first. A concurrent winner's own tombstone+cleanup remains
+    /// authoritative and converges the tree afterwards.
+    RecoveryConflict {
+        /// The preserved original partial.
+        partial_path: PathBuf,
+        /// The preserved existing destination.
+        final_path: PathBuf,
+        /// Human-safe conflict description (no secrets; operator-known
+        /// paths only).
+        reason: String,
     },
 
     /// Readable content was salvaged through THIS attempt's unique scratch,
@@ -302,10 +557,15 @@ pub enum RecoveryError {
     },
 
     /// A per-ATTEMPT storage problem on this attempt's OWN artifact: the
-    /// finalized scratch could not be stat-ed, or the no-replace publish
-    /// failed with something other than the idempotent collision. The
-    /// scratch was claimed successfully, so the storage root demonstrably
-    /// still accepts new files — this coexists with continued recording.
+    /// finalized scratch could not be stat-ed, the no-replace publish
+    /// failed with something other than the idempotent collision, or an
+    /// OUTPUT-side failure opening/writing/finalizing this attempt's own
+    /// scratch (final safety remediation §5 — a mux/output write, trailer
+    /// or flush failure is NOT evidence that the original partial's
+    /// content is unreadable, so it is never classified as a content
+    /// verdict). The scratch was claimed successfully, so the storage root
+    /// demonstrably still accepts new files — this coexists with continued
+    /// recording.
     #[error("recovery artifact failure while trying to {operation}: {source}")]
     Artifact {
         /// Which operation failed (stable label, not an OS string).
@@ -316,9 +576,9 @@ pub enum RecoveryError {
     },
 
     /// One partial's CONTENT could not be proven recoverable (failed open,
-    /// no video stream, no usable time base, trailer/flush failure on the
-    /// salvage output, or a poisoned mux write). Per-file only: quarantine
-    /// the file and keep recording — it must never block new camera work.
+    /// no video stream, no usable time base, or a poisoned/unreadable
+    /// source). Per-file only: quarantine the file and keep recording — it
+    /// must never block new camera work.
     #[error("partial is not provably recoverable media: {message}")]
     Unreadable {
         /// Human-safe backend description (secret-free by media-layer
@@ -352,10 +612,13 @@ impl RecoveryError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecoveryIdentity {
     /// Deterministic recovered recording (`<base>.recovered.mkv`). Its
-    /// EXISTENCE is the authoritative already-recovered signal.
+    /// existence alone is NOT proof of anything (final safety remediation
+    /// §1) — it must be resolved through
+    /// [`tombstone_proves_transaction`] / [`resolve_existing_final`].
     final_path: PathBuf,
     /// Tombstone sidecar (`<base>.recovered.mkv.done`), created atomically
-    /// (no-replace) only after publication.
+    /// (no-replace, durable) only after a publication by THIS pass. It is
+    /// the ONLY trusted already-recovered evidence.
     tombstone: PathBuf,
 }
 
@@ -374,37 +637,146 @@ fn recovery_identity(partial_path: &Path) -> Option<RecoveryIdentity> {
     })
 }
 
-/// Writes the tombstone sidecar with atomic no-replace semantics; returns
-/// whether it NOW persists as a regular file (freshly created or left by an
-/// earlier pass). Creation only ever happens after the recovered final is
-/// published (§5); a `false` here is the observable persistence failure.
-fn ensure_tombstone(identity: &RecoveryIdentity, original: &Path) -> bool {
-    if identity.tombstone.is_file() {
+/// Magic first line of a TRUSTED tombstone (final safety remediation §1).
+/// A `.done` file without exactly this structure is foreign content, never
+/// transaction evidence.
+const TOMBSTONE_MAGIC: &str = "NIAN-RECOVERY-TOMBSTONE v1";
+
+/// The transaction record a tombstone must carry to be trusted: the magic
+/// version line, the ORIGINAL canonical file name and the FINAL file name.
+/// Anything else — empty files, foreign markers, wrong names — fails
+/// validation and yields a preserved conflict instead of a deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TombstoneTransaction {
+    original: String,
+    final_name: String,
+}
+
+fn tombstone_payload(original_name: &str, final_name: &str) -> String {
+    format!("{TOMBSTONE_MAGIC}\noriginal: {original_name}\nfinal: {final_name}\n")
+}
+
+/// Strictly parses tombstone bytes; `None` for any malformed/foreign
+/// content (wrong magic, missing/mismatched fields, extra content).
+fn parse_tombstone(bytes: &[u8]) -> Option<TombstoneTransaction> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != TOMBSTONE_MAGIC {
+        return None;
+    }
+    let original = lines.next()?.strip_prefix("original: ")?;
+    let final_name = lines.next()?.strip_prefix("final: ")?;
+    if original.is_empty() || final_name.is_empty() || lines.next().is_some() {
+        return None;
+    }
+    Some(TombstoneTransaction {
+        original: original.to_owned(),
+        final_name: final_name.to_owned(),
+    })
+}
+
+/// Whether the tombstone next to the deterministic final TRUSTEDLY proves
+/// THIS original→final transaction (final safety remediation §1, case B):
+/// readable, structurally valid, AND naming exactly this pair. A tombstone
+/// for a different original/final is untrusted here — name matching is the
+/// transaction binding.
+fn tombstone_proves_transaction(identity: &RecoveryIdentity, original_name: &str) -> bool {
+    let Some(final_name) = identity.final_path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    std::fs::read(&identity.tombstone)
+        .ok()
+        .and_then(|bytes| parse_tombstone(&bytes))
+        .is_some_and(|transaction| {
+            transaction.original == original_name && transaction.final_name == final_name
+        })
+}
+
+/// Writes the tombstone sidecar with atomic no-replace semantics and a
+/// durable sync; returns whether it NOW persists as a TRUSTED transaction
+/// record for this original→final pair. Creation only ever happens after
+/// THIS pass published the recovered final (§1: never retroactively, to
+/// legitimize a pre-existing destination); a `false` here is the observable
+/// persistence failure.
+fn record_tombstone(identity: &RecoveryIdentity, original_name: &str) -> bool {
+    if tombstone_proves_transaction(identity, original_name) {
         return true;
     }
-    let payload = format!(
-        "nian-vision recovery tombstone\noriginal: {}\nfinal: {}\n",
-        original
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default(),
-        identity
-            .final_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default(),
-    );
-    std::fs::OpenOptions::new()
+    let final_name = identity
+        .final_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let payload = tombstone_payload(original_name, final_name);
+    let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true) // atomic no-replace on every supported platform
         .open(&identity.tombstone)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, payload.as_bytes()))
-        .is_ok()
+        .and_then(|mut file| {
+            std::io::Write::write_all(&mut file, payload.as_bytes())?;
+            file.sync_all()
+        })
+        .is_ok();
+    written && tombstone_proves_transaction(identity, original_name)
 }
 
-/// Process-unique serial for per-attempt scratch names: pid distinguishes
-/// concurrent PROCESSES, the counter distinguishes concurrent ATTEMPTS in
-/// one process, and the clock nanos break any exotic pid/counter reuse.
+/// Resolves an EXISTING deterministic destination against the transaction
+/// contract (final safety remediation §1). Both the early recognition path
+/// (before any media work) and the concurrent `DestinationExists` publish
+/// path come through here, so they can never disagree:
+///
+/// * trusted tombstone for this original→final pair → `AlreadyRecovered`
+///   with a cleanup retry (case B);
+/// * anything else → `RecoveryConflict`, preserving BOTH files (case C):
+///   no remux, no retroactive success tombstone, no deletion of either
+///   file. A concurrent winner that has published but not yet written its
+///   tombstone therefore surfaces as a pending conflict — the loser must
+///   NOT delete the original during that window; the winner's own
+///   tombstone+cleanup converges the tree afterwards.
+fn resolve_existing_final(identity: &RecoveryIdentity, partial_path: &Path) -> RecoveryOutcome {
+    let original_name = partial_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if tombstone_proves_transaction(identity, original_name) {
+        let original_removed = match std::fs::remove_file(partial_path) {
+            Ok(()) => true,
+            // Already gone: the transaction has converged — the cleanup
+            // goal is achieved whoever performed it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        return RecoveryOutcome::AlreadyRecovered {
+            partial_path: partial_path.to_path_buf(),
+            final_path: identity.final_path.clone(),
+            original_removed,
+        };
+    }
+    let reason = if identity.tombstone.is_file() {
+        "recovered destination exists but its tombstone is untrusted for this transaction (malformed or foreign)"
+    } else if identity.final_path.is_dir() {
+        "recovered destination exists as a directory"
+    } else {
+        "recovered destination exists without trusted transaction evidence (possible crash after publication, or a foreign file)"
+    };
+    RecoveryOutcome::RecoveryConflict {
+        partial_path: partial_path.to_path_buf(),
+        final_path: identity.final_path.clone(),
+        reason: reason.to_owned(),
+    }
+}
+
+/// Process-GLOBAL monotonic serial for per-attempt scratch names (final
+/// safety remediation §6): every claim — concurrent or sequential, across
+/// retries — takes the next value, so the tag is unique per attempt within
+/// this process by construction, not merely per call site.
+static SCRATCH_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// Builds the unique-attempt tag `<pid>-<serial>-<nanos>`: the pid
+/// distinguishes concurrent PROCESSES, the process-global serial
+/// distinguishes every claim attempt in this process, and the clock nanos
+/// break any exotic pid/counter reuse. `create_new` remains the final
+/// no-replace arbiter.
 fn unique_attempt_tag(serial: u64) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -421,10 +793,9 @@ fn unique_attempt_tag(serial: u64) -> String {
 /// failing here means the storage root cannot host new files at all — an
 /// INFRASTRUCTURE failure.
 fn claim_unique_scratch(day_dir: &Path, base: &str) -> Result<PathBuf, RecoveryError> {
-    let serial_counter = AtomicU64::new(0);
     let mut last_error: Option<StorageError> = None;
     for _ in 0..8 {
-        let serial = serial_counter.fetch_add(1, Ordering::Relaxed);
+        let serial = SCRATCH_SERIAL.fetch_add(1, Ordering::Relaxed);
         let scratch = day_dir.join(format!(
             "{base}.recovery-{}.tmp",
             unique_attempt_tag(serial)
@@ -467,6 +838,42 @@ fn claim_unique_scratch(day_dir: &Path, base: &str) -> Result<PathBuf, RecoveryE
             source: std::io::Error::other("scratch claim exhausted retries"),
         }),
     })
+}
+
+/// Consumes the muxer — closing the output handle on success AND failure
+/// alike (Windows-first) — and flattens its result for the typed artifact
+/// mapping.
+fn finalize_muxer(muxer: MatroskaMuxer) -> Result<String, String> {
+    muxer
+        .finalize()
+        .map(|published| published.display().to_string())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn alignment_gate_wait() {
+    // Clone the Arc OUT of the mutex: parking while holding the registry
+    // lock would deadlock the test side.
+    let gate = HOOK_ALIGNMENT_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(std::sync::Arc::clone);
+    if let Some(gate) = gate {
+        gate.park();
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn publish_hold_wait() {
+    let hold = HOOK_PUBLISH_HOLD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(std::sync::Arc::clone);
+    if let Some(hold) = hold {
+        hold.park();
+    }
 }
 
 /// Recovers all classifiable partials of one camera.
@@ -608,21 +1015,18 @@ fn salvage_media(
     let stop_requested = || graceful_stop.is_some_and(StopFlag::is_requested);
 
     // ---- 1. Already-recovered recognition BEFORE any media work ------------
+    //
+    // Final safety remediation §1: pathname existence alone is NEVER proof.
+    // The destination is resolved through the transaction contract — a
+    // trusted tombstone yields `AlreadyRecovered` with a cleanup retry;
+    // anything else yields `RecoveryConflict` preserving both files. This
+    // never opens the demuxer in either branch.
     let identity =
         recovery_identity(&partial.partial_path).ok_or_else(|| RecoveryError::Unreadable {
             message: "partial name carries no canonical recovery identity".to_owned(),
         })?;
     if identity.final_path.exists() {
-        // Repair the transaction (final correctness remediation §5): ensure
-        // the tombstone, retry the original's cleanup, report both — never
-        // remux, never duplicate.
-        let _tombstone_recorded = ensure_tombstone(&identity, &partial.partial_path);
-        let original_removed = std::fs::remove_file(&partial.partial_path).is_ok();
-        return Ok(RecoveryOutcome::AlreadyRecovered {
-            partial_path: partial.partial_path.clone(),
-            final_path: identity.final_path,
-            original_removed,
-        });
+        return Ok(resolve_existing_final(&identity, &partial.partial_path));
     }
 
     // ---- 2. Graceful-stop gate before working on this file (§2) ------------
@@ -668,14 +1072,44 @@ fn salvage_media(
     // Prove a selected VIDEO keyframe is reachable WITHOUT creating an
     // output first: a truncated-before-keyframe candidate manufactures ZERO
     // junk recovery artifacts.
+    //
+    // Final safety remediation §2: an EXPLICIT loop — graceful stop and
+    // forced cancellation are checked BEFORE every packet read and
+    // classified deliberately after every error. The previous
+    // `while let Some(...) = next_packet().ok().flatten()` shape collapsed
+    // EOF, media errors, timeouts and cancellation into one silent
+    // None-path that could never observe a stop during alignment.
     let mut found_keyframe = false;
-    while let Some(packet) = input.next_packet().ok().flatten() {
-        let metadata = packet.metadata();
-        if metadata.stream_index == video_index && metadata.keyframe {
-            found_keyframe = true;
-            break;
+    loop {
+        #[cfg(any(test, feature = "test-hooks"))]
+        // Deterministic seam: park INSIDE the alignment phase before the
+        // first packet read (final safety remediation §2 tests).
+        alignment_gate_wait();
+        if stop_requested() || interrupt.is_cancelled() {
+            return Err(RecoveryError::Cancelled);
         }
-        // EOF/truncation ends via None from next_packet next round.
+        match input.next_packet() {
+            Ok(Some(packet)) => {
+                let metadata = packet.metadata();
+                if metadata.stream_index == video_index && metadata.keyframe {
+                    found_keyframe = true;
+                    break;
+                }
+            }
+            Ok(None) => break, // readable span exhausted: no keyframe inside
+            Err(error) => {
+                // Cancellation arriving DURING a blocked read is a stop,
+                // never a content verdict (§2/§7); any other read failure
+                // is a deliberate per-file content classification.
+                if interrupt.is_cancelled() {
+                    return Err(RecoveryError::Cancelled);
+                }
+                return Ok(RecoveryOutcome::KeptUnrecoverable {
+                    partial_path: partial.partial_path.clone(),
+                    reason: format!("media read failed during keyframe alignment: {error}"),
+                });
+            }
+        }
     }
 
     if !found_keyframe {
@@ -718,14 +1152,45 @@ fn salvage_media(
     let scratch = claim_unique_scratch(&day_dir, base)?;
 
     let selection = streams.clone();
-    let mut muxer = MatroskaMuxer::create_with_selection(&mut input, &scratch, interrupt, |info| {
-        selection
-            .iter()
-            .any(|s| s.stream_index == info.stream_index)
-    })
-    .map_err(|error| RecoveryError::Unreadable {
-        message: format!("salvage output could not be opened: {error}"),
-    })?;
+    // Final safety remediation §5 test seam: an output-OPEN failure AFTER a
+    // successful scratch claim — the muxer target is pointed at an
+    // un-creatable location so the failure flows through the real backend
+    // path while `scratch` stays the cleanup target.
+    #[cfg(any(test, feature = "test-hooks"))]
+    let muxer_target = if HOOK_BREAK_OUTPUT_OPEN.load(Ordering::SeqCst) {
+        day_dir
+            .join("missing-parent")
+            .join(scratch.file_name().unwrap_or_default())
+    } else {
+        scratch.clone()
+    };
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    let muxer_target = scratch.clone();
+    let mut muxer =
+        match MatroskaMuxer::create_with_selection(&mut input, &muxer_target, interrupt, |info| {
+            selection
+                .iter()
+                .any(|s| s.stream_index == info.stream_index)
+        }) {
+            Ok(muxer) => muxer,
+            Err(error) => {
+                // Output-side failure on THIS attempt's own scratch (final
+                // safety remediation §5): never evidence about the
+                // original's content — a typed ARTIFACT failure. Only this
+                // attempt's scratch is removed; nothing publishes; the
+                // original stays untouched.
+                let _ = std::fs::remove_file(&scratch);
+                return Err(RecoveryError::Artifact {
+                    operation: "open the recovery output",
+                    source: StorageError::Io {
+                        path: scratch,
+                        source: std::io::Error::other(format!(
+                            "salvage output could not be opened: {error}"
+                        )),
+                    },
+                });
+            }
+        };
 
     // ---- 6. Copy loop with POISON-on-write-failure + stop gates ------------
     let mut aligned = false;
@@ -797,8 +1262,18 @@ fn salvage_media(
     if fault_poisoned || mux_write_failed {
         drop(muxer);
         let _ = std::fs::remove_file(&scratch);
-        return Err(RecoveryError::Unreadable {
-            message: "salvage output write failed; output poisoned, never published".to_owned(),
+        // Final safety remediation §5: a mux/output write failure is an
+        // OUTPUT-side problem on this attempt's own scratch — a typed
+        // ARTIFACT failure, never a content verdict about the original.
+        // Nothing was finalized or published; the original stays intact.
+        return Err(RecoveryError::Artifact {
+            operation: "write the recovery output",
+            source: StorageError::Io {
+                path: scratch.clone(),
+                source: std::io::Error::other(
+                    "salvage output write failed; output poisoned, never published",
+                ),
+            },
         });
     }
 
@@ -829,11 +1304,39 @@ fn salvage_media(
         let _ = std::fs::remove_file(&scratch);
         return Err(RecoveryError::Cancelled);
     }
-    muxer
-        .finalize()
-        .map_err(|error| RecoveryError::Unreadable {
-            message: format!("salvaged output failed to finalize: {error}"),
-        })?;
+    // Final safety remediation §5: a finalize/trailer/flush failure is an
+    // OUTPUT-side problem on this attempt's own scratch — a typed ARTIFACT
+    // failure, never a verdict about the original's content. The muxer is
+    // CONSUMED by `finalize` (its handle is closed on success and failure
+    // alike, Windows-first), then this attempt's scratch is removed and
+    // NOTHING publishes.
+    let finalize_result = {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            if HOOK_FAIL_FINALIZE.load(Ordering::SeqCst) {
+                drop(muxer); // close the output handle before scratch removal
+                Err("injected finalize failure".to_owned())
+            } else {
+                finalize_muxer(muxer)
+            }
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        {
+            finalize_muxer(muxer)
+        }
+    };
+    if let Err(message) = finalize_result {
+        let _ = std::fs::remove_file(&scratch);
+        return Err(RecoveryError::Artifact {
+            operation: "finalize the recovery output",
+            source: StorageError::Io {
+                path: scratch,
+                source: std::io::Error::other(format!(
+                    "salvaged output failed to finalize: {message}"
+                )),
+            },
+        });
+    }
 
     #[cfg(any(test, feature = "test-hooks"))]
     if HOOK_FAIL_METADATA.load(Ordering::SeqCst) {
@@ -897,20 +1400,18 @@ fn salvage_media(
     if let Err(error) = publish_no_replace(&scratch, &identity.final_path) {
         return match error {
             // An earlier pass (or a concurrent one) already committed this
-            // recording. The deterministic identity guarantees it is the
-            // SAME original's recovered slot: recognize it, remove ONLY
-            // this attempt's scratch (never another attempt's), repair the
-            // transaction and report idempotent success — never a
-            // duplicate publication.
+            // recording slot. Final safety remediation §1: the SAME
+            // transaction contract applies here as at the early recognition
+            // path — a TRUSTED tombstone yields `AlreadyRecovered` with a
+            // cleanup retry; a missing/untrusted tombstone (the concurrent-
+            // loser window: the winner has not yet written its tombstone,
+            // or a foreign file) yields a preserved `RecoveryConflict`.
+            // This attempt removes ONLY its own scratch, NEVER deletes the
+            // original on inference, and NEVER writes a retroactive
+            // tombstone.
             StorageError::DestinationExists { .. } => {
                 let _ = std::fs::remove_file(&scratch);
-                let _tombstone_recorded = ensure_tombstone(&identity, &partial.partial_path);
-                let original_removed = std::fs::remove_file(&partial.partial_path).is_ok();
-                Ok(RecoveryOutcome::AlreadyRecovered {
-                    partial_path: partial.partial_path.clone(),
-                    final_path: identity.final_path,
-                    original_removed,
-                })
+                Ok(resolve_existing_final(&identity, &partial.partial_path))
             }
             other => Err(RecoveryError::Artifact {
                 operation: "publish the recovered recording",
@@ -919,6 +1420,12 @@ fn salvage_media(
         };
     }
 
+    // Final safety remediation §1 test seam: hold JUST past the durable
+    // publication commit, BEFORE the tombstone — the exact concurrent-loser
+    // window (the destination exists, no trusted tombstone yet).
+    #[cfg(any(test, feature = "test-hooks"))]
+    publish_hold_wait();
+
     // ---- 10. Source closed FIRST, tombstone, then observable cleanup ------
     drop(input);
 
@@ -926,7 +1433,13 @@ fn salvage_media(
     // observable, but the deterministic identity keeps idempotency intact.
     // No stop gate here: the transaction already crossed its durable commit
     // point, so the tiny post-publication bookkeeping always completes.
-    let tombstone_recorded = ensure_tombstone(&identity, &partial.partial_path);
+    let original_name = partial
+        .partial_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    let tombstone_recorded = record_tombstone(&identity, &original_name);
 
     #[cfg(any(test, feature = "test-hooks"))]
     if HOOK_HIJACK_CLEANUP.load(Ordering::SeqCst) {
@@ -960,6 +1473,75 @@ fn partial_source(path: &std::path::Path) -> nian_media::MediaSource {
 }
 
 #[cfg(test)]
+mod tombstone_contract_tests {
+    //! Pure unit coverage for the tombstone transaction contract (final
+    //! safety remediation §1): the trusted format, strict parsing, and the
+    //! name binding that makes evidence transaction-specific.
+
+    use super::*;
+
+    #[test]
+    fn trusted_tombstone_parses_and_binds_names() {
+        let payload = tombstone_payload("08-30-00.partial.mkv", "08-30-00.recovered.mkv");
+        let parsed = parse_tombstone(payload.as_bytes()).expect("valid payload must parse");
+        assert_eq!(parsed.original, "08-30-00.partial.mkv");
+        assert_eq!(parsed.final_name, "08-30-00.recovered.mkv");
+    }
+
+    #[test]
+    fn foreign_or_malformed_marker_content_is_never_trusted() {
+        // Arbitrary/foreign `.done` contents fail the strict parser.
+        for bad in [
+            "",                                                              // empty
+            "nian-vision recovery tombstone\noriginal: a\nfinal: b\n", // legacy/foreign format
+            "NIAN-RECOVERY-TOMBSTONE v2\noriginal: a\nfinal: b\n",     // wrong version
+            "NIAN-RECOVERY-TOMBSTONE v1\noriginal: a\n",               // missing final
+            "NIAN-RECOVERY-TOMBSTONE v1\nfinal: b\noriginal: a\n",     // wrong order
+            "NIAN-RECOVERY-TOMBSTONE v1\noriginal: \nfinal: b\n",      // empty original
+            "NIAN-RECOVERY-TOMBSTONE v1\noriginal: a\nfinal: b\nextra: x\n", // extra content
+            "NIAN-RECOVERY-TOMBSTONE v1\noriginal: a\nfinal: b\ntrailing\n",
+        ] {
+            assert!(
+                parse_tombstone(bad.as_bytes()).is_none(),
+                "malformed tombstone must be rejected: {bad:?}"
+            );
+        }
+        // Non-UTF8 bytes are foreign content too.
+        assert!(parse_tombstone(&[0xff, 0xfe, 0xfd]).is_none());
+    }
+
+    #[test]
+    fn tombstone_evidence_is_bound_to_the_exact_transaction() {
+        // A trusted tombstone for original A proves NOTHING for original B
+        // sharing the same day directory (final safety remediation §1:
+        // name matching is the transaction binding).
+        let dir = tempfile::tempdir().unwrap();
+        let camera_day = dir.path().join("day");
+        std::fs::create_dir_all(&camera_day).unwrap();
+        let original_a = camera_day.join("08-30-00.partial.mkv");
+        std::fs::write(&original_a, b"x").unwrap();
+        let identity = recovery_identity(&original_a).unwrap();
+        assert!(record_tombstone(&identity, "08-30-00.partial.mkv"));
+        assert!(tombstone_proves_transaction(
+            &identity,
+            "08-30-00.partial.mkv"
+        ));
+        assert!(!tombstone_proves_transaction(
+            &identity,
+            "08-30-01.partial.mkv"
+        ));
+        // The destination name is part of the binding too.
+        assert!(!tombstone_proves_transaction(
+            &RecoveryIdentity {
+                final_path: camera_day.join("OTHER.recovered.mkv"),
+                tombstone: identity.tombstone.clone(),
+            },
+            "08-30-00.partial.mkv"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod fault_injection_tests {
     //! In-crate deterministic fault injection for the recovery pipeline:
     //! real FFmpeg remux runs where the ONLY synthetic element is the
@@ -980,7 +1562,7 @@ mod fault_injection_tests {
     }
 
     impl Storage {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let layout = RecordingsLayout::new(dir.path().join("rec")).unwrap();
             let camera = CameraId::parse("cam-fault").unwrap();
@@ -1065,6 +1647,21 @@ mod fault_injection_tests {
                 .iter()
                 .any(|outcome| matches!(outcome, RecoveryOutcome::KeptUnrecoverable { .. }));
         assert!(failure_reported, "{outcomes:?} / {failures:?}");
+        // Final safety remediation §5: a mux/output write failure is a
+        // typed ARTIFACT failure on the output side — never a content
+        // verdict about the original.
+        assert!(failures.len() == 1, "{failures:?}");
+        assert!(
+            matches!(
+                failures[0].error,
+                RecoveryError::Artifact {
+                    operation: "write the recovery output",
+                    ..
+                }
+            ),
+            "write failure must be a typed artifact failure: {failures:?}"
+        );
+        assert!(!failures[0].error.is_infrastructure());
     }
 
     #[test]
@@ -1148,22 +1745,40 @@ mod fault_injection_tests {
         assert!(final_path.is_file());
     }
 
+    /// Writes a TRUSTED tombstone for `original_path` through the
+    /// production recorder — the exact bytes a real winning pass persists.
+    fn seed_trusted_tombstone(original_path: &Path) {
+        let identity = recovery_identity(original_path).unwrap();
+        let original_name = original_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            record_tombstone(&identity, &original_name),
+            "seeding the trusted tombstone must succeed"
+        );
+    }
+
     #[test]
-    fn already_recovered_path_repairs_the_transaction() {
-        // Final correctness remediation §5: crash window AFTER publication
-        // but BEFORE cleanup/tombstone — the deterministic final and the
-        // original both exist. The next pass must recognize the recording
-        // WITHOUT remuxing, CREATE the missing tombstone, RETRY the
-        // original's cleanup, and converge: final exists, original gone,
-        // tombstone in known state.
+    fn valid_transaction_tombstone_yields_already_recovered_and_cleanup_retry() {
+        // Final safety remediation §1, case B (review row 5): the final
+        // exists AND a trusted tombstone proves THIS original→final
+        // transaction → AlreadyRecovered, the cleanup retry removes the
+        // original, and no second recording is ever produced. The old
+        // "repair" semantics (retroactively creating a tombstone for a
+        // pre-existing destination) are FORBIDDEN by §1 and replaced by
+        // the conflict contract.
         let storage = Storage::new();
         let (original_name, original_path) = seed_original(&storage);
         let payload = std::fs::read(&original_path).unwrap();
 
-        // Simulate the earlier pass's published final; no tombstone yet.
+        // Simulate an earlier pass: published final + trusted tombstone,
+        // then crashed BEFORE the original's cleanup.
         let base = original_name.strip_suffix(".partial.mkv").unwrap();
         let final_path = storage.day_dir.join(format!("{base}.recovered.mkv"));
         std::fs::write(&final_path, &payload).unwrap();
+        seed_trusted_tombstone(&original_path);
 
         let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
 
@@ -1194,10 +1809,159 @@ mod fault_injection_tests {
                 .day_dir
                 .join(format!("{base}.recovered.mkv.done"))
                 .is_file(),
-            "convergence: the tombstone is created during the repair pass"
+            "the trusted tombstone persists"
         );
         assert_eq!(count_recordings(&storage.day_dir), 1);
         assert_eq!(std::fs::read(&final_path).unwrap(), payload);
+    }
+
+    #[test]
+    fn recovery_conflict_when_destination_path_is_a_directory() {
+        // Final safety remediation §1 (review row 1): a DIRECTORY at the
+        // deterministic recovered pathname is never proof that the original
+        // was recovered. The original must survive untouched, the
+        // destination must survive untouched, and no retroactive success
+        // tombstone may appear.
+        let storage = Storage::new();
+        let (name, original_path) = seed_original(&storage);
+        let base = name.strip_suffix(".partial.mkv").unwrap();
+        let final_path = storage.day_dir.join(format!("{base}.recovered.mkv"));
+        std::fs::create_dir_all(&final_path).unwrap();
+
+        let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+
+        assert!(
+            failures.is_empty(),
+            "a conflict is an outcome, never a failure: {failures:?}"
+        );
+        let conflicts: Vec<_> = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                RecoveryOutcome::RecoveryConflict {
+                    partial_path,
+                    final_path,
+                    reason,
+                } => Some((partial_path.clone(), final_path.clone(), reason.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(conflicts.len(), 1, "{outcomes:?}");
+        assert_eq!(conflicts[0].0, original_path);
+        assert_eq!(conflicts[0].1, final_path);
+        assert!(original_path.is_file(), "the original must survive");
+        assert!(final_path.is_dir(), "the destination must survive");
+        assert!(
+            !storage
+                .day_dir
+                .join(format!("{base}.recovered.mkv.done"))
+                .exists(),
+            "no success tombstone may be created retroactively"
+        );
+    }
+
+    #[test]
+    fn recovery_conflict_when_destination_is_a_zero_byte_or_foreign_file() {
+        // Final safety remediation §1 (review rows 2+3): a zero-byte file
+        // or a foreign VALID media file at the deterministic pathname is
+        // never transaction evidence — the original must survive and the
+        // destination's bytes must stay untouched.
+        for (label, content) in [
+            ("zero-byte", Vec::new()),
+            (
+                "foreign-valid-mkv",
+                std::fs::read(fixtures_dir().join("sample_av.mkv")).unwrap(),
+            ),
+        ] {
+            let storage = Storage::new();
+            let (name, original_path) = seed_original(&storage);
+            let base = name.strip_suffix(".partial.mkv").unwrap();
+            let final_path = storage.day_dir.join(format!("{base}.recovered.mkv"));
+            std::fs::write(&final_path, &content).unwrap();
+
+            let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+
+            assert!(
+                failures.is_empty(),
+                "{label}: a conflict is an outcome, never a failure: {failures:?}"
+            );
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|outcome| matches!(outcome, RecoveryOutcome::RecoveryConflict { .. })),
+                "{label}: the pass must report a conflict: {outcomes:?}"
+            );
+            assert!(
+                original_path.is_file(),
+                "{label}: the original must survive"
+            );
+            assert_eq!(
+                std::fs::read(&final_path).unwrap(),
+                content,
+                "{label}: the destination bytes must stay untouched"
+            );
+            assert!(
+                !storage
+                    .day_dir
+                    .join(format!("{base}.recovered.mkv.done"))
+                    .exists(),
+                "{label}: no success tombstone may be created retroactively"
+            );
+            assert!(
+                !std::fs::read_dir(&storage.day_dir)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|entry| entry.file_name().to_string_lossy().contains(".recovery-")),
+                "{label}: no scratch may be claimed for a conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_conflict_when_tombstone_is_malformed_or_foreign() {
+        // Final safety remediation §1 (review row 4): a `.done` file is
+        // trusted ONLY with the exact tombstone structure naming THIS
+        // transaction. Malformed content, foreign markers and
+        // wrong-name tombstones all yield a preserved conflict — never a
+        // deletion of the original.
+        let setups: [(&str, String); 3] = [
+            ("malformed", "just some operator marker\n".to_owned()),
+            ("empty", String::new()),
+            (
+                "wrong-original",
+                tombstone_payload("08-30-01.partial.mkv", "08-30-00.recovered.mkv"),
+            ),
+        ];
+        for (label, content) in setups {
+            let storage = Storage::new();
+            let (name, original_path) = seed_original(&storage);
+            let base = name.strip_suffix(".partial.mkv").unwrap();
+            let final_path = storage.day_dir.join(format!("{base}.recovered.mkv"));
+            std::fs::write(&final_path, b"destination").unwrap();
+            std::fs::write(
+                storage.day_dir.join(format!("{base}.recovered.mkv.done")),
+                content.as_bytes(),
+            )
+            .unwrap();
+
+            let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+
+            assert!(failures.is_empty(), "{label}: {failures:?}");
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|outcome| matches!(outcome, RecoveryOutcome::RecoveryConflict { .. })),
+                "{label}: an untrusted tombstone must yield a conflict: {outcomes:?}"
+            );
+            assert!(
+                original_path.is_file(),
+                "{label}: the original must survive"
+            );
+            assert_eq!(
+                std::fs::read(&final_path).unwrap(),
+                b"destination",
+                "{label}: the destination must survive"
+            );
+        }
     }
 
     #[test]
@@ -1211,6 +1975,7 @@ mod fault_injection_tests {
             &payload,
         )
         .unwrap();
+        seed_trusted_tombstone(&original_path);
 
         let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
         assert!(failures.is_empty(), "{failures:?}");
@@ -1231,6 +1996,76 @@ mod fault_injection_tests {
             names.iter().all(|name| !name.contains(".recovery-")),
             "no scratch artifact may appear: {names:?}"
         );
+    }
+
+    #[test]
+    fn loser_never_deletes_original_before_tombstone_evidence_exists() {
+        // Final safety remediation §1 (review row 6, the race window): the
+        // winner PUBLISHES and parks before its tombstone; a second
+        // attempt observing the destination at that moment must NOT delete
+        // the original — it reports the pending conflict and leaves the
+        // cleanup to the winner. After release, the winner's trusted
+        // tombstone + cleanup converge the tree.
+        let _fault_serialization_guard = test_hooks::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_hook_guard, hold) = arm_publish_hold();
+        let storage = Storage::new();
+        let (name, original_path) = seed_original(&storage);
+        let base = name.strip_suffix(".partial.mkv").unwrap();
+
+        let layout = storage.layout.clone();
+        let camera = storage.camera.clone();
+        let winner = std::thread::spawn(move || recover_camera_partials(&layout, &camera));
+
+        // The winner has PUBLISHED and is parked BEFORE its tombstone.
+        hold.wait_arrived();
+
+        // The loser observes the destination INSIDE the no-evidence window.
+        let (loser_outcomes, loser_failures) =
+            recover_camera_partials(&storage.layout, &storage.camera);
+        assert!(loser_failures.is_empty(), "{loser_failures:?}");
+        assert!(
+            loser_outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, RecoveryOutcome::RecoveryConflict { .. })),
+            "the loser must report a pending conflict: {loser_outcomes:?}"
+        );
+        assert!(
+            original_path.is_file(),
+            "the loser must NEVER delete the original before trusted evidence exists"
+        );
+        assert!(
+            !storage
+                .day_dir
+                .join(format!("{base}.recovered.mkv.done"))
+                .exists(),
+            "the loser must never write a retroactive tombstone"
+        );
+
+        // The winner completes its own transaction.
+        hold.release();
+        let (winner_outcomes, winner_failures) = winner.join().unwrap();
+        assert!(winner_failures.is_empty(), "{winner_failures:?}");
+        assert!(winner_outcomes.iter().any(|outcome| matches!(
+            outcome,
+            RecoveryOutcome::Recovered {
+                tombstone_recorded: true,
+                original_removed: true,
+                ..
+            }
+        )));
+
+        // Convergence: one final, trusted tombstone, original gone.
+        assert_eq!(count_recordings(&storage.day_dir), 1);
+        assert!(
+            tombstone_proves_transaction(
+                &recovery_identity(&original_path).unwrap(),
+                &original_path.file_name().unwrap().to_string_lossy()
+            ),
+            "the winner's tombstone must be trusted evidence"
+        );
+        assert!(!original_path.exists());
     }
 
     #[test]
@@ -1277,11 +2112,15 @@ mod fault_injection_tests {
 
     #[test]
     fn concurrent_recoveries_use_unique_scratches_and_produce_one_final() {
-        // Final correctness remediation §1: two process-shaped attempts
-        // against the SAME original. The publication barrier releases both
-        // at their commit step deterministically; the deterministic final
-        // arbitrates. Exactly one final, unique scratch pathnames, the
-        // loser reports AlreadyRecovered and removes only its own scratch.
+        // Final correctness remediation §1 + final safety remediation §1:
+        // two process-shaped attempts against the SAME original. The
+        // publication barrier releases both at their commit step
+        // deterministically; the deterministic final arbitrates. Exactly
+        // one final, unique scratch pathnames, and the loser resolves the
+        // collision through the SAME transaction contract as every other
+        // path: a trusted tombstone in time → AlreadyRecovered (deletion
+        // WITH evidence); the winner's not-yet-tombstoned window →
+        // RecoveryConflict (original left to the winner's cleanup).
         let _fault_serialization_guard = test_hooks::FAULT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1300,7 +2139,7 @@ mod fault_injection_tests {
         let res_b = handle.join().unwrap();
 
         let mut recovered = 0usize;
-        let mut already = 0usize;
+        let mut loser_kinds: Vec<&'static str> = Vec::new();
         let mut finals = Vec::new();
         for (outcomes, failures) in [res_a, res_b] {
             assert!(
@@ -1318,19 +2157,26 @@ mod fault_injection_tests {
                         original_removed,
                         ..
                     } => {
-                        already += 1;
+                        loser_kinds.push("already");
                         finals.push(final_path);
-                        // The loser's original-cleanup retry races the
-                        // winner's — either outcome is honest; the loser
-                        // NEVER reports a second recording.
+                        // The loser saw the winner's trusted tombstone in
+                        // time and retried the cleanup: deletion WITH
+                        // evidence; either unlink outcome is honest.
                         let _ = original_removed;
+                    }
+                    RecoveryOutcome::RecoveryConflict {
+                        final_path, reason, ..
+                    } => {
+                        loser_kinds.push("conflict");
+                        finals.push(final_path);
+                        assert!(!reason.is_empty(), "conflicts report an observable reason");
                     }
                     other => panic!("unexpected outcome in concurrent run: {other:?}"),
                 }
             }
         }
         assert_eq!(recovered, 1, "exactly one attempt publishes");
-        assert_eq!(already, 1, "the loser recognizes the committed final");
+        assert_eq!(loser_kinds.len(), 1, "exactly one loser");
         assert_eq!(
             finals[0], finals[1],
             "both agree on the deterministic final"
@@ -1351,9 +2197,27 @@ mod fault_injection_tests {
             "scratch names carry the unique-attempt shape: {scratches:?}"
         );
 
-        // Exactly ONE recovered final exists and it independently demuxes;
-        // the original was removed by the winner (never overwritten).
+        // Convergence: exactly ONE recovered final, the winner's trusted
+        // tombstone persists, the original is gone (winner cleanup), and
+        // no scratch remains. The final independently demuxes.
         assert_eq!(count_recordings(&storage.day_dir), 1);
+        assert!(
+            tombstone_proves_transaction(
+                &recovery_identity(&original_path).unwrap(),
+                &original_path.file_name().unwrap().to_string_lossy()
+            ),
+            "the winner's tombstone must be trusted evidence"
+        );
+        assert!(!original_path.exists());
+        let leftovers: Vec<String> = std::fs::read_dir(&storage.day_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.iter().all(|name| !name.contains(".recovery-")),
+            "no scratch may survive a converged transaction: {leftovers:?}"
+        );
         let final_path = &finals[0];
         use nian_media::Probe as _;
         let backend = nian_media_ffmpeg::FfmpegBackend::new().unwrap();
@@ -1366,8 +2230,151 @@ mod fault_injection_tests {
                 .iter()
                 .any(|stream| stream.media_type == nian_domain::MediaType::Video)
         );
-        assert!(!original_path.exists());
         let _ = original_payload;
+    }
+
+    #[test]
+    fn graceful_stop_during_keyframe_alignment_abandons_at_the_packet_boundary() {
+        // Final safety remediation §2: the alignment probe is an EXPLICIT
+        // loop that checks the graceful-stop domain before EVERY packet
+        // read. The attempt parks INSIDE the alignment phase (before its
+        // first packet, deterministically); ONE stop request makes it exit
+        // at the next packet boundary with a typed cancellation — no
+        // scratch is ever claimed, nothing publishes, the original stays,
+        // and no force-cancel is needed.
+        let _fault_serialization_guard = test_hooks::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_hook_guard, gate) = arm_alignment_gate();
+        let storage = Storage::new();
+        let (_, original_path) = seed_original(&storage);
+
+        let stop = StopFlag::new();
+        let stop_for_worker = stop.clone();
+        let layout = storage.layout.clone();
+        let camera = storage.camera.clone();
+        let worker = std::thread::spawn(move || {
+            let interrupt = InterruptHandle::new();
+            recover_camera_partials_with_interrupt(
+                &layout,
+                &camera,
+                &interrupt,
+                Some(&stop_for_worker),
+            )
+        });
+
+        // Parked INSIDE the alignment probe → press stop ONCE → release.
+        gate.wait_arrived();
+        stop.request();
+        gate.release();
+
+        let (outcomes, failures) = worker.join().unwrap();
+        assert!(
+            failures
+                .iter()
+                .all(|failure| matches!(failure.error, RecoveryError::Cancelled)),
+            "alignment-phase stop is a typed cancellation: {failures:?}"
+        );
+        assert!(
+            outcomes.is_empty(),
+            "nothing may be reported as published: {outcomes:?}"
+        );
+        // The probe never completed: NO scratch was ever claimed.
+        assert!(
+            HOOK_SCRATCHES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the alignment phase must exit before scratch acquisition"
+        );
+        // Original stays safely recoverable; no recovered final; no scratch.
+        assert!(original_path.is_file());
+        assert_eq!(count_recordings(&storage.day_dir), 0);
+        let names: Vec<String> = std::fs::read_dir(&storage.day_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.contains(".recovery-")),
+            "no scratch artifact may appear: {names:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_failure_is_a_typed_artifact_failure_never_published() {
+        // Final safety remediation §5: a muxer finalize/trailer failure is
+        // an OUTPUT-side problem — a typed ARTIFACT failure, never a
+        // verdict about the original's content. Nothing publishes; this
+        // attempt's scratch is removed; the original stays intact.
+        let _fault_serialization_guard = test_hooks::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _hook_guard = arm_finalize_failure();
+        let storage = Storage::new();
+        seed_original(&storage);
+
+        let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            matches!(
+                failures[0].error,
+                RecoveryError::Artifact {
+                    operation: "finalize the recovery output",
+                    ..
+                }
+            ),
+            "finalize failure must be a typed artifact failure: {failures:?}"
+        );
+        assert!(!failures[0].error.is_infrastructure());
+        assert!(
+            outcomes.is_empty(),
+            "nothing may publish after a finalize failure: {outcomes:?}"
+        );
+        assert_eq!(count_files(&storage.day_dir, false), 0);
+        assert_eq!(count_files(&storage.day_dir, true), 1, "original intact");
+    }
+
+    #[test]
+    fn output_open_failure_is_a_typed_artifact_failure_never_published() {
+        // Final safety remediation §5: an output-OPEN failure AFTER a
+        // successful scratch claim is a per-attempt ARTIFACT failure (the
+        // claim proved the storage root still accepts new files). Nothing
+        // publishes; the claimed scratch is cleaned up; the original
+        // stays intact.
+        let _fault_serialization_guard = test_hooks::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _hook_guard = arm_output_open_fault();
+        let storage = Storage::new();
+        seed_original(&storage);
+
+        let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            matches!(
+                failures[0].error,
+                RecoveryError::Artifact {
+                    operation: "open the recovery output",
+                    ..
+                }
+            ),
+            "output-open failure must be a typed artifact failure: {failures:?}"
+        );
+        assert!(!failures[0].error.is_infrastructure());
+        assert!(outcomes.is_empty(), "{outcomes:?}");
+        // The claim happened (one scratch), but its cleanup removed it.
+        assert_eq!(
+            HOOK_SCRATCHES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+        assert_eq!(count_files(&storage.day_dir, false), 0);
+        assert_eq!(count_files(&storage.day_dir, true), 1, "original intact");
     }
 
     #[test]

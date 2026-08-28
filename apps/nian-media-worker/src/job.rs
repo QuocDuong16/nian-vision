@@ -98,6 +98,16 @@ pub struct RecoverySummary {
     /// this is positive and nothing was recovered, the job fails
     /// permanently — safe storage operation is impossible.
     pub infrastructure_failures: usize,
+    /// Per-attempt ARTIFACT failures (final correctness remediation §7 /
+    /// final safety remediation §5): output-side problems on THIS
+    /// attempt's own scratch that coexist with continued recording.
+    pub artifact_failures: usize,
+    /// Final safety remediation §1, case C: deterministic destinations
+    /// that exist WITHOUT trusted transaction evidence (foreign files,
+    /// directories, crash-before-tombstone, or a concurrent winner's
+    /// not-yet-tombstoned window). Both the original and the destination
+    /// are preserved — reported observably, never resolved by deletion.
+    pub conflicts: usize,
 }
 
 impl RecoverySummary {
@@ -107,6 +117,8 @@ impl RecoverySummary {
             "quarantined": self.quarantined,
             "failed": self.failed,
             "infrastructure_failures": self.infrastructure_failures,
+            "artifact_failures": self.artifact_failures,
+            "conflicts": self.conflicts,
         })
     }
 }
@@ -255,11 +267,13 @@ impl JobSpec {
 pub struct JobStatus {
     /// Camera under supervision (empty when none yet).
     pub camera_id: String,
-    /// Coarse lifecycle word (`recovering | connecting | backoff | recording
-    /// | stopping | stopped | failed | idle`), lowercase. `recovering`
-    /// (final remediation §6) is the asynchronous startup-reconciliation
-    /// phase AFTER `recording.start` was accepted: IPC stays responsive,
-    /// status works, and stop/shutdown interrupt recovery in a bounded way.
+    /// Coarse lifecycle word (`idle | recovering | connecting | recording |
+    /// backoff | stopped | failed`), lowercase, from EXPLICIT stable wire
+    /// values (final safety remediation §8): supervisor states come from
+    /// [`nian_recorder::SupervisorState::as_str`]; `recovering` (final
+    /// remediation §6) is the asynchronous startup-reconciliation phase
+    /// AFTER `recording.start` was accepted: IPC stays responsive, status
+    /// works, and stop/shutdown interrupt recovery in a bounded way.
     pub state: String,
     /// Consecutive retry attempt currently armed (0 once connected).
     pub retry_attempt: u32,
@@ -805,6 +819,19 @@ fn run_recovering_then_supervising<
                 )
             })
             .count();
+        // Final safety remediation §1 case C: a deterministic destination
+        // without trusted transaction evidence is an OBSERVABLE conflict —
+        // both files preserved, never resolved by deletion, and never a
+        // job failure (the storage is provably fine).
+        let conflicts = outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome,
+                    nian_recorder::RecoveryOutcome::RecoveryConflict { .. }
+                )
+            })
+            .count();
         // Typed classification (final correctness remediation §7):
         // INFRASTRUCTURE failures mean the storage target is unsafe for
         // new recording; per-attempt ARTIFACT failures and content
@@ -812,7 +839,18 @@ fn run_recovering_then_supervising<
         // neither and is not counted as a failure at all.
         let infrastructure_failures = failures
             .iter()
-            .filter(|failure| failure.error.is_infrastructure())
+            .filter(|failure| {
+                matches!(
+                    failure.error,
+                    nian_recorder::RecoveryError::Infrastructure { .. }
+                )
+            })
+            .count();
+        let artifact_failures = failures
+            .iter()
+            .filter(|failure| {
+                matches!(failure.error, nian_recorder::RecoveryError::Artifact { .. })
+            })
             .count();
         let failed = failures
             .iter()
@@ -823,6 +861,8 @@ fn run_recovering_then_supervising<
             quarantined,
             failed,
             infrastructure_failures,
+            artifact_failures,
+            conflicts,
         }
     };
 
@@ -886,7 +926,10 @@ fn supervise_and_fold<
         let mut slot = shared.status.lock().unwrap();
         match event {
             SupervisorEvent::StateChanged { to, .. } => {
-                slot.state = format!("{to:?}").to_lowercase();
+                // Final safety remediation §8: the wire value is the
+                // EXPLICIT stable vocabulary (`SupervisorState::as_str`),
+                // never Rust Debug output.
+                slot.state = to.as_str().to_owned();
             }
             SupervisorEvent::ReconnectScheduled { retry_attempt, .. } => {
                 slot.state = "backoff".to_owned();
@@ -1213,6 +1256,71 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_destination_is_reported_as_a_conflict_and_does_not_block_recording() {
+        // Final safety remediation §1 case C at the worker level: a
+        // leftover whose deterministic recovered destination is occupied by
+        // a FOREIGN file (no trusted tombstone) is reported observably as
+        // a CONFLICT — both files preserved, no deletion, no job failure —
+        // and the new recording continues to its natural EOF.
+        let fixtures = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/nian-media-ffmpeg/tests/fixtures/sample_av.mkv"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let layout = nian_storage::RecordingsLayout::new(temp.path().join("rec")).unwrap();
+        let camera = CameraId::parse("cam-conflict").unwrap();
+        let day_dir = layout.day_dir(&camera, chrono::Local::now().date_naive());
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let stamp = chrono::Local::now().naive_local();
+        let partial_name = nian_storage::paths::partial_file_name(stamp.time());
+        std::fs::write(
+            day_dir.join(&partial_name),
+            std::fs::read(fixtures).unwrap(),
+        )
+        .unwrap();
+        // Occupied destination WITHOUT trusted transaction evidence.
+        let base = partial_name.strip_suffix(".partial.mkv").unwrap();
+        let occupied = day_dir.join(format!("{base}.recovered.mkv"));
+        std::fs::write(&occupied, b"foreign destination bytes").unwrap();
+
+        let mut manager = RecordingJobManager::new();
+        manager
+            .start(JobSpec {
+                camera,
+                storage_root: temp.path().join("rec").to_path_buf(),
+                source: JobSource::File(PathBuf::from(fixtures)),
+                segment_target: Duration::from_secs(300),
+                copy_audio: true,
+            })
+            .expect("start must NOT be refused by a preserved conflict");
+
+        assert!(wait_finished(&manager, 60), "recording must complete");
+        let status = manager.status();
+        assert_eq!(
+            status.end_kind, "completed",
+            "a preserved conflict never fails the job"
+        );
+        let recovery = status.recovery.expect("recovery summary present");
+        assert_eq!(
+            recovery.conflicts, 1,
+            "the conflict must be reported observably: {recovery:?}"
+        );
+        assert_eq!(recovery.recovered, 0);
+        assert_eq!(recovery.failed, 0);
+        assert_eq!(recovery.infrastructure_failures, 0);
+        // Lossless-first: BOTH the original and the destination survive.
+        assert!(
+            day_dir.join(&partial_name).is_file(),
+            "the original partial must survive the conflict"
+        );
+        assert_eq!(
+            std::fs::read(&occupied).unwrap(),
+            b"foreign destination bytes",
+            "the destination must survive the conflict untouched"
+        );
+    }
+
+    #[test]
     fn infrastructure_storage_failure_fails_the_job_permanently() {
         let _hooks = nian_recorder::test_hooks::FAULT_LOCK
             .lock()
@@ -1394,6 +1502,94 @@ mod tests {
 
         // No camera connection: a connection would have produced normal
         // (`<HH-MM-SS>.mkv`) recording finals — there are none.
+        let names: Vec<String> = std::fs::read_dir(&day_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        let normal_finals = names
+            .iter()
+            .filter(|name| {
+                name.ends_with(".mkv")
+                    && !name.contains(".partial.")
+                    && !name.contains(".recovered")
+            })
+            .count();
+        assert_eq!(
+            normal_finals, 0,
+            "no camera connection may happen: {names:?}"
+        );
+        assert!(
+            names.iter().all(|name| !name.contains(".recovery-")),
+            "no scratch may survive the abandoned attempt: {names:?}"
+        );
+        assert!(
+            day_dir.join(&partial_name).is_file(),
+            "the original partial stays safely recoverable"
+        );
+    }
+
+    #[test]
+    fn one_stop_during_recovery_alignment_ends_the_job_without_connecting() {
+        // Final safety remediation §2: graceful stop is observable during
+        // the ALIGNMENT phase of recovery — the explicit keyframe probe —
+        // not only at the pre-publication checkpoint. The attempt parks
+        // INSIDE the probe deterministically; ONE recording.stop ends the
+        // job boundedly as `stopped`, the camera is never connected, the
+        // original stays recoverable, and no scratch/final appears.
+        let _hooks = nian_recorder::test_hooks::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_hooks_guard, gate) = nian_recorder::arm_alignment_gate();
+        let fixtures = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/nian-media-ffmpeg/tests/fixtures/sample_av.mkv"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let layout = nian_storage::RecordingsLayout::new(temp.path().join("rec")).unwrap();
+        let camera = CameraId::parse("cam-align-stop").unwrap();
+        let day_dir = layout.day_dir(&camera, chrono::Local::now().date_naive());
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let stamp = chrono::Local::now().naive_local();
+        let partial_name = nian_storage::paths::partial_file_name(stamp.time());
+        std::fs::write(
+            day_dir.join(&partial_name),
+            std::fs::read(fixtures).unwrap(),
+        )
+        .unwrap();
+
+        let mut manager = RecordingJobManager::new();
+        manager
+            .start(JobSpec {
+                camera,
+                storage_root: temp.path().join("rec").to_path_buf(),
+                source: JobSource::File(PathBuf::from(fixtures)),
+                segment_target: Duration::from_secs(300),
+                copy_audio: true,
+            })
+            .expect("start ok");
+        assert!(
+            wait_status(&manager, |status| status.state == "recovering"),
+            "the job must be observed in the recovering state"
+        );
+
+        // The recovery thread parks inside the ALIGNMENT probe; the single
+        // stop lands there deterministically.
+        gate.wait_arrived();
+        let presses = manager.stop().expect("stop accepted");
+        assert_eq!(presses, 1, "a single graceful press must suffice");
+        gate.release();
+
+        assert!(
+            wait_finished(&manager, 30),
+            "one press must end the job boundedly during alignment"
+        );
+        let status = manager.status();
+        assert_eq!(status.end_kind, "stopped");
+        assert_eq!(status.finalized_segments, 0, "nothing was recorded");
+
+        // No camera connection (no normal finals), no scratch, original
+        // partial intact.
         let names: Vec<String> = std::fs::read_dir(&day_dir)
             .unwrap()
             .filter_map(Result::ok)

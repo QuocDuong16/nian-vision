@@ -151,20 +151,35 @@ restartable; backoff waits interrupted by operator shutdown.
   finalize/publication); a pre-publication delay hook holds attempts
   mid-flight so recorder- and worker-level tests prove ONE stop during
   `recovering` ends bounded as `stopped` without a camera connection,
-  without publishing, and without a second press; protocol shutdown ends
-  recovery gracefully before its force-cancel grace.
-* AlreadyRecovered repair (final correctness §5): the recognition path
-  ensures the tombstone and retries the original's cleanup
-  (`original_removed` reported) — publish-succeeded + cleanup-failed
-  converges to final-exists/original-gone/tombstone-known.
+  without publishing, and without a second press; the EXPLICIT
+  keyframe-alignment probe checks the stop domains before every packet
+  read, with an alignment-gate seam parking an attempt INSIDE the
+  alignment phase (recorder- and worker-level: one stop ends the job
+  without any camera connection); protocol shutdown ends recovery
+  gracefully before its force-cancel grace.
+* Tombstone transaction/conflict contract (final safety §1): a
+  deterministic destination's mere existence is NEVER proof — directory,
+  zero-byte, foreign-valid-MKV and malformed/foreign-tombstone
+  destinations all yield `RecoveryConflict` preserving BOTH files (no
+  remux, no retroactive tombstone, no deletion); a trusted tombstone
+  (magic + strict original/final name binding) yields `AlreadyRecovered`
+  with a cleanup retry; a publish-hold seam deterministically opens the
+  winner's not-yet-tombstoned window and proves the loser never deletes
+  the original there; concurrent attempts still converge to exactly one
+  final, one trusted tombstone, original gone.
 * Storage classification (final correctness §6/§7/§8): recovered MKV
   classifies as a recording; scratch/tombstones as artifacts; unknown
   names as Unknown; a stat failure on this attempt's finalized scratch is
   a typed ARTIFACT failure that coexists with continued recording (worker
   test) while scan/claim failures are INFRASTRUCTURE failures that fail
-  the job; the camera-dir pre-flight probes NEW-file writability with a
-  reserved no-overwrite probe file and fails on genuinely unwritable
-  targets.
+  the job; output-side open/write/finalize failures are ARTIFACT
+  failures, never content verdicts (deterministic open-fault and
+  finalize-fault seams, nothing ever publishes); the camera-dir
+  pre-flight exclusively creates a probe, writes and flushes bytes,
+  REMOVES it (removal failure surfaced), retries collisions with a fresh
+  probe identity, and fails on genuinely unwritable targets; the scratch
+  classifier matches ONLY the exact `<stem>.recovery-<pid>-<serial>
+  -<nonce>.tmp` grammar.
 * Terminal authority (final correctness §3): terminal Completed/Failed/
   Stopped statuses keep their outcomes (`JobCompletedCleanly` /
   `PermanentRecordingFailure` / `RequestedShutdown`) even when the worker
@@ -173,6 +188,15 @@ restartable; backoff waits interrupted by operator shutdown.
 * Poll ids (final correctness §4): a late response to poll N cannot
   satisfy poll N+1 (episode-local monotonic ids); the missed-response
   bound still classifies the episode Unresponsive.
+* Terminal-parse strictness (final safety §7): `finished=true` with an
+  unknown/missing `end_kind`, or `failed` with a missing/non-canonical
+  `failure_category`, is a PERMANENT protocol violation (typed error,
+  spawn counter stays at 1) — never silently "still running", never an
+  invented `Unknown` category; the canonical vocabulary is validated
+  against the shared `nian_domain::FailureCategory`.
+* Stable wire values (final safety §8): `SupervisorState::as_str` is the
+  explicit status vocabulary (exact strings, unit-tested), replacing the
+  Debug-then-lowercase conversion in the worker's status fold.
 * Worker job lifecycle (`nian-media-worker` job tests): prompt
   `recording.start` ack with `recovering` state before any media work;
   async recovery accounted once per job; corrupt leftover quarantined

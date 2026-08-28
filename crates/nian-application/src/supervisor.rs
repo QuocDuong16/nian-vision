@@ -210,25 +210,66 @@ pub enum JobTerminal {
     Failed(String),
 }
 
+/// A `recording.status` payload that CLAIMED `finished: true` but carries
+/// an unparseable terminal state (final safety remediation §7): an unknown
+/// `end_kind`, a missing one, or a `failed` end without a present, valid
+/// canonical failure category. Canonical worker and parent binaries must
+/// never disagree silently — this is a protocol violation, never "still
+/// running" and never an invented `Unknown` category.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalParseError(String);
+
+impl std::fmt::Display for TerminalParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 impl JobTerminal {
-    /// Parses a `recording.status` result payload; `None` while running.
-    fn parse(status: &serde_json::Value) -> Option<Self> {
-        if !status.get("finished")?.as_bool()? {
-            return None;
+    /// Parses a `recording.status` result payload:
+    ///
+    /// * `Ok(None)` — the job is still running (no truthful `finished`);
+    /// * `Ok(Some(terminal))` — a terminal state with STABLE wire values;
+    /// * `Err(TerminalParseError)` — the payload declared `finished: true`
+    ///   but contradicts the canonical vocabulary: a protocol violation.
+    fn parse(status: &serde_json::Value) -> Result<Option<Self>, TerminalParseError> {
+        let Some(finished) = status.get("finished") else {
+            return Ok(None); // no finished flag: the running case
+        };
+        let Some(finished) = finished.as_bool() else {
+            return Err(TerminalParseError(
+                "finished is present but not a boolean".to_owned(),
+            ));
+        };
+        if !finished {
+            return Ok(None);
         }
-        let end_kind = status.get("end_kind").and_then(serde_json::Value::as_str)?;
+        let violation = |message: String| Err(TerminalParseError(message));
+        let Some(end_kind) = status.get("end_kind").and_then(serde_json::Value::as_str) else {
+            return violation("finished=true without a string end_kind".to_owned());
+        };
         match end_kind {
-            "stopped" => Some(Self::Stopped),
-            "completed" => Some(Self::Completed),
+            "stopped" => Ok(Some(Self::Stopped)),
+            "completed" => Ok(Some(Self::Completed)),
             "failed" => {
-                let category = status
+                let Some(category) = status
                     .get("failure_category")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("Unknown")
-                    .to_owned();
-                Some(Self::Failed(category))
+                else {
+                    return violation(
+                        "finished=failed without a string failure_category".to_owned(),
+                    );
+                };
+                // The category must be the SHARED canonical vocabulary
+                // (nian-domain): never an invented `Unknown`.
+                if nian_domain::FailureCategory::from_wire(category).is_none() {
+                    return violation(format!(
+                        "finished=failed carries unknown failure_category {category:?}"
+                    ));
+                }
+                Ok(Some(Self::Failed(category.to_owned())))
             }
-            _ => None,
+            other => violation(format!("finished=true carries unknown end_kind {other:?}")),
         }
     }
 }
@@ -673,40 +714,54 @@ impl<L: WorkerLauncher> WorkerSupervisor<L> {
                         } = *envelope
                             && reply_id == poll_id
                         {
-                            if let Some(terminal) = JobTerminal::parse(&result) {
-                                self.mark_job_terminal(terminal.clone());
-                                // Final correctness remediation §3: the
-                                // recording-job terminal state is AUTHORITATIVE.
-                                // The worker cleanup shutdown below is
-                                // best-effort process hygiene — its outcome
-                                // (acked, lost, wedged, or errored) never
-                                // reinterprets the recording result.
-                                let authoritative = match terminal {
-                                    JobTerminal::Completed => Flow::JobCompleted,
-                                    JobTerminal::Stopped => Flow::ShutdownAcked,
-                                    JobTerminal::Failed(_) => Flow::JobFailedObservation,
-                                };
-                                // A terminal job state leaves the worker's
-                                // serve loop alive and idle: end the episode
-                                // with a bounded cleanup shutdown, and if the
-                                // worker fails to exit cleanly, force-terminate
-                                // so reaping can never block on a wedged
-                                // process. Anomaly is logged; the outcome is
-                                // already known.
-                                let cleanup = self.request_shutdown(pipes, shutdown_requested);
-                                if !matches!(
-                                    cleanup,
-                                    Ok(Flow::ShutdownAcked | Flow::EofAfterShutdownRequest)
-                                ) {
-                                    tracing::warn!(
-                                        "worker cleanup shutdown after a terminal job state did                                          not complete; force-terminating (recording outcome kept)"
-                                    );
-                                    let _ = pipes.stdin_tx.send(WriterCommand::Close);
-                                    let _ = pipes.child.kill();
+                            // Final safety remediation §7: a payload that
+                            // CLAIMS finished=true but carries an unknown
+                            // end_kind or a missing/invalid failure
+                            // category is a PROTOCOL VIOLATION — canonical
+                            // binaries never disagree silently, and the
+                            // job is never silently reinterpreted as
+                            // "still running".
+                            match JobTerminal::parse(&result) {
+                                Ok(Some(terminal)) => {
+                                    self.mark_job_terminal(terminal.clone());
+                                    // Final correctness remediation §3: the
+                                    // recording-job terminal state is AUTHORITATIVE.
+                                    // The worker cleanup shutdown below is
+                                    // best-effort process hygiene — its outcome
+                                    // (acked, lost, wedged, or errored) never
+                                    // reinterprets the recording result.
+                                    let authoritative = match terminal {
+                                        JobTerminal::Completed => Flow::JobCompleted,
+                                        JobTerminal::Stopped => Flow::ShutdownAcked,
+                                        JobTerminal::Failed(_) => Flow::JobFailedObservation,
+                                    };
+                                    // A terminal job state leaves the worker's
+                                    // serve loop alive and idle: end the episode
+                                    // with a bounded cleanup shutdown, and if the
+                                    // worker fails to exit cleanly, force-terminate
+                                    // so reaping can never block on a wedged
+                                    // process. Anomaly is logged; the outcome is
+                                    // already known.
+                                    let cleanup = self.request_shutdown(pipes, shutdown_requested);
+                                    if !matches!(
+                                        cleanup,
+                                        Ok(Flow::ShutdownAcked | Flow::EofAfterShutdownRequest)
+                                    ) {
+                                        tracing::warn!(
+                                            "worker cleanup shutdown after a terminal job state did not complete; force-terminating (recording outcome kept)"
+                                        );
+                                        let _ = pipes.stdin_tx.send(WriterCommand::Close);
+                                        let _ = pipes.child.kill();
+                                    }
+                                    return Ok(authoritative);
                                 }
-                                return Ok(authoritative);
+                                Ok(None) => answered = true, // running normally
+                                Err(violation) => {
+                                    return Ok(Flow::PermanentProtocol(format!(
+                                        "recording.status protocol violation: {violation}"
+                                    )));
+                                }
                             }
-                            answered = true; // running normally
                         }
                         // Stray other-id replies (including LATE replies to
                         // older polls) and events: keep waiting for OUR

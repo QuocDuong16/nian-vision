@@ -184,6 +184,25 @@ pub enum SupervisorState {
     Failed,
 }
 
+impl SupervisorState {
+    /// Stable wire representation for IPC payloads (final safety
+    /// remediation §8): the worker's `recording.status` `state` field and
+    /// any UI/M4 consumption contract on THESE strings — never Rust `Debug`
+    /// output. Vocabulary: `idle`, `connecting`, `recording`, `backoff`,
+    /// `stopped`, `failed` (the worker's job-level snapshot adds
+    /// `recovering` and `stopping` outside this enum).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Connecting => "connecting",
+            Self::Recording => "recording",
+            Self::Backoff => "backoff",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// How a supervised run finally ended (payload of `Finished`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisorEnd {
@@ -722,6 +741,24 @@ mod tests {
     use nian_domain::CameraId;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn supervisor_state_wire_values_are_explicit_and_stable() {
+        // Final safety remediation §8: the wire contract is the explicit
+        // `as_str()` vocabulary, never Rust Debug output.
+        let expected = [
+            (SupervisorState::Idle, "idle"),
+            (SupervisorState::Connecting, "connecting"),
+            (SupervisorState::Recording, "recording"),
+            (SupervisorState::Backoff, "backoff"),
+            (SupervisorState::Stopped, "stopped"),
+            (SupervisorState::Failed, "failed"),
+        ];
+        for (state, wire) in expected {
+            assert_eq!(state.as_str(), wire);
+            assert_eq!(state.as_str(), format!("{state:?}").to_lowercase());
+        }
+    }
 
     // ---- Test doubles (test-only; no fake media logic in production) ----
 

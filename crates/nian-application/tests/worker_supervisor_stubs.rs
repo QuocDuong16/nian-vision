@@ -529,3 +529,109 @@ fn late_status_response_cannot_satisfy_a_newer_poll() {
         "the missed-response bound must hold, took {started:?}"
     );
 }
+
+fn violating_status_json(extra: &str) -> String {
+    format!(
+        r#"{{"camera_id":"cam-violation","state":"failed","retry_attempt":0,"finalized_segments":0,"finished":true{extra},"recovery":null}}"#
+    )
+}
+
+fn protocol_violation_stub(
+    dir: &std::path::Path,
+    name: &str,
+    status_json: &str,
+) -> CountingLauncher {
+    // Ack id=1 like the real worker, then answer EVERY status poll with the
+    // violating terminal payload while staying alive.
+    let violating = response(3, status_json);
+    let body = format!(
+        "printf '%s\n' '{HELLO_OK}'\n\
+         while read -r req; do\n\
+           case \"$req\" in\n\
+             *'\"id\":1,'*) printf '%s\\n' '{START_ACK}' ;;\n\
+             *'shutdown'*) printf '%s\\n' '{SHUTDOWN_ACK}' ;;\n\
+             *) printf '%s\\n' '{violating}' ;;\n\
+           esac\n\
+         done\n"
+    );
+    let prog = script(dir, name, &body);
+    CountingLauncher {
+        inner: ScriptLauncher { program: prog },
+        spawns: Arc::new(AtomicUsize::new(0)),
+    }
+}
+
+#[test]
+fn finished_status_with_unknown_end_kind_is_a_protocol_violation() {
+    // Final safety remediation §7: finished=true with an unknown end_kind
+    // must NEVER be silently interpreted as "still running" — it is a
+    // permanent protocol violation, and supervision stops instead of
+    // looping.
+    let temp = tempfile::tempdir().unwrap();
+    let status = violating_status_json(r#","end_kind":"mystery""#);
+    let launcher = protocol_violation_stub(temp.path(), "unknown-end-kind", &status);
+    let spawns = Arc::clone(&launcher.spawns);
+    let mut supervisor = WorkerSupervisor::with_deadlines(launcher, fixture_deadlines());
+    supervisor.set_desired_recording(desired("cam-violation"));
+    match supervisor.run_forever(&|| false, &|_| {}) {
+        Err(ApplicationError::WorkerProtocol(message)) => {
+            assert!(
+                message.contains("end_kind"),
+                "the violation must name the offending field: {message}"
+            );
+        }
+        other => panic!("unknown end_kind must be a protocol violation, got {other:?}"),
+    }
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        1,
+        "a protocol violation must never spawn another worker"
+    );
+}
+
+#[test]
+fn failed_status_without_category_is_a_protocol_violation() {
+    // Final safety remediation §7: finished=failed with a MISSING
+    // failure_category is a protocol violation — never an invented
+    // `Unknown` category and never "still running".
+    let temp = tempfile::tempdir().unwrap();
+    let status = violating_status_json(r#","end_kind":"failed""#);
+    let launcher = protocol_violation_stub(temp.path(), "failed-no-category", &status);
+    let spawns = Arc::clone(&launcher.spawns);
+    let mut supervisor = WorkerSupervisor::with_deadlines(launcher, fixture_deadlines());
+    supervisor.set_desired_recording(desired("cam-violation"));
+    match supervisor.run_forever(&|| false, &|_| {}) {
+        Err(ApplicationError::WorkerProtocol(message)) => {
+            assert!(
+                message.contains("failure_category"),
+                "the violation must name the offending field: {message}"
+            );
+        }
+        other => panic!("missing failure_category must be a violation, got {other:?}"),
+    }
+    assert_eq!(spawns.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn failed_status_with_unknown_category_is_a_protocol_violation() {
+    // Final safety remediation §7: a failure_category outside the SHARED
+    // canonical vocabulary (nian-domain's FailureCategory) is a protocol
+    // violation — the parent never invents an interpretation for a string
+    // both binaries have not agreed on.
+    let temp = tempfile::tempdir().unwrap();
+    let status = violating_status_json(r#","end_kind":"failed","failure_category":"mystery""#);
+    let launcher = protocol_violation_stub(temp.path(), "failed-unknown-category", &status);
+    let spawns = Arc::clone(&launcher.spawns);
+    let mut supervisor = WorkerSupervisor::with_deadlines(launcher, fixture_deadlines());
+    supervisor.set_desired_recording(desired("cam-violation"));
+    match supervisor.run_forever(&|| false, &|_| {}) {
+        Err(ApplicationError::WorkerProtocol(message)) => {
+            assert!(
+                message.contains("failure_category"),
+                "the violation must name the offending field: {message}"
+            );
+        }
+        other => panic!("unknown failure_category must be a violation, got {other:?}"),
+    }
+    assert_eq!(spawns.load(Ordering::SeqCst), 1);
+}
