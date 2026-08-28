@@ -520,3 +520,85 @@ FFmpeg-free `nian-domain` crate (`FailureCategory` re-exported by
 (`as_str`: `idle`/`connecting`/`recording`/`backoff`/`stopped`/`failed`),
 replacing the Debug-then-lowercase conversion in the worker's status
 fold.
+
+## Amendment 5 — M3 identity safety remediation (2026-08-28)
+
+The fifth review round closes the transaction-IDENTITY gaps: evidence must
+describe the object it vouches for, and a consumed recording identity must
+never be re-issued — even across wall-clock rollbacks.
+
+### Tombstone v2: evidence bound to the actual recovered file (§1)
+
+`NIAN-RECOVERY-TOMBSTONE v2` adds the published final's exact size:
+
+```
+NIAN-RECOVERY-TOMBSTONE v2
+original: <canonical original basename>
+final: <canonical recovered basename>
+size: <published final size in bytes>
+```
+
+Case B (`AlreadyRecovered` + original cleanup) now requires ALL of:
+deterministic final exists; it is a REGULAR file (`symlink_metadata` —
+symlinks deliberately refused); the tombstone parses strictly as v2; the
+original basename matches; the final basename matches; AND the current
+object's size equals the recorded published size. Any failure — a
+directory, a zero-byte/truncated replacement, a different-size file at the
+recovered pathname — demotes the state to `RecoveryConflict`: original and
+destination both preserved, no remux, no retroactive success tombstone, no
+deletion of either object. Names alone never authorize a deletion.
+
+Backward compatibility: this project is pre-v1 and v1 markers bind only
+NAMES — insufficient to prove the object at the final pathname — so v1 is
+rejected as untrusted (case C conflict, both files preserved); it is never
+silently treated as equivalent to v2.
+
+### Identity reservation across the whole Nian-owned namespace (§2)
+
+`allocate_segment_sequence` previously reserved identities only for names
+`parse_segment_file_name` accepts, so `<stem>.recovered.mkv` /
+`<stem>.recovered.mkv.done` occupied nothing. The data-loss scenario — old
+partial recovered, then a manual clock rollback / NTP backward step / DST
+repeated local time re-presents the same wall-clock second and the
+allocator hands the SAME identity to new footage, which a crash would
+leave look-alike to the old transaction — is now closed by construction:
+the new `owned_recording_name` parser (nian-storage `classification`)
+resolves every Nian-owned name — normal recording, partial, recovered
+final, tombstone, and exact-grammar recovery scratch — to an
+`OwnedRecordingName { started_at, sequence, kind }`, and the allocator
+marks the `(started_at, sequence)` OCCUPIED for any of them. Foreign and
+Unknown files reserve nothing. `08-30-00.recovered.mkv` alone forces the
+next claim to `08-30-00-2.partial.mkv`; a tombstone alone reserves the
+sequence as well; wasting a sequence is harmless, identity ambiguity is
+not.
+
+### Clock-rollback regression (§3)
+
+An end-to-end filesystem/recovery test
+(`clock_rollback_cannot_reallocate_a_recovered_transaction_identity`)
+seeds a partial at T through the real `claim_segment`, recovers it,
+verifies the v2 tombstone's size binding, then simulates a new recording
+at the SAME wall-clock second T through the real layout: the claim lands
+on `-2`, new media recovers under its own distinct identity, the old
+tombstone never claims the new footage, and both recovered recordings
+remain independently identifiable.
+
+### Stop domains win over alignment read errors (§4)
+
+After the keyframe-alignment probe's `next_packet` returns `Err`, BOTH
+stop domains — the graceful `StopFlag` and `InterruptHandle` cancellation
+— are re-checked BEFORE any content verdict; only when neither is active
+is the read classified `KeptUnrecoverable`. The asynchronous recovery
+status therefore stays honest when a stop races a failing read.
+
+### Tombstone durability, precisely (§6)
+
+The marker's bytes are flushed with `sync_all`. On POSIX, a freshly
+created directory ENTRY additionally requires syncing the parent
+directory: `record_tombstone` now performs that best-effort (`fsync` on
+the opened parent directory handle). On Windows/NTFS no public
+directory-fsync exists; namespace changes are journaled and the guarantee
+is deliberately documented as weaker. The conflict contract remains safe
+under EVERY durability level: if a tombstone disappears after sudden
+power loss, the surviving final has no trusted evidence → case C conflict
+→ the original partial is preserved, never deleted on inference.

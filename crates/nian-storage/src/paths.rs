@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use nian_domain::CameraId;
 
+use crate::classification::owned_recording_name;
 use crate::error::StorageError;
 
 #[cfg(test)]
@@ -496,6 +497,16 @@ pub struct AllocatedSegmentPaths {
 /// hours/minutes/seconds only, while a live clock carries nanoseconds —
 /// comparing raw `NaiveTime`s would make `17:12:00.877` miss the existing
 /// `17-12-00.mkv` and hand out sequence 1 twice.
+///
+/// Identity reservation (identity safety remediation §2): the scan covers
+/// the WHOLE Nian-owned namespace — not only names `parse_segment_file_name`
+/// accepts. A recovered final (`08-30-00.recovered.mkv`), its tombstone
+/// (`08-30-00.recovered.mkv.done`), or a valid recovery scratch reserves the
+/// `(started_at, sequence)` of its canonical stem, so a wall-clock rollback
+/// (manual clock change, NTP backward adjustment, DST repeated local time)
+/// can never re-allocate an identity a finished transaction already used —
+/// the allocator hands out `08-30-00-2.partial.mkv` instead. Foreign/Unknown
+/// files reserve nothing.
 pub fn allocate_segment_sequence(
     day_dir: &Path,
     started_at: NaiveTime,
@@ -523,10 +534,10 @@ pub fn allocate_segment_sequence(
         let Some(name) = name.to_str() else {
             continue; // non-UTF-8 names cannot be our segments
         };
-        if let Ok(parsed) = parse_segment_file_name(name)
-            && parsed.started_at == started_at
+        if let Some(owned) = owned_recording_name(name)
+            && owned.started_at == started_at
         {
-            occupied.insert(parsed.sequence);
+            occupied.insert(owned.sequence);
         }
     }
 
@@ -926,6 +937,173 @@ mod tests {
             claim.final_path().file_name().unwrap().to_string_lossy(),
             "08-30-00-2.mkv",
             "sequence 1 is occupied despite the subsecond mismatch"
+        );
+    }
+
+    #[test]
+    fn recovered_final_reserves_its_sequence_against_clock_rollback() {
+        // Identity safety remediation §2 (review row: "recovered final
+        // reserves sequence"): `08-30-00.recovered.mkv` does not parse as a
+        // segment name, yet it OCCUPIES the (08:30:00, sequence 1) identity
+        // of its canonical stem. A wall-clock rollback (manual change, NTP
+        // backward adjustment, DST repeated local time) must never hand
+        // that identity to new footage — the allocator must pick
+        // 08-30-00-2.partial.mkv.
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        touch(&day_dir.join("08-30-00.recovered.mkv"));
+
+        let allocated = layout.allocate_segment(&camera, sample_start()).unwrap();
+        assert_eq!(
+            allocated
+                .partial_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            "08-30-00-2.partial.mkv",
+            "the recovered transaction identity must never be re-allocated"
+        );
+        assert_eq!(
+            allocated.final_path.file_name().unwrap().to_string_lossy(),
+            "08-30-00-2.mkv"
+        );
+    }
+
+    #[test]
+    fn tombstone_alone_reserves_its_sequence() {
+        // Identity safety remediation §2 (review row: "tombstone reserves
+        // sequence"): even when only `08-30-00.recovered.mkv.done` remains
+        // (the recovered final since moved away by an M4 policy, say),
+        // sequence 1 stays reserved.
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        touch(&day_dir.join("08-30-00.recovered.mkv.done"));
+
+        let claim = layout.claim_segment(&camera, sample_start()).unwrap();
+        assert_eq!(
+            claim.partial_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00-2.partial.mkv"
+        );
+    }
+
+    #[test]
+    fn recovered_and_normal_files_produce_the_next_correct_sequence() {
+        // Identity safety remediation §2 (review row: "recovered + normal
+        // files produce the next correct sequence"): reservation counts
+        // across BOTH name grammars — normal seq 2 plus the recovered
+        // transaction at seq 1 → the next free sequence is 3.
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        touch(&day_dir.join("08-30-00.recovered.mkv")); // seq 1 (transaction)
+        touch(&day_dir.join("08-30-00.recovered.mkv.done")); // seq 1 (tombstone)
+        touch(&day_dir.join("08-30-00-2.mkv")); // seq 2 (normal recording)
+
+        let claim = layout.claim_segment(&camera, sample_start()).unwrap();
+        assert_eq!(
+            claim.partial_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00-3.partial.mkv"
+        );
+        assert_eq!(
+            claim.final_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00-3.mkv"
+        );
+    }
+
+    #[test]
+    fn recovery_scratch_reserves_its_sequence() {
+        // Identity safety remediation §2 (preferred reservation): a valid
+        // exact-grammar scratch occupies its stem's identity too — wasting
+        // a sequence is harmless, identity ambiguity is not.
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        touch(&day_dir.join("08-30-00.recovery-4194305-0-123456789.tmp"));
+
+        let allocated = layout.allocate_segment(&camera, sample_start()).unwrap();
+        assert_eq!(
+            allocated
+                .partial_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            "08-30-00-2.partial.mkv"
+        );
+    }
+
+    #[test]
+    fn unknown_foreign_files_reserve_nothing() {
+        // Identity safety remediation §2 (review row: "Unknown foreign
+        // files do not reserve sequence"): arbitrary operator files must
+        // never consume recording identities.
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        touch(&day_dir.join("holiday.mkv"));
+        touch(&day_dir.join("notes.txt"));
+        touch(&day_dir.join("08-30-00.recovered.mkv.doneX"));
+        touch(&day_dir.join("08-30-00.recovery-not-ours.txt"));
+        touch(&day_dir.join("12-00-00.recovered.mkv")); // different second
+
+        let allocated = layout.allocate_segment(&camera, sample_start()).unwrap();
+        assert_eq!(
+            allocated
+                .partial_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            "08-30-00.partial.mkv",
+            "foreign names must not reserve anything"
+        );
+    }
+
+    #[test]
+    fn identity_reservation_respects_whole_second_granularity() {
+        // Identity safety remediation §2 (review row: "whole-second
+        // comparison remains correct"): a recovered final at 08-30-00 also
+        // forces a subsecond 08:30:00.877 claim to sequence 2, while the
+        // NEXT whole second still receives the bare name.
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        touch(&day_dir.join("08-30-00.recovered.mkv"));
+
+        let subsecond_start = sample_start()
+            .with_nanosecond(877_000_000)
+            .expect("valid subsecond time");
+        let claim = layout.claim_segment(&camera, subsecond_start).unwrap();
+        assert_eq!(
+            claim.partial_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00-2.partial.mkv",
+            "reservation must be second-granular, not name-exact"
+        );
+
+        let next_second = sample_start().with_second(1).expect("valid time");
+        let later = layout.allocate_segment(&camera, next_second).unwrap();
+        assert_eq!(
+            later.partial_path.file_name().unwrap().to_string_lossy(),
+            "08-30-01.partial.mkv",
+            "the neighboring second stays untouched"
         );
     }
 

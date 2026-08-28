@@ -374,10 +374,16 @@ fn failed_recovery_preserves_the_original_partial() {
     let storage = Storage::new();
     storage.place_fixture("14-00-00.partial.mkv");
 
-    let mut permissions = std::fs::metadata(&storage.day_dir).unwrap().permissions();
-    #[allow(clippy::permissions_set_readonly_false)] // one direction per branch
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o500); // r-x
-    std::fs::set_permissions(&storage.day_dir, permissions).unwrap();
+    // Read-only enforcement is POSIX-only; on non-Unix the test target must
+    // still COMPILE (it never runs there), so `claims_blocked` simply stays
+    // false and the success contract is asserted below.
+    #[cfg(unix)]
+    {
+        let mut permissions = std::fs::metadata(&storage.day_dir).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)] // one direction per branch
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o500); // r-x
+        std::fs::set_permissions(&storage.day_dir, permissions).unwrap();
+    }
 
     let probe_path = storage.path("claim-probe.tmp");
     let claims_blocked = std::fs::File::create(&probe_path).is_err();
@@ -387,10 +393,13 @@ fn failed_recovery_preserves_the_original_partial() {
     }));
 
     // Restore permissions BEFORE asserting so cleanup always works.
-    let mut permissions = std::fs::metadata(&storage.day_dir).unwrap().permissions();
-    #[allow(clippy::permissions_set_readonly_false)]
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
-    std::fs::set_permissions(&storage.day_dir, permissions).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = std::fs::metadata(&storage.day_dir).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
+        std::fs::set_permissions(&storage.day_dir, permissions).unwrap();
+    }
     let _ = std::fs::remove_file(&probe_path);
 
     let (outcomes, failures) = result.expect("recovery must not panic on claim failure");
@@ -608,4 +617,169 @@ fn recovery_does_not_inherit_session_defaults() {
     // timeouts. If someone couples them, this placeholder keeps the intent
     // visible.
     let _ = Duration::from_secs(15);
+}
+
+// ---- M3 identity safety remediation §3 ----------------------------------
+/// The clock-rollback regression: a finished recovery transaction
+/// (`08-30-00.partial.mkv` → `08-30-00.recovered.mkv` + trusted tombstone)
+/// must keep its identity FOREVER. Local wall clocks are not monotonic —
+/// manual adjustment, NTP backward steps and DST repeated local times can
+/// all present the SAME wall-clock second again. The allocator must refuse
+/// to re-issue the consumed identity (the reservation is carried by the
+/// recovered final and its tombstone themselves, which never parse as
+/// segment names), so new footage recorded in that second gets
+/// `08-30-00-2.partial.mkv` and can never be mistaken for — or deleted
+/// by — the old transaction.
+#[test]
+fn clock_rollback_cannot_reallocate_a_recovered_transaction_identity() {
+    let storage = Storage::new();
+    let t = chrono::NaiveDate::from_ymd_opt(2026, 8, 27)
+        .unwrap()
+        .and_hms_opt(8, 30, 0)
+        .unwrap();
+    let fixture = std::fs::read(fixtures_dir().join(HEALTHY_FIXTURE)).unwrap();
+
+    // 1. Seed the OLD transaction's canonical partial at timestamp T,
+    //    claimed through the real RecordingsLayout.
+    let old_claim = storage.layout.claim_segment(&storage.camera, t).unwrap();
+    let old_partial = old_claim.partial_path().to_path_buf();
+    assert_eq!(
+        old_partial.file_name().unwrap().to_string_lossy(),
+        "08-30-00.partial.mkv",
+        "test premise: an empty tree hands out the bare identity"
+    );
+    std::fs::write(&old_partial, &fixture).unwrap();
+    drop(old_claim);
+
+    // 2. Recover it successfully.
+    let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [RecoveryOutcome::Recovered {
+                original_removed: true,
+                tombstone_recorded: true,
+                ..
+            }]
+        ),
+        "the old transaction must recover cleanly: {outcomes:?}"
+    );
+
+    // 3. Verify the recovered final + its trusted v2 tombstone.
+    let old_final = storage.path("08-30-00.recovered.mkv");
+    let old_tombstone = storage.path("08-30-00.recovered.mkv.done");
+    assert!(old_final.is_file());
+    assert!(old_tombstone.is_file());
+    let recorded = std::fs::read_to_string(&old_tombstone).unwrap();
+    assert!(
+        recorded.starts_with("NIAN-RECOVERY-TOMBSTONE v2\n"),
+        "the trusted marker must be v2: {recorded:?}"
+    );
+    let recorded_size: u64 = recorded
+        .lines()
+        .find_map(|line| line.strip_prefix("size: "))
+        .expect("the tombstone records the published size")
+        .parse()
+        .expect("the recorded size must be numeric");
+    assert_eq!(
+        recorded_size,
+        std::fs::metadata(&old_final).unwrap().len(),
+        "the tombstone's size binding must describe the object at the final path"
+    );
+    let old_final_bytes = std::fs::read(&old_final).unwrap();
+
+    // 4.+5. A NEW recording begins at the SAME wall-clock second T —
+    //       claimed through the real RecordingsLayout, as the recorder
+    //       would after a clock rollback.
+    let new_claim = storage.layout.claim_segment(&storage.camera, t).unwrap();
+
+    // 6. Its identity DIFFERS from the old transaction: the recovered
+    //    final and tombstone reserve sequence 1.
+    assert_eq!(
+        new_claim
+            .partial_path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy(),
+        "08-30-00-2.partial.mkv",
+        "the allocator must NOT re-issue 08-30-00.partial.mkv after a rollback"
+    );
+    assert_eq!(
+        new_claim
+            .final_path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy(),
+        "08-30-00-2.mkv"
+    );
+    assert_ne!(new_claim.partial_path(), old_partial);
+
+    // 7. Seed valid new partial media in that slot.
+    std::fs::write(new_claim.partial_path(), &fixture).unwrap();
+    let new_partial = new_claim.partial_path().to_path_buf();
+    drop(new_claim);
+
+    // 8.+9. Startup recovery: the new footage is a NEW transaction —
+    //       never interpreted as AlreadyRecovered from the old tombstone.
+    let (outcomes2, failures2) = recover_camera_partials(&storage.layout, &storage.camera);
+    assert!(failures2.is_empty(), "{failures2:?}");
+    assert!(
+        !outcomes2
+            .iter()
+            .any(|outcome| matches!(outcome, RecoveryOutcome::AlreadyRecovered { .. })),
+        "the old tombstone must never claim the NEW footage: {outcomes2:?}"
+    );
+    assert!(
+        !outcomes2
+            .iter()
+            .any(|outcome| matches!(outcome, RecoveryOutcome::RecoveryConflict { .. })),
+        "the new transaction must not collide with the old one: {outcomes2:?}"
+    );
+    assert!(
+        matches!(
+            outcomes2.as_slice(),
+            [RecoveryOutcome::Recovered {
+                final_path,
+                original_removed: true,
+                tombstone_recorded: true,
+                ..
+            }] if final_path == &storage.path("08-30-00-2.recovered.mkv")
+        ),
+        "the new footage must recover under its OWN distinct identity: {outcomes2:?}"
+    );
+    assert!(!new_partial.exists(), "the new original was recovered");
+
+    // 10. Both recovered recordings remain independently identifiable:
+    //     distinct finals, both still on disk, the old one byte-identical,
+    //     each tombstone bound to its own names.
+    let new_final = storage.path("08-30-00-2.recovered.mkv");
+    let new_tombstone = storage.path("08-30-00-2.recovered.mkv.done");
+    assert!(old_final.is_file());
+    assert!(new_final.is_file());
+    assert_ne!(old_final, new_final);
+    assert_eq!(
+        std::fs::read(&old_final).unwrap(),
+        old_final_bytes,
+        "the old recovered recording must be untouched by the second transaction"
+    );
+    assert!(old_tombstone.is_file());
+    assert!(new_tombstone.is_file());
+    let new_recorded = std::fs::read_to_string(&new_tombstone).unwrap();
+    assert!(
+        new_recorded.contains("original: 08-30-00-2.partial.mkv\n")
+            && new_recorded.contains("final: 08-30-00-2.recovered.mkv\n"),
+        "the new tombstone must bind the NEW transaction's names: {new_recorded:?}"
+    );
+    // Both files classify as first-class recordings with distinct stems.
+    assert_eq!(
+        nian_storage::classify_recording_file_name("08-30-00.recovered.mkv"),
+        nian_storage::RecordingFileKind::RecoveredRecording
+    );
+    assert_eq!(
+        nian_storage::classify_recording_file_name("08-30-00-2.recovered.mkv"),
+        nian_storage::RecordingFileKind::RecoveredRecording
+    );
+    assert!(probe_has_video(&old_final));
+    assert!(probe_has_video(&new_final));
 }

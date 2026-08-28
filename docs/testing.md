@@ -157,16 +157,41 @@ restartable; backoff waits interrupted by operator shutdown.
   alignment phase (recorder- and worker-level: one stop ends the job
   without any camera connection); protocol shutdown ends recovery
   gracefully before its force-cancel grace.
-* Tombstone transaction/conflict contract (final safety §1): a
-  deterministic destination's mere existence is NEVER proof — directory,
-  zero-byte, foreign-valid-MKV and malformed/foreign-tombstone
+* Tombstone transaction/conflict contract (final safety §1 + identity
+  safety §1): a deterministic destination's mere existence is NEVER proof
+  — directory, zero-byte, foreign-valid-MKV and malformed/foreign-tombstone
   destinations all yield `RecoveryConflict` preserving BOTH files (no
-  remux, no retroactive tombstone, no deletion); a trusted tombstone
-  (magic + strict original/final name binding) yields `AlreadyRecovered`
-  with a cleanup retry; a publish-hold seam deterministically opens the
-  winner's not-yet-tombstoned window and proves the loser never deletes
-  the original there; concurrent attempts still converge to exactly one
-  final, one trusted tombstone, original gone.
+  remux, no retroactive tombstone, no deletion); a trusted v2 tombstone
+  (magic + strict original/final name binding + the PUBLISHED SIZE,
+  re-verified against the object CURRENTLY at the final path as a regular
+  file) yields `AlreadyRecovered` with a cleanup retry; a tombstone whose
+  destination was since replaced (directory / zero-byte /
+  different-size file) is a conflict, never a deletion; legacy v1 markers
+  are rejected as untrusted; a publish-hold seam deterministically opens
+  the winner's not-yet-tombstoned window and proves the loser never
+  deletes the original there; concurrent attempts still converge to
+  exactly one final, one trusted tombstone, original gone.
+* Identity reservation + clock rollback (identity safety §2/§3): the
+  allocator marks `(started_at, sequence)` occupied for EVERY Nian-owned
+  name (recovered final, tombstone, valid scratch — not only parseable
+  segment names), so `08-30-00.recovered.mkv` (or its `.done` alone)
+  forces the next claim to `08-30-00-2.partial.mkv`; foreign/Unknown files
+  reserve nothing; whole-second granularity still holds. The end-to-end
+  clock-rollback regression re-claims the same wall-clock second through
+  the real layout after a finished recovery and proves the new footage
+  takes a distinct identity, recovers as a NEW transaction, is never
+  claimed by the old tombstone, and both recovered recordings stay
+  independently identifiable.
+* Alignment read errors vs stop domains (identity safety §4): a
+  deterministic read-error seam fails the alignment probe's read after a
+  configurable hold — with no stop domain active it is an honest
+  `KeptUnrecoverable` content verdict; a graceful stop landing INSIDE the
+  failing read classifies as `Cancelled`, never a false "unreadable".
+* Tombstone durability (identity safety §6): the marker's bytes are
+  synced and (POSIX, best-effort) the parent directory is fsynced for
+  directory-entry durability; the contract stays safe if a tombstone
+  vanishes after power loss (final without trusted evidence → preserved
+  conflict).
 * Storage classification (final correctness §6/§7/§8): recovered MKV
   classifies as a recording; scratch/tombstones as artifacts; unknown
   names as Unknown; a stat failure on this attempt's finalized scratch is

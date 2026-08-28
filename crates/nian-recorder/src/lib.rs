@@ -76,9 +76,9 @@ pub use recovery::{
 };
 #[cfg(any(test, feature = "test-hooks"))]
 pub use recovery::{
-    arm_alignment_gate, arm_cleanup_hijack, arm_finalize_failure, arm_metadata_failure,
-    arm_output_open_fault, arm_publish_barrier, arm_publish_hold, arm_recovery_delay,
-    arm_write_fault, test_hooks,
+    arm_alignment_gate, arm_alignment_read_failure, arm_cleanup_hijack, arm_finalize_failure,
+    arm_metadata_failure, arm_output_open_fault, arm_publish_barrier, arm_publish_hold,
+    arm_recovery_delay, arm_write_fault, test_hooks,
 };
 pub use session::{RecordingSession, RecordingSummary, StopFlag};
 pub use supervisor::{

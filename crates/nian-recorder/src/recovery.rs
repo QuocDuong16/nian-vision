@@ -27,16 +27,37 @@
 //! pathname. Instead, an explicit transaction/conflict contract decides:
 //!
 //! * A. final absent → a normal recovery attempt;
-//! * B. final present AND a TRUSTED tombstone (magic version line + the
-//!   exact original/final names, strictly parsed) proves THIS
-//!   original→final transaction → `AlreadyRecovered` with a cleanup
-//!   retry — no remux, no duplicate;
+//! * B. final present AND a TRUSTED tombstone (v2: magic version line, the
+//!   exact original/final names AND the published size, strictly parsed)
+//!   proves THIS original→final transaction AND the object CURRENTLY at
+//!   the final pathname is still that published regular file (same byte
+//!   size) → `AlreadyRecovered` with a cleanup retry — no remux, no
+//!   duplicate (identity safety remediation §1: a valid old tombstone
+//!   NEVER authorizes deleting an original when the pathname has since
+//!   become a directory, a zero-byte/truncated file, or a replacement);
 //! * C. final present WITHOUT trusted evidence → `RecoveryConflict`:
 //!   original and destination both preserved, no remux, no retroactive
 //!   success tombstone, no deletion of either file. No recording data is
 //!   ever deleted on name-based inference; crash-after-publication-before-
 //!   tombstone states are recoverable conflicts, and future repair tooling
 //!   may inspect them — M3 stays lossless first.
+//!
+//! Tombstone FORMAT VERSIONS: only `NIAN-RECOVERY-TOMBSTONE v2` is
+//! trusted. This project is pre-v1, and v1 markers bound only NAMES —
+//! insufficient to prove the object at the final pathname — so a v1
+//! marker is rejected as untrusted (case C conflict, both files
+//! preserved); it is never silently treated as equivalent to v2.
+//!
+//! Tombstone DURABILITY (identity safety remediation §6): the marker's
+//! DATA is flushed with `sync_all`. On POSIX a newly created directory
+//! ENTRY additionally requires syncing the parent directory, which
+//! [`record_tombstone`] performs best-effort where the platform supports
+//! it; on Windows/NTFS namespace operations are journaled and no public
+//! directory-fsync exists, so the guarantee there is deliberately weaker.
+//! The conflict contract remains safe under EVERY durability level: if a
+//! tombstone disappears after sudden power loss, the surviving final has
+//! no trusted evidence → case C conflict → the original partial is
+//! preserved, never deleted on inference.
 //!
 //! The recovery SCRATCH is per-ATTEMPT UNIQUE
 //! (`<base>.recovery-<pid>-<serial>-<nanos>.tmp`, created with atomic
@@ -161,6 +182,12 @@ pub mod test_hooks {
     /// When armed, the muxer finalize step fails deterministically (final
     /// safety remediation §5).
     pub static FAIL_FINALIZE: AtomicBool = AtomicBool::new(false);
+    /// When armed, the keyframe-alignment probe's next packet read FAILS
+    /// after sleeping this many milliseconds — the deterministic read-error
+    /// seam (identity safety remediation §4): tests can race a stop domain
+    /// against the error surface inside the hold window. `u64::MAX` =
+    /// disarmed (0 = fail immediately).
+    pub static ALIGNMENT_READ_FAIL_MS: AtomicU64 = AtomicU64::new(u64::MAX);
     /// Every scratch path this process claimed, in claim order (uniqueness
     /// assertions for concurrent attempts).
     pub static CLAIMED_SCRATCHES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -322,6 +349,7 @@ pub mod test_hooks {
             PRE_PUBLISH_DELAY_MS.store(0, Ordering::SeqCst);
             FAIL_FINALIZE.store(false, Ordering::SeqCst);
             BREAK_OUTPUT_OPEN.store(false, Ordering::SeqCst);
+            ALIGNMENT_READ_FAIL_MS.store(u64::MAX, Ordering::SeqCst);
             *PUBLISH_BARRIER
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -341,12 +369,12 @@ pub mod test_hooks {
 
 #[cfg(any(test, feature = "test-hooks"))]
 use test_hooks::{
-    ALIGNMENT_GATE as HOOK_ALIGNMENT_GATE, BREAK_OUTPUT_OPEN as HOOK_BREAK_OUTPUT_OPEN,
-    CLAIMED_SCRATCHES as HOOK_SCRATCHES, FAIL_FINALIZE as HOOK_FAIL_FINALIZE,
-    FAIL_METADATA as HOOK_FAIL_METADATA, HIJACK_CLEANUP_TO_DIR as HOOK_HIJACK_CLEANUP,
-    PRE_PUBLISH_DELAY_MS as HOOK_DELAY_MS, PUBLISH_BARRIER as HOOK_BARRIER,
-    PUBLISH_HOLD as HOOK_PUBLISH_HOLD, WRITE_CALLS as HOOK_WRITE_CALLS,
-    WRITE_FAIL_AFTER_CALLS as HOOK_WRITE_FAIL_AFTER,
+    ALIGNMENT_GATE as HOOK_ALIGNMENT_GATE, ALIGNMENT_READ_FAIL_MS as HOOK_ALIGN_READ_FAIL_MS,
+    BREAK_OUTPUT_OPEN as HOOK_BREAK_OUTPUT_OPEN, CLAIMED_SCRATCHES as HOOK_SCRATCHES,
+    FAIL_FINALIZE as HOOK_FAIL_FINALIZE, FAIL_METADATA as HOOK_FAIL_METADATA,
+    HIJACK_CLEANUP_TO_DIR as HOOK_HIJACK_CLEANUP, PRE_PUBLISH_DELAY_MS as HOOK_DELAY_MS,
+    PUBLISH_BARRIER as HOOK_BARRIER, PUBLISH_HOLD as HOOK_PUBLISH_HOLD,
+    WRITE_CALLS as HOOK_WRITE_CALLS, WRITE_FAIL_AFTER_CALLS as HOOK_WRITE_FAIL_AFTER,
 };
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -431,6 +459,17 @@ pub fn arm_output_open_fault() -> test_hooks::Guard {
     test_hooks::Guard
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
+/// Arms the deterministic alignment read-error seam: the probe's next
+/// packet read fails after holding `hold_ms` milliseconds (identity safety
+/// remediation §4). A stop request landing inside the hold window must
+/// classify as `Cancelled`; with no stop domain active the error is an
+/// honest content verdict.
+pub fn arm_alignment_read_failure(hold_ms: u64) -> test_hooks::Guard {
+    test_hooks::ALIGNMENT_READ_FAIL_MS.store(hold_ms, Ordering::SeqCst);
+    test_hooks::Guard
+}
+
 /// Canonical `<HH-MM-SS>.partial.mkv` name for a timestamp — the exact
 /// shape the scanner accepts (mirrors nian-storage's allocator naming).
 #[cfg(any(test, feature = "test-hooks"))]
@@ -456,12 +495,13 @@ pub enum RecoveryOutcome {
     },
 
     /// This original's deterministic recovered final ALREADY exists AND a
-    /// TRUSTED tombstone proves this exact original→final transaction
-    /// (final safety remediation §1, case B). Recognized WITHOUT opening
-    /// the demuxer, so the same surviving original can never be remuxed (or
-    /// duplicated) again. The path then REPAIRS the transaction (final
-    /// correctness remediation §5): retry removing the original, report
-    /// the cleanup result.
+    /// TRUSTED tombstone proves this exact original→final transaction AND
+    /// the object currently at the final pathname is still the published
+    /// regular file (v2 size binding, identity safety remediation §1,
+    /// case B). Recognized WITHOUT opening the demuxer, so the same
+    /// surviving original can never be remuxed (or duplicated) again. The
+    /// path then REPAIRS the transaction (final correctness remediation
+    /// §5): retry removing the original, report the cleanup result.
     AlreadyRecovered {
         /// The surviving original partial.
         partial_path: PathBuf,
@@ -637,27 +677,35 @@ fn recovery_identity(partial_path: &Path) -> Option<RecoveryIdentity> {
     })
 }
 
-/// Magic first line of a TRUSTED tombstone (final safety remediation §1).
-/// A `.done` file without exactly this structure is foreign content, never
-/// transaction evidence.
-const TOMBSTONE_MAGIC: &str = "NIAN-RECOVERY-TOMBSTONE v1";
+/// Magic first line of a TRUSTED tombstone (final safety remediation §1;
+/// v2 size binding: identity safety remediation §1). A `.done` file
+/// without exactly this structure is foreign content, never transaction
+/// evidence. v1 markers are deliberately NOT trusted: they bound only
+/// names, not the object at the final pathname, and this pre-v1 project
+/// never silently upgrades old evidence.
+const TOMBSTONE_MAGIC: &str = "NIAN-RECOVERY-TOMBSTONE v2";
 
 /// The transaction record a tombstone must carry to be trusted: the magic
-/// version line, the ORIGINAL canonical file name and the FINAL file name.
-/// Anything else — empty files, foreign markers, wrong names — fails
-/// validation and yields a preserved conflict instead of a deletion.
+/// version line, the ORIGINAL canonical file name, the FINAL file name and
+/// the PUBLISHED FINAL SIZE in bytes. Anything else — empty files, foreign
+/// markers, wrong names, missing size — fails validation and yields a
+/// preserved conflict instead of a deletion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TombstoneTransaction {
     original: String,
     final_name: String,
+    size_bytes: u64,
 }
 
-fn tombstone_payload(original_name: &str, final_name: &str) -> String {
-    format!("{TOMBSTONE_MAGIC}\noriginal: {original_name}\nfinal: {final_name}\n")
+fn tombstone_payload(original_name: &str, final_name: &str, size_bytes: u64) -> String {
+    format!(
+        "{TOMBSTONE_MAGIC}\noriginal: {original_name}\nfinal: {final_name}\nsize: {size_bytes}\n"
+    )
 }
 
 /// Strictly parses tombstone bytes; `None` for any malformed/foreign
-/// content (wrong magic, missing/mismatched fields, extra content).
+/// content (wrong magic/version — including legacy v1 — missing or
+/// mismatched fields, non-numeric size, extra content).
 fn parse_tombstone(bytes: &[u8]) -> Option<TombstoneTransaction> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut lines = text.lines();
@@ -666,21 +714,57 @@ fn parse_tombstone(bytes: &[u8]) -> Option<TombstoneTransaction> {
     }
     let original = lines.next()?.strip_prefix("original: ")?;
     let final_name = lines.next()?.strip_prefix("final: ")?;
-    if original.is_empty() || final_name.is_empty() || lines.next().is_some() {
+    let size = lines.next()?.strip_prefix("size: ")?;
+    if original.is_empty() || final_name.is_empty() || size.is_empty() || lines.next().is_some() {
         return None;
     }
+    let size_bytes = size.parse::<u64>().ok()?;
     Some(TombstoneTransaction {
         original: original.to_owned(),
         final_name: final_name.to_owned(),
+        size_bytes,
     })
 }
 
+/// Whether the object CURRENTLY at the deterministic final path is still
+/// the regular file the transaction published (identity safety remediation
+/// §1): the deterministic final exists, is a REGULAR file (`symlink_metadata`
+/// deliberately refuses symlinks), and its size still matches the recorded
+/// published size. A directory, a zero-byte/truncated replacement, or any
+/// other object at that pathname fails this binding.
+fn published_final_matches(final_path: &Path, expected_size: u64) -> bool {
+    match std::fs::symlink_metadata(final_path) {
+        Ok(metadata) => metadata.is_file() && metadata.len() == expected_size,
+        Err(_) => false,
+    }
+}
+
 /// Whether the tombstone next to the deterministic final TRUSTEDLY proves
-/// THIS original→final transaction (final safety remediation §1, case B):
-/// readable, structurally valid, AND naming exactly this pair. A tombstone
-/// for a different original/final is untrusted here — name matching is the
-/// transaction binding.
+/// THIS original→final transaction over the object NOW at that path
+/// (final safety remediation §1 case B + identity safety remediation §1):
+/// readable, structurally valid v2, naming exactly this pair, AND the
+/// current object still matching the recorded published size. A tombstone
+/// for a different original/final — or one whose destination was since
+/// replaced — is untrusted here.
 fn tombstone_proves_transaction(identity: &RecoveryIdentity, original_name: &str) -> bool {
+    let Some(final_name) = identity.final_path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(transaction) = std::fs::read(&identity.tombstone)
+        .ok()
+        .and_then(|bytes| parse_tombstone(&bytes))
+    else {
+        return false;
+    };
+    transaction.original == original_name
+        && transaction.final_name == final_name
+        && published_final_matches(&identity.final_path, transaction.size_bytes)
+}
+
+/// Whether a tombstone NAMES this transaction (structurally valid + name
+/// bound) WITHOUT judging the object at the final path. Used only to pick
+/// the precise conflict reason when the full proof above fails.
+fn tombstone_names_transaction(identity: &RecoveryIdentity, original_name: &str) -> bool {
     let Some(final_name) = identity.final_path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
@@ -698,7 +782,14 @@ fn tombstone_proves_transaction(identity: &RecoveryIdentity, original_name: &str
 /// THIS pass published the recovered final (§1: never retroactively, to
 /// legitimize a pre-existing destination); a `false` here is the observable
 /// persistence failure.
-fn record_tombstone(identity: &RecoveryIdentity, original_name: &str) -> bool {
+///
+/// Durability (identity safety remediation §6): the marker's bytes are
+/// flushed with `sync_all`; on POSIX the freshly created directory entry
+/// additionally needs the parent directory synced, which happens
+/// best-effort below. Even if the marker never becomes durable, the
+/// contract stays safe: a final without trusted tombstone is a preserved
+/// conflict, never a deletion.
+fn record_tombstone(identity: &RecoveryIdentity, original_name: &str, size_bytes: u64) -> bool {
     if tombstone_proves_transaction(identity, original_name) {
         return true;
     }
@@ -707,7 +798,7 @@ fn record_tombstone(identity: &RecoveryIdentity, original_name: &str) -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    let payload = tombstone_payload(original_name, final_name);
+    let payload = tombstone_payload(original_name, final_name, size_bytes);
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true) // atomic no-replace on every supported platform
@@ -715,24 +806,50 @@ fn record_tombstone(identity: &RecoveryIdentity, original_name: &str) -> bool {
         .and_then(|mut file| {
             std::io::Write::write_all(&mut file, payload.as_bytes())?;
             file.sync_all()
-        })
-        .is_ok();
-    written && tombstone_proves_transaction(identity, original_name)
+        });
+    if written.is_ok() {
+        sync_parent_directory(&identity.tombstone);
+    }
+    written.is_ok() && tombstone_proves_transaction(identity, original_name)
 }
 
+/// Best-effort POSIX durability for a freshly created directory entry
+/// (identity safety remediation §6): `fsync` on the parent directory.
+/// No-op where the platform exposes no public directory sync (Windows/NTFS
+/// journals namespace operations; the conflict contract covers the gap).
+#[cfg(unix)]
+fn sync_parent_directory(marker: &Path) {
+    if let Some(parent) = marker.parent()
+        && let Ok(dir_handle) = std::fs::File::open(parent)
+    {
+        let _ = dir_handle.sync_all();
+    }
+}
+
+/// Windows/NTFS: no public directory-fsync; namespace changes are covered
+/// by the NTFS journal. The weaker guarantee is documented, and the
+/// conflict contract stays safe if a tombstone vanishes after power loss.
+#[cfg(not(unix))]
+fn sync_parent_directory(_marker: &Path) {}
+
 /// Resolves an EXISTING deterministic destination against the transaction
-/// contract (final safety remediation §1). Both the early recognition path
-/// (before any media work) and the concurrent `DestinationExists` publish
-/// path come through here, so they can never disagree:
+/// contract (final safety remediation §1; object binding: identity safety
+/// remediation §1). Both the early recognition path (before any media
+/// work) and the concurrent `DestinationExists` publish path come through
+/// here, so they can never disagree:
 ///
-/// * trusted tombstone for this original→final pair → `AlreadyRecovered`
-///   with a cleanup retry (case B);
+/// * trusted tombstone for this original→final pair AND the current
+///   object at the final path still matching the recorded publication →
+///   `AlreadyRecovered` with a cleanup retry (case B);
 /// * anything else → `RecoveryConflict`, preserving BOTH files (case C):
 ///   no remux, no retroactive success tombstone, no deletion of either
 ///   file. A concurrent winner that has published but not yet written its
 ///   tombstone therefore surfaces as a pending conflict — the loser must
 ///   NOT delete the original during that window; the winner's own
-///   tombstone+cleanup converges the tree afterwards.
+///   tombstone+cleanup converges the tree afterwards. A tombstone that
+///   still NAMES this transaction but whose destination has since become a
+///   directory or a different-size object is likewise a conflict: names
+///   alone never authorize a deletion.
 fn resolve_existing_final(identity: &RecoveryIdentity, partial_path: &Path) -> RecoveryOutcome {
     let original_name = partial_path
         .file_name()
@@ -752,8 +869,10 @@ fn resolve_existing_final(identity: &RecoveryIdentity, partial_path: &Path) -> R
             original_removed,
         };
     }
-    let reason = if identity.tombstone.is_file() {
-        "recovered destination exists but its tombstone is untrusted for this transaction (malformed or foreign)"
+    let reason = if tombstone_names_transaction(identity, original_name) {
+        "trusted tombstone names this transaction, but the object at the recovered path is no longer the published recording (replaced, truncated, or not a regular file)"
+    } else if identity.tombstone.is_file() {
+        "recovered destination exists but its tombstone is untrusted for this transaction (malformed, legacy, or foreign)"
     } else if identity.final_path.is_dir() {
         "recovered destination exists as a directory"
     } else {
@@ -1079,6 +1198,11 @@ fn salvage_media(
     // `while let Some(...) = next_packet().ok().flatten()` shape collapsed
     // EOF, media errors, timeouts and cancellation into one silent
     // None-path that could never observe a stop during alignment.
+    //
+    // Identity safety remediation §4: after a FAILED read, BOTH stop
+    // domains are checked again BEFORE any content verdict — a graceful
+    // stop or cancellation that raced the failing read keeps the recovery
+    // status honest (`Cancelled`), never a false "unreadable".
     let mut found_keyframe = false;
     loop {
         #[cfg(any(test, feature = "test-hooks"))]
@@ -1088,7 +1212,28 @@ fn salvage_media(
         if stop_requested() || interrupt.is_cancelled() {
             return Err(RecoveryError::Cancelled);
         }
-        match input.next_packet() {
+        let read = {
+            #[cfg(any(test, feature = "test-hooks"))]
+            {
+                let hold_ms = HOOK_ALIGN_READ_FAIL_MS.load(Ordering::SeqCst);
+                if hold_ms != u64::MAX {
+                    // Deterministic read-error seam (identity safety §4):
+                    // the read "fails" after the configured hold, so tests
+                    // can land a stop request INSIDE the failing read.
+                    std::thread::sleep(Duration::from_millis(hold_ms));
+                    Err::<std::option::Option<_>, String>(
+                        "injected alignment read failure".to_owned(),
+                    )
+                } else {
+                    input.next_packet().map_err(|error| error.to_string())
+                }
+            }
+            #[cfg(not(any(test, feature = "test-hooks")))]
+            {
+                input.next_packet().map_err(|error| error.to_string())
+            }
+        };
+        match read {
             Ok(Some(packet)) => {
                 let metadata = packet.metadata();
                 if metadata.stream_index == video_index && metadata.keyframe {
@@ -1098,10 +1243,13 @@ fn salvage_media(
             }
             Ok(None) => break, // readable span exhausted: no keyframe inside
             Err(error) => {
-                // Cancellation arriving DURING a blocked read is a stop,
-                // never a content verdict (§2/§7); any other read failure
-                // is a deliberate per-file content classification.
-                if interrupt.is_cancelled() {
+                // Stop domains WIN over content verdicts (identity safety
+                // remediation §4): both the graceful StopFlag and forced
+                // cancellation are re-checked after the failed read before
+                // declaring the media unreadable. Only when neither stop
+                // domain is active is this a deliberate per-file content
+                // classification.
+                if interrupt.is_cancelled() || stop_requested() {
                     return Err(RecoveryError::Cancelled);
                 }
                 return Ok(RecoveryOutcome::KeptUnrecoverable {
@@ -1433,13 +1581,15 @@ fn salvage_media(
     // observable, but the deterministic identity keeps idempotency intact.
     // No stop gate here: the transaction already crossed its durable commit
     // point, so the tiny post-publication bookkeeping always completes.
+    // The recorded size is the PUBLISHED file's exact size — the v2
+    // evidence binding (identity safety remediation §1).
     let original_name = partial
         .partial_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default()
         .to_owned();
-    let tombstone_recorded = record_tombstone(&identity, &original_name);
+    let tombstone_recorded = record_tombstone(&identity, &original_name, size_bytes);
 
     #[cfg(any(test, feature = "test-hooks"))]
     if HOOK_HIJACK_CLEANUP.load(Ordering::SeqCst) {
@@ -1475,31 +1625,39 @@ fn partial_source(path: &std::path::Path) -> nian_media::MediaSource {
 #[cfg(test)]
 mod tombstone_contract_tests {
     //! Pure unit coverage for the tombstone transaction contract (final
-    //! safety remediation §1): the trusted format, strict parsing, and the
-    //! name binding that makes evidence transaction-specific.
+    //! safety remediation §1 + identity safety remediation §1): the trusted
+    //! v2 format, strict parsing (legacy v1 rejected), the name binding
+    //! that makes evidence transaction-specific, and the SIZE binding to
+    //! the object currently at the final path.
 
     use super::*;
 
     #[test]
-    fn trusted_tombstone_parses_and_binds_names() {
-        let payload = tombstone_payload("08-30-00.partial.mkv", "08-30-00.recovered.mkv");
+    fn trusted_tombstone_parses_and_binds_names_and_size() {
+        let payload = tombstone_payload("08-30-00.partial.mkv", "08-30-00.recovered.mkv", 123_456);
         let parsed = parse_tombstone(payload.as_bytes()).expect("valid payload must parse");
         assert_eq!(parsed.original, "08-30-00.partial.mkv");
         assert_eq!(parsed.final_name, "08-30-00.recovered.mkv");
+        assert_eq!(parsed.size_bytes, 123_456);
     }
 
     #[test]
     fn foreign_or_malformed_marker_content_is_never_trusted() {
         // Arbitrary/foreign `.done` contents fail the strict parser.
         for bad in [
-            "",                                                              // empty
-            "nian-vision recovery tombstone\noriginal: a\nfinal: b\n", // legacy/foreign format
-            "NIAN-RECOVERY-TOMBSTONE v2\noriginal: a\nfinal: b\n",     // wrong version
-            "NIAN-RECOVERY-TOMBSTONE v1\noriginal: a\n",               // missing final
-            "NIAN-RECOVERY-TOMBSTONE v1\nfinal: b\noriginal: a\n",     // wrong order
-            "NIAN-RECOVERY-TOMBSTONE v1\noriginal: \nfinal: b\n",      // empty original
-            "NIAN-RECOVERY-TOMBSTONE v1\noriginal: a\nfinal: b\nextra: x\n", // extra content
-            "NIAN-RECOVERY-TOMBSTONE v1\noriginal: a\nfinal: b\ntrailing\n",
+            "",                                                                 // empty
+            "nian-vision recovery tombstone\noriginal: a\nfinal: b\nsize: 1\n", // foreign format
+            // Legacy v1 evidence: rejected by version (identity safety §1).
+            "NIAN-RECOVERY-TOMBSTONE v1\noriginal: a\nfinal: b\n",
+            "NIAN-RECOVERY-TOMBSTONE v1\noriginal: a\nfinal: b\nsize: 1\n",
+            "NIAN-RECOVERY-TOMBSTONE v2\noriginal: a\nfinal: b\n", // missing size
+            "NIAN-RECOVERY-TOMBSTONE v2\nfinal: b\noriginal: a\nsize: 1\n", // wrong order
+            "NIAN-RECOVERY-TOMBSTONE v2\noriginal: \nfinal: b\nsize: 1\n", // empty original
+            "NIAN-RECOVERY-TOMBSTONE v2\noriginal: a\nfinal: b\nsize: \n", // empty size
+            "NIAN-RECOVERY-TOMBSTONE v2\noriginal: a\nfinal: b\nsize: twelve\n", // non-numeric
+            "NIAN-RECOVERY-TOMBSTONE v2\noriginal: a\nfinal: b\nsize: -1\n", // negative
+            "NIAN-RECOVERY-TOMBSTONE v2\noriginal: a\nfinal: b\nsize: 1\nextra: x\n", // extra content
+            "NIAN-RECOVERY-TOMBSTONE v2\noriginal: a\nfinal: b\nsize: 1\ntrailing\n",
         ] {
             assert!(
                 parse_tombstone(bad.as_bytes()).is_none(),
@@ -1511,17 +1669,21 @@ mod tombstone_contract_tests {
     }
 
     #[test]
-    fn tombstone_evidence_is_bound_to_the_exact_transaction() {
+    fn tombstone_evidence_is_bound_to_the_exact_transaction_and_object() {
         // A trusted tombstone for original A proves NOTHING for original B
-        // sharing the same day directory (final safety remediation §1:
-        // name matching is the transaction binding).
+        // sharing the same day directory, and a v2 tombstone proves NOTHING
+        // once the object at the final path no longer matches the recorded
+        // published size (identity safety remediation §1: name matching
+        // AND the size binding are both required).
         let dir = tempfile::tempdir().unwrap();
         let camera_day = dir.path().join("day");
         std::fs::create_dir_all(&camera_day).unwrap();
         let original_a = camera_day.join("08-30-00.partial.mkv");
         std::fs::write(&original_a, b"x").unwrap();
         let identity = recovery_identity(&original_a).unwrap();
-        assert!(record_tombstone(&identity, "08-30-00.partial.mkv"));
+        // The published final must EXIST and match the recorded size.
+        std::fs::write(&identity.final_path, vec![0u8; 4096]).unwrap();
+        assert!(record_tombstone(&identity, "08-30-00.partial.mkv", 4096));
         assert!(tombstone_proves_transaction(
             &identity,
             "08-30-00.partial.mkv"
@@ -1536,6 +1698,26 @@ mod tombstone_contract_tests {
                 final_path: camera_day.join("OTHER.recovered.mkv"),
                 tombstone: identity.tombstone.clone(),
             },
+            "08-30-00.partial.mkv"
+        ));
+        // The SIZE binding: a truncated replacement at the same pathname
+        // invalidates the evidence even though every name still matches.
+        std::fs::write(&identity.final_path, vec![0u8; 4095]).unwrap();
+        assert!(
+            !tombstone_proves_transaction(&identity, "08-30-00.partial.mkv"),
+            "a size-mismatched replacement must never pass as the published object"
+        );
+        // A zero-byte replacement likewise.
+        std::fs::write(&identity.final_path, b"").unwrap();
+        assert!(!tombstone_proves_transaction(
+            &identity,
+            "08-30-00.partial.mkv"
+        ));
+        // A DIRECTORY at the final pathname likewise.
+        std::fs::remove_file(&identity.final_path).unwrap();
+        std::fs::create_dir_all(&identity.final_path).unwrap();
+        assert!(!tombstone_proves_transaction(
+            &identity,
             "08-30-00.partial.mkv"
         ));
     }
@@ -1747,6 +1929,8 @@ mod fault_injection_tests {
 
     /// Writes a TRUSTED tombstone for `original_path` through the
     /// production recorder — the exact bytes a real winning pass persists.
+    /// The tombstone records the CURRENT size of the published final, the
+    /// v2 object binding (identity safety remediation §1).
     fn seed_trusted_tombstone(original_path: &Path) {
         let identity = recovery_identity(original_path).unwrap();
         let original_name = original_path
@@ -1754,8 +1938,11 @@ mod fault_injection_tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
+        let size = std::fs::metadata(&identity.final_path)
+            .expect("seeding requires the published final to exist")
+            .len();
         assert!(
-            record_tombstone(&identity, &original_name),
+            record_tombstone(&identity, &original_name, size),
             "seeding the trusted tombstone must succeed"
         );
     }
@@ -1928,7 +2115,7 @@ mod fault_injection_tests {
             ("empty", String::new()),
             (
                 "wrong-original",
-                tombstone_payload("08-30-01.partial.mkv", "08-30-00.recovered.mkv"),
+                tombstone_payload("08-30-01.partial.mkv", "08-30-00.recovered.mkv", 12),
             ),
         ];
         for (label, content) in setups {
@@ -2375,6 +2562,226 @@ mod fault_injection_tests {
         );
         assert_eq!(count_files(&storage.day_dir, false), 0);
         assert_eq!(count_files(&storage.day_dir, true), 1, "original intact");
+    }
+
+    #[test]
+    fn trusted_tombstone_with_a_replaced_destination_is_a_conflict_never_a_deletion() {
+        // Identity safety remediation §1: a valid v2 tombstone proves only
+        // the PUBLISHED object. When the deterministic final pathname has
+        // SINCE become a directory, a zero-byte file, or a different-size
+        // replacement, the evidence must NOT authorize deleting the
+        // original — the pass reports a conflict, preserves both objects,
+        // and never repairs the tombstone retroactively. No test may
+        // authorize an original deletion purely from names.
+        fn replace_with_directory(final_path: &Path) {
+            std::fs::remove_file(final_path).unwrap();
+            std::fs::create_dir_all(final_path).unwrap();
+        }
+        fn replace_with_zero_byte(final_path: &Path) {
+            std::fs::write(final_path, b"").unwrap();
+        }
+        fn replace_with_other_size(final_path: &Path) {
+            std::fs::write(final_path, b"a replacement of another length").unwrap();
+        }
+        for (label, replace) in [
+            ("directory", replace_with_directory as fn(&Path)),
+            ("zero-byte", replace_with_zero_byte as fn(&Path)),
+            ("different-size", replace_with_other_size as fn(&Path)),
+        ] {
+            let storage = Storage::new();
+            let (name, original_path) = seed_original(&storage);
+            let base = name.strip_suffix(".partial.mkv").unwrap();
+            let final_path = storage.day_dir.join(format!("{base}.recovered.mkv"));
+            // The EARLIER pass published this final and tombstoned it:
+            std::fs::write(
+                &final_path,
+                std::fs::read(fixtures_dir().join("sample_av.mkv")).unwrap(),
+            )
+            .unwrap();
+            seed_trusted_tombstone(&original_path);
+            // …then the pathname was REPLACED by a foreign object:
+            replace(&final_path);
+            // The object that must survive is the REPLACEMENT, whatever it
+            // is (the point is that NEITHER side is touched by recovery).
+            let surviving_object: Vec<u8> = match label {
+                "directory" => Vec::new(), // checked via is_dir below
+                "zero-byte" => Vec::new(),
+                _ => b"a replacement of another length".to_vec(),
+            };
+
+            let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+
+            assert!(
+                failures.is_empty(),
+                "{label}: a conflict is an outcome, never a failure: {failures:?}"
+            );
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|outcome| matches!(outcome, RecoveryOutcome::RecoveryConflict { .. })),
+                "{label}: a replaced destination must be a conflict: {outcomes:?}"
+            );
+            assert!(
+                !outcomes
+                    .iter()
+                    .any(|outcome| matches!(outcome, RecoveryOutcome::AlreadyRecovered { .. })),
+                "{label}: the stale tombstone must NOT authorize AlreadyRecovered: {outcomes:?}"
+            );
+            assert!(
+                original_path.is_file(),
+                "{label}: the original must survive — names alone never authorize deletion"
+            );
+            if label == "directory" {
+                assert!(final_path.is_dir(), "{label}: destination preserved");
+            } else {
+                assert_eq!(
+                    std::fs::read(&final_path).unwrap(),
+                    surviving_object,
+                    "{label}: the destination object must stay untouched"
+                );
+            }
+            assert!(
+                !std::fs::read_dir(&storage.day_dir)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|entry| entry.file_name().to_string_lossy().contains(".recovery-")),
+                "{label}: no scratch may be claimed for a conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_v1_tombstones_are_rejected_as_untrusted_conflicts() {
+        // Identity safety remediation §1, backward compatibility: v1
+        // markers bound only NAMES, insufficient to prove the object at
+        // the final pathname. This pre-v1 project rejects them as
+        // untrusted (case C conflict, both files preserved) and never
+        // silently treats v1 as equivalent to v2.
+        let storage = Storage::new();
+        let (name, original_path) = seed_original(&storage);
+        let base = name.strip_suffix(".partial.mkv").unwrap();
+        let final_path = storage.day_dir.join(format!("{base}.recovered.mkv"));
+        std::fs::write(
+            &final_path,
+            std::fs::read(fixtures_dir().join("sample_av.mkv")).unwrap(),
+        )
+        .unwrap();
+        // An EXACT v1-format tombstone with fully matching names:
+        let v1_payload =
+            format!("NIAN-RECOVERY-TOMBSTONE v1\noriginal: {name}\nfinal: {base}.recovered.mkv\n");
+        std::fs::write(
+            storage.day_dir.join(format!("{base}.recovered.mkv.done")),
+            v1_payload.as_bytes(),
+        )
+        .unwrap();
+
+        let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(
+            outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, RecoveryOutcome::RecoveryConflict { .. })),
+            "legacy v1 evidence must yield a conflict: {outcomes:?}"
+        );
+        assert!(
+            !outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, RecoveryOutcome::AlreadyRecovered { .. })),
+            "v1 evidence must never authorize the original's deletion: {outcomes:?}"
+        );
+        assert!(original_path.is_file(), "the original must survive");
+        assert!(final_path.is_file(), "the destination must survive");
+    }
+
+    #[test]
+    fn alignment_read_error_is_a_content_verdict_when_no_stop_domain_is_active() {
+        // Identity safety remediation §4, verdict branch: a read failure
+        // during keyframe alignment with NEITHER stop domain active is an
+        // honest per-file content classification — no publication, no
+        // scratch, the original preserved.
+        let _fault_serialization_guard = test_hooks::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _hook_guard = arm_alignment_read_failure(0);
+        let storage = Storage::new();
+        let (_, original_path) = seed_original(&storage);
+
+        let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+
+        assert!(failures.is_empty(), "{failures:?}");
+        let kept = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                RecoveryOutcome::KeptUnrecoverable {
+                    partial_path,
+                    reason,
+                } if reason.contains("media read failed during keyframe alignment") => {
+                    Some(partial_path.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kept, vec![original_path.clone()], "{outcomes:?}");
+        assert!(original_path.is_file(), "the original must survive");
+        assert!(HOOK_SCRATCHES.lock().unwrap().is_empty());
+        assert_eq!(count_recordings(&storage.day_dir), 0);
+    }
+
+    #[test]
+    fn alignment_read_error_yields_to_the_graceful_stop_domain() {
+        // Identity safety remediation §4, stop branch: a graceful stop
+        // that lands WHILE the alignment read is failing must classify as
+        // `Cancelled` — never as a false "unreadable" content verdict.
+        // Nothing publishes, no scratch is claimed, the original stays
+        // safely recoverable, and no second press is needed.
+        let _fault_serialization_guard = test_hooks::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _hook_guard = arm_alignment_read_failure(1_000);
+        let storage = Storage::new();
+        let (_, original_path) = seed_original(&storage);
+
+        let stop = StopFlag::new();
+        let stop_for_worker = stop.clone();
+        let layout = storage.layout.clone();
+        let camera = storage.camera.clone();
+        let worker = std::thread::spawn(move || {
+            let interrupt = InterruptHandle::new();
+            recover_camera_partials_with_interrupt(
+                &layout,
+                &camera,
+                &interrupt,
+                Some(&stop_for_worker),
+            )
+        });
+
+        // The stop lands INSIDE the failing read's hold window (1 s).
+        std::thread::sleep(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        stop.request();
+
+        let (outcomes, failures) = worker.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the graceful stop must end the failing read promptly"
+        );
+        assert!(
+            failures
+                .iter()
+                .all(|failure| matches!(failure.error, RecoveryError::Cancelled)),
+            "a stop racing the read error is a cancellation, never a verdict: {failures:?}"
+        );
+        assert!(
+            outcomes.iter().all(|outcome| matches!(
+                outcome,
+                RecoveryOutcome::NothingToDo | RecoveryOutcome::KeptUnrecoverable { .. }
+            )) || outcomes.is_empty(),
+            "nothing may publish after the stop: {outcomes:?}"
+        );
+        assert!(original_path.is_file(), "the original must survive");
+        assert!(HOOK_SCRATCHES.lock().unwrap().is_empty());
+        assert_eq!(count_recordings(&storage.day_dir), 0);
     }
 
     #[test]

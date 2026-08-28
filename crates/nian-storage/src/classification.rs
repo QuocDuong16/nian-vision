@@ -12,6 +12,8 @@
 
 use std::path::Path;
 
+use chrono::NaiveTime;
+
 use crate::paths::{SEGMENT_EXTENSION, parse_segment_file_name};
 
 /// What a file inside the canonical recording tree is.
@@ -136,6 +138,64 @@ pub fn classify_recording_file(path: &Path) -> RecordingFileKind {
         Some(name) => classify_recording_file_name(name),
         None => RecordingFileKind::Unknown,
     }
+}
+
+/// A Nian-owned name resolved to its RECORDING IDENTITY (identity safety
+/// remediation §2): every transaction-relevant object in the recording
+/// tree reserves the `(started_at, sequence)` slot its canonical stem
+/// names. The segment allocator consults this so a recovered final or a
+/// tombstone alone — names that `parse_segment_file_name` cannot parse —
+/// still occupy their second, making the crash/rollback scenario
+/// ("old `08-30-00.partial.mkv` recovered, then a clock rollback hands the
+/// SAME identity to new footage") impossible by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnedRecordingName {
+    /// Start time-of-day encoded in the canonical stem.
+    pub started_at: NaiveTime,
+    /// Disambiguation sequence encoded in the canonical stem (1 = bare).
+    pub sequence: u32,
+    /// Which kind of Nian-owned object carries this identity.
+    pub kind: RecordingFileKind,
+}
+
+/// Resolves any Nian-owned file name to its recording identity; `None` for
+/// foreign/Unknown names, which never reserve anything (identity safety
+/// remediation §2: do not reserve arbitrary operator files). Every owned
+/// kind — normal recording, partial, recovered final, tombstone, exact-
+/// grammar scratch — carries a canonical `<HH-MM-SS[-N]>` stem.
+pub fn owned_recording_name(name: &str) -> Option<OwnedRecordingName> {
+    let kind = classify_recording_file_name(name);
+    let parsed = match kind {
+        RecordingFileKind::Unknown => return None,
+        // `parse_segment_file_name` reads these two shapes directly.
+        RecordingFileKind::NormalRecording | RecordingFileKind::ActiveOrCrashPartial => {
+            return parse_segment_file_name(name)
+                .ok()
+                .map(|parsed| OwnedRecordingName {
+                    started_at: parsed.started_at,
+                    sequence: parsed.sequence,
+                    kind,
+                });
+        }
+        RecordingFileKind::RecoveredRecording => name.strip_suffix(RECOVERED_NAME_SUFFIX)?,
+        RecordingFileKind::RecoveryTombstone => name
+            .strip_suffix(TOMBSTONE_NAME_SUFFIX)?
+            .strip_suffix(RECOVERED_NAME_SUFFIX)?,
+        RecordingFileKind::RecoveryScratch => {
+            name.strip_suffix(SCRATCH_SUFFIX)?
+                .split_once(SCRATCH_INFIX)?
+                .0
+        }
+    };
+    // The stem's shape was already validated by classification; parse it
+    // back through the same canonical grammar (the same trick
+    // `is_canonical_stem` uses) to recover time and sequence.
+    let parsed = parse_segment_file_name(&format!("{parsed}{PARTIAL_NAME_SUFFIX}")).ok()?;
+    Some(OwnedRecordingName {
+        started_at: parsed.started_at,
+        sequence: parsed.sequence,
+        kind,
+    })
 }
 
 #[cfg(test)]
@@ -270,5 +330,54 @@ mod tests {
             classify_recording_file(&PathBuf::from("/")),
             RecordingFileKind::Unknown
         );
+    }
+
+    #[test]
+    fn owned_name_parser_resolves_every_nian_identity() {
+        // Identity safety remediation §2: every Nian-owned kind resolves to
+        // the (started_at, sequence, kind) identity its canonical stem
+        // names — including the shapes `parse_segment_file_name` cannot
+        // read (recovered finals, tombstones, scratch).
+        let at = |h: u32, m: u32, s: u32| NaiveTime::from_hms_opt(h, m, s).unwrap();
+
+        let normal = owned_recording_name("08-30-00.mkv").unwrap();
+        assert_eq!(
+            (normal.started_at, normal.sequence, normal.kind),
+            (at(8, 30, 0), 1, RecordingFileKind::NormalRecording)
+        );
+        let partial = owned_recording_name("08-30-00-4.partial.mkv").unwrap();
+        assert_eq!(
+            (partial.started_at, partial.sequence, partial.kind),
+            (at(8, 30, 0), 4, RecordingFileKind::ActiveOrCrashPartial)
+        );
+        let recovered = owned_recording_name("08-30-00-2.recovered.mkv").unwrap();
+        assert_eq!(
+            (recovered.started_at, recovered.sequence, recovered.kind),
+            (at(8, 30, 0), 2, RecordingFileKind::RecoveredRecording)
+        );
+        let tombstone = owned_recording_name("08-30-00.recovered.mkv.done").unwrap();
+        assert_eq!(
+            (tombstone.started_at, tombstone.sequence, tombstone.kind),
+            (at(8, 30, 0), 1, RecordingFileKind::RecoveryTombstone)
+        );
+        let scratch = owned_recording_name("08-30-00.recovery-4194305-7-123456789.tmp").unwrap();
+        assert_eq!(
+            (scratch.started_at, scratch.sequence, scratch.kind),
+            (at(8, 30, 0), 1, RecordingFileKind::RecoveryScratch)
+        );
+
+        // Foreign/Unknown names never reserve anything.
+        for foreign in [
+            "notes.txt",
+            "holiday-video.mkv",
+            "08-30-00.recovery-not-ours.txt",
+            "08-30-00.recovered.mkv.doneX",
+            "08-30-00.partial.mkv.recovered",
+        ] {
+            assert!(
+                owned_recording_name(foreign).is_none(),
+                "foreign names must not resolve to an identity: {foreign}"
+            );
+        }
     }
 }
