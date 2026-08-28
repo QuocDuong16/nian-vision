@@ -1,7 +1,13 @@
 //! Deterministic stub-worker tests for parent-side supervision policy rows
-//! (M3 remediation findings 4-7, 18): each launcher spawns a TINY SHELL
-//! SCRIPT through the real WorkerSupervisor coordinator - no sleeps beyond
-//! injected millisecond deadlines, every outcome row pinned.
+//! (M3 remediation findings 4-7, 18; final remediation §1-§3, §8): each
+//! launcher spawns a TINY SHELL SCRIPT through the real WorkerSupervisor
+//! coordinator - no sleeps beyond injected millisecond deadlines, every
+//! outcome row pinned.
+//!
+//! Every stub fixture uses the REAL worker protocol exactly: `recording.
+//! status` results ARE the worker's JobStatus object (canonical shape,
+//! final remediation §1) with STABLE snake_case failure categories (§9);
+//! start acks are `{"started":true}`.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
@@ -22,6 +28,24 @@ fn test_deadlines() -> SupervisorDeadlines {
         start_ack: Duration::from_millis(300),
         shutdown_ack: Duration::from_millis(200),
         status_poll: Duration::from_millis(20),
+        status_response: Duration::from_millis(120),
+    }
+}
+
+/// Deadlines for tests where a bash STUB must get its scripted flow through
+/// under FULL-SUITE CPU contention: bash startup alone can exceed the tight
+/// default handshake windows when many tests run in parallel, which would
+/// turn every fixture into a spurious `Unresponsive{phase:"hello"}`. The
+/// windows here are still bounded and stay milliseconds-scale in practice;
+/// tests that ASSERT an elapsed bound (wedged hello, monitor silence) keep
+/// the tight [`test_deadlines`] instead.
+fn fixture_deadlines() -> SupervisorDeadlines {
+    SupervisorDeadlines {
+        hello: Duration::from_secs(5),
+        start_ack: Duration::from_secs(5),
+        shutdown_ack: Duration::from_secs(1),
+        status_poll: Duration::from_millis(20),
+        status_response: Duration::from_secs(2),
     }
 }
 
@@ -51,7 +75,48 @@ impl WorkerLauncher for ScriptLauncher {
     }
 }
 
-const HELLO_OK: &str = r#"{"type":"event","v":1,"name":"hello","data":{"protocol":1,"ffmpeg":{"libavformat_major":62}}}"#;
+/// Spawn counter: proves (final remediation §2) that a permanent job
+/// failure never spawns a second worker.
+struct CountingLauncher {
+    inner: ScriptLauncher,
+    spawns: Arc<AtomicUsize>,
+}
+
+impl WorkerLauncher for CountingLauncher {
+    fn spawn(&mut self) -> std::io::Result<Child> {
+        self.spawns.fetch_add(1, Ordering::SeqCst);
+        self.inner.spawn()
+    }
+}
+
+const HELLO_OK: &str = r#"{"type":"event","v":1,"name":"hello","data":{"worker":"nian-media-worker","protocol":1,"ffmpeg":{"libavformat_major":62,"libavcodec_major":62,"libavutil_major":60}}}"#;
+
+/// Start ack EXACTLY as the real worker answers `recording.start`.
+const START_ACK: &str = r#"{"type":"response","v":1,"id":1,"ok":true,"result":{"started":true}}"#;
+
+/// Shutdown ack EXACTLY as the real worker answers `shutdown`: the request
+/// id (always 2 from the coordinator) echoed with `{"bye":true}`.
+const SHUTDOWN_ACK: &str = r#"{"type":"response","v":1,"id":2,"ok":true,"result":{"bye":true}}"#;
+
+/// Canonical terminal FAILED JobStatus with the STABLE wire category (§9).
+fn failed_status_json(category: &str) -> String {
+    format!(
+        r#"{{"camera_id":"cam-z","state":"failed","retry_attempt":0,"finalized_segments":2,"finished":true,"end_kind":"failed","failure_category":"{category}","recovery":{{"recovered":0,"quarantined":0,"failed":1,"infrastructure_failures":1}}}}"#
+    )
+}
+
+fn response(id: u64, result_json: &str) -> String {
+    format!(r#"{{"type":"response","v":1,"id":{id},"ok":true,"result":{result_json}}}"#)
+}
+
+fn desired(camera: &str) -> DesiredRecording {
+    DesiredRecording {
+        camera: camera.to_owned(),
+        storage_root: "/tmp".to_owned(),
+        source_json: serde_json::json!({"kind": "file", "path": "/dev/null"}),
+        segment_target_secs: 300,
+    }
+}
 
 #[test]
 fn crash_before_hello_is_a_retryable_episode() {
@@ -100,8 +165,11 @@ fn protocol_version_mismatch_is_permanent() {
 #[test]
 fn transient_start_refusal_retries_instead_of_stopping() {
     let temp = tempfile::tempdir().unwrap();
-    let refusal =
-        r#"{"type":"response","v":1,"id":1,"ok":false,"error_code":"storage_unavailable"}"#;
+    // Final remediation §8: a GENUINELY transient code — `start_failed` is
+    // the only one the real worker contract defines as transient (the job
+    // thread could not spawn). `storage_unavailable` moved to the PERMANENT
+    // contract and has its own test below.
+    let refusal = r#"{"type":"response","v":1,"id":1,"ok":false,"error_code":"start_failed"}"#;
     let body = format!(
         "printf '%s\\n' '{HELLO_OK}'\n\
          read -r line\n\
@@ -110,17 +178,45 @@ fn transient_start_refusal_retries_instead_of_stopping() {
     );
     let prog = script(temp.path(), "transient-refusal", &body);
     let mut supervisor =
-        WorkerSupervisor::with_deadlines(ScriptLauncher { program: prog }, test_deadlines());
-    supervisor.set_desired_recording(DesiredRecording {
-        camera: "cam-x".to_owned(),
-        storage_root: "/tmp".to_owned(),
-        source_json: serde_json::json!({"kind": "file", "path": "/dev/null"}),
-        segment_target_secs: 300,
-    });
+        WorkerSupervisor::with_deadlines(ScriptLauncher { program: prog }, fixture_deadlines());
+    supervisor.set_desired_recording(desired("cam-x"));
     match supervisor.run_one_episode(&|| false).unwrap() {
         WorkerEnd::RetryableEpisode => {}
         other => panic!("transient refusal must be retryable, got {other:?}"),
     }
+}
+
+#[test]
+fn storage_unavailable_refusal_is_permanent_never_retried() {
+    // Final remediation §8: `storage_unavailable` is genuine storage
+    // infrastructure failure — a PERMANENT start refusal. Restarting the
+    // worker would only loop; supervision must stop instead.
+    let temp = tempfile::tempdir().unwrap();
+    let refusal =
+        r#"{"type":"response","v":1,"id":1,"ok":false,"error_code":"storage_unavailable"}"#;
+    let body = format!(
+        "printf '%s\\n' '{HELLO_OK}'\n\
+         read -r line\n\
+         printf '%s\\n' '{refusal}'\n\
+         sleep 60\n"
+    );
+    let prog = script(temp.path(), "storage-unavailable-refusal", &body);
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let supervisor_launcher = CountingLauncher {
+        inner: ScriptLauncher { program: prog },
+        spawns: Arc::clone(&spawns),
+    };
+    let mut supervisor = WorkerSupervisor::with_deadlines(supervisor_launcher, fixture_deadlines());
+    supervisor.set_desired_recording(desired("cam-storage"));
+    match supervisor.run_one_episode(&|| false) {
+        Err(ApplicationError::PermanentRecordingConfig(_)) => {}
+        other => panic!("storage_unavailable must be permanent, got {other:?}"),
+    }
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        1,
+        "a permanent refusal must never lead to another spawn"
+    );
 }
 
 #[test]
@@ -136,13 +232,8 @@ fn permanent_start_refusal_stops_supervision() {
     );
     let prog = script(temp.path(), "permanent-refusal", &body);
     let mut supervisor =
-        WorkerSupervisor::with_deadlines(ScriptLauncher { program: prog }, test_deadlines());
-    supervisor.set_desired_recording(DesiredRecording {
-        camera: "cam-y".to_owned(),
-        storage_root: "/tmp".to_owned(),
-        source_json: serde_json::json!({"kind": "rtsp", "url": "x"}),
-        segment_target_secs: 300,
-    });
+        WorkerSupervisor::with_deadlines(ScriptLauncher { program: prog }, fixture_deadlines());
+    supervisor.set_desired_recording(desired("cam-y"));
     match supervisor.run_one_episode(&|| false) {
         Err(ApplicationError::PermanentRecordingConfig(_)) => {}
         other => panic!("expected permanent failure, got {other:?}"),
@@ -152,33 +243,111 @@ fn permanent_start_refusal_stops_supervision() {
 #[test]
 fn recording_job_failure_is_observed_while_process_lives() {
     let temp = tempfile::tempdir().unwrap();
-    // Ack id=1 then answer EVERY later request (status poll id>=3, plus
-    // any shutdown) with a FAILED job status while staying alive. finding
-    // 7: terminal recording failure must be observable in a healthy process.
-    let failed_status = r#"{"type":"response","v":1,"id":3,"ok":true,"result":{"finished":true,"end_kind":"failed","failure_category":"StorageFailed","finalized_segments":2}}"#;
-    let generic_ack = r#"{"type":"response","v":1,"id":1,"ok":true,"result":{}}"#;
+    // Ack id=1 with the REAL start ack, then answer EVERY later request
+    // exactly like the real worker would: status polls with a canonical
+    // terminal FAILED JobStatus (STABLE wire category), the protocol
+    // shutdown with its id-echoed `bye` — while staying alive. finding 7:
+    // terminal recording failure must be observable in a healthy process.
+    let failed = response(3, &failed_status_json("storage_failed"));
     let body = format!(
         "printf '%s\n' '{HELLO_OK}'\n\
          while read -r req; do\n\
-           case \"$req\" in *'\"id\":1,'*) printf '%s\\n' '{generic_ack}' ;; *) printf '%s\\n' '{failed_status}' ;; esac\n\
+           case \"$req\" in\n\
+             *'\"id\":1,'*) printf '%s\\n' '{START_ACK}' ;;\n\
+             *'shutdown'*) printf '%s\\n' '{SHUTDOWN_ACK}' ;;\n\
+             *) printf '%s\\n' '{failed}' ;;\n\
+           esac\n\
          done\n"
     );
     let prog = script(temp.path(), "job-failed", &body);
     let mut supervisor =
-        WorkerSupervisor::with_deadlines(ScriptLauncher { program: prog }, test_deadlines());
-    supervisor.set_desired_recording(DesiredRecording {
-        camera: "cam-z".to_owned(),
-        storage_root: "/tmp".to_owned(),
-        source_json: serde_json::json!({"kind": "file", "path": "/dev/null"}),
-        segment_target_secs: 300,
-    });
-    match supervisor.run_one_episode(&|| false).unwrap() {
-        WorkerEnd::RetryableEpisode => {}
-        other => panic!("failed observation ends episode, got {other:?}"),
+        WorkerSupervisor::with_deadlines(ScriptLauncher { program: prog }, fixture_deadlines());
+    supervisor.set_desired_recording(desired("cam-z"));
+    // Final remediation §2: a terminal FAILED job is PERMANENT for the
+    // parent — typed error carrying the stable category, NOT a retryable
+    // episode.
+    match supervisor.run_one_episode(&|| false) {
+        Err(ApplicationError::PermanentRecordingFailure { category }) => {
+            assert_eq!(category, "storage_failed");
+        }
+        other => panic!("failed observation must be permanent, got {other:?}"),
     }
     assert_eq!(
         supervisor.last_job_terminal(),
-        Some(&JobTerminal::Failed("StorageFailed".to_owned()))
+        Some(&JobTerminal::Failed("storage_failed".to_owned()))
+    );
+}
+
+#[test]
+fn storage_failed_job_never_spawns_another_worker() {
+    // Final remediation §2 (explicit test row): a terminal StorageFailed
+    // job must NOT spawn another worker. run_forever stops on the FIRST
+    // episode's permanent job failure; the spawn counter proves no restart
+    // ever happened.
+    let temp = tempfile::tempdir().unwrap();
+    let failed = response(3, &failed_status_json("storage_failed"));
+    let body = format!(
+        "printf '%s\n' '{HELLO_OK}'\n\
+         while read -r req; do\n\
+           case \"$req\" in\n\
+             *'\"id\":1,'*) printf '%s\\n' '{START_ACK}' ;;\n\
+             *'shutdown'*) printf '%s\\n' '{SHUTDOWN_ACK}' ;;\n\
+             *) printf '%s\\n' '{failed}' ;;\n\
+           esac\n\
+         done\n"
+    );
+    let prog = script(temp.path(), "storage-failed-no-restart", &body);
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let mut supervisor = WorkerSupervisor::with_deadlines(
+        CountingLauncher {
+            inner: ScriptLauncher { program: prog },
+            spawns: Arc::clone(&spawns),
+        },
+        fixture_deadlines(),
+    );
+    supervisor.set_desired_recording(desired("cam-norestart"));
+    let outcome = supervisor.run_forever(&|| false, &|_| {});
+    match outcome {
+        Err(ApplicationError::PermanentRecordingFailure { category }) => {
+            assert_eq!(category, "storage_failed");
+        }
+        other => panic!("StorageFailed must stop supervision, got {other:?}"),
+    }
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        1,
+        "a terminal StorageFailed job must never respawn the worker"
+    );
+}
+
+#[test]
+fn silent_after_start_ack_becomes_unresponsive_monitor_and_retries() {
+    // Final remediation §3: a worker that acks recording.start and then
+    // goes COMPLETELY SILENT (alive, never answering status polls) must be
+    // bounded — Unresponsive in the monitor phase — and become a retryable
+    // episode, NOT polled forever.
+    let temp = tempfile::tempdir().unwrap();
+    let body = format!(
+        "printf '%s\\n' '{HELLO_OK}'\n\
+         read -r line\n\
+         printf '%s\\n' '{START_ACK}'\n\
+         sleep 60\n"
+    );
+    let prog = script(temp.path(), "silent-after-ack", &body);
+    let mut supervisor =
+        WorkerSupervisor::with_deadlines(ScriptLauncher { program: prog }, test_deadlines());
+    supervisor.set_desired_recording(desired("cam-silent"));
+    let started = std::time::Instant::now();
+    match supervisor.run_one_episode(&|| false).unwrap() {
+        WorkerEnd::RetryableEpisode => {}
+        other => panic!("monitor silence must be retryable, got {other:?}"),
+    }
+    // Two missed polls at 120 ms each + pacing: the bound must hold long
+    // before any production-scale timeout would.
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "silent worker must be bounded quickly, took {:?}",
+        started.elapsed()
     );
 }
 

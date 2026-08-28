@@ -26,6 +26,18 @@ pub enum ApplicationError {
     /// retrying forever (M3 §14/§8).
     #[error("permanent recording configuration failure: {0}")]
     PermanentRecordingConfig(String),
+
+    /// The recording job itself failed permanently INSIDE the worker (final
+    /// remediation §2): the camera supervisor's retryability policy already
+    /// ran there, so restarting the worker can never fix it — supervision
+    /// stops. The category is the STABLE wire value (final remediation §9,
+    /// e.g. `storage_failed`); it is machine vocabulary, never a secret and
+    /// never raw technical detail.
+    #[error("recording failed permanently (category: {category})")]
+    PermanentRecordingFailure {
+        /// Stable failure-category wire value from `recording.status`.
+        category: String,
+    },
 }
 
 impl ApplicationError {
@@ -40,8 +52,10 @@ impl ApplicationError {
             }
             // Permanent failures DO need operator attention — but never raw
             // technical detail in the UI.
-            Self::PermanentRecordingConfig(_) => {
-                "Recording cannot start with the current settings. Please review them.".to_owned()
+            Self::PermanentRecordingConfig(_) | Self::PermanentRecordingFailure { .. } => {
+                "Recording cannot continue with the current settings or storage. \
+                 Please review them."
+                    .to_owned()
             }
         }
     }
@@ -79,5 +93,22 @@ mod tests {
             "codes must stay out of the UI"
         );
         assert!(ui.contains("review"), "{ui}");
+
+        // Final remediation §2: the typed job-failure error carries the
+        // stable category for LOGS/host state, but the UI message never
+        // exposes raw protocol vocabulary either.
+        let job_failed = ApplicationError::PermanentRecordingFailure {
+            category: "storage_failed".to_owned(),
+        };
+        let ui = job_failed.ui_message();
+        assert!(
+            !ui.contains("storage_failed"),
+            "categories must stay out of the UI"
+        );
+        assert!(ui.contains("review"), "{ui}");
+        assert_eq!(
+            job_failed.to_string(),
+            "recording failed permanently (category: storage_failed)"
+        );
     }
 }

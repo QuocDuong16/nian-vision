@@ -1,5 +1,5 @@
 //! Parent-side supervision of the media worker process (M3 §14; remediated
-//! per M3 review findings 3–7, 18, 19).
+//! per M3 review findings 3–7, 18, 19; final remediation §1–§3, §8).
 //!
 //! # Coordinator architecture (finding 3)
 //!
@@ -12,12 +12,14 @@
 //! thread consuming one command channel — never concurrent unsynchronized
 //! stdin writes.
 //!
-//! # Deadlines (finding 4)
+//! # Deadlines (finding 4, final remediation §3)
 //!
-//! Hello / recording.start / shutdown responses are bounded by injected,
-//! configurable deadlines ([`SupervisorDeadlines`]); a silent-but-alive
-//! worker is an UNHEALTHY episode handled by restart policy, not an
-//! indefinite block.
+//! Hello / recording.start / shutdown responses AND recording.status polls
+//! are bounded by injected, configurable deadlines
+//! ([`SupervisorDeadlines`]): a silent-but-alive worker is an UNHEALTHY
+//! episode handled by restart policy, not an indefinite block — including
+//! the monitor phase, where consecutive missed status polls escalate to
+//! `Unresponsive { phase: "monitor" }`.
 //!
 //! # Crash phases (finding 5)
 //!
@@ -27,13 +29,19 @@
 //! version mismatches stay PERMANENT. Wedged-but-alive workers surface via
 //! response deadlines as unhealthy episodes (restartable).
 //!
-//! # Recording visibility (findings 6/7)
+//! # Recording visibility (findings 6/7, final remediation §1/§2)
 //!
-//! The coordinator periodically polls `recording.status`. Terminal job
-//! states (`stopped`, `completed`, `failed` + typed failure category) come
-//! back through [`EpisodeUpdate`]-shaped flows — the parent NEVER equates
-//! a healthy process with healthy recording. Transient start refusals map
-//! to retryable episodes (finding 6), permanent ones to permanent errors.
+//! The coordinator periodically polls `recording.status` whose result IS
+//! the worker's JobStatus object (canonical wire shape, §1). Terminal job
+//! states (`stopped`, `completed`, `failed` + STABLE failure-category wire
+//! value, §9) come back through [`EpisodeUpdate`]-shaped flows — the parent
+//! NEVER equates a healthy process with healthy recording. A terminal
+//! FAILED job is a PERMANENT supervision error (§2): the worker must not be
+//! restarted for StorageFailed/OutputWriteFailed/PermanentConfiguration
+//! (or any other terminal category), because the camera supervisor already
+//! exhausted its retryability policy inside the worker. Transient start
+//! refusals map to retryable episodes (finding 6); permanent ones —
+//! including `storage_unavailable` (§8) — to permanent errors.
 //!
 //! # Framing (finding 19)
 //!
@@ -96,8 +104,9 @@ pub enum WorkerEnd {
     JobCompletedCleanly,
 }
 
-/// Bounded deadlines for one supervised episode (finding 4). Tests use
-/// short values; production defaults cover slow RTSP handshakes.
+/// Bounded deadlines for one supervised episode (finding 4, final
+/// remediation §3). Tests use short values; production defaults cover slow
+/// RTSP handshakes.
 #[derive(Debug, Clone, Copy)]
 pub struct SupervisorDeadlines {
     /// Max wait for the hello handshake after spawn.
@@ -109,6 +118,10 @@ pub struct SupervisorDeadlines {
     pub shutdown_ack: Duration,
     /// Interval between recording.status polls while monitoring.
     pub status_poll: Duration,
+    /// Max wait for ONE status response (final remediation §3): a poll that
+    /// stays unanswered this long counts as missed; consecutive misses (see
+    /// [`MAX_MISSED_STATUS_POLLS`]) classify the episode Unresponsive.
+    pub status_response: Duration,
 }
 
 impl Default for SupervisorDeadlines {
@@ -118,9 +131,15 @@ impl Default for SupervisorDeadlines {
             start_ack: Duration::from_secs(15),
             shutdown_ack: Duration::from_secs(15),
             status_poll: Duration::from_secs(1),
+            status_response: Duration::from_secs(3),
         }
     }
 }
+
+/// Consecutive unanswered status polls tolerated before a live-but-silent
+/// worker is declared Unresponsive in the monitor phase (final remediation
+/// §3). Any valid expected status response resets the counter.
+const MAX_MISSED_STATUS_POLLS: u32 = 2;
 
 /// The recording state a restart must restore verbatim.
 ///
@@ -175,13 +194,19 @@ enum WriterCommand {
 
 /// Terminal recording-job state observed from status polls (§7): lets the
 /// parent see FAILED/STOPPED jobs while the PROCESS stays alive.
+///
+/// Parses the CANONICAL wire shape (final remediation §1): the
+/// `recording.status` result IS the worker's JobStatus object carrying
+/// `finished` / `end_kind` / `failure_category` at the top level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobTerminal {
     /// Operator stop reached the job; everything finalized gracefully.
     Stopped,
     /// Finite source completed naturally.
     Completed,
-    /// Permanent recording failure INSIDE the worker (typed category).
+    /// Permanent recording failure INSIDE the worker (STABLE failure-
+    /// category wire value per final remediation §9, e.g.
+    /// `storage_failed` — never Rust Debug output).
     Failed(String),
 }
 
@@ -231,10 +256,11 @@ enum Flow {
     EofAfterShutdownRequest,
     /// File-source recording completed inside a live worker.
     JobCompleted,
-    /// Recording job reached a terminal FAILED/STOPPED state while the
-    /// process stayed alive (finding 7): episode-level signal so the
-    /// restart policy and hosts observe it; category accessible via
-    /// `last_job_terminal()`.
+    /// Recording job reached a terminal FAILED state while the process
+    /// stayed alive (finding 7, final remediation §2): PERMANENT — the
+    /// camera supervisor's retryability policy already ran inside the
+    /// worker, so the parent stops supervision with a typed error; the
+    /// stable category is accessible via `last_job_terminal()`.
     JobFailedObservation,
     ChildDied,
     Unresponsive {
@@ -246,7 +272,17 @@ enum Flow {
 }
 
 fn classify_start_refusal(code: String) -> Flow {
-    const PERMANENT_PREFIXES: [&str; 3] = ["invalid_params", "job_already_active", "unsupported"];
+    // Permanent IPC refusal contract (final remediation §8): configuration
+    // rows can never succeed on retry, and `storage_unavailable` is a
+    // GENUINE storage-infrastructure failure — restarting the worker would
+    // only loop. Everything else (e.g. `start_failed`) is transient and
+    // retried under backoff.
+    const PERMANENT_PREFIXES: [&str; 4] = [
+        "invalid_params",
+        "job_already_active",
+        "storage_unavailable",
+        "unsupported",
+    ];
     if PERMANENT_PREFIXES
         .iter()
         .any(|prefix| code.starts_with(prefix))
@@ -357,10 +393,22 @@ impl<L: WorkerLauncher> WorkerSupervisor<L> {
                 self.consecutive_fast_deaths = 0;
                 Ok(WorkerEnd::JobCompletedCleanly)
             }
-            Flow::ChildDied
-            | Flow::Unresponsive { .. }
-            | Flow::TransientStartRefusal(_)
-            | Flow::JobFailedObservation => {
+            // Final remediation §2: the recording job itself reached a
+            // terminal FAILED state inside the worker — the camera
+            // supervisor's retryability policy ALREADY ran there, so this
+            // category (storage_failed, output_write_failed,
+            // permanent_configuration, an exhausted source-retry budget, …)
+            // is PERMANENT for the parent. Restarting the worker can never
+            // fix it; supervision stops with a typed, secret-safe error.
+            // A live worker is still terminated (its job is over).
+            Flow::JobFailedObservation => {
+                let category = match &self.last_job_terminal {
+                    Some(JobTerminal::Failed(category)) => category.clone(),
+                    _ => "unknown".to_owned(),
+                };
+                Err(ApplicationError::PermanentRecordingFailure { category })
+            }
+            Flow::ChildDied | Flow::Unresponsive { .. } | Flow::TransientStartRefusal(_) => {
                 if stable_episode {
                     self.backoff.reset();
                     self.consecutive_fast_deaths = 0;
@@ -511,7 +559,9 @@ impl<L: WorkerLauncher> WorkerSupervisor<L> {
                     }
                     Err(message) => return Ok(Flow::PermanentProtocol(message)),
                 },
-                Recv::Eof => return Ok(Flow::ChildDied),
+                Recv::Eof => {
+                    return Ok(Flow::ChildDied);
+                }
                 Recv::DecodeError(text) => {
                     return Ok(Flow::PermanentProtocol(format!(
                         "malformed frame during hello: {text}"
@@ -574,7 +624,14 @@ impl<L: WorkerLauncher> WorkerSupervisor<L> {
             }
         }
 
-        // ---- Monitor: poll-driven, responsive to shutdown (§3/§7) ----------
+        // ---- Monitor: poll-driven, responsive to shutdown (§3/§7) ---------
+        //
+        // Final remediation §3: every poll has a RESPONSE deadline
+        // (`status_response`); consecutive missed responses (a worker that
+        // stays alive but stops answering IPC) escalate to
+        // `Unresponsive { phase: "monitor" }` instead of polling forever.
+        // Any valid expected status response resets the missed counter.
+        let mut missed_status_responses: u32 = 0;
         loop {
             if shutdown_requested() {
                 return self.request_shutdown(pipes, shutdown_requested);
@@ -592,13 +649,13 @@ impl<L: WorkerLauncher> WorkerSupervisor<L> {
                 return Ok(Flow::ChildDied);
             }
 
-            let poll_end = Instant::now() + self.deadlines.status_poll;
-            let mut poll_done = false;
-            while !poll_done {
+            let response_deadline = Instant::now() + self.deadlines.status_response;
+            let mut answered = false;
+            while !answered {
                 if shutdown_requested() {
                     return self.request_shutdown(pipes, shutdown_requested);
                 }
-                match recv_until(&pipes.reader_rx, poll_end)? {
+                match recv_until(&pipes.reader_rx, response_deadline)? {
                     Recv::Frame(envelope) => {
                         if let Envelope::Response {
                             id: reply_id,
@@ -610,14 +667,33 @@ impl<L: WorkerLauncher> WorkerSupervisor<L> {
                         {
                             if let Some(terminal) = JobTerminal::parse(&result) {
                                 self.mark_job_terminal(terminal.clone());
-                                return Ok(match terminal {
-                                    JobTerminal::Completed => Flow::JobCompleted,
-                                    JobTerminal::Stopped => Flow::ShutdownAcked,
-                                    JobTerminal::Failed(_) => Flow::JobFailedObservation,
-                                });
+                                // A COMPLETED/STOPPED job leaves the worker's
+                                // serve loop alive and idle (final remediation
+                                // §1's clean-completion row): end the episode
+                                // CLEANLY by delivering a bounded protocol
+                                // shutdown instead of waiting forever on a
+                                // process that will never exit on its own.
+                                return Ok(
+                                    match self.request_shutdown(pipes, shutdown_requested)? {
+                                        Flow::ShutdownAcked | Flow::EofAfterShutdownRequest => {
+                                            match terminal {
+                                                JobTerminal::Completed => Flow::JobCompleted,
+                                                JobTerminal::Stopped => Flow::ShutdownAcked,
+                                                JobTerminal::Failed(_) => {
+                                                    Flow::JobFailedObservation
+                                                }
+                                            }
+                                        }
+                                        // Wedged shutdown after a healthy job:
+                                        // still an unhealthy episode (bounded).
+                                        other => other,
+                                    },
+                                );
                             }
-                            poll_done = true; // running normally; next poll soon
+                            answered = true; // running normally
                         }
+                        // Stray other-id replies/events: keep waiting for
+                        // OUR response within the same deadline.
                     }
                     Recv::Eof => return Ok(Flow::ChildDied),
                     Recv::DecodeError(text) => {
@@ -627,8 +703,37 @@ impl<L: WorkerLauncher> WorkerSupervisor<L> {
                     }
                     Recv::Tick => {}
                 }
-                if Instant::now() >= poll_end && !poll_done {
-                    poll_done = true; // unanswered poll retried next round
+                if Instant::now() >= response_deadline && !answered {
+                    break; // this poll went unanswered
+                }
+            }
+
+            if answered {
+                missed_status_responses = 0;
+                // Pace the next poll `status_poll` after the answer, staying
+                // responsive to operator shutdown throughout the gap.
+                let next_poll_at = Instant::now() + self.deadlines.status_poll;
+                while Instant::now() < next_poll_at {
+                    if shutdown_requested() {
+                        return self.request_shutdown(pipes, shutdown_requested);
+                    }
+                    match recv_until(&pipes.reader_rx, next_poll_at)? {
+                        // Death signals observed during pacing keep the
+                        // crash-in-any-phase semantics (no swallowed EOF).
+                        Recv::Eof => return Ok(Flow::ChildDied),
+                        Recv::DecodeError(text) => {
+                            return Ok(Flow::PermanentProtocol(format!(
+                                "malformed frame while monitoring: {text}"
+                            )));
+                        }
+                        Recv::Frame(_) | Recv::Tick => {}
+                    }
+                }
+            } else {
+                missed_status_responses += 1;
+                if missed_status_responses >= MAX_MISSED_STATUS_POLLS {
+                    let _ = pipes.stdin_tx.send(WriterCommand::Close);
+                    return Ok(Flow::Unresponsive { phase: "monitor" });
                 }
             }
 
@@ -711,9 +816,12 @@ fn recv_until(
         Ok(ReaderMessage::Eof) => Ok(Recv::Eof),
         Ok(ReaderMessage::DecodeError(text)) => Ok(Recv::DecodeError(text)),
         Err(mpsc::RecvTimeoutError::Timeout) => Ok(Recv::Tick),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ApplicationError::WorkerProtocol(
-            "worker stdout channel closed".to_owned(),
-        )),
+        // A closed channel IS end-of-stdout: the reader thread reports
+        // Eof/DecodeError before exiting, and a disconnect (e.g. an EOF
+        // already drained by a pacing window) carries the same death
+        // semantics. Surfacing it as EOF keeps crash-in-any-phase
+        // classification uniform instead of inventing a protocol error.
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(Recv::Eof),
     }
 }
 

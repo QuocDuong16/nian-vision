@@ -94,11 +94,60 @@ recovery.
   worker_supervision_integration.rs`, M3 §15): parent supervisor spawns the
   REAL `nian-media-worker` binary, verifies hello, sends
   `recording.start` for a file source, hard-kills the child mid-recording
-  (deterministic killer thread), observes the crash episode, restarts the
-  worker with bounded waiting, re-handshakes, restores desired recording
-  state, and only then delivers protocol shutdown once disk-visible
-  progress exists. No sleep-of-faith: shutdown armament is driven by
-  published finals appearing on disk.
+  (deterministic killer thread that fires as soon as the first partial
+  segment is disk-visible — local fixtures remux at hundreds of times
+  realtime, so a fixed-delay kill would land after completion), observes
+  the crash episode, restarts the worker with bounded waiting,
+  re-handshakes, restores desired recording state, and only then delivers
+  protocol shutdown once disk-visible progress exists. No sleep-of-faith:
+  shutdown armament is driven by published finals appearing on disk.
+* **Real-worker protocol rows (final remediation §1/§2/§4, same file)**:
+  * file EOF reaches the parent as `JobCompletedCleanly` through the
+    canonical `recording.status` shape (result IS the JobStatus object);
+  * a permanently un-openable source ends as a terminal `failed` status
+    with the stable `source_open_failed` wire category observed while the
+    process lives → typed `PermanentRecordingFailure`, never a restart;
+  * ONE protocol shutdown on an active recording finalizes and publishes
+    the healthy active segment (zero abandoned partials) and the worker
+    exits with status 0.
+
+### Stub-worker supervision rows (`nian-application/tests/worker_supervisor_stubs.rs`, M3 rem. + final rem.)
+
+Shell-script workers driven through the REAL coordinator with
+millisecond-scale injected deadlines; every fixture replicates the real
+worker protocol exactly (canonical status shape, `{"started":true}` start
+acks, id-echoed `{"bye":true}` shutdown acks, snake_case failure
+categories): crash-before-hello → retryable; wedged hello → bounded
+unhealthy; protocol-version mismatch → permanent; `start_failed` refusal
+→ transient retry; `storage_unavailable`/`invalid_params` refusals →
+permanent (spawn-count proves no second worker); terminal
+`storage_failed` job status → typed permanent error and NO respawn
+(`run_forever` + spawn counter); start-ack-then-total-silence →
+`Unresponsive{phase:"monitor"}` within the missed-poll bound, then
+restartable; backoff waits interrupted by operator shutdown.
+
+### Recovery idempotency + classification (final remediation §5/§7)
+
+* Deterministic recovery identity tests (`nian-recorder`): a surviving
+  original whose deterministic final already exists is reported
+  `AlreadyRecovered` WITHOUT remuxing (original bytes untouched, exactly
+  one recovered final); a repeat pass after a forced cleanup failure
+  yields `finals_after == finals_before`; tombstone persistence failure is
+  observable (`tombstone_recorded=false`) without invalidating the
+  recording; poisoned/metadata-failed passes remove only recovery-owned
+  scratch and never publish.
+* Typed classification: a camera tree that cannot be scanned (camera path
+  occupied by a file) surfaces `RecoveryError::Storage` with
+  `is_infrastructure()==true` — the worker-level permanent-job signal —
+  while content failures quarantine per file.
+* Worker job lifecycle (`nian-media-worker` job tests): prompt
+  `recording.start` ack with `recovering` state before any media work;
+  async recovery accounted once per job; corrupt leftover quarantined
+  (`failed>=1`, `infrastructure_failures==0`) while the new recording
+  still completes; occupied day-dir path fails the job terminally with
+  `storage_failed`; idempotent `request_graceful_stop` never consumes the
+  press counter; shutdown during recovery ends bounded without
+  connecting.
 
 ### CLI/IPC smoke checks (manual, seconds)
 

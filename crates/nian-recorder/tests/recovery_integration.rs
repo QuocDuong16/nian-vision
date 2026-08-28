@@ -72,7 +72,7 @@ impl Storage {
     fn finals(&self) -> Vec<PathBuf> {
         list_files(&self.day_dir)
             .into_iter()
-            .filter(|p| !is_partial(p))
+            .filter(|p| !is_partial(p) && !is_recovery_artifact(p))
             .collect()
     }
 
@@ -82,6 +82,16 @@ impl Storage {
             .filter(|p| is_partial(p))
             .collect()
     }
+}
+
+/// Recovery-owned artifacts (deterministic identity names, final remediation
+/// §5): never recordings, never crash partials, invisible to the scanner.
+fn is_recovery_artifact(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    name.ends_with(".recovered-tmp") || name.ends_with(".done")
 }
 
 fn list_files(dir: &Path) -> Vec<PathBuf> {
@@ -551,12 +561,45 @@ fn ensure_ffprobe_present() -> bool {
     Command::new("ffprobe").arg("-version").output().is_ok()
 }
 
+#[test]
+fn scan_infrastructure_failure_is_typed_not_content() {
+    // Final remediation §7: when the canonical camera tree itself cannot be
+    // SCANNED (here the camera path is a file — read_dir fails for any uid,
+    // including root), the failure is STORAGE-INFRASTRUCTURE by TYPE
+    // (`RecoveryError::is_infrastructure`), never a content verdict and
+    // never decided by parsing error strings. Worker policy keys off this
+    // distinction: infrastructure failure may fail the job permanently;
+    // content failures only quarantine.
+    let dir = tempfile::tempdir().unwrap();
+    let layout = RecordingsLayout::new(dir.path().join("recordings")).unwrap();
+    let camera = CameraId::parse("cam-broken-tree").unwrap();
+    // NO Storage::new here — it would pre-create the camera directory.
+    let camera_path = layout.camera_dir(&camera);
+    std::fs::create_dir_all(camera_path.parent().unwrap()).unwrap();
+    std::fs::write(&camera_path, b"not a directory").unwrap();
+
+    let (outcomes, failures) = recover_camera_partials(&layout, &camera);
+
+    assert!(
+        outcomes.is_empty(),
+        "nothing can be classified when the tree is unscannable: {outcomes:?}"
+    );
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].error.is_infrastructure(),
+        "scan failure must classify as infrastructure: {:?}",
+        failures[0].error
+    );
+}
+
 /// Timeout sanity guard used implicitly by recovery's internal deadlines;
 /// referenced here so a regression in defaults surfaces in review diffs.
 #[test]
 fn recovery_does_not_inherit_session_defaults() {
-    // Documentation-by-test: recovery owns its own private interrupt and a
-    // fixed open budget; it must never depend on RecorderConfig timeouts.
-    // If someone couples them, this placeholder keeps the intent visible.
+    // Documentation-by-test: recovery owns its open budgets (15 s per open)
+    // and only observes an EXTERNALLY supplied interrupt for cancellation
+    // (final remediation §6); it must never depend on RecorderConfig
+    // timeouts. If someone couples them, this placeholder keeps the intent
+    // visible.
     let _ = Duration::from_secs(15);
 }

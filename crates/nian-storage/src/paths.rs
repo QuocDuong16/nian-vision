@@ -66,6 +66,20 @@ impl RecordingsLayout {
             .expect("validated CameraId is always path-safe")
     }
 
+    /// Creates the camera directory if missing, so a failing call is a
+    /// CHEAP, genuine storage-infrastructure signal (final remediation §7/§8):
+    /// the worker refuses `recording.start` with `storage_unavailable` only
+    /// when safe storage operation is impossible — never for per-file
+    /// content problems, which recovery quarantines instead.
+    pub fn ensure_camera_dir(&self, camera: &CameraId) -> Result<PathBuf, StorageError> {
+        let dir = self.camera_dir(camera);
+        std::fs::create_dir_all(&dir).map_err(|source| StorageError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(dir)
+    }
+
     /// `<root>/<camera-id>/<year>/<month>/<day>`
     #[allow(clippy::expect_used)]
     pub fn day_dir(&self, camera: &CameraId, date: NaiveDate) -> PathBuf {

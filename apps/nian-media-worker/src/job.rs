@@ -1,12 +1,29 @@
 //! Worker-side recording job lifecycle over NDJSON IPC (M3 §13).
 //!
-//! ONE recording job per worker process: `recording.start` claims the
-//! single job slot, spawns a dedicated thread running the
+//! ONE recording job per worker process: `recording.start` validates CHEAP
+//! parameters, spawns a dedicated job thread and replies immediately (final
+//! remediation §6) — the job thread then runs asynchronous startup
+//! recovery (`recovering` state, observable and stoppable) followed by the
 //! [`CameraRecordingSupervisor`] above real [`RecordingSession`]s, and
 //! publishes a typed [`JobStatus`] snapshot that `recording.status` serves.
-//! `recording.stop` requests graceful shutdown of the whole supervised run;
-//! pressing it again escalates to forced cancellation of blocking I/O in
-//! whichever session attempt is live.
+//!
+//! # Stop-cancellation control model (final remediation §4)
+//!
+//! Operator escalation and process shutdown are SEPARATE operations:
+//!
+//! * `recording.stop` keeps the user-facing two-press semantics (press 1
+//!   graceful, press 2 force-cancels blocking I/O in the live attempt);
+//! * process shutdown uses [`RecordingJobManager::request_graceful_stop`]
+//!   (IDEMPOTENT — calling it twice must never become a force cancel),
+//!   then a bounded grace join, then — only if grace expires —
+//!   [`RecordingJobManager::force_cancel_current_io`], then a bounded
+//!   final join. The press counter is never control flow for shutdown.
+//!
+//! Stop wiring: the supervisor's run-level [`StopFlag`] is a shared atomic
+//! captured BEFORE the supervisor moves into the job thread. Forced escape
+//! works through the `latest_interrupt` slot: every `open_session` (and the
+//! asynchronous recovery pass) deposits the fresh handle it built, so a
+//! force-cancel aborts whatever media I/O is currently live.
 //!
 //! # Threading model
 //!
@@ -15,14 +32,6 @@
 //! plain data (paths, config, URL string) moves through `.spawn`. Stdout
 //! stays single-owner — the serve-loop thread writes every frame; the job
 //! thread only updates its snapshot slot.
-//!
-//! Stop wiring: the supervisor's run-level [`StopFlag`] is a shared atomic;
-//! the manager captures a clone BEFORE the supervisor moves into the job
-//! thread and requests stops through it. Forced-escape works through the
-//! `latest_interrupt` slot: every `open_session` deposits the fresh handle
-//! it built, and a second stop press cancels whatever handle is current,
-//! aborting a blocked read/write exactly like the manual CLI's Ctrl+C
-//! escalation (M2 review §9 semantics, hosted form).
 //!
 //! # Secrets contract (master spec §4/§7)
 //!
@@ -50,6 +59,13 @@ use nian_recorder::{
 };
 
 /// Stable IPC error codes for the recording namespace.
+///
+/// # Start-refusal contract (final remediation §8)
+///
+/// `invalid_params`, `job_already_active` and `storage_unavailable` are
+/// PERMANENT refusals: the parent must never restart the worker expecting a
+/// different answer. `start_failed` is the only transient refusal (the job
+/// thread could not be spawned — retrying is meaningful).
 pub mod code {
     /// A start request arrived while this worker already has/had its job.
     pub const JOB_ALREADY_ACTIVE: &str = "job_already_active";
@@ -57,20 +73,31 @@ pub mod code {
     pub const NO_ACTIVE_JOB: &str = "no_active_job";
     /// Start parameters failed validation (bad camera id/storage/source).
     pub const INVALID_PARAMS: &str = "invalid_params";
-    /// Startup partial-reconciliation could not run against this storage —
-    /// typed permanent/local failure per remediation §13.
+    /// Genuine storage-infrastructure failure detected at the cheap
+    /// pre-flight (the camera directory could not be created). PERMANENT.
+    /// Async recovery infrastructure failures surface as terminal job
+    /// state (`failed`/`storage_failed`) instead of a refusal.
     pub const STORAGE_UNAVAILABLE: &str = "storage_unavailable";
+    /// The job thread could not be spawned. The only TRANSIENT refusal.
+    pub const START_FAILED: &str = "start_failed";
 }
 
-/// §13: outcome of the once-per-job startup reconciliation.
+/// §13/§7: outcome of the once-per-job startup reconciliation, classified
+/// by TYPED recovery dispositions (never error strings).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RecoverySummary {
-    /// Partials remuxed and published as fresh recordings.
+    /// Partials remuxed and published as fresh recordings (including ones
+    /// recognized as already recovered from an earlier pass).
     pub recovered: usize,
     /// Partials kept in place (empty/invalid/no-keyframe).
     pub quarantined: usize,
-    /// Partials whose recovery attempt failed (reported upstream).
+    /// Partials whose recovery attempt failed with a content verdict
+    /// (unreadable/corrupt). Reported; never blocks new recording.
     pub failed: usize,
+    /// Typed count of INFRASTRUCTURE failures (storage unusable). When
+    /// this is positive and nothing was recovered, the job fails
+    /// permanently — safe storage operation is impossible.
+    pub infrastructure_failures: usize,
 }
 
 impl RecoverySummary {
@@ -79,6 +106,7 @@ impl RecoverySummary {
             "recovered": self.recovered,
             "quarantined": self.quarantined,
             "failed": self.failed,
+            "infrastructure_failures": self.infrastructure_failures,
         })
     }
 }
@@ -227,8 +255,11 @@ impl JobSpec {
 pub struct JobStatus {
     /// Camera under supervision (empty when none yet).
     pub camera_id: String,
-    /// Coarse lifecycle word (`connecting | backoff | recording | stopping |
-    /// stopped | failed | idle`), lowercase.
+    /// Coarse lifecycle word (`recovering | connecting | backoff | recording
+    /// | stopping | stopped | failed | idle`), lowercase. `recovering`
+    /// (final remediation §6) is the asynchronous startup-reconciliation
+    /// phase AFTER `recording.start` was accepted: IPC stays responsive,
+    /// status works, and stop/shutdown interrupt recovery in a bounded way.
     pub state: String,
     /// Consecutive retry attempt currently armed (0 once connected).
     pub retry_attempt: u32,
@@ -388,19 +419,21 @@ enum BoxedSupervisor {
 pub struct RecordingJobManager {
     shared: Arc<SharedState>,
     /// Clone of the supervisor's run-level flag captured at `start()` time;
-    /// `stop()` requests go here and are honored by the supervised loop.
+    /// stop requests go here and are honored by the supervised loop.
     run_stop: Option<StopFlag>,
-    /// Where every attempt deposits its fresh interrupt handle; the second
-    /// stop press cancels the current one.
+    /// Where every attempt deposits its fresh interrupt handle; a
+    /// force-cancel cancels the current one (live attempt OR recovery).
     latest_interrupt: LatestInterruptSlot,
     active: Option<std::thread::JoinHandle<()>>,
     started_once: bool,
-    /// §2: presses are PER-MANAGER state. A new manager (new job) starts
-    /// from zero — never a process-global.
+    /// §2/§4: presses are PER-MANAGER operator state. A new manager (new
+    /// job) starts from zero — never a process-global — and process
+    /// shutdown NEVER touches this counter (it uses `request_graceful_stop`).
     stop_presses: u32,
-    /// §13: result of the once-per-job startup reconciliation (Some after
-    /// a start attempt).
-    recovery_run: Option<RecoverySummary>,
+    /// §4: whether the IDEMPOTENT graceful-stop request already fired for
+    /// this job (shutdown orchestration + stop press 1 share the flag, but
+    /// never the escalation counter).
+    graceful_stop_requested: bool,
 }
 
 impl Default for RecordingJobManager {
@@ -422,16 +455,14 @@ impl RecordingJobManager {
             active: None,
             started_once: false,
             stop_presses: 0,
-            recovery_run: None,
+            graceful_stop_requested: false,
         }
     }
 
     /// Current status snapshot (thread-safe read of the job's progress).
     #[allow(clippy::unwrap_used)] // lock guards are panic-free label updates
     pub fn status(&self) -> JobStatus {
-        let mut status = self.shared.status.lock().unwrap().clone();
-        status.recovery = self.recovery_run;
-        status
+        self.shared.status.lock().unwrap().clone()
     }
 
     /// Whether a job was started AND already reached a terminal state.
@@ -439,74 +470,45 @@ impl RecordingJobManager {
         self.started_once && self.shared.done.load(Ordering::SeqCst)
     }
 
-    /// Starts a supervised job from a validated spec. Fails with
-    /// `job_already_active` when this worker already has/had a job (one job
-    /// per worker lifetime keeps recovery boundaries clean).
+    /// Starts a supervised job from a validated spec. Only CHEAP validation
+    /// happens here (final remediation §6): parameter checks, the storage
+    /// pre-flight and building the supervisor objects — no media work, no
+    /// recovery. The job thread then runs `recovering` → connection →
+    /// recording asynchronously, so `recording.start` acks promptly even
+    /// when large crash files need remuxing.
+    ///
+    /// Fails with `job_already_active` when this worker already has/had a
+    /// job (one job per worker lifetime keeps recovery boundaries clean),
+    /// `storage_unavailable` ONLY for genuine infrastructure failure at the
+    /// pre-flight, or `start_failed` when the thread cannot spawn.
     pub fn start(&mut self, spec: JobSpec) -> Result<(), &'static str> {
         if self.started_once || self.active.is_some() {
             return Err(code::JOB_ALREADY_ACTIVE);
         }
 
+        let layout = nian_storage::RecordingsLayout::new(spec.storage_root.clone())
+            .map_err(|_| code::INVALID_PARAMS)?;
+
+        // Cheap storage pre-flight (§7/§8): creating the camera directory is
+        // the smallest operation that proves the storage root is USABLE at
+        // all. Its failure is genuine infrastructure trouble → permanent
+        // refusal. Per-file content problems are NOT visible here; they are
+        // quarantined by the asynchronous recovery below.
+        layout
+            .ensure_camera_dir(&spec.camera)
+            .map_err(|_| code::STORAGE_UNAVAILABLE)?;
+
         *self.shared.status.lock().unwrap() = JobStatus {
             camera_id: spec.camera.as_str().to_owned(),
-            state: "connecting".to_owned(),
+            state: "recovering".to_owned(),
             retry_attempt: 0,
             finalized_segments: 0,
             finished: false,
             end_kind: String::new(),
             failure_category: String::new(),
-            recovery: self.recovery_run,
+            recovery: None,
         };
 
-        let layout = nian_storage::RecordingsLayout::new(spec.storage_root.clone())
-            .map_err(|_| code::INVALID_PARAMS)?;
-
-        // ---- Startup reconciliation (M3 remediation §13): ONCE per job ---
-        // Before ANY connection attempt, reconcile this camera's canonical
-        // partials. Storage-level infrastructure failures here make safe
-        // recording impossible → typed permanent failure instead of starting
-        // a doomed supervisor loop. Quarantined/unrecoverable leftovers only
-        // REPORT; they never block new recording.
-        let (recovery_outcomes, recovery_failures) =
-            nian_recorder::recover_camera_partials(&layout, &spec.camera);
-        let recovery_summary = {
-            let outcomes = &recovery_outcomes;
-            let failures = &recovery_failures;
-            let recovered = outcomes
-                .iter()
-                .filter(|outcome| {
-                    matches!(outcome, nian_recorder::RecoveryOutcome::Recovered { .. })
-                })
-                .count();
-            let quarantined = outcomes
-                .iter()
-                .filter(|outcome| {
-                    matches!(
-                        outcome,
-                        nian_recorder::RecoveryOutcome::KeptUnrecoverable { .. }
-                    )
-                })
-                .count();
-            if !failures.is_empty() && recovered == 0 {
-                *self.shared.status.lock().unwrap() = JobStatus {
-                    camera_id: spec.camera.as_str().to_owned(),
-                    state: "failed".to_owned(),
-                    retry_attempt: 0,
-                    finalized_segments: 0,
-                    finished: true,
-                    end_kind: "failed".to_owned(),
-                    failure_category: "StorageFailed".to_owned(),
-                    recovery: None,
-                };
-                return Err(code::STORAGE_UNAVAILABLE);
-            }
-            RecoverySummary {
-                recovered,
-                quarantined,
-                failed: failures.len(),
-            }
-        };
-        self.recovery_run = Some(recovery_summary);
         let mut config =
             RecorderConfig::new(spec.camera.clone()).with_segment_target(spec.segment_target);
         if !spec.copy_audio {
@@ -524,6 +526,9 @@ impl RecordingJobManager {
 
         // Only plain data crosses `.spawn`; MediaInput is !Send, which is why
         // connections are constructed per-attempt inside the factories.
+        // Construction performs NO media I/O, so it belongs to the prompt
+        // start path — this is also how the run-level stop flag is captured
+        // by construction before the supervisor moves into the job thread.
         let boxed = match thread_source {
             ThreadSource::File(path) => BoxedSupervisor::File(CameraRecordingSupervisor::new(
                 spec.camera.clone(),
@@ -531,7 +536,7 @@ impl RecordingJobManager {
                 SupervisorConfig::default(),
                 FileFactory {
                     path,
-                    layout,
+                    layout: layout.clone(),
                     config,
                     latest_interrupt: Arc::clone(&self.latest_interrupt),
                 },
@@ -544,7 +549,7 @@ impl RecordingJobManager {
                 SupervisorConfig::default(),
                 RtspFactory {
                     url,
-                    layout,
+                    layout: layout.clone(),
                     config,
                     latest_interrupt: Arc::clone(&self.latest_interrupt),
                 },
@@ -561,17 +566,34 @@ impl RecordingJobManager {
         };
 
         let shared_for_run = Arc::clone(&self.shared);
+        let interrupt_slot = Arc::clone(&self.latest_interrupt);
+        let camera = spec.camera.clone();
+        let thread_stop = run_stop.clone();
         let join = std::thread::Builder::new()
             .name("recording-job".to_owned())
             .spawn(move || match boxed {
                 BoxedSupervisor::File(supervisor) => {
-                    supervise_and_fold(supervisor, shared_for_run);
+                    run_recovering_then_supervising(
+                        supervisor,
+                        shared_for_run,
+                        interrupt_slot,
+                        layout,
+                        camera,
+                        &thread_stop,
+                    );
                 }
                 BoxedSupervisor::Rtsp(supervisor) => {
-                    supervise_and_fold(supervisor, shared_for_run);
+                    run_recovering_then_supervising(
+                        supervisor,
+                        shared_for_run,
+                        interrupt_slot,
+                        layout,
+                        camera,
+                        &thread_stop,
+                    );
                 }
             })
-            .map_err(|_| "thread spawn failed")?;
+            .map_err(|_| code::START_FAILED)?;
 
         self.run_stop = Some(run_stop);
         self.active = Some(join);
@@ -596,6 +618,9 @@ impl RecordingJobManager {
         };
         self.stop_presses += 1;
         let presses = self.stop_presses;
+        if presses == 1 {
+            self.graceful_stop_requested = true;
+        }
         stop_flag.request();
         if presses >= 2
             && let Some(interrupt) = self.latest_interrupt.lock().unwrap().as_ref()
@@ -605,54 +630,70 @@ impl RecordingJobManager {
         Ok(presses)
     }
 
-    /// §8 real shutdown lifecycle for `cmd_run`: graceful stop → bounded
-    /// join → escalation → bounded join → forced-path flag. The grace
-    /// window deliberately exceeds the normal bounded read operation
-    /// (`SourceTimeouts::read` default 15 s) plus finalization headroom so
-    /// a healthy session always finishes publishing inside it.
-    pub fn shutdown(&mut self) -> ShutdownDisposition {
-        let grace = if self.started_once {
-            DEFAULT_GRACE_BEFORE_FORCE
-        } else {
-            Duration::ZERO
+    /// Final remediation §4: the IDEMPOTENT graceful-stop operation used by
+    /// protocol shutdown. Requesting it twice (or after a graceful stop
+    /// press) must NEVER become a force cancel — it only sets the shared
+    /// run-level flag. Returns whether THIS call actually requested it.
+    pub fn request_graceful_stop(&mut self) -> bool {
+        let Some(stop_flag) = &self.run_stop else {
+            return false;
         };
+        if self.graceful_stop_requested {
+            return false;
+        }
+        self.graceful_stop_requested = true;
+        stop_flag.request();
+        true
+    }
 
-        // Never started or already finished: nothing to wait for.
-        if !self.started_once {
-            return ShutdownDisposition::CleanExit;
+    /// Final remediation §4: cancels whatever blocking media I/O is live
+    /// right now (session attempt or asynchronous recovery). Used ONLY by
+    /// the operator's second stop press and by shutdown AFTER its grace
+    /// window expired — never by the graceful path.
+    pub fn force_cancel_current_io(&mut self) {
+        if let Some(stop_flag) = &self.run_stop {
+            stop_flag.request();
         }
-        if self.is_finished() {
-            return self.join_now(grace);
-        }
-        // First (graceful) press regardless of prior manual stop presses.
-        let _ = self.stop();
-        match self.join_deadline(std::time::Instant::now() + grace) {
-            JoinOutcome::Joined => return ShutdownDisposition::CleanExit,
-            JoinOutcome::StillRunning => {}
-        }
-        // Grace expired while blocks were in flight: force-cancel and wait
-        // the absolute safety bound.
         if let Some(interrupt) = self.latest_interrupt.lock().unwrap().as_ref() {
             interrupt.cancel();
         }
-        let _ = self.stop(); // ensure run-level flag also set
-        match self.join_deadline(std::time::Instant::now() + ABSOLUTE_FORCE_BOUND) {
-            JoinOutcome::Joined => ShutdownDisposition::ForcedCancellationSurvived,
-            JoinOutcome::StillRunning => ShutdownDisposition::UnsafeTermination,
+    }
+
+    /// §8 real shutdown lifecycle for `cmd_run`, rebuilt per final
+    /// remediation §4: ONE idempotent graceful request → bounded grace join
+    /// → force-cancel ONLY if grace expires → bounded absolute join. The
+    /// grace window deliberately exceeds the normal bounded read operation
+    /// (`SourceTimeouts::read` default 15 s) plus finalization headroom so
+    /// a healthy session always finishes publishing inside it. The operator
+    /// press counter is never consulted.
+    pub fn shutdown(&mut self) -> ShutdownDisposition {
+        if !self.started_once {
+            return ShutdownDisposition::CleanExit;
+        }
+        self.request_graceful_stop();
+        if self.is_finished() {
+            self.join_until(std::time::Instant::now());
+            return ShutdownDisposition::CleanExit;
+        }
+        match self.join_until(std::time::Instant::now() + DEFAULT_GRACE_BEFORE_FORCE) {
+            JoinOutcome::Joined => ShutdownDisposition::CleanExit,
+            JoinOutcome::StillRunning => {
+                // Grace expired while blocks were in flight: force-cancel
+                // and wait the absolute safety bound.
+                self.force_cancel_current_io();
+                match self.join_until(std::time::Instant::now() + ABSOLUTE_FORCE_BOUND) {
+                    JoinOutcome::Joined => ShutdownDisposition::ForcedCancellationSurvived,
+                    JoinOutcome::StillRunning => ShutdownDisposition::UnsafeTermination,
+                }
+            }
         }
     }
 
-    fn join_now(&mut self, _grace: Duration) -> ShutdownDisposition {
-        if let Some(join) = self.active.take() {
-            let _ = join.join();
-        }
-        ShutdownDisposition::CleanExit
-    }
-
-    fn join_deadline(&mut self, deadline: std::time::Instant) -> JoinOutcome {
-        // The supervisor sets `done` right before its thread returns; we
-        // join on that signal so the thread is fully reaped, and treat a
-        // finished-done flag as authoritative within the bound.
+    /// Bounded join that actually REAPS the thread (final remediation §4):
+    /// whenever the job is observed finished — by the `done` flag or by
+    /// `JoinHandle::is_finished` — the handle is TAKEN and joined, never
+    /// left stored while claiming `Joined`.
+    fn join_until(&mut self, deadline: std::time::Instant) -> JoinOutcome {
         loop {
             if self.shared.done.load(Ordering::SeqCst) {
                 if let Some(join) = self.active.take() {
@@ -660,13 +701,17 @@ impl RecordingJobManager {
                 }
                 return JoinOutcome::Joined;
             }
-            match &mut self.active {
-                None => return JoinOutcome::Joined,
-                Some(join) => {
-                    if join.is_finished() {
-                        return JoinOutcome::Joined;
-                    }
+            if let Some(join) = self.active.take() {
+                if join.is_finished() {
+                    // Finished without the flag (impossible for a healthy
+                    // run, but then it MUST still be reaped): join now.
+                    let _ = join.join();
+                    return JoinOutcome::Joined;
                 }
+                // Still running: put the handle back and keep waiting.
+                self.active = Some(join);
+            } else {
+                return JoinOutcome::Joined;
             }
             if std::time::Instant::now() >= deadline {
                 return JoinOutcome::StillRunning;
@@ -708,6 +753,116 @@ fn job_seed() -> u64 {
         .unwrap_or(0x9E37_79B9_7F4A_7C15)
 }
 
+/// Job-thread body (final remediation §6): asynchronous startup recovery
+/// FIRST — observable as `recovering`, interruptible via the deposited
+/// interrupt handle, skipped entirely when a stop already arrived — and
+/// only then the supervised recording run. Recovery never blocks the IPC
+/// serve loop: it lives entirely on this thread.
+fn run_recovering_then_supervising<
+    F: nian_recorder::SessionFactory,
+    W: nian_recorder::Waiter,
+    J: nian_recorder::Jitter,
+>(
+    supervisor: CameraRecordingSupervisor<F, W, J>,
+    shared: Arc<SharedState>,
+    interrupt_slot: LatestInterruptSlot,
+    layout: nian_storage::RecordingsLayout,
+    camera: CameraId,
+    run_stop: &StopFlag,
+) {
+    // The recovery pass deposits ITS interrupt handle in the same slot the
+    // session attempts use, so a force-cancel aborts blocked recovery I/O
+    // in a bounded way (§6).
+    let recovery_interrupt = InterruptHandle::new();
+    *interrupt_slot.lock().unwrap() = Some(recovery_interrupt.clone());
+
+    let (outcomes, failures) = nian_recorder::recover_camera_partials_with_interrupt(
+        &layout,
+        &camera,
+        &recovery_interrupt,
+    );
+    let summary = {
+        let recovered = outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome,
+                    nian_recorder::RecoveryOutcome::Recovered { .. }
+                        | nian_recorder::RecoveryOutcome::AlreadyRecovered { .. }
+                )
+            })
+            .count();
+        let quarantined = outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome,
+                    nian_recorder::RecoveryOutcome::KeptUnrecoverable { .. }
+                )
+            })
+            .count();
+        // Typed classification (§7): infrastructure failures are Storage;
+        // content verdicts (Unreadable) quarantine their file; Cancelled is
+        // neither and is not counted as a failure at all.
+        let infrastructure_failures = failures
+            .iter()
+            .filter(|failure| failure.error.is_infrastructure())
+            .count();
+        let failed = failures
+            .iter()
+            .filter(|failure| !matches!(failure.error, nian_recorder::RecoveryError::Cancelled))
+            .count();
+        RecoverySummary {
+            recovered,
+            quarantined,
+            failed,
+            infrastructure_failures,
+        }
+    };
+
+    // Recovery ran exactly ONCE per job (§13, final remediation §5): its
+    // summary publishes through the status snapshot either way.
+    let failed_permanently = {
+        let mut slot = shared.status.lock().unwrap();
+        slot.recovery = Some(summary);
+        // Only genuine INFRASTRUCTURE failure (nothing recovered + storage
+        // unusable) fails the job permanently; per-file content failures
+        // never block new recording (§7).
+        summary.infrastructure_failures > 0 && summary.recovered == 0
+    };
+
+    if failed_permanently {
+        let mut slot = shared.status.lock().unwrap();
+        slot.state = "failed".to_owned();
+        slot.finished = true;
+        slot.end_kind = "failed".to_owned();
+        // §9: stable wire value, never Debug formatting.
+        slot.failure_category = nian_recorder::FailureCategory::StorageFailed
+            .as_str()
+            .to_owned();
+        shared.done.store(true, Ordering::SeqCst);
+        return;
+    }
+
+    if run_stop.is_requested() {
+        // Stop/shutdown arrived during recovery (§6): end the job as an
+        // operator stop WITHOUT connecting. Whatever recovery published
+        // stays; unattempted partials wait for the next startup.
+        let mut slot = shared.status.lock().unwrap();
+        slot.state = "stopped".to_owned();
+        slot.finished = true;
+        slot.end_kind = "stopped".to_owned();
+        shared.done.store(true, Ordering::SeqCst);
+        return;
+    }
+
+    {
+        let mut slot = shared.status.lock().unwrap();
+        slot.state = "connecting".to_owned();
+    }
+    supervise_and_fold(supervisor, &shared);
+}
+
 /// Runs the supervisor to completion on the job thread, folding events into
 /// the shared status snapshot; marks the slot done when finished.
 fn supervise_and_fold<
@@ -716,7 +871,7 @@ fn supervise_and_fold<
     J: nian_recorder::Jitter,
 >(
     supervisor: CameraRecordingSupervisor<F, W, J>,
-    shared: Arc<SharedState>,
+    shared: &Arc<SharedState>,
 ) {
     let fold = |event: SupervisorEvent| {
         let mut slot = shared.status.lock().unwrap();
@@ -751,17 +906,19 @@ fn supervise_and_fold<
                 slot.finalized_segments = finalized_segments;
                 slot.finished = true;
                 // §7: terminal disposition AND its failure category must be
-                // visible to hosts — worker-alive ≠ recording-healthy.
+                // visible to hosts — worker-alive ≠ recording-healthy. §9:
+                // the category crosses the wire as its STABLE as_str value,
+                // never Rust Debug output.
                 let (kind, category) = match end {
                     SupervisorEnd::SourceCompleted => ("completed", None),
                     SupervisorEnd::StoppedByOperator { .. } => ("stopped", None),
                     SupervisorEnd::PermanentFailure { category } => {
-                        ("failed", Some(format!("{category:?}")))
+                        ("failed", Some(category.as_str()))
                     }
                 };
                 slot.end_kind = kind.to_owned();
                 if let Some(category) = category {
-                    slot.failure_category = category;
+                    slot.failure_category = category.to_owned();
                 }
             }
         }
@@ -780,8 +937,9 @@ impl RecordingJobManager {
 
 #[cfg(test)]
 mod tests {
-    //! Unit coverage for §2 (per-job stop presses), §8 (shutdown lifecycle),
-    //! and §13 (startup recovery invocation + typed storage failure).
+    //! Unit coverage for §2 (per-job stop presses), §4 (graceful-stop
+    //! operation split), §6 (asynchronous recovery lifecycle), §7 (typed
+    //! recovery classification) and §8 (shutdown lifecycle).
 
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -808,6 +966,28 @@ mod tests {
         }
     }
 
+    /// Bounded wait for the job to reach a terminal state.
+    fn wait_finished(manager: &RecordingJobManager, seconds: u64) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+        while !manager.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        manager.is_finished()
+    }
+
+    /// Bounded wait until the job's status satisfies `predicate` (used for
+    /// the asynchronous `recovering` → later phases lifecycle, §6).
+    fn wait_status(manager: &RecordingJobManager, predicate: impl Fn(&JobStatus) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if predicate(&manager.status()) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
     #[test]
     fn stop_presses_are_per_manager_and_start_at_zero() {
         let mut manager = RecordingJobManager::new();
@@ -818,6 +998,35 @@ mod tests {
         // (each new() starts stop_presses = 0).
         assert_eq!(RecordingJobManager::new().stop_presses_field(), 0);
         assert_eq!(manager.stop_presses_field(), 0);
+    }
+
+    #[test]
+    fn start_acks_promptly_with_recovering_state_before_any_media_work() {
+        // §6: recording.start must return BEFORE the recovery/remux work —
+        // the status snapshot is already observable as `recovering` (or has
+        // already moved on for tiny inputs) while the job thread runs.
+        let fixtures = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/nian-media-ffmpeg/tests/fixtures/sample_av.mkv"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = RecordingJobManager::new();
+        let result = manager.start(JobSpec {
+            camera: CameraId::parse("cam-async").unwrap(),
+            storage_root: temp.path().join("rec").to_path_buf(),
+            source: JobSource::File(PathBuf::from(fixtures)),
+            segment_target: Duration::from_secs(300),
+            copy_audio: true,
+        });
+        assert!(result.is_ok(), "start must ack without doing media work");
+        // State moved off `idle` immediately; the camera is already set.
+        let status = manager.status();
+        assert_eq!(status.camera_id, "cam-async");
+        assert_ne!(status.state, "idle");
+        assert!(!status.finished);
+
+        let _ = manager.stop();
+        assert!(wait_finished(&manager, 30));
     }
 
     #[test]
@@ -842,13 +1051,8 @@ mod tests {
         let presses = manager.stop().expect("stop accepted");
         assert_eq!(presses, 1);
 
-        // Bounded wait for the job to finish gracefully.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while !manager.is_finished() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
         assert!(
-            manager.is_finished(),
+            wait_finished(&manager, 30),
             "first graceful stop must finish the job"
         );
         let status = manager.status();
@@ -856,10 +1060,46 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_runs_once_per_job_start() {
-        // §13: seed a leftover partial for the target camera; after start()
-        // completes its reconciliation, the status must carry a recovery
-        // summary with recovered >= 1 (real remux into a published final).
+    fn request_graceful_stop_is_idempotent_and_never_consumes_the_press_counter() {
+        // Final remediation §4: shutdown orchestration uses the idempotent
+        // operation; calling it repeatedly must NOT become a force cancel
+        // and must leave the operator press counter untouched.
+        let fixtures = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/nian-media-ffmpeg/tests/fixtures/sample_av.mkv"
+        );
+        let mut manager = RecordingJobManager::new();
+        manager
+            .start(spec_for(
+                JobSource::File(PathBuf::from(fixtures)),
+                "cam-graceful-shutdown",
+            ))
+            .expect("job starts");
+
+        assert!(
+            manager.request_graceful_stop(),
+            "first graceful request fires"
+        );
+        assert!(
+            !manager.request_graceful_stop(),
+            "second graceful request is a no-op, NEVER an escalation"
+        );
+        assert_eq!(
+            manager.stop_presses_field(),
+            0,
+            "the operator press counter must not be reused as control flow"
+        );
+        assert!(wait_finished(&manager, 30));
+        assert_eq!(manager.status().end_kind, "stopped");
+        // The shutdown lifecycle on an already-stopped job is a clean exit.
+        assert_eq!(manager.shutdown(), ShutdownDisposition::CleanExit);
+    }
+
+    #[test]
+    fn startup_recovery_runs_once_and_asynchronously_per_job_start() {
+        // §13/§6: seed a leftover partial for the target camera; after the
+        // ASYNC reconciliation completes, the status must carry a recovery
+        // summary with real salvage accounting, and the job still records.
         let fixtures = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../crates/nian-media-ffmpeg/tests/fixtures/sample_av.mkv"
@@ -878,18 +1118,22 @@ mod tests {
 
         let mut manager = RecordingJobManager::new();
         let source_path = fixtures.to_string();
-        let spec = JobSpec {
-            camera,
-            storage_root: temp.path().join("rec").to_path_buf(),
-            source: JobSource::File(PathBuf::from(source_path)),
-            segment_target: Duration::from_secs(300),
-            copy_audio: true,
-        };
-        // Storage validates at start(); recovery then runs BEFORE any media
-        // open in the job thread? NO — remediation requires it BEFORE spawn;
-        // so recover_camera_partials runs synchronously inside start().
-        manager.start(spec).expect("start ok");
+        manager
+            .start(JobSpec {
+                camera,
+                storage_root: temp.path().join("rec").to_path_buf(),
+                source: JobSource::File(PathBuf::from(source_path)),
+                segment_target: Duration::from_secs(300),
+                copy_audio: true,
+            })
+            .expect("start ok");
 
+        // §6: the summary appears asynchronously once the job thread ran
+        // the (single) reconciliation pass.
+        assert!(
+            wait_status(&manager, |status| status.recovery.is_some()),
+            "the seeded partial must be accounted by startup recovery"
+        );
         let recovery = manager.status().recovery.expect("summary present");
         assert!(
             recovery.recovered >= 1 || recovery.quarantined >= 1,
@@ -898,10 +1142,138 @@ mod tests {
 
         // Stop quickly to keep this test bounded (fixture is short).
         let _ = manager.stop();
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while !manager.is_finished() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        assert!(wait_finished(&manager, 30));
+    }
+
+    #[test]
+    fn corrupt_leftover_is_quarantined_and_does_not_block_new_recording() {
+        // Final remediation §7: a per-file CONTENT failure (unreadable
+        // bytes) is quarantined/reported and must NOT prevent the new
+        // camera recording — and must NOT classify as infrastructure.
+        let fixtures = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/nian-media-ffmpeg/tests/fixtures/sample_av.mkv"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let layout = nian_storage::RecordingsLayout::new(temp.path().join("rec")).unwrap();
+        let camera = CameraId::parse("cam-corrupt").unwrap();
+        let day_dir = layout.day_dir(&camera, chrono::Local::now().date_naive());
+        std::fs::create_dir_all(&day_dir).unwrap();
+        // EBML-magic garbage above the size threshold: scanner routes it to
+        // media-level recovery, the demuxer refuses it → content failure.
+        let mut junk = vec![0x1A_u8, 0x45, 0xDF, 0xA3];
+        junk.extend(std::iter::repeat_n(0xEE_u8, 2048));
+        let stamp = chrono::Local::now().naive_local();
+        std::fs::write(
+            day_dir.join(nian_storage::paths::partial_file_name(stamp.time())),
+            junk,
+        )
+        .unwrap();
+
+        let mut manager = RecordingJobManager::new();
+        manager
+            .start(JobSpec {
+                camera,
+                storage_root: temp.path().join("rec").to_path_buf(),
+                source: JobSource::File(PathBuf::from(fixtures)),
+                segment_target: Duration::from_secs(300),
+                copy_audio: true,
+            })
+            .expect("start must NOT be refused by a corrupt leftover");
+
+        assert!(wait_finished(&manager, 60), "recording must complete");
+        let status = manager.status();
+        assert_eq!(
+            status.end_kind, "completed",
+            "the new recording must run to its natural EOF"
+        );
+        let recovery = status.recovery.expect("recovery summary present");
+        assert!(
+            recovery.failed >= 1 && recovery.infrastructure_failures == 0,
+            "corrupt leftover is a CONTENT failure: {recovery:?}"
+        );
+    }
+
+    #[test]
+    fn infrastructure_storage_failure_fails_the_job_permanently() {
+        // Final remediation §7/§8: a genuine storage-infrastructure failure
+        // (the day directory path is occupied by a file — creation/claim is
+        // impossible) fails the job TERMINALLY with the stable
+        // `storage_failed` category. No retry loop, no refusal ambiguity.
+        let fixtures = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/nian-media-ffmpeg/tests/fixtures/sample_av.mkv"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let layout = nian_storage::RecordingsLayout::new(temp.path().join("rec")).unwrap();
+        let camera = CameraId::parse("cam-infra").unwrap();
+        // Pre-flight (camera dir) succeeds; the DAY dir path is a file, so
+        // every later storage operation (recovery scan passes it, but the
+        // first claim fails at filesystem level).
+        let month_dir = layout.day_dir(&camera, chrono::Local::now().date_naive());
+        std::fs::create_dir_all(month_dir.parent().unwrap()).unwrap();
+        std::fs::write(&month_dir, b"not a directory").unwrap();
+
+        let mut manager = RecordingJobManager::new();
+        manager
+            .start(JobSpec {
+                camera,
+                storage_root: temp.path().join("rec").to_path_buf(),
+                source: JobSource::File(PathBuf::from(fixtures)),
+                segment_target: Duration::from_secs(300),
+                copy_audio: true,
+            })
+            .expect("start itself must ack (pre-flight only proves the camera dir)");
+
+        assert!(
+            wait_finished(&manager, 60),
+            "the job must reach a terminal state"
+        );
+        let status = manager.status();
+        assert_eq!(status.end_kind, "failed");
+        assert_eq!(
+            status.failure_category, "storage_failed",
+            "§9: stable wire value for the failure category"
+        );
+    }
+
+    #[test]
+    fn shutdown_during_recovery_ends_bounded_without_connecting() {
+        // §6: stop/shutdown during the `recovering` phase ends the job in a
+        // bounded way — recovery runs once, nothing connects, terminal
+        // disposition is an operator stop.
+        let fixtures = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/nian-media-ffmpeg/tests/fixtures/sample_av.mkv"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let layout = nian_storage::RecordingsLayout::new(temp.path().join("rec")).unwrap();
+        let camera = CameraId::parse("cam-stop-recovery").unwrap();
+        let day_dir = layout.day_dir(&camera, chrono::Local::now().date_naive());
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let stamp = chrono::Local::now().naive_local();
+        std::fs::write(
+            day_dir.join(nian_storage::paths::partial_file_name(stamp.time())),
+            std::fs::read(fixtures).unwrap(),
+        )
+        .unwrap();
+
+        let mut manager = RecordingJobManager::new();
+        manager
+            .start(JobSpec {
+                camera,
+                storage_root: temp.path().join("rec").to_path_buf(),
+                source: JobSource::File(PathBuf::from(fixtures)),
+                segment_target: Duration::from_secs(300),
+                copy_audio: true,
+            })
+            .expect("start ok");
+
+        // Shutdown lifecycle (graceful request → bounded joins) while the
+        // job is still in/near recovery: must return CleanExit, never hang.
+        assert_eq!(manager.shutdown(), ShutdownDisposition::CleanExit);
+        assert!(wait_finished(&manager, 30));
+        assert_eq!(manager.status().end_kind, "stopped");
     }
 
     #[test]
@@ -929,10 +1301,13 @@ mod tests {
             })
             .expect("job starts");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while manager.status().state != "recording" && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        // Best-effort: catch the job while a segment is live. A local file
+        // records FASTER than real time, so it may complete between polls;
+        // what this test pins deterministically is the per-manager press
+        // counter and bounded completion, not the race window itself.
+        let _ = wait_status(&manager, |status| {
+            status.state == "recording" || status.finished
+        });
 
         let presses_1 = manager.stop().expect("first stop");
         assert_eq!(presses_1, 1, "graceful first");
@@ -941,12 +1316,8 @@ mod tests {
         let presses_2 = manager.stop().expect("second stop");
         assert_eq!(presses_2, 2, "escalation recorded per-manager");
 
-        let finished_by = std::time::Instant::now() + Duration::from_secs(30);
-        while !manager.is_finished() && std::time::Instant::now() < finished_by {
-            std::thread::sleep(Duration::from_millis(50));
-        }
         assert!(
-            manager.is_finished(),
+            wait_finished(&manager, 30),
             "forced cancellation must end the job"
         );
         let status = manager.status();

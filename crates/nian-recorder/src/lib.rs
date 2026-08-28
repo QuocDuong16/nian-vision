@@ -70,7 +70,10 @@ use nian_domain::CameraId;
 use nian_media::MediaError;
 use nian_storage::StorageError;
 
-pub use recovery::{RecoveryError, RecoveryFailure, RecoveryOutcome, recover_camera_partials};
+pub use recovery::{
+    RecoveryError, RecoveryFailure, RecoveryOutcome, recover_camera_partials,
+    recover_camera_partials_with_interrupt,
+};
 pub use session::{RecordingSession, RecordingSummary, StopFlag};
 pub use supervisor::{
     AttemptOutcome, CameraRecordingSupervisor, EofInterpretation, Jitter, NoJitter, SeededJitter,
@@ -233,6 +236,46 @@ pub enum FailureCategory {
     /// usable video stream/time base, FFmpeg ABI mismatch or media
     /// initialization failure. Retrying cannot succeed.
     PermanentConfiguration,
+}
+
+impl FailureCategory {
+    /// Stable wire representation for IPC payloads (final remediation §9).
+    ///
+    /// This — NOT Rust `Debug` output — is the protocol contract between the
+    /// worker's `recording.status` and the parent's classification; Rust
+    /// enum-variant naming must never leak into the wire format.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OperatorStop => "operator_stop",
+            Self::OperatorCancellation => "operator_cancellation",
+            Self::CleanEof => "clean_eof",
+            Self::SourceOpenFailed => "source_open_failed",
+            Self::SourceReadFailed => "source_read_failed",
+            Self::SourceTimedOut => "source_timed_out",
+            Self::OutputWriteFailed => "output_write_failed",
+            Self::StorageFailed => "storage_failed",
+            Self::PermanentConfiguration => "permanent_configuration",
+        }
+    }
+
+    /// Parses the stable wire representation back into the typed category
+    /// (parent-side consumption of the protocol strings). Unknown strings
+    /// (newer workers) yield `None` instead of guessing.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        let category = match value {
+            "operator_stop" => Self::OperatorStop,
+            "operator_cancellation" => Self::OperatorCancellation,
+            "clean_eof" => Self::CleanEof,
+            "source_open_failed" => Self::SourceOpenFailed,
+            "source_read_failed" => Self::SourceReadFailed,
+            "source_timed_out" => Self::SourceTimedOut,
+            "output_write_failed" => Self::OutputWriteFailed,
+            "storage_failed" => Self::StorageFailed,
+            "permanent_configuration" => Self::PermanentConfiguration,
+            _ => return None,
+        };
+        Some(category)
+    }
 }
 
 /// Stream-selection plan derived from probing the input.
@@ -506,5 +549,33 @@ mod classification_tests {
         assert_eq!(timeout.category(), FailureCategory::SourceTimedOut);
         assert_eq!(cancelled.category(), FailureCategory::OperatorCancellation);
         assert_ne!(timeout.category(), cancelled.category());
+    }
+
+    #[test]
+    fn wire_values_are_stable_and_roundtrip_without_debug() {
+        // Final remediation §9: the wire representation is an explicit
+        // contract, never Rust Debug output. Every category roundtrips
+        // through its snake_case wire value; no wire value is a Debug
+        // (PascalCase) rendering.
+        for category in [
+            FailureCategory::OperatorStop,
+            FailureCategory::OperatorCancellation,
+            FailureCategory::CleanEof,
+            FailureCategory::SourceOpenFailed,
+            FailureCategory::SourceReadFailed,
+            FailureCategory::SourceTimedOut,
+            FailureCategory::OutputWriteFailed,
+            FailureCategory::StorageFailed,
+            FailureCategory::PermanentConfiguration,
+        ] {
+            let wire = category.as_str();
+            assert!(
+                wire.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{wire} must be snake_case wire data, not Debug output"
+            );
+            assert_eq!(FailureCategory::from_wire(wire), Some(category));
+        }
+        assert_eq!(FailureCategory::from_wire("StorageFailed"), None);
+        assert_eq!(FailureCategory::from_wire("something_new"), None);
     }
 }

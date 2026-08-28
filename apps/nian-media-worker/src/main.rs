@@ -518,16 +518,22 @@ impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
                 }))),
                 Err(code) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(code))),
             },
-            recording_method::STATUS => nian_ipc::Dispatch::Reply(Ok(json!({
-                "status": self.jobs.status().to_json(),
-            }))),
+            recording_method::STATUS => {
+                // Canonical wire shape (final remediation §1): the result IS
+                // the JobStatus object (`finished`, `end_kind`,
+                // `failure_category`, `recovery`, …) — no wrapper layer, so
+                // the parent's terminal-state parser consumes exactly what
+                // this serves.
+                nian_ipc::Dispatch::Reply(Ok(self.jobs.status().to_json()))
+            }
             method::SHUTDOWN => {
-                // A running job must not survive a protocol shutdown: first
-                // press stops it gracefully; the shutdown reply only leaves
-                // the loop, and run() waits for the thread to finish below.
-                if !self.jobs.is_finished() && self.jobs.status().state != "idle" {
-                    let _ = self.jobs.stop();
-                }
+                // Final remediation §4: process shutdown is its OWN
+                // orchestration — one IDEMPOTENT graceful request here; the
+                // run loop's bounded grace/force-cancel/join sequence in
+                // cmd_run does the waiting. The operator two-press counter
+                // is never consulted, so a shutdown can never escalate to a
+                // forced cancellation by itself.
+                self.jobs.request_graceful_stop();
                 nian_ipc::Dispatch::ShutdownReply(Ok(json!({"bye": true})))
             }
             _ => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new("method_not_found"))),

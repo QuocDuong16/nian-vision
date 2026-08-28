@@ -13,23 +13,56 @@
 //! 3. anything that cannot be PROVEN recoverable keeps its partial file in
 //!    place untouched: no invented recordings, no blind renames to final.
 //!
+//! # True idempotency (final remediation §5)
+//!
+//! Recovery uses a DETERMINISTIC identity derived from the original's
+//! canonical name (see [`recovery_identity`]): the same surviving original
+//! always resolves to the same scratch file, the same recovered final and
+//! the same tombstone marker, no matter how many startup passes run. The
+//! final's mere existence is the authoritative "already recovered" signal
+//! — a repeat pass recognizes it BEFORE opening the demuxer and never
+//! remuxes again. After publication, a tombstone sidecar
+//! (`<base>.recovered.mkv.done`, created with atomic no-replace
+//! `create_new`) records the transaction for observability and debugging;
+//! a crash anywhere in the sequence leaves a state the next pass resolves
+//! correctly:
+//!
+//! * crash before publication → scratch only; the stale scratch is safe to
+//!   delete (the original always outlives it) and the pass simply redoes
+//!   the recovery;
+//! * crash after publication, before tombstone/unlink → the deterministic
+//!   final exists → the next pass reports `AlreadyRecovered` without
+//!   touching the demuxer;
+//! * crash after tombstone, before unlink → same as above; unlink is then
+//!   retried.
+//!
+//! The identity names (`<base>.recovered-tmp`, `<base>.recovered.mkv`,
+//! `<base>.recovered.mkv.done`) never parse as canonical segment names, so
+//! the storage scanner and the M4 retention janitor cannot mistake recovery
+//! artifacts for crash partials or recordings. No SQLite, no index: the
+//! filesystem alone carries the transaction state (Windows-first semantics:
+//! every step is `create_new`/no-replace-rename, both atomic on NTFS).
+//!
 //! A truncated-but-readable partial never becomes "the final it was named
-//! after": its recovered content is a distinct recording slot claimed like
-//! any other segment (name anchored when recovery runs), published with the
-//! ordinary no-replace machinery, so an existing final can never be
-//! overwritten by recovery. If that publication is refused, the recovered
-//! output stays a `.partial.mkv` and the ORIGINAL is kept too.
+//! after": its recovered content is a DISTINCT recording slot
+//! (`<original-stem>.recovered.mkv`), so an existing final can never be
+//! overwritten by recovery, and normal-recording names never collide with
+//! recovery identities.
 //!
-//! # Failure containment
+//! # Failure containment (final remediation §7)
 //!
-//! One partial's recovery failure never aborts other files: caller-visible
+//! Failures are TYPED, not string-classified: [`RecoveryError::Storage`]
+//! means storage infrastructure trouble (scan/claim/publish/stat failed —
+//! safe recording is impossible), [`RecoveryError::Unreadable`] means one
+//! partial's content could not be proven (quarantine it, keep recording),
+//! and [`RecoveryError::Cancelled`] means stop/shutdown interrupted the
+//! pass. One partial's failure never aborts other files: caller-visible
 //! failures are collected per-file, and the source file always survives any
 //! failed attempt.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::Local;
 use nian_domain::{CameraId, MediaRational};
 use nian_media_ffmpeg::{InterruptHandle, MatroskaMuxer, MediaInput};
 use nian_storage::paths::publish_no_replace;
@@ -112,9 +145,21 @@ pub enum RecoveryOutcome {
         reason: String,
     },
 
-    /// Readable content was salvaged into a fresh claimed segment,
-    /// finalized durably and published no-replace. The ORIGINAL partial was
-    /// removed only after that publication succeeded.
+    /// Final remediation §5: this original's deterministic recovered final
+    /// ALREADY exists — an earlier pass published it (possibly crashing
+    /// before cleanup). Recognized WITHOUT opening the demuxer, so the same
+    /// surviving original can never be remuxed (or duplicated) again.
+    AlreadyRecovered {
+        /// The surviving original partial.
+        partial_path: PathBuf,
+        /// The recording published by the earlier pass.
+        final_path: PathBuf,
+    },
+
+    /// Readable content was salvaged into the original's deterministic
+    /// recovery slot, finalized durably and published no-replace. The
+    /// tombstone is written only after that publication; the ORIGINAL
+    /// partial is removed last.
     Recovered {
         /// The newly published recording.
         final_path: PathBuf,
@@ -130,9 +175,15 @@ pub enum RecoveryOutcome {
         from_finalized_leftover: bool,
         /// M3 remediation §12: whether unlinking the original succeeded.
         /// `false` surfaces an observable cleanup failure; the recovery
-        /// itself stays valid, and idempotency is guaranteed because the
-        /// recovered final blocks any republish (`DestinationExists`).
+        /// itself stays valid, and idempotency is guaranteed by the
+        /// deterministic identity — a repeat pass recognizes the published
+        /// final and never remuxes again.
         original_removed: bool,
+        /// Final remediation §5: whether the tombstone sidecar now persists
+        /// next to the recording. `false` is an observable failure (the
+        /// recording itself remains fully valid; the deterministic identity
+        /// still prevents duplicates).
+        tombstone_recorded: bool,
     },
 }
 
@@ -145,17 +196,22 @@ pub struct RecoveryFailure {
     pub error: RecoveryError,
 }
 
-/// Recovery-specific failures.
+/// Recovery-specific failures. The variant IS the classification (final
+/// remediation §7): callers never parse error strings to decide whether a
+/// failure is a per-file content problem or broken storage infrastructure.
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
-    /// The scan or claiming the recovery output failed (filesystem
-    /// trouble). Source files remain untouched.
+    /// Storage infrastructure failure: scanning the camera tree, claiming
+    /// the recovery output, stat-ing the finalized scratch or publishing
+    /// failed at the filesystem level. Safe storage operation is
+    /// impossible — the CALLER may fail the recording job permanently.
     #[error(transparent)]
     Storage(#[from] StorageError),
 
-    /// The demuxer could not prove the partial is readable media (failed
-    /// open, no video stream, or trailer/flush failed on the salvage
-    /// output).
+    /// One partial's CONTENT could not be proven recoverable (failed open,
+    /// no video stream, no usable time base, trailer/flush failure on the
+    /// salvage output, or a poisoned mux write). Per-file only: quarantine
+    /// the file and keep recording — it must never block new camera work.
     #[error("partial is not provably recoverable media: {message}")]
     Unreadable {
         /// Human-safe backend description (secret-free by media-layer
@@ -163,12 +219,83 @@ pub enum RecoveryError {
         message: String,
     },
 
-    /// Publication of the recovered output was refused because the
-    /// destination already exists. Neither the recovered output nor the
-    /// original partial is removed; a later pass may still salvage under a
-    /// different claim.
-    #[error("recovered recording destination already exists")]
-    DestinationExists,
+    /// Stop/shutdown interrupted recovery (final remediation §6/§7). The
+    /// untouched partial stays for the next startup pass; this is neither
+    /// infrastructure breakage nor a content verdict.
+    #[error("recovery was cancelled")]
+    Cancelled,
+}
+
+impl RecoveryError {
+    /// True when this failure means storage infrastructure is unusable —
+    /// the worker-level signal for a permanent job failure. Per-file
+    /// content failures and cancellation classify `false`.
+    pub fn is_infrastructure(&self) -> bool {
+        matches!(self, RecoveryError::Storage(_))
+    }
+}
+
+/// The deterministic recovery transaction for one original partial (final
+/// remediation §5, option C): every artifact name is derived from the
+/// original's canonical name, so the same original always maps to the same
+/// scratch, the same final and the same tombstone across any number of
+/// passes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryIdentity {
+    /// Scratch file the salvage muxer writes into (`<base>.recovered-tmp`).
+    /// Never a canonical segment name, so the scanner cannot mistake a
+    /// crashed pass's scratch for a camera partial.
+    scratch: PathBuf,
+    /// Deterministic recovered recording (`<base>.recovered.mkv`). Its
+    /// EXISTENCE is the authoritative already-recovered signal.
+    final_path: PathBuf,
+    /// Tombstone sidecar (`<base>.recovered.mkv.done`), created atomically
+    /// (no-replace) only after publication.
+    tombstone: PathBuf,
+}
+
+/// Canonical partial names end with exactly this suffix.
+const PARTIAL_NAME_SUFFIX: &str = ".partial.mkv";
+
+/// Derives the identity from a partial's canonical name; `None` for names
+/// that somehow reached recovery without the scanner's canonical guarantee.
+fn recovery_identity(partial_path: &Path) -> Option<RecoveryIdentity> {
+    let name = partial_path.file_name()?.to_str()?;
+    let base = name.strip_suffix(PARTIAL_NAME_SUFFIX)?;
+    let dir = partial_path.parent()?;
+    Some(RecoveryIdentity {
+        scratch: dir.join(format!("{base}.recovered-tmp")),
+        final_path: dir.join(format!("{base}.recovered.mkv")),
+        tombstone: dir.join(format!("{base}.recovered.mkv.done")),
+    })
+}
+
+/// Writes the tombstone sidecar with atomic no-replace semantics; returns
+/// whether it NOW persists as a regular file (freshly created or left by an
+/// earlier pass). Creation only ever happens after the recovered final is
+/// published (§5); a `false` here is the observable persistence failure.
+fn ensure_tombstone(identity: &RecoveryIdentity, original: &Path) -> bool {
+    if identity.tombstone.is_file() {
+        return true;
+    }
+    let payload = format!(
+        "nian-vision recovery tombstone\noriginal: {}\nfinal: {}\n",
+        original
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default(),
+        identity
+            .final_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default(),
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true) // atomic no-replace on every supported platform
+        .open(&identity.tombstone)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, payload.as_bytes()))
+        .is_ok()
 }
 
 /// Recovers all classifiable partials of one camera.
@@ -180,6 +307,20 @@ pub enum RecoveryError {
 pub fn recover_camera_partials(
     layout: &RecordingsLayout,
     camera: &CameraId,
+) -> (Vec<RecoveryOutcome>, Vec<RecoveryFailure>) {
+    let interrupt = InterruptHandle::new();
+    recover_camera_partials_with_interrupt(layout, camera, &interrupt)
+}
+
+/// Like [`recover_camera_partials`], but all media I/O observes the given
+/// interrupt handle (final remediation §6): cancelling it aborts blocked
+/// demux/mux operations and stops before starting any further file, so a
+/// stop/shutdown during asynchronous startup recovery is BOUNDED. Files
+/// never attempted simply stay partials for the next startup pass.
+pub fn recover_camera_partials_with_interrupt(
+    layout: &RecordingsLayout,
+    camera: &CameraId,
+    interrupt: &InterruptHandle,
 ) -> (Vec<RecoveryOutcome>, Vec<RecoveryFailure>) {
     let mut outcomes = Vec::new();
     let mut failures = Vec::new();
@@ -203,7 +344,12 @@ pub fn recover_camera_partials(
     }
 
     for partial in partials {
-        match recover_one(layout, camera, &partial) {
+        if interrupt.is_cancelled() {
+            // Bounded stop (§6): the run is being stopped; remaining
+            // partials keep waiting for the next startup reconciliation.
+            break;
+        }
+        match recover_one(&partial, interrupt) {
             Ok(outcome) => outcomes.push(outcome),
             Err(error) => failures.push(RecoveryFailure {
                 partial_path: partial.partial_path.clone(),
@@ -216,9 +362,8 @@ pub fn recover_camera_partials(
 
 /// Recovers ONE partial according to its classification.
 fn recover_one(
-    layout: &RecordingsLayout,
-    camera: &CameraId,
     partial: &PartialFile,
+    interrupt: &InterruptHandle,
 ) -> Result<RecoveryOutcome, RecoveryError> {
     match &partial.disposition {
         // Cheap classification proved there cannot be media here. Keep the
@@ -230,55 +375,83 @@ fn recover_one(
 
         // Both media classes go through the SAME proven pipeline: demux →
         // keyframe-aligned packet copy → durable finalize → no-replace
-        // publish → remove original LAST.
+        // publish → tombstone → remove original LAST.
         PartialDisposition::RecoverableMedia { .. }
-        | PartialDisposition::FinalizedButUnpublished { .. } => {
-            salvage_media(layout, camera, partial)
-        }
+        | PartialDisposition::FinalizedButUnpublished { .. } => salvage_media(partial, interrupt),
     }
 }
 
-/// The demux → alignment → claim → copy → finalize → publish → cleanup
-/// pipeline shared by both media classes.
+/// The demux → alignment → claim → copy → finalize → publish → tombstone →
+/// cleanup pipeline shared by both media classes.
 ///
-/// M3 remediation ordering contract (§9–§12):
+/// M3 remediation ordering contract (§9–§12), extended by the final
+/// remediation (§5 deterministic identity, §6 cancellation):
 ///
-/// 1. open the ORIGINAL and validate streams/time base (§10: before any
+/// 1. RECOGNIZE an already-recovered original FIRST (§5): when the
+///    deterministic final exists, return `AlreadyRecovered` without ever
+///    opening the demuxer — repeat passes never remux again;
+/// 2. open the ORIGINAL and validate streams/time base (§10: before any
 ///    new output exists);
-/// 2. scan/discard until the first primary-video keyframe is PROVEN to
+/// 3. scan/discard until the first primary-video keyframe is PROVEN to
 ///    exist (§10), then restart the source for the actual copy;
-/// 3. ONLY THEN claim the fresh recovery output and open its muxer;
-/// 4. write packets keyframe-aligned until EOF/truncation;
-/// 5. ANY muxer write failure poisons the output (§9): it is never
-///    finalized/published — the poisoned partial stays on disk, the
-///    original stays untouched, a `RecoveryFailure` is reported;
-/// 6. finalize durably; the size lookup on the still-partial file must
+/// 4. ONLY THEN claim the DETERMINISTIC recovery scratch (§5) and open its
+///    muxer — a stale scratch from a crashed pass is deleted first (the
+///    original always outlives the scratch, so it can never hold unique
+///    content);
+/// 5. write packets keyframe-aligned until EOF/truncation;
+/// 6. ANY muxer write failure poisons the output (§9): it is never
+///    finalized/published — the poisoned scratch is removed, the original
+///    stays untouched, a `RecoveryFailure` is reported;
+/// 7. finalize durably; the size lookup on the still-partial file must
 ///    succeed or nothing publishes (§11: no `unwrap_or(0)`);
-/// 7. no-replace publication commits the recovered recording;
-/// 8. drop the SOURCE INPUT first (§12), then remove the original — with
-///    cleanup made IDEMPOTENT by the no-replace rule: if unlinking fails,
-///    `original_removed=false` surfaces it observably, and a repeat run
-///    cannot duplicate the recording because the recovered final blocks
-///    any republish via `DestinationExists`.
+/// 8. no-replace publication commits the recovered recording at its
+///    DETERMINISTIC final — a `DestinationExists` here means an earlier
+///    pass already published it: report `AlreadyRecovered`, never a
+///    duplicate;
+/// 9. drop the SOURCE INPUT first (§12), write the tombstone (§5), then
+///    remove the original — with a failed unlink surfaced observably via
+///    `original_removed=false`.
 fn salvage_media(
-    layout: &RecordingsLayout,
-    camera: &CameraId,
     partial: &PartialFile,
+    interrupt: &InterruptHandle,
 ) -> Result<RecoveryOutcome, RecoveryError> {
     let from_finalized = matches!(
         partial.disposition,
         PartialDisposition::FinalizedButUnpublished { .. }
     );
 
-    // ---- 1. Open + validate the ORIGINAL -----------------------------------
-    let interrupt = InterruptHandle::new();
-    let _open_budget = interrupt.scoped_deadline(Duration::from_secs(15));
-    let source = partial_source(&partial.partial_path);
-    let mut input =
-        MediaInput::open(&source, &interrupt).map_err(|error| RecoveryError::Unreadable {
-            message: error.to_string(),
+    // ---- 1. Already-recovered recognition BEFORE any media work (§5) -------
+    let identity =
+        recovery_identity(&partial.partial_path).ok_or_else(|| RecoveryError::Unreadable {
+            message: "partial name carries no canonical recovery identity".to_owned(),
         })?;
-    drop(_open_budget);
+    if identity.final_path.exists() {
+        // Best-effort tombstone: covers the crash window between publication
+        // and tombstone persistence. The recording itself is authoritative.
+        let _ = ensure_tombstone(&identity, &partial.partial_path);
+        return Ok(RecoveryOutcome::AlreadyRecovered {
+            partial_path: partial.partial_path.clone(),
+            final_path: identity.final_path,
+        });
+    }
+
+    // Cancellation-aware open mapping: a cancel arriving during a blocked
+    // open classifies as Cancelled, never as a content verdict (§6/§7).
+    let open_result = |error: nian_media::MediaError| {
+        if interrupt.is_cancelled() {
+            RecoveryError::Cancelled
+        } else {
+            RecoveryError::Unreadable {
+                message: error.to_string(),
+            }
+        }
+    };
+
+    // ---- 2. Open + validate the ORIGINAL -----------------------------------
+    let open_budget = interrupt.scoped_deadline(Duration::from_secs(15));
+    let source = partial_source(&partial.partial_path);
+    let mut input = MediaInput::open(&source, interrupt).map_err(open_result)?;
+    drop(open_budget);
 
     let streams = input.streams();
     let video = streams
@@ -295,11 +468,11 @@ fn salvage_media(
         })?;
     let video_index = video.stream_index;
 
-    // ---- 2. Alignment probe BEFORE claiming anything (§10) -----------------
+    // ---- 3. Alignment probe BEFORE claiming anything (§10) -----------------
     //
     // Prove a selected VIDEO keyframe is reachable WITHOUT creating an
     // output first: a truncated-before-keyframe candidate manufactures ZERO
-    // junk recovery partials.
+    // junk recovery artifacts.
     let mut found_keyframe = false;
     while let Some(packet) = input.next_packet().ok().flatten() {
         let metadata = packet.metadata();
@@ -319,33 +492,32 @@ fn salvage_media(
 
     // `next_packet` consumed packets up to that keyframe; MediaInput cannot
     // unread, so RESTART the proven-readable source once. From here the copy
-    // loop performs its own alignment identically to live recording.
+    // loop performs its own alignment identically to live recording. The
+    // restart open gets its own operation-scoped budget (M3 §5 discipline).
     drop(input);
-    let mut input =
-        MediaInput::open(&source, &interrupt).map_err(|error| RecoveryError::Unreadable {
-            message: error.to_string(),
-        })?;
+    let reopen_budget = interrupt.scoped_deadline(Duration::from_secs(15));
+    let mut input = MediaInput::open(&source, interrupt).map_err(open_result)?;
+    drop(reopen_budget);
 
-    // ---- 3. Claim + open the recovery output (AFTER proof) -----------------
-    let claim_started = Local::now().naive_local();
-    let claim = layout.claim_segment(camera, claim_started)?;
+    // ---- 4. Claim the DETERMINISTIC scratch (§5) ----------------------------
+    //
+    // A stale scratch can only come from a crashed earlier pass of THIS
+    // same original: publication renames it away, and the original is
+    // unlinked strictly after that. Deleting it therefore never discards
+    // unique content.
+    let scratch = claim_recovery_scratch(&identity.scratch)?;
 
     let selection = streams.clone();
-    let mut muxer = MatroskaMuxer::create_with_selection(
-        &mut input,
-        claim.partial_path(),
-        &interrupt,
-        |info| {
-            selection
-                .iter()
-                .any(|s| s.stream_index == info.stream_index)
-        },
-    )
+    let mut muxer = MatroskaMuxer::create_with_selection(&mut input, &scratch, interrupt, |info| {
+        selection
+            .iter()
+            .any(|s| s.stream_index == info.stream_index)
+    })
     .map_err(|error| RecoveryError::Unreadable {
         message: format!("salvage output could not be opened: {error}"),
     })?;
 
-    // ---- 4. Copy loop with POISON-on-write-failure (§9) ---------------------
+    // ---- 5. Copy loop with POISON-on-write-failure (§9) ---------------------
     let mut aligned = false;
     let mut start_media: Option<i64> = None;
     let mut last_media: Option<i64> = None;
@@ -374,6 +546,9 @@ fn salvage_media(
                     {
                         // fall through to a real write
                     } else {
+                        // Poisoned scratch is OUR artifact, not a camera
+                        // partial: remove it, keep the original, report.
+                        let _ = std::fs::remove_file(&scratch);
                         return Err(RecoveryError::Unreadable {
                             message:
                                 "salvage output write failed; output poisoned, never published"
@@ -383,8 +558,10 @@ fn salvage_media(
                 }
                 if muxer.write_packet(&packet).is_err() {
                     // M2 invariant applies verbatim: ANY mux/output write
-                    // failure poisons this output — NEVER finalize/publish it.
-                    // Poisoned partial stays for diagnosis; original intact.
+                    // failure poisons this output — NEVER finalize/publish
+                    // it. The scratch is removed (it is recovery-owned,
+                    // never a camera partial); the original stays intact.
+                    let _ = std::fs::remove_file(&scratch);
                     mux_write_failed = true;
                     break;
                 }
@@ -398,28 +575,43 @@ fn salvage_media(
                 }
             }
             Ok(None) => break, // clean EOF: everything readable was copied
-            Err(_) => break,   // truncation mid-partial: expected shape here
+            Err(_) => {
+                if interrupt.is_cancelled() {
+                    // Stop/shutdown interrupted the salvage (§6): nothing
+                    // publishes, the original stays for the next pass.
+                    let _ = std::fs::remove_file(&scratch);
+                    return Err(RecoveryError::Cancelled);
+                }
+                break; // truncation mid-partial: expected shape here
+            }
         }
     }
 
     if mux_write_failed {
-        drop(muxer); // NOT finalized: stays in `.partial`-recovery shape
+        drop(muxer); // NOT finalized: nothing published
         return Err(RecoveryError::Unreadable {
             message: "salvage output write failed; output poisoned, never published".to_owned(),
         });
     }
 
+    if interrupt.is_cancelled() {
+        drop(muxer);
+        let _ = std::fs::remove_file(&scratch);
+        return Err(RecoveryError::Cancelled);
+    }
+
     // Zero committed video packets is not a recording (tiny-output guard).
-    // Keep BOTH files; publish nothing, remove nothing.
+    // Remove the recovery-owned scratch, keep the original, publish nothing.
     if video_packets == 0 {
         drop(muxer);
+        let _ = std::fs::remove_file(&scratch);
         return Ok(RecoveryOutcome::KeptUnrecoverable {
             partial_path: partial.partial_path.clone(),
             reason: "demuxed but no video packets survived alignment".to_owned(),
         });
     }
 
-    // ---- 6. Durable finalize + REQUIRED size lookup (§11) ------------------
+    // ---- 7. Durable finalize + REQUIRED size lookup (§11) ------------------
     muxer
         .finalize()
         .map_err(|error| RecoveryError::Unreadable {
@@ -430,16 +622,17 @@ fn salvage_media(
     if HOOK_FAIL_METADATA.load(std::sync::atomic::Ordering::SeqCst) {
         // Simulate a post-finalize stat failure: nothing may publish even
         // though the trailer succeeded (finding 11's transaction boundary).
+        let _ = std::fs::remove_file(&scratch);
         return Err(RecoveryError::Storage(StorageError::Io {
-            path: claim.partial_path().to_path_buf(),
+            path: scratch.clone(),
             source: std::io::Error::other("injected"),
         }));
     }
 
-    let size_bytes = std::fs::metadata(claim.partial_path())
+    let size_bytes = std::fs::metadata(&scratch)
         .map_err(|source| {
             RecoveryError::Storage(StorageError::Io {
-                path: claim.partial_path().to_path_buf(),
+                path: scratch.clone(),
                 source,
             })
         })?
@@ -450,14 +643,31 @@ fn salvage_media(
         _ => None,
     };
 
-    // ---- 7. Atomic no-replace publication ==================================
-    publish_no_replace(claim.partial_path(), claim.final_path()).map_err(|error| match error {
-        StorageError::DestinationExists { .. } => RecoveryError::DestinationExists,
-        other => RecoveryError::Storage(other),
-    })?;
+    // ---- 8. Atomic no-replace publication at the DETERMINISTIC final =======
+    if let Err(error) = publish_no_replace(&scratch, &identity.final_path) {
+        return match error {
+            // An earlier pass (or the crash window between publication and
+            // tombstone) already committed this recording. The identity
+            // guarantees it is the SAME original's recovered slot: report
+            // idempotent success, never a duplicate publication.
+            StorageError::DestinationExists { .. } => {
+                let _ = std::fs::remove_file(&scratch);
+                let _ = ensure_tombstone(&identity, &partial.partial_path);
+                Ok(RecoveryOutcome::AlreadyRecovered {
+                    partial_path: partial.partial_path.clone(),
+                    final_path: identity.final_path,
+                })
+            }
+            other => Err(RecoveryError::Storage(other)),
+        };
+    }
 
-    // ---- 8. Source closed FIRST, then observable idempotent cleanup (§12) --
+    // ---- 9. Source closed FIRST, tombstone, then observable cleanup (§12) --
     drop(input);
+
+    // Tombstone strictly AFTER publication (§5): its persistence failure is
+    // observable, but the deterministic identity keeps idempotency intact.
+    let tombstone_recorded = ensure_tombstone(&identity, &partial.partial_path);
 
     #[cfg(test)]
     if HOOK_HIJACK_CLEANUP.load(std::sync::atomic::Ordering::SeqCst) {
@@ -475,12 +685,47 @@ fn salvage_media(
     let original_removed = removed.is_ok();
 
     Ok(RecoveryOutcome::Recovered {
-        final_path: claim.final_path().to_path_buf(),
+        final_path: identity.final_path,
         media_duration,
         size_bytes,
         from_finalized_leftover: from_finalized,
         original_removed,
+        tombstone_recorded,
     })
+}
+
+/// Exclusively claims the deterministic recovery scratch. A stale scratch
+/// (crashed earlier pass of the same original) is deleted first — see
+/// `salvage_media` step 4 for why that is always safe.
+fn claim_recovery_scratch(scratch: &Path) -> Result<PathBuf, RecoveryError> {
+    let claim = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(scratch)
+    };
+    match claim() {
+        Ok(_) => Ok(scratch.to_path_buf()),
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(scratch).map_err(|remove_source| {
+                RecoveryError::Storage(StorageError::Io {
+                    path: scratch.to_path_buf(),
+                    source: remove_source,
+                })
+            })?;
+            claim().map_err(|source| {
+                RecoveryError::Storage(StorageError::Io {
+                    path: scratch.to_path_buf(),
+                    source,
+                })
+            })?;
+            Ok(scratch.to_path_buf())
+        }
+        Err(source) => Err(RecoveryError::Storage(StorageError::Io {
+            path: scratch.to_path_buf(),
+            source,
+        })),
+    }
 }
 
 /// Builds the demuxer source for a partial path (local file by definition —
@@ -557,17 +802,19 @@ mod fault_injection_tests {
 
         let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
 
-        // NOTHING published: no non-partial file anywhere.
+        // NOTHING published: no non-partial, non-recovery file anywhere.
         assert_eq!(
             count_files(&storage.day_dir, false),
             0,
             "poisoned recovery output must never be published"
         );
-        // The poisoned salvage partial exists for diagnosis; the ORIGINAL
-        // stays untouched (canonical leftover).
-        assert!(
-            count_files(&storage.day_dir, true) >= 1,
-            "a poisoned/failed pass leaves partials behind: {outcomes:?} / {failures:?}"
+        // The poisoned recovery scratch is REMOVED (it is recovery-owned,
+        // never a camera partial); the ORIGINAL stays untouched as the
+        // canonical leftover for the next pass.
+        let leftovers = count_files(&storage.day_dir, true);
+        assert_eq!(
+            leftovers, 1,
+            "exactly the original partial must remain: {outcomes:?} / {failures:?}"
         );
         let failure_reported = !failures.is_empty()
             || outcomes
@@ -593,18 +840,19 @@ mod fault_injection_tests {
         let (_outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
 
         // finalize succeeded but the REQUIRED size lookup failed → nothing
-        // published; failure surfaced as Storage error; original intact.
+        // published; failure surfaced as typed Storage (infrastructure);
+        // original intact.
         assert!(
             failures
                 .iter()
-                .any(|failure| matches!(failure.error, RecoveryError::Storage(_))),
+                .any(|failure| failure.error.is_infrastructure()),
             "metadata failure must surface as typed storage failure: {failures:?}"
         );
         assert_eq!(count_files(&storage.day_dir, false), 0);
     }
 
     #[test]
-    fn cleanup_failure_is_observable_and_idempotency_keeps_finals_safe() {
+    fn cleanup_failure_is_observable_and_repeat_pass_never_duplicates() {
         let _fault_serialization_guard = test_hooks::FAULT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -626,28 +874,153 @@ mod fault_injection_tests {
                 RecoveryOutcome::Recovered {
                     original_removed,
                     final_path,
+                    tombstone_recorded,
                     ..
-                } => Some((*original_removed, final_path.clone())),
+                } => Some((*original_removed, *tombstone_recorded, final_path.clone())),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(recovered.len(), 1);
-        let (original_removed, final_path) = &recovered[0];
+        let (original_removed, tombstone_recorded, final_path) = &recovered[0];
         assert!(!original_removed, "hijacked unlink must be observable");
+        assert!(
+            *tombstone_recorded,
+            "the tombstone persists after successful publication"
+        );
         assert!(
             final_path.is_file(),
             "the recovered recording itself stays fully valid"
         );
 
-        // Idempotent repeat: whatever original-shaped content remains,
-        // publishing a NEW claim can never overwrite the existing final;
-        // total finals after a second pass may only grow by distinct slots.
-        let finals_before = count_files(&storage.day_dir, false);
-        let (o2, f2) = recover_camera_partials(&storage.layout, &storage.camera);
-        let _ = (o2, f2);
-        let finals_after = count_files(&storage.day_dir, false);
-        assert!(finals_after >= finals_before);
-        // …and specifically OUR final from before is untouched:
+        // Final remediation §5: the repeat pass on the same surviving
+        // original must produce ZERO additional final files — the
+        // deterministic identity makes duplicates impossible.
+        let finals_before = count_recordings(&storage.day_dir);
+        let (o2, _f2) = recover_camera_partials(&storage.layout, &storage.camera);
+        let finals_after = count_recordings(&storage.day_dir);
+        assert_eq!(
+            finals_after, finals_before,
+            "a repeat recovery pass must never publish a second copy: {o2:?}"
+        );
+        // …and OUR final from before is untouched:
         assert!(final_path.is_file());
+    }
+
+    /// Counts recordings the way the §5 invariant demands: recovered
+    /// finals are `<stem>.recovered.mkv` files; scratch/tombstone artifacts
+    /// and partials never count.
+    fn count_recordings(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        name.ends_with(".recovered.mkv")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn surviving_original_recognized_as_already_recovered_without_remux() {
+        // Final remediation §5: simulate the crash window AFTER publication
+        // but BEFORE cleanup — the deterministic final and the original
+        // both exist. The next pass must recognize the recording WITHOUT
+        // opening the demuxer: no remux, no new files, original untouched.
+        let storage = Storage::new();
+        let original_name = __recovery_canonical_name(chrono::Local::now().naive_local());
+        let original_path = storage.day_dir.join(&original_name);
+        let payload = std::fs::read(fixtures_dir().join("sample_av.mkv")).unwrap();
+        std::fs::write(&original_path, &payload).unwrap();
+
+        // Derive the deterministic final the same way recovery does.
+        let base = original_name.strip_suffix(".partial.mkv").unwrap();
+        let final_path = storage.day_dir.join(format!("{base}.recovered.mkv"));
+        std::fs::write(&final_path, &payload).unwrap();
+
+        let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+
+        assert!(
+            failures.is_empty(),
+            "already-recovered recognition is not a failure: {failures:?}"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, RecoveryOutcome::AlreadyRecovered { .. })),
+            "the pass must report AlreadyRecovered: {outcomes:?}"
+        );
+        // The original was NOT remuxed: its bytes are byte-identical, the
+        // deterministic final is still the ONLY recovered recording, and no
+        // scratch artifact appeared (the best-effort tombstone may exist).
+        assert_eq!(std::fs::read(&original_path).unwrap(), payload);
+        let names: Vec<String> = std::fs::read_dir(&storage.day_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.ends_with(".recovered-tmp")),
+            "no scratch artifact may appear: {names:?}"
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.ends_with(".recovered.mkv"))
+                .count(),
+            1,
+            "exactly one recovered final must exist: {names:?}"
+        );
+    }
+
+    #[test]
+    fn tombstone_persistence_failure_is_observable_but_not_blocking() {
+        let _fault_serialization_guard = test_hooks::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let storage = Storage::new();
+        let name = __recovery_canonical_name(chrono::Local::now().naive_local());
+        let original_path = storage.day_dir.join(&name);
+        std::fs::write(
+            &original_path,
+            std::fs::read(fixtures_dir().join("sample_av.mkv")).unwrap(),
+        )
+        .unwrap();
+
+        // Pre-create the tombstone as a DIRECTORY: create_new fails
+        // deterministically regardless of uid, exactly like a real
+        // persistence failure would.
+        let base = name.strip_suffix(".partial.mkv").unwrap();
+        std::fs::create_dir_all(storage.day_dir.join(format!("{base}.recovered.mkv.done")))
+            .unwrap();
+
+        let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+        assert!(
+            failures.is_empty(),
+            "tombstone failure must not fail the recovery: {failures:?}"
+        );
+        let recovered = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                RecoveryOutcome::Recovered {
+                    tombstone_recorded, ..
+                } => Some(*tombstone_recorded),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recovered.len(), 1);
+        assert!(
+            !recovered[0],
+            "the failed tombstone persistence must be observable"
+        );
+        // The recording is still fully published and valid.
+        assert!(
+            storage
+                .day_dir
+                .join(format!("{base}.recovered.mkv"))
+                .is_file()
+        );
     }
 }
