@@ -783,3 +783,169 @@ fn clock_rollback_cannot_reallocate_a_recovered_transaction_identity() {
     assert!(probe_has_video(&old_final));
     assert!(probe_has_video(&new_final));
 }
+
+// ---- M3 atomic identity claim remediation §6 ----------------------------
+/// The CONCURRENT transition case of the clock-rollback regression: a new
+/// recording claim races the namespace transition of a recovery transaction
+/// (publish `<stem>.recovered.mkv` → write trusted tombstone → remove the
+/// original partial LAST). The claim's advisory scan is forced — via the
+/// day-dir-keyed claim gate — into the exact window the review describes:
+/// it chose sequence 1 from a state where the identity looked free, and by
+/// the time its `create_new` runs, the old transaction has fully committed.
+/// Without the post-claim identity fence the claim would return the OLD
+/// transaction's identity and a later crash could let the old tombstone
+/// swallow the new footage; with the fence the candidate is relinquished
+/// and the claim retries onto a distinct sequence.
+#[test]
+fn racing_claim_during_recovery_transition_never_reuses_the_transaction_identity() {
+    use nian_storage::test_hooks::arm_claim_identity_gate;
+
+    let storage = Storage::new();
+    let t = chrono::NaiveDate::from_ymd_opt(2026, 8, 27)
+        .unwrap()
+        .and_hms_opt(8, 30, 0)
+        .unwrap();
+    let fixture = std::fs::read(fixtures_dir().join(HEALTHY_FIXTURE)).unwrap();
+
+    // Arm the one-shot gate for THIS day directory: the FIRST claim into it
+    // (the racing NEW recording below) parks after its advisory scan.
+    let (_guard, gate) = arm_claim_identity_gate(&storage.day_dir);
+
+    // The racing claim: scans an EMPTY day directory, chooses sequence 1,
+    // parks BEFORE creating its candidate.
+    let layout = storage.layout.clone();
+    let camera = storage.camera.clone();
+    let claimer = std::thread::spawn(move || {
+        layout
+            .claim_segment(&camera, t)
+            .expect("the racing claim must succeed")
+    });
+    gate.wait_arrived();
+
+    // The OLD transaction's claim proceeds while the racer is parked (the
+    // one-shot gate is consumed): it takes 08-30-00.partial.mkv, receives
+    // valid media, and "crashes" (the handle is dropped, content remains).
+    let old_claim = storage.layout.claim_segment(&storage.camera, t).unwrap();
+    assert_eq!(
+        old_claim
+            .partial_path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy(),
+        "08-30-00.partial.mkv"
+    );
+    std::fs::write(old_claim.partial_path(), &fixture).unwrap();
+    drop(old_claim);
+
+    // REAL startup recovery performs the namespace transition:
+    // publish → trusted tombstone → remove the original partial LAST.
+    let (outcomes, failures) = recover_camera_partials(&storage.layout, &storage.camera);
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [RecoveryOutcome::Recovered {
+                original_removed: true,
+                tombstone_recorded: true,
+                ..
+            }]
+        ),
+        "the old transaction must recover cleanly: {outcomes:?} / {failures:?}"
+    );
+
+    let old_final = storage.path("08-30-00.recovered.mkv");
+    let old_tombstone = storage.path("08-30-00.recovered.mkv.done");
+    assert!(old_final.is_file() && old_tombstone.is_file());
+    let old_final_bytes = std::fs::read(&old_final).unwrap();
+    let old_tombstone_bytes = std::fs::read(&old_tombstone).unwrap();
+
+    // Release the racer: its candidate create_new(08-30-00.partial.mkv)
+    // now SUCCEEDS (recovery freed the name by removing the original), and
+    // the post-claim identity fence must detect the freshly published
+    // reservation for (T, 1) and force the retry onto sequence 2.
+    gate.release();
+    let new_claim = claimer.join().expect("the racing claim must not panic");
+
+    assert_eq!(
+        new_claim
+            .partial_path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy(),
+        "08-30-00-2.partial.mkv",
+        "sequence 1 must never be returned after the competing recovered \
+         reservation appeared"
+    );
+    assert_eq!(
+        new_claim
+            .final_path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy(),
+        "08-30-00-2.mkv"
+    );
+    assert!(
+        !storage.path("08-30-00.partial.mkv").exists(),
+        "the temporary losing candidate must be removed cleanly"
+    );
+    assert!(
+        new_claim.partial_path().is_file(),
+        "the winning claim owns its own candidate"
+    );
+    // The old transaction's artifacts are untouched by the relinquish.
+    assert_eq!(std::fs::read(&old_final).unwrap(), old_final_bytes);
+    assert_eq!(std::fs::read(&old_tombstone).unwrap(), old_tombstone_bytes);
+
+    // New valid media lands in the DISTINCT slot; then the crash it implies
+    // (the claim handle is dropped, media stays under the partial name).
+    std::fs::write(new_claim.partial_path(), &fixture).unwrap();
+    let new_partial = new_claim.partial_path().to_path_buf();
+    drop(new_claim);
+
+    // Startup recovery: the OLD trusted tombstone must never claim the NEW
+    // partial — the new footage recovers under its OWN identity.
+    let (outcomes2, failures2) = recover_camera_partials(&storage.layout, &storage.camera);
+    assert!(failures2.is_empty(), "{failures2:?}");
+    assert!(
+        !outcomes2
+            .iter()
+            .any(|outcome| matches!(outcome, RecoveryOutcome::AlreadyRecovered { .. })),
+        "the old tombstone must never swallow the new footage: {outcomes2:?}"
+    );
+    assert!(
+        !outcomes2
+            .iter()
+            .any(|outcome| matches!(outcome, RecoveryOutcome::RecoveryConflict { .. })),
+        "the two transactions must not collide: {outcomes2:?}"
+    );
+    assert!(
+        matches!(
+            outcomes2.as_slice(),
+            [RecoveryOutcome::Recovered {
+                final_path,
+                original_removed: true,
+                tombstone_recorded: true,
+                ..
+            }] if final_path == &storage.path("08-30-00-2.recovered.mkv")
+        ),
+        "the new footage must recover under its own distinct identity: {outcomes2:?}"
+    );
+    assert!(!new_partial.exists());
+
+    // Both recovered recordings survive, independently identifiable: the
+    // old one byte-identical, each tombstone bound to its own names, both
+    // files independently probeable.
+    let new_final = storage.path("08-30-00-2.recovered.mkv");
+    let new_tombstone = storage.path("08-30-00-2.recovered.mkv.done");
+    assert!(old_final.is_file() && new_final.is_file());
+    assert_ne!(old_final, new_final);
+    assert_eq!(std::fs::read(&old_final).unwrap(), old_final_bytes);
+    assert!(old_tombstone.is_file() && new_tombstone.is_file());
+    let new_recorded = std::fs::read_to_string(&new_tombstone).unwrap();
+    assert!(
+        new_recorded.contains("original: 08-30-00-2.partial.mkv\n")
+            && new_recorded.contains("final: 08-30-00-2.recovered.mkv\n"),
+        "the new tombstone must bind the NEW transaction's names: {new_recorded:?}"
+    );
+    assert!(probe_has_video(&old_final));
+    assert!(probe_has_video(&new_final));
+}

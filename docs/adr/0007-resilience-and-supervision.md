@@ -602,3 +602,71 @@ is deliberately documented as weaker. The conflict contract remains safe
 under EVERY durability level: if a tombstone disappears after sudden
 power loss, the surviving final has no trusted evidence → case C conflict
 → the original partial is preserved, never deleted on inference.
+
+## Amendment 6 — M3 atomic identity claim remediation (2026-08-28)
+
+The sixth review round closes the one remaining cross-process TOCTOU:
+`allocate_segment_sequence` reserved the whole Nian-owned namespace, but
+`claim_segment`'s scan-then-`create_new` could still miss a reservation
+that a competing process published WHILE the directory enumeration was in
+flight — and `create_new` is atomic only for the ONE partial pathname, not
+for the identity against `<stem>.mkv`, `<stem>.recovered.mkv`,
+`<stem>.recovered.mkv.done` and `<stem>.recovery-<attempt>.tmp`.
+
+### Post-claim identity fence (§2/§3)
+
+`RecordingsLayout::claim_segment` now performs, after the candidate partial
+is exclusively created and BEFORE the claim is returned: a FRESH
+Nian-owned namespace check (`identity_conflict_after_claim`) for the SAME
+`(started_at, sequence)`, excluding the candidate itself and consulting the
+existing `owned_recording_name` classifier — never a second filename
+parser. A recovered final, tombstone, valid recovery scratch, or normal
+finalized recording appearing mid-flight forces the candidate to be
+relinquished (handle closed FIRST — Windows-first discipline — then
+ONLY this attempt's candidate removed) and a higher sequence retried. The
+candidate was never returned to the recorder, so no media writer can
+observe it; relinquishing is unambiguous. Any removal failure — including
+an unexpected NotFound, which would mean an external party deleted the
+claim — is ambiguous ownership and surfaces as a typed `StorageError`,
+never silently ignored; an unvalidatable fence (enumeration error)
+likewise fails the claim typed, with the candidate removed best-effort (an
+unremovable empty candidate has a canonical crash-partial name and is
+quarantined by the next startup pass — never published, never deleted).
+
+### Recovery ordering makes the fence sound (§4)
+
+The existing recovery ordering — publish the recovered final → write the
+trusted tombstone → remove the original partial LAST — is preserved
+unchanged, and is exactly what makes the fence effective: a freed original
+pathname (the precondition for a competing `create_new` on that name to
+succeed) implies the transaction reservation is already published and
+observable by a fresh post-claim enumeration. The fence therefore converts
+the review's concrete failure (stale scan → claim sequence 1 → new footage
+under the old transaction's identity → a later crash lets the old
+tombstone swallow it) into a structurally impossible state.
+
+### Deterministic race regression (§5/§6)
+
+A day-dir-keyed one-shot claim gate (`nian-storage::test_hooks`, compiled
+only under the `test-hooks` feature) parks a claim AFTER its advisory scan
+chose a sequence but BEFORE the candidate is created — the deterministic
+stand-in for a stale non-atomic directory snapshot, no filesystem
+scheduling luck. Unit tests plant a competing recovered final, tombstone,
+normal final, or exact-grammar scratch inside the window and prove the
+fence fires (retry to `-2`, losing candidate removed, planted object
+untouched) while foreign/Unknown files do NOT trigger it. The end-to-end
+regression (`racing_claim_during_recovery_transition_never_reuses_the_
+transaction_identity`) drives the REAL recovery pipeline through the
+transition while a REAL `claim_segment` races it via the gate, then proves
+the old tombstone never claims the new footage, both recovered recordings
+survive independently identifiable, and no data is deleted through
+identity reuse.
+
+### Naming discipline (§7)
+
+`allocate_segment_sequence` is documented as ADVISORY selection;
+`claim_segment` is the authoritative race-safe acquisition primitive;
+`PartialFile::final_path` is documented as the NORMAL live-recording
+publication target — startup recovery deliberately publishes recovered
+media under the distinct `<stem>.recovered.mkv` slot, never under
+`<stem>.mkv`. The distinction is kept explicit for M4.

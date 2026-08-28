@@ -28,5 +28,10 @@ windows-sys = { version = "=0.61.2", features = [
 [dev-dependencies]
 tempfile = { workspace = true }
 
+# Deterministic claim-pipeline hooks for cross-crate TESTS only (the
+# recorder's test target arms them); production builds never enable it.
+[features]
+test-hooks = []
+
 [lints]
 workspace = true

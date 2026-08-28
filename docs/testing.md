@@ -182,6 +182,19 @@ restartable; backoff waits interrupted by operator shutdown.
   takes a distinct identity, recovers as a NEW transaction, is never
   claimed by the old tombstone, and both recovered recordings stay
   independently identifiable.
+* Post-claim identity fence (atomic identity claim §2/§3/§5/§6): a
+  day-dir-keyed one-shot gate parks a `claim_segment` AFTER its advisory
+  scan chose sequence 1 but BEFORE the candidate is created — the
+  deterministic stand-in for a stale non-atomic directory snapshot. A
+  recovered final, tombstone, normal final or exact-grammar scratch
+  planted inside that window forces the fence to fire: the losing
+  candidate is relinquished (removed cleanly, planted object untouched)
+  and the claim retries to `-2`; foreign/Unknown files do NOT trigger the
+  fence. The end-to-end concurrent-transition regression drives REAL
+  recovery (publish → tombstone → remove original) against the racing
+  REAL claim and proves sequence 1 is never returned, the old trusted
+  tombstone never claims the new footage, and both recovered recordings
+  survive independently identifiable.
 * Alignment read errors vs stop domains (identity safety §4): a
   deterministic read-error seam fails the alignment probe's read after a
   configurable hold — with no stop domain active it is an honest

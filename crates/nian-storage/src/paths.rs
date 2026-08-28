@@ -241,16 +241,32 @@ impl RecordingsLayout {
         Ok(path)
     }
 
-    /// Exclusively claims the next free segment slot for `started_at`.
+    /// Authoritatively and race-safely claims the next free segment slot
+    /// for `started_at` (atomic identity claim remediation §1/§2).
     ///
-    /// This is the race-safe primitive M2 must use instead of
-    /// [`RecordingsLayout::allocate_segment`] (whose scan-then-open shape is
-    /// only a dry-run naming helper): the day directory is created if needed,
-    /// then the partial file is created with exclusive semantics
-    /// (`create_new`, O_EXCL). If another worker won the same name between
-    /// scan and create, the claim retries with the next sequence, so two
-    /// workers racing in the same second always end up with distinct files
-    /// and an existing recording is never truncated or replaced.
+    /// [`allocate_segment_sequence`] is only ADVISORY selection: directory
+    /// enumeration is not an atomic snapshot, so between its scan and an
+    /// exclusive creation another process can publish a reservation for the
+    /// SAME `(started_at, sequence)` identity. This method is the
+    /// authoritative acquisition primitive and closes the window in two
+    /// layers:
+    ///
+    /// 1. the partial file is created with exclusive semantics
+    ///    (`create_new`, O_EXCL); a lost name race rescans and retries;
+    /// 2. a POST-CLAIM IDENTITY FENCE then re-checks the freshly created
+    ///    candidate against a NEW Nian-owned namespace enumeration for the
+    ///    same identity — a recovered final, its tombstone, a valid
+    ///    recovery scratch, or a normal finalized recording that appeared
+    ///    mid-flight forces this candidate to be relinquished (handle
+    ///    closed, ONLY the candidate partial removed) and a higher sequence
+    ///    retried. The fence is sound because startup recovery publishes
+    ///    the recovered final and writes the tombstone BEFORE removing the
+    ///    original partial: a freed original pathname implies the
+    ///    transaction reservation is already observable.
+    ///
+    /// The day directory is created if needed. Two workers racing in the
+    /// same second therefore always end up with distinct identities and an
+    /// existing recording is never truncated or replaced.
     ///
     /// The returned [`ClaimedSegment`] documents the finalize contract
     /// (write into `partial_path`, publish to `final_path` with
@@ -268,23 +284,23 @@ impl RecordingsLayout {
 
         loop {
             let sequence = allocate_segment_sequence(&day_dir, started_at.time())?;
+            // Deterministic test seam (atomic identity claim remediation
+            // §5): parks AFTER the advisory scan chose a sequence but
+            // BEFORE the candidate is created — the window where a
+            // competing namespace transition lands in production.
+            #[cfg(any(test, feature = "test-hooks"))]
+            crate::test_hooks::claim_identity_gate_wait(&day_dir);
             let partial_path =
                 day_dir.join(partial_file_name_with_sequence(started_at.time(), sequence));
             let final_path =
                 day_dir.join(segment_file_name_with_sequence(started_at.time(), sequence));
 
-            match std::fs::OpenOptions::new()
+            let claim = match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&partial_path)
             {
-                Ok(partial_file) => {
-                    return Ok(ClaimedSegment {
-                        partial_path,
-                        final_path,
-                        _partial_file: partial_file,
-                    });
-                }
+                Ok(partial_file) => partial_file,
                 // Lost the race for this name (another writer created it
                 // first): rescan and try the next sequence.
                 Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -294,7 +310,52 @@ impl RecordingsLayout {
                         source,
                     });
                 }
+            };
+
+            // Post-claim identity fence (atomic identity claim remediation
+            // §2): the candidate exists but was NEVER returned to the
+            // recorder, so relinquishing it is unambiguous.
+            let conflicted = match identity_conflict_after_claim(
+                &day_dir,
+                started_at.time(),
+                sequence,
+                &partial_path,
+            ) {
+                Ok(conflicted) => conflicted,
+                Err(fence_error) => {
+                    // The identity cannot be VALIDATED: never return this
+                    // claim. Relinquish best-effort — an unremovable empty
+                    // candidate has a canonical crash-partial name and is
+                    // classified as an empty quarantine leftover by the
+                    // next startup pass (never published, never deleted) —
+                    // then surface the fence failure TYPED.
+                    drop(claim);
+                    let _ = std::fs::remove_file(&partial_path);
+                    return Err(fence_error);
+                }
+            };
+            if conflicted {
+                // Safe rollback of a LOSING candidate (§3): close the
+                // handle FIRST (Windows-first: an open handle blocks the
+                // unlink), then remove ONLY this attempt's candidate. Any
+                // removal failure — including an unexpected NotFound,
+                // which would mean an external party deleted our claim —
+                // is ambiguous ownership: surfaced TYPED, never ignored.
+                drop(claim);
+                if let Err(source) = std::fs::remove_file(&partial_path) {
+                    return Err(StorageError::Io {
+                        path: partial_path,
+                        source,
+                    });
+                }
+                continue;
             }
+
+            return Ok(ClaimedSegment {
+                partial_path,
+                final_path,
+                _partial_file: claim,
+            });
         }
     }
 }
@@ -490,8 +551,12 @@ pub struct AllocatedSegmentPaths {
     pub final_path: PathBuf,
 }
 
-/// Picks the smallest segment sequence for `started_at` that collides with
-/// no existing file in `day_dir`. See [`RecordingsLayout::allocate_segment`].
+/// ADVISORY selection of the smallest segment sequence for `started_at`
+/// that collides with no existing file in `day_dir` — a dry-run naming
+/// helper, never an acquisition primitive (atomic identity claim
+/// remediation §7: only [`RecordingsLayout::claim_segment`] authoritatively
+/// claims an identity, with the post-claim fence). See
+/// [`RecordingsLayout::allocate_segment`].
 ///
 /// Comparison happens at **whole-second granularity**: segment names encode
 /// hours/minutes/seconds only, while a live clock carries nanoseconds —
@@ -558,6 +623,51 @@ pub fn allocate_segment_sequence(
 /// the second-granular names the allocator emits.
 fn whole_seconds(time: NaiveTime) -> NaiveTime {
     NaiveTime::from_hms_opt(time.hour(), time.minute(), time.second()).unwrap_or(time)
+}
+
+/// Post-claim identity fence (atomic identity claim remediation §2).
+///
+/// Directory enumeration is NOT an atomic snapshot: between the advisory
+/// scan ([`allocate_segment_sequence`]) and this claim's exclusive
+/// candidate creation, a competing process can publish a reservation for
+/// the SAME `(started_at, sequence)` identity — a recovered recording, its
+/// tombstone, a valid recovery scratch, or a normal finalized recording.
+/// This fence performs a FRESH Nian-owned namespace check for the identity,
+/// EXCLUDING the candidate partial this claim just created (`except`; the
+/// only same-identity partial pathname possible). Returns `Ok(true)` when
+/// the identity is no longer free: the caller must relinquish the candidate
+/// and retry a higher sequence. Enumeration errors propagate — an
+/// unvalidatable claim is never returned.
+fn identity_conflict_after_claim(
+    day_dir: &Path,
+    started_at: NaiveTime,
+    sequence: u32,
+    except: &Path,
+) -> Result<bool, StorageError> {
+    let entries = std::fs::read_dir(day_dir).map_err(|source| StorageError::Io {
+        path: day_dir.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| StorageError::Io {
+            path: day_dir.to_path_buf(),
+            source,
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue; // non-UTF-8 names cannot be our segments
+        };
+        if Some(name) == except.file_name().and_then(|n| n.to_str()) {
+            continue; // the candidate THIS claim just created
+        }
+        if let Some(owned) = owned_recording_name(name)
+            && owned.started_at == started_at
+            && owned.sequence == sequence
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Formats the final segment file name for a start time (`08-30-00.mkv`).
@@ -1105,6 +1215,189 @@ mod tests {
             "08-30-01.partial.mkv",
             "the neighboring second stays untouched"
         );
+    }
+
+    // ---- Post-claim identity fence (atomic identity claim remediation §5)
+    //
+    // The gate parks a claim AFTER its advisory scan chose sequence 1 but
+    // BEFORE the candidate partial is created — the deterministic stand-in
+    // for a stale non-atomic directory snapshot. A competing reservation
+    // planted inside that window must be caught by the post-claim fence:
+    // the losing candidate is relinquished and a higher sequence retried.
+
+    /// Runs `claim_segment` on a thread against the layout's day directory,
+    /// parks it at the claim gate, lets the test plant a competing object,
+    /// releases, and returns the final claim.
+    fn claim_racing_planted_object(
+        layout: &RecordingsLayout,
+        camera: &CameraId,
+        plant: &dyn Fn(&Path),
+    ) -> ClaimedSegment {
+        use crate::test_hooks::arm_claim_identity_gate;
+
+        let _fault_serialization_guard = crate::test_hooks::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let day_dir = layout.day_dir(camera, sample_start().date());
+        let (_guard, gate) = arm_claim_identity_gate(&day_dir);
+
+        let layout = layout.clone();
+        let camera = camera.clone();
+        let claimer = std::thread::spawn(move || {
+            layout
+                .claim_segment(&camera, sample_start())
+                .expect("claim must succeed")
+        });
+
+        // The claim scanned an (apparently) free namespace and parked
+        // BEFORE creating its candidate.
+        gate.wait_arrived();
+        plant(&day_dir);
+        gate.release();
+
+        claimer.join().expect("claim thread must not panic")
+    }
+
+    #[test]
+    fn claim_fence_retries_when_a_recovered_reservation_appears_midflight() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let claim = claim_racing_planted_object(&layout, &camera, &|day_dir| {
+            std::fs::write(
+                day_dir.join("08-30-00.recovered.mkv"),
+                b"published-recovery",
+            )
+            .unwrap();
+        });
+
+        // Sequence 1 was NEVER returned: the fence detected the recovered
+        // reservation, relinquished the candidate and retried at 2.
+        assert_eq!(
+            claim.partial_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00-2.partial.mkv"
+        );
+        assert_eq!(
+            claim.final_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00-2.mkv"
+        );
+        // The temporary losing partial was removed cleanly...
+        assert!(
+            !day_dir.join("08-30-00.partial.mkv").exists(),
+            "the losing candidate must be relinquished"
+        );
+        assert!(claim.partial_path().is_file());
+        // ...and the competing recovered final is untouched.
+        assert_eq!(
+            std::fs::read(day_dir.join("08-30-00.recovered.mkv")).unwrap(),
+            b"published-recovery"
+        );
+    }
+
+    #[test]
+    fn claim_fence_retries_on_a_tombstone_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let tombstone_bytes =
+            b"NIAN-RECOVERY-TOMBSTONE v2\noriginal: 08-30-00.partial.mkv\nfinal: 08-30-00.recovered.mkv\nsize: 3\n";
+        let claim = claim_racing_planted_object(&layout, &camera, &|day_dir| {
+            std::fs::write(day_dir.join("08-30-00.recovered.mkv.done"), tombstone_bytes).unwrap();
+        });
+
+        assert_eq!(
+            claim.partial_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00-2.partial.mkv",
+            "a lone tombstone still reserves the identity"
+        );
+        assert!(!day_dir.join("08-30-00.partial.mkv").exists());
+        assert_eq!(
+            std::fs::read(day_dir.join("08-30-00.recovered.mkv.done")).unwrap(),
+            tombstone_bytes
+        );
+    }
+
+    #[test]
+    fn claim_fence_retries_on_a_normal_final_appearing() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let claim = claim_racing_planted_object(&layout, &camera, &|day_dir| {
+            std::fs::write(day_dir.join("08-30-00.mkv"), b"finalized").unwrap();
+        });
+
+        assert_eq!(
+            claim.partial_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00-2.partial.mkv"
+        );
+        assert!(!day_dir.join("08-30-00.partial.mkv").exists());
+        assert_eq!(
+            std::fs::read(day_dir.join("08-30-00.mkv")).unwrap(),
+            b"finalized"
+        );
+    }
+
+    #[test]
+    fn claim_fence_retries_on_valid_scratch_appearing() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        // Exact production scratch grammar only (final safety remediation
+        // §3): this shape is a Nian-owned reservation.
+        let scratch_name = "08-30-00.recovery-4194305-0-123456789.tmp";
+        let claim = claim_racing_planted_object(&layout, &camera, &|day_dir| {
+            std::fs::write(day_dir.join(scratch_name), b"active scratch").unwrap();
+        });
+
+        assert_eq!(
+            claim.partial_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00-2.partial.mkv"
+        );
+        assert!(!day_dir.join("08-30-00.partial.mkv").exists());
+        assert_eq!(
+            std::fs::read(day_dir.join(scratch_name)).unwrap(),
+            b"active scratch"
+        );
+    }
+
+    #[test]
+    fn claim_fence_ignores_foreign_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        // Foreign/Unknown names (wrong scratch grammar, operator files) are
+        // NOT Nian-owned reservations: the fence must NOT fire.
+        let claim = claim_racing_planted_object(&layout, &camera, &|day_dir| {
+            std::fs::write(day_dir.join("holiday.mkv"), b"operator").unwrap();
+            std::fs::write(day_dir.join("notes.txt"), b"operator").unwrap();
+            std::fs::write(day_dir.join("08-30-00.recovery-not-ours.txt"), b"operator").unwrap();
+        });
+
+        assert_eq!(
+            claim.partial_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00.partial.mkv",
+            "foreign files reserve nothing: sequence 1 stays valid"
+        );
+        assert_eq!(
+            claim.final_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00.mkv"
+        );
+        assert!(claim.partial_path().is_file());
     }
 
     #[test]

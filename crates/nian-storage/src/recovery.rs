@@ -74,8 +74,14 @@ pub enum PartialDisposition {
 pub struct PartialFile {
     /// Path of the `<HH-MM-SS[-N]>.partial.mkv` file.
     pub partial_path: PathBuf,
-    /// Where a recovered/finalized recording would be published
-    /// (`<HH-MM-SS[-N]>.mkv` next to the partial).
+    /// The NORMAL live-recording publication target
+    /// (`<HH-MM-SS[-N]>.mkv` next to the partial) — where a segment
+    /// finalized by the recorder would be renamed. Startup recovery
+    /// deliberately does NOT publish here: the conservative salvage
+    /// pipeline publishes recovered media under the DISTINCT slot
+    /// `<HH-MM-SS[-N]>.recovered.mkv` (atomic identity claim remediation
+    /// §7), so recovery can never overwrite an existing normal recording
+    /// and the two name grammars stay disjoint for M4.
     pub final_path: PathBuf,
     /// Parsed name components (start time-of-day, sequence).
     pub parsed: ParsedSegmentName,

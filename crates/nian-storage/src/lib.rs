@@ -24,6 +24,8 @@ pub mod classification;
 pub mod error;
 pub mod paths;
 pub mod recovery;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_hooks;
 
 pub use classification::{
     RecordingFileKind, classify_recording_file, classify_recording_file_name,
