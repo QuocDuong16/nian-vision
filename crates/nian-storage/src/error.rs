@@ -44,4 +44,23 @@ pub enum StorageError {
         /// The colliding final path.
         destination: PathBuf,
     },
+
+    /// The post-claim identity fence could not VALIDATE a freshly created
+    /// candidate, and removing that unreturned candidate also failed. The
+    /// claim is never returned, so the leftover ownership is ambiguous —
+    /// both contexts are carried here so that ambiguity is observable
+    /// instead of the cleanup failure being silently discarded.
+    #[error(
+        "post-claim identity fence failed for candidate {candidate:?}: {fence_error}; \
+         removing the unreturned candidate also failed: {cleanup}"
+    )]
+    ClaimFenceCleanup {
+        /// The candidate partial whose relinquish cleanup failed.
+        candidate: PathBuf,
+        /// Why the fence could not validate the identity.
+        #[source]
+        fence_error: Box<StorageError>,
+        /// Why the candidate could not be removed.
+        cleanup: std::io::Error,
+    },
 }

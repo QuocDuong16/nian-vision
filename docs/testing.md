@@ -195,6 +195,20 @@ restartable; backoff waits interrupted by operator shutdown.
   REAL claim and proves sequence 1 is never returned, the old trusted
   tombstone never claims the new footage, and both recovered recordings
   survive independently identifiable.
+* Sub-second identity + fence cleanup (sub-second identity §1–§4):
+  filesystem identity is explicitly (WHOLE-second local time, sequence) —
+  `claim_segment` normalizes the live claim timestamp once and shares it
+  across allocation, naming and the post-claim fence. The race regressions
+  are duplicated with sub-second timestamps (`08:30:00.123456789` against a
+  planted `08-30-00.recovered.mkv` at the storage layer; a full
+  concurrent-transition E2E at `2026-08-27 08:30:00.877`) and were proven
+  FAILING against the raw-comparison fence before the fix. A fence that
+  cannot even validate still never returns its candidate, and a failing
+  relinquish now surfaces typed (`StorageError::ClaimFenceCleanup` carrying
+  the fence error AND the cleanup error) instead of a silent best-effort
+  discard — exercised by a day-directory-loss hook that makes both failures
+  real ENOENTs. The two E2E gate users serialize on `FAULT_LOCK` (arming
+  the day-dir-keyed gate replaces the single armed slot).
 * Alignment read errors vs stop domains (identity safety §4): a
   deterministic read-error seam fails the alignment probe's read after a
   configurable hold — with no stop domain active it is an honest

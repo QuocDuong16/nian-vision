@@ -127,12 +127,47 @@ pub fn claim_identity_gate_wait(day_dir: &Path) {
     arm.gate.park();
 }
 
-/// Panic-safe: disarms the gate whenever this guard dies.
+/// Armed one-shot day-directory loss (sub-second identity remediation §4):
+/// the next `claim_segment` into `day_dir` has its directory REMOVED after
+/// the candidate partial is created but BEFORE the post-claim identity fence
+/// validates it. This is a real-world "storage vanished mid-claim" fault:
+/// both the fence enumeration and the losing-candidate cleanup fail with
+/// genuine OS errors (ENOENT) — no injected error values, so the typed
+/// dual-context error is exercised end-to-end.
+pub static CLAIM_DAY_DIR_LOSS: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Arms a one-shot day-directory loss for `day_dir`. Panic-safe via the
+/// returned guard, which disarms on drop.
+pub fn arm_claim_day_dir_loss(day_dir: &Path) -> Guard {
+    *CLAIM_DAY_DIR_LOSS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(day_dir.to_path_buf());
+    Guard
+}
+
+/// Pipeline-side seam: consume-and-fire if THIS claim's day directory is the
+/// armed one. One-shot, keyed like the claim gate so unrelated claims stay
+/// unaffected.
+pub fn claim_day_dir_loss_fire(day_dir: &Path) {
+    let mut armed = CLAIM_DAY_DIR_LOSS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(armed_dir) = armed.take_if(|armed_dir| armed_dir.as_path() == day_dir) else {
+        return;
+    };
+    drop(armed);
+    let _ = std::fs::remove_dir_all(armed_dir);
+}
+
+/// Panic-safe: disarms any hook this guard armed whenever it dies.
 pub struct Guard;
 
 impl Drop for Guard {
     fn drop(&mut self) {
         *CLAIM_IDENTITY_GATE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        *CLAIM_DAY_DIR_LOSS
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
     }

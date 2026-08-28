@@ -670,3 +670,58 @@ identity reuse.
 publication target — startup recovery deliberately publishes recovered
 media under the distinct `<stem>.recovered.mkv` slot, never under
 `<stem>.mkv`. The distinction is kept explicit for M4.
+
+## Amendment 7 — M3 sub-second identity remediation (2026-08-28)
+
+### Whole-second filesystem identity, normalized once (§1)
+
+The filesystem identity invariant is now explicit: a recording identity is
+**(whole-second local time, sequence)** — recording names encode wall-clock
+time only to whole seconds, while a live claim timestamp
+(`Local::now().naive_local()`) carries nanoseconds. `claim_segment`
+normalizes the claim timestamp EXACTLY ONCE (`let identity_time =
+whole_seconds(started_at.time());`) and shares that truncated value across
+every identity use: the advisory `allocate_segment_sequence`, the candidate
+naming (`partial_file_name_with_sequence` /
+`segment_file_name_with_sequence`) and the post-claim fence
+(`identity_conflict_after_claim`). Before this amendment the fence compared
+the RAW caller-supplied `NaiveTime` against whole-second names parsed from
+disk, so a claim at `08:30:00.877` missed a reservation parsed from
+`08-30-00.recovered.mkv` and the old transaction's identity was handed to
+new footage — the exact data-loss window the fence exists to close. The
+full (sub-second) timestamp remains available only where human/event
+metadata needs it; no helper is relied on to truncate independently.
+
+### Sub-second regression coverage (§2/§3)
+
+Both race regressions are duplicated with sub-second claim timestamps and
+were verified to FAIL against the pre-amendment fence before the fix:
+
+* the storage-layer fence test claims at `08:30:00.123456789` against a
+  planted `08-30-00.recovered.mkv` reservation and proves the fence treats
+  them as the same identity second (retry to `08-30-00-2.partial.mkv`,
+  losing candidate relinquished, planted object untouched);
+* the end-to-end concurrent-transition regression
+  (`racing_claim_with_subsecond_start_time_never_reuses_the_transaction_
+  identity`) re-runs the full clock-rollback race — parked claim, real
+  recovery transition, `create_new` success on the freed name, fence,
+  retry, crash, second startup recovery — at `2026-08-27 08:30:00.877`
+  and proves both recovered recordings survive independently.
+
+The two E2E gate users serialize on the process-global `FAULT_LOCK`
+(arming the day-dir-keyed gate REPLACES the single armed slot, so parallel
+gate-arming tests would clobber each other and hang on `wait_arrived`).
+
+### Fence-cleanup failure is surfaced, never discarded (§4)
+
+When the fence itself cannot validate (enumeration error), the candidate is
+still never returned: the claim handle is closed first, ONLY this attempt's
+still-empty candidate is removed, and a CLEANUP FAILURE now surfaces as a
+dedicated typed `StorageError::ClaimFenceCleanup` carrying BOTH contexts
+(the fence error as `#[source]` plus the cleanup OS error) — the previous
+best-effort `let _ = remove_file(...)` silently discarded ambiguous
+leftover ownership. The `conflicted == true` rollback path is unchanged.
+A day-directory-loss test hook (`claim_day_dir_loss_fire`) deterministically
+removes the day directory between candidate creation and fence validation,
+so both failures are genuine OS errors (ENOENT) and the dual-context error
+is exercised end-to-end.

@@ -268,6 +268,16 @@ impl RecordingsLayout {
     /// same second therefore always end up with distinct identities and an
     /// existing recording is never truncated or replaced.
     ///
+    /// Filesystem identity invariant (sub-second identity remediation §1):
+    /// a recording identity is (WHOLE-second local time, sequence) because
+    /// recording names encode no sub-second component. The caller-supplied
+    /// timestamp is normalized EXACTLY ONCE, here — the advisory
+    /// allocation, the candidate naming and the post-claim fence all share
+    /// this truncated identity time, so a live clock's nanoseconds can
+    /// never make the fence compare `08:30:00.877` against a reservation
+    /// parsed from `08-30-00.…` and miss the conflict. The full timestamp
+    /// stays available for human/event metadata only.
+    ///
     /// The returned [`ClaimedSegment`] documents the finalize contract
     /// (write into `partial_path`, publish to `final_path` with
     /// [`publish_no_replace`]).
@@ -282,8 +292,12 @@ impl RecordingsLayout {
             source,
         })?;
 
+        // The single normalization point for the filesystem identity
+        // (sub-second identity remediation §1).
+        let identity_time = whole_seconds(started_at.time());
+
         loop {
-            let sequence = allocate_segment_sequence(&day_dir, started_at.time())?;
+            let sequence = allocate_segment_sequence(&day_dir, identity_time)?;
             // Deterministic test seam (atomic identity claim remediation
             // §5): parks AFTER the advisory scan chose a sequence but
             // BEFORE the candidate is created — the window where a
@@ -291,9 +305,8 @@ impl RecordingsLayout {
             #[cfg(any(test, feature = "test-hooks"))]
             crate::test_hooks::claim_identity_gate_wait(&day_dir);
             let partial_path =
-                day_dir.join(partial_file_name_with_sequence(started_at.time(), sequence));
-            let final_path =
-                day_dir.join(segment_file_name_with_sequence(started_at.time(), sequence));
+                day_dir.join(partial_file_name_with_sequence(identity_time, sequence));
+            let final_path = day_dir.join(segment_file_name_with_sequence(identity_time, sequence));
 
             let claim = match std::fs::OpenOptions::new()
                 .write(true)
@@ -312,25 +325,40 @@ impl RecordingsLayout {
                 }
             };
 
+            // Deterministic test seam (sub-second identity remediation §4):
+            // one-shot day-directory loss AFTER the candidate exists but
+            // BEFORE the fence validates it — a real "storage vanished
+            // mid-claim" fault whose failures are genuine OS errors.
+            #[cfg(any(test, feature = "test-hooks"))]
+            crate::test_hooks::claim_day_dir_loss_fire(&day_dir);
+
             // Post-claim identity fence (atomic identity claim remediation
             // §2): the candidate exists but was NEVER returned to the
             // recorder, so relinquishing it is unambiguous.
             let conflicted = match identity_conflict_after_claim(
                 &day_dir,
-                started_at.time(),
+                identity_time,
                 sequence,
                 &partial_path,
             ) {
                 Ok(conflicted) => conflicted,
                 Err(fence_error) => {
                     // The identity cannot be VALIDATED: never return this
-                    // claim. Relinquish best-effort — an unremovable empty
-                    // candidate has a canonical crash-partial name and is
-                    // classified as an empty quarantine leftover by the
-                    // next startup pass (never published, never deleted) —
-                    // then surface the fence failure TYPED.
+                    // claim. Relinquish it — close the handle first
+                    // (Windows-first: an open handle blocks the unlink),
+                    // then remove ONLY this attempt's still-empty candidate.
+                    // A cleanup failure is itself ambiguous leftover
+                    // ownership: surfaced TYPED together with the fence
+                    // failure, never silently discarded (sub-second
+                    // identity remediation §4).
                     drop(claim);
-                    let _ = std::fs::remove_file(&partial_path);
+                    if let Err(cleanup) = std::fs::remove_file(&partial_path) {
+                        return Err(StorageError::ClaimFenceCleanup {
+                            candidate: partial_path,
+                            fence_error: Box::new(fence_error),
+                            cleanup,
+                        });
+                    }
                     return Err(fence_error);
                 }
             };
@@ -638,6 +666,10 @@ fn whole_seconds(time: NaiveTime) -> NaiveTime {
 /// the identity is no longer free: the caller must relinquish the candidate
 /// and retry a higher sequence. Enumeration errors propagate — an
 /// unvalidatable claim is never returned.
+///
+/// `started_at` must already be the WHOLE-second identity time
+/// ([`whole_seconds`]; `claim_segment` normalizes once for all identity
+/// uses), because names parsed from disk carry no sub-second component.
 fn identity_conflict_after_claim(
     day_dir: &Path,
     started_at: NaiveTime,
@@ -1233,19 +1265,30 @@ mod tests {
         camera: &CameraId,
         plant: &dyn Fn(&Path),
     ) -> ClaimedSegment {
+        claim_racing_planted_object_at(layout, camera, sample_start(), plant)
+    }
+
+    /// Like [`claim_racing_planted_object`] but with an explicit (possibly
+    /// sub-second) claim timestamp.
+    fn claim_racing_planted_object_at(
+        layout: &RecordingsLayout,
+        camera: &CameraId,
+        started_at: NaiveDateTime,
+        plant: &dyn Fn(&Path),
+    ) -> ClaimedSegment {
         use crate::test_hooks::arm_claim_identity_gate;
 
         let _fault_serialization_guard = crate::test_hooks::FAULT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let day_dir = layout.day_dir(camera, sample_start().date());
+        let day_dir = layout.day_dir(camera, started_at.date());
         let (_guard, gate) = arm_claim_identity_gate(&day_dir);
 
         let layout = layout.clone();
         let camera = camera.clone();
         let claimer = std::thread::spawn(move || {
             layout
-                .claim_segment(&camera, sample_start())
+                .claim_segment(&camera, started_at)
                 .expect("claim must succeed")
         });
 
@@ -1398,6 +1441,110 @@ mod tests {
             "08-30-00.mkv"
         );
         assert!(claim.partial_path().is_file());
+    }
+
+    #[test]
+    fn claim_fence_treats_a_subsecond_claim_time_as_the_same_identity_second() {
+        // Sub-second identity remediation §3: names parsed from disk carry
+        // WHOLE seconds only, while a live claim timestamp carries
+        // nanoseconds. The fence's identity comparison must therefore be
+        // whole-second: a claim made at 08:30:00.123456789 must see the
+        // freshly planted 08-30-00.recovered.mkv reservation as the SAME
+        // identity second and retry — comparing raw `NaiveTime`s would miss
+        // the conflict and hand the transaction's identity to new footage.
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-1").unwrap();
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let subsecond = sample_start()
+            .with_nanosecond(123_456_789)
+            .expect("valid subsecond time");
+        let claim = claim_racing_planted_object_at(&layout, &camera, subsecond, &|day_dir| {
+            std::fs::write(
+                day_dir.join("08-30-00.recovered.mkv"),
+                b"published-recovery",
+            )
+            .unwrap();
+        });
+
+        // The reservation at 08-30-00 must fence the 08:30:00.123456789
+        // claim off sequence 1 exactly as it fences a whole-second claim.
+        assert_eq!(
+            claim.partial_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00-2.partial.mkv",
+            "the fence must fire across the subsecond-vs-whole-second comparison"
+        );
+        assert_eq!(
+            claim.final_path().file_name().unwrap().to_string_lossy(),
+            "08-30-00-2.mkv"
+        );
+        assert!(
+            !day_dir.join("08-30-00.partial.mkv").exists(),
+            "the losing candidate must be relinquished"
+        );
+        assert!(claim.partial_path().is_file());
+        assert_eq!(
+            std::fs::read(day_dir.join("08-30-00.recovered.mkv")).unwrap(),
+            b"published-recovery",
+            "the competing recovered final is untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fence_failure_with_uncleanable_candidate_surfaces_both_contexts() {
+        // Sub-second identity remediation §4: when the fence cannot even
+        // VALIDATE the identity, the candidate is never returned; its
+        // relinquish is attempted, and if the removal ITSELF fails, that
+        // failure is surfaced TYPED together with the fence failure — the
+        // ambiguous leftover ownership is observable, never silently
+        // discarded. The day-directory-loss hook produces a real-world
+        // "storage vanished mid-claim" fault: both the fence enumeration
+        // and the cleanup fail with genuine ENOENTs. (Unix-only: removing
+        // a directory that still holds the open claim handle is a Windows
+        // error, so the fault could not fire there.)
+        let _fault_serialization = crate::test_hooks::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let layout = layout_in(temp.path());
+        let camera = CameraId::parse("cam-vanish").unwrap();
+        let day_dir = layout.day_dir(&camera, sample_start().date());
+
+        let _guard = crate::test_hooks::arm_claim_day_dir_loss(&day_dir);
+        let outcome = layout.claim_segment(&camera, sample_start());
+
+        let error = outcome.expect_err("a vanished day directory must fail the claim");
+        match error {
+            StorageError::ClaimFenceCleanup {
+                candidate,
+                fence_error,
+                cleanup,
+            } => {
+                assert_eq!(
+                    candidate,
+                    day_dir.join("08-30-00.partial.mkv"),
+                    "the typed error must name the exact unreturned candidate"
+                );
+                assert!(
+                    matches!(&*fence_error, StorageError::Io { path, .. } if path == &day_dir),
+                    "the fence failure must be the vanished-directory enumeration \
+                     error: {fence_error:?}"
+                );
+                assert_eq!(
+                    cleanup.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "the candidate cleanup must have failed on the vanished directory"
+                );
+            }
+            other => panic!("expected ClaimFenceCleanup, got {other:?}"),
+        }
+        // The fault really fired: the whole day directory (with the
+        // candidate) is gone, which is exactly why cleanup could not
+        // succeed and the dual-context error was required.
+        assert!(!day_dir.exists());
     }
 
     #[test]
