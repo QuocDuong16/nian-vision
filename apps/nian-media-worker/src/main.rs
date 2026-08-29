@@ -228,6 +228,88 @@ fn versions_json(versions: RuntimeVersions) -> serde_json::Value {
     })
 }
 
+/// Manual-command ownership wrapper.
+///
+/// No production `RecordingSession` may write a canonical recording tree
+/// unless its caller holds the matching `CameraLease` for the entire session
+/// lifetime. The supervised job enforces that boundary in `job.rs`; this
+/// wrapper enforces the same boundary for the narrow manual smoke command.
+///
+/// `session` stays inside an `Option` so `run(self)` can consume it while the
+/// wrapper continues to own `_lease`. The session therefore finishes all mux,
+/// finalization/publication and teardown work before the lease can drop.
+#[derive(Debug)]
+struct ManualRecordingSession {
+    session: Option<nian_recorder::RecordingSession>,
+    _lease: nian_storage::CameraLease,
+}
+
+impl ManualRecordingSession {
+    fn open(
+        source: &MediaSource,
+        layout: nian_storage::RecordingsLayout,
+        config: nian_recorder::RecorderConfig,
+    ) -> Result<Self, String> {
+        let lease =
+            nian_storage::CameraLease::try_acquire(&layout, &config.camera).map_err(|error| {
+                match error {
+                    nian_storage::StorageError::CameraAlreadyActive { camera_id, .. } => {
+                        format!("camera {camera_id} is already active")
+                    }
+                    other => format!("cannot acquire camera recording lease: {other}"),
+                }
+            })?;
+
+        // Ownership comes first. A competing manual process must not even run
+        // the ordinary write/delete probe, much less open media or create a
+        // canonical partial, while another process owns this camera.
+        layout
+            .ensure_camera_dir(&config.camera)
+            .map_err(|error| format!("storage preflight failed: {error}"))?;
+
+        let session = nian_recorder::RecordingSession::open(source, layout, config)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            session: Some(session),
+            _lease: lease,
+        })
+    }
+
+    fn stop_flag(&self) -> Option<nian_recorder::StopFlag> {
+        self.session
+            .as_ref()
+            .map(nian_recorder::RecordingSession::stop_flag)
+    }
+
+    fn interrupt_handle(&self) -> Option<nian_media_ffmpeg::InterruptHandle> {
+        self.session
+            .as_ref()
+            .map(|session| session.interrupt_handle().clone())
+    }
+
+    fn run(
+        mut self,
+        events: &mut dyn FnMut(nian_recorder::RecordingEvent),
+    ) -> Result<nian_recorder::RecordingSummary, String> {
+        let Some(session) = self.session.take() else {
+            return Err("manual recording session was already consumed".to_owned());
+        };
+        // `self` (and therefore `_lease`) remains alive for this entire call.
+        // RecordingSession::run consumes the session and completes segment
+        // finalization/publication before returning.
+        session.run(events).map_err(|error| error.to_string())
+    }
+}
+
+impl Drop for ManualRecordingSession {
+    fn drop(&mut self) {
+        // Explicitly destroy any not-yet-run session before Rust proceeds to
+        // drop `_lease`. This preserves the same ordering on early-return
+        // paths such as Ctrl+C handler installation failure.
+        let _ = self.session.take();
+    }
+}
+
 /// Manual development command (M2 §15, stop modes made explicit in M3):
 /// record from a local file or `NIAN_VISION_RTSP_URL` into the recordings
 /// layout. Stop modes are mutually exclusive and explicit:
@@ -245,7 +327,7 @@ fn versions_json(versions: RuntimeVersions) -> serde_json::Value {
 /// credential-free, the env route carries credentials and is never echoed.
 /// Event output goes to stderr and contains file paths only.
 fn cmd_record(args: &[String]) -> Result<(), String> {
-    use nian_recorder::{AudioPolicy, RecorderConfig, RecordingSession};
+    use nian_recorder::{AudioPolicy, RecorderConfig};
     use nian_storage::RecordingsLayout;
     use std::time::Duration as StdDuration;
 
@@ -350,8 +432,7 @@ fn cmd_record(args: &[String]) -> Result<(), String> {
     let config = RecorderConfig::new(camera)
         .with_segment_target(segment_target)
         .with_audio(audio);
-    let session =
-        RecordingSession::open(&source, layout, config).map_err(|error| error.to_string())?;
+    let session = ManualRecordingSession::open(&source, layout, config)?;
 
     // Two-stage Ctrl+C (M2 review §9): the first press requests a graceful
     // stop; a second press forces interrupt cancellation. The graceful flag
@@ -359,8 +440,12 @@ fn cmd_record(args: &[String]) -> Result<(), String> {
     // its own stall deadline, but the force-cancel path remains for the
     // operator who will not wait that long.
     let signal_presses = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let signal_stop = session.stop_flag();
-    let signal_cancel = session.interrupt_handle().clone();
+    let signal_stop = session
+        .stop_flag()
+        .ok_or("manual recording session is unavailable")?;
+    let signal_cancel = session
+        .interrupt_handle()
+        .ok_or("manual recording session is unavailable")?;
     let handler_presses = std::sync::Arc::clone(&signal_presses);
     ctrlc::set_handler(move || {
         use std::sync::atomic::Ordering;
@@ -387,14 +472,18 @@ fn cmd_record(args: &[String]) -> Result<(), String> {
     match stop_mode {
         StopMode::SignalOnly => {}
         StopMode::AfterDuration(duration) => {
-            let stop_flag = session.stop_flag();
+            let stop_flag = session
+                .stop_flag()
+                .ok_or("manual recording session is unavailable")?;
             std::thread::spawn(move || {
                 std::thread::sleep(duration);
                 stop_flag.request();
             });
         }
         StopMode::OnStdinEof => {
-            let stop_flag = session.stop_flag();
+            let stop_flag = session
+                .stop_flag()
+                .ok_or("manual recording session is unavailable")?;
             std::thread::spawn(move || {
                 // Read stdin to EOF: piping/closing the input or Ctrl+D
                 // stops recording gracefully.
@@ -406,14 +495,95 @@ fn cmd_record(args: &[String]) -> Result<(), String> {
     }
 
     eprintln!("recording started");
-    let summary = session
-        .run(&mut |event| print_recording_event(&event))
-        .map_err(|error| error.to_string())?;
+    let summary = session.run(&mut |event| print_recording_event(&event))?;
     eprintln!(
         "recording finished ({:?}): {} segment(s), {} bytes",
         summary.end_reason, summary.finalized_segments, summary.bytes_written
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod manual_recording_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn manual_record_refuses_owned_camera_before_source_open_or_tree_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let layout = nian_storage::RecordingsLayout::new(root).unwrap();
+        let camera = nian_domain::CameraId::parse("cam-manual-lease").unwrap();
+
+        let holder = nian_storage::CameraLease::try_acquire(&layout, &camera).unwrap();
+        let claim = layout
+            .claim_segment(&camera, chrono::Local::now().naive_local())
+            .unwrap();
+        let live_partial = claim.partial_path().to_path_buf();
+        let live_bytes = b"holder-live-partial-must-remain-untouched".to_vec();
+        std::fs::write(&live_partial, &live_bytes).unwrap();
+
+        // Deliberately invalid: reaching RecordingSession::open would surface
+        // a media/source error. The ownership fence must win first.
+        let invalid_source = MediaSource::file(temp.path().join("must-not-open.mkv"));
+        let blocked = ManualRecordingSession::open(
+            &invalid_source,
+            layout.clone(),
+            nian_recorder::RecorderConfig::new(camera.clone()),
+        )
+        .expect_err("the second manual writer must be rejected by the lease");
+
+        assert_eq!(blocked, format!("camera {camera} is already active"));
+        assert_eq!(std::fs::read(&live_partial).unwrap(), live_bytes);
+
+        let day_dir = live_partial.parent().unwrap();
+        let names: Vec<String> = std::fs::read_dir(day_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.contains(".recovered.mkv")),
+            "manual conflict must not publish recovery output: {names:?}"
+        );
+        assert!(
+            names.iter().all(|name| !name.contains(".recovery-")),
+            "manual conflict must not create recovery scratch: {names:?}"
+        );
+        assert!(
+            names.iter().all(|name| !name.ends_with(".done")),
+            "manual conflict must not create recovery tombstones: {names:?}"
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.ends_with(".partial.mkv"))
+                .count(),
+            1,
+            "the blocked writer must not create another canonical partial"
+        );
+
+        drop(claim);
+        drop(holder);
+
+        // Once the holder is genuinely gone, the SAME manual entry path can
+        // acquire ownership and reach media open normally.
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/nian-media-ffmpeg/tests/fixtures/sample_av.mkv"
+        );
+        let source = MediaSource::file(PathBuf::from(fixture));
+        let reopened = ManualRecordingSession::open(
+            &source,
+            layout,
+            nian_recorder::RecorderConfig::new(camera),
+        );
+        assert!(
+            reopened.is_ok(),
+            "manual ownership should be acquirable after release"
+        );
+    }
 }
 
 /// Renders recorder events for the operator; paths only — never URLs.

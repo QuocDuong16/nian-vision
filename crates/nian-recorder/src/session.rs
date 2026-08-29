@@ -298,6 +298,11 @@ pub struct RecordingSummary {
 }
 
 /// A running recorder bound to one source and one recordings layout.
+///
+/// Ownership boundary: no production `RecordingSession` may write a canonical
+/// recording tree unless its caller holds the matching
+/// [`nian_storage::CameraLease`] for the entire session lifetime. This type is
+/// intentionally low-level so crate tests can exercise session mechanics.
 pub struct RecordingSession {
     input: MediaInput,
     /// Derived from `input.interrupt_handle()` by construction: one shared

@@ -443,6 +443,26 @@ closes the handle and releases the lease automatically, making the previous
 owner's canonical partials valid crash-recovery candidates for the next job.
 The lock file classifies `Unknown` and never reserves recording identity.
 
+The manual `nian-media-worker record` smoke path follows the SAME boundary:
+argument validation → layout construction → camera lease → writeability
+pre-flight → media/session open → recording/finalization → lease drop. Its
+small `ManualRecordingSession` wrapper keeps the lease alive while
+`RecordingSession::run` consumes the session, including graceful Ctrl+C
+finalization and force-cancel teardown. If ownership is already held, manual
+recording fails before media open and before any canonical partial is created.
+
+**Ownership invariant:** No production `RecordingSession` may write a
+canonical recording tree unless its caller holds the matching `CameraLease`
+for the entire session lifetime. The only production session factories are
+the supervised worker factories (covered by the job-thread lease) and the
+manual wrapper above. Low-level crate tests may deliberately bypass this
+boundary to exercise transaction mechanics.
+
+Standalone recovery distinguishes ownership from storage health:
+`CameraAlreadyActive` and `CameraLeaseMismatch` map to
+`RecoveryError::Ownership` (`is_infrastructure() == false`) before scanning;
+real lock-file/open filesystem failures remain `Infrastructure`.
+
 ## Amendment 4 — M3 final safety remediation (2026-08-28)
 
 ### Tombstone transaction/conflict contract (review §1)

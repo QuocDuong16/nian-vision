@@ -137,9 +137,18 @@ restartable; backoff waits interrupted by operator shutdown.
   recording; poisoned/metadata-failed passes remove only recovery-owned
   scratch and never publish.
 * Typed classification: a camera tree that cannot be scanned (camera path
-  occupied by a file) surfaces `RecoveryError::Storage` with
+  occupied by a file) surfaces `RecoveryError::Infrastructure` with
   `is_infrastructure()==true` — the worker-level permanent-job signal —
-  while content failures quarantine per file.
+  while content failures quarantine per file. A held camera lease instead
+  yields `RecoveryError::Ownership` with `CameraAlreadyActive`, and a lease
+  supplied for the wrong camera/layout yields `RecoveryError::Ownership` with
+  `CameraLeaseMismatch`; both return before scan and both have
+  `is_infrastructure()==false`.
+* Manual record lease regression (`nian-media-worker`): holder A keeps a live
+  canonical partial while holding the camera lease; manual record B uses an
+  invalid source but fails on `camera already active` before media open, creates
+  no second partial/recovery final/scratch/tombstone, and leaves A's bytes
+  untouched. After A releases the lease, the same manual helper opens normally.
 * Concurrent recovery (final correctness §1): two process-shaped
   attempts against the same original, synchronized at their publication
   step by a deterministic barrier hook — unique per-attempt scratch

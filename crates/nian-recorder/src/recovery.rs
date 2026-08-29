@@ -582,6 +582,20 @@ pub struct RecoveryFailure {
 /// error strings to decide what a failure means for the recording job.
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
+    /// Camera ownership conflict or lease-contract failure. This says nothing
+    /// about storage health: another process may legitimately own the camera,
+    /// or a caller supplied a lease for the wrong camera/layout. In either
+    /// case recovery must stop before scanning and must never pretend the disk
+    /// is broken.
+    #[error("camera ownership failure while trying to {operation}: {source}")]
+    Ownership {
+        /// Which ownership operation failed (stable label, not an OS string).
+        operation: &'static str,
+        /// Typed lease error; callers never parse its display text.
+        #[source]
+        source: StorageError,
+    },
+
     /// Storage INFRASTRUCTURE failure: the storage target itself is unsafe
     /// for continued operation — the camera tree cannot be scanned, or new
     /// files cannot be created where recovery must claim its scratch. New
@@ -638,7 +652,7 @@ pub enum RecoveryError {
 impl RecoveryError {
     /// True when this failure means the storage target is unsafe for new
     /// recording — the worker-level signal for a permanent job failure.
-    /// Artifact, content and cancellation classify `false`.
+    /// Ownership, artifact, content and cancellation classify `false`.
     pub fn is_infrastructure(&self) -> bool {
         matches!(self, RecoveryError::Infrastructure { .. })
     }
@@ -1000,7 +1014,8 @@ fn publish_hold_wait() {
 ///
 /// Standalone callers acquire the same kernel-backed [`CameraLease`] used by
 /// production before scanning. If another process owns the camera, recovery
-/// returns a typed infrastructure failure without touching the camera tree.
+/// returns a typed ownership failure without scanning or touching recording
+/// artifacts. Genuine lock-file/open filesystem failures remain infrastructure.
 /// Production jobs that already hold the lease use
 /// [`recover_camera_partials_with_interrupt`] so ownership remains held across
 /// recovery, connecting, recording, backoff, reconnects, and shutdown.
@@ -1016,14 +1031,21 @@ pub fn recover_camera_partials(
     let lease = match CameraLease::try_acquire(layout, camera) {
         Ok(lease) => lease,
         Err(source) => {
+            let error = match source {
+                source @ StorageError::CameraAlreadyActive { .. } => RecoveryError::Ownership {
+                    operation: "acquire camera lease",
+                    source,
+                },
+                source => RecoveryError::Infrastructure {
+                    operation: "acquire camera lease",
+                    source,
+                },
+            };
             return (
                 Vec::new(),
                 vec![RecoveryFailure {
                     partial_path: layout.camera_dir(camera),
-                    error: RecoveryError::Infrastructure {
-                        operation: "acquire camera lease",
-                        source,
-                    },
+                    error,
                 }],
             );
         }
@@ -1056,7 +1078,7 @@ pub fn recover_camera_partials_with_interrupt(
             Vec::new(),
             vec![RecoveryFailure {
                 partial_path: layout.camera_dir(camera),
-                error: RecoveryError::Infrastructure {
+                error: RecoveryError::Ownership {
                     operation: "validate camera lease",
                     source,
                 },
@@ -1683,6 +1705,65 @@ fn salvage_media(
 /// partials only ever exist inside the storage tree).
 fn partial_source(path: &std::path::Path) -> nian_media::MediaSource {
     nian_media::MediaSource::File(path.to_path_buf())
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn standalone_recovery_classifies_active_camera_as_ownership_not_infrastructure() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = RecordingsLayout::new(temp.path().join("recordings")).unwrap();
+        let camera = CameraId::parse("cam-owned").unwrap();
+        let _holder = CameraLease::try_acquire(&layout, &camera).unwrap();
+
+        let (outcomes, failures) = recover_camera_partials(&layout, &camera);
+
+        assert!(outcomes.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert!(!failures[0].error.is_infrastructure());
+        assert!(matches!(
+            failures[0].error,
+            RecoveryError::Ownership {
+                source: StorageError::CameraAlreadyActive { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mismatched_lease_is_ownership_contract_failure_before_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = RecordingsLayout::new(temp.path().join("recordings")).unwrap();
+        let camera_a = CameraId::parse("cam-a").unwrap();
+        let camera_b = CameraId::parse("cam-b").unwrap();
+        let lease = CameraLease::try_acquire(&layout, &camera_a).unwrap();
+
+        // Make camera B's root deliberately unscannable as a directory. If
+        // recovery ignored the lease contract and scanned anyway, this would
+        // become an infrastructure error instead of the ownership error below.
+        let camera_b_root = layout.camera_dir(&camera_b);
+        std::fs::create_dir_all(camera_b_root.parent().unwrap()).unwrap();
+        std::fs::write(&camera_b_root, b"not a directory").unwrap();
+
+        let interrupt = InterruptHandle::new();
+        let (outcomes, failures) =
+            recover_camera_partials_with_interrupt(&layout, &camera_b, &lease, &interrupt, None);
+
+        assert!(outcomes.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert!(!failures[0].error.is_infrastructure());
+        assert!(matches!(
+            failures[0].error,
+            RecoveryError::Ownership {
+                source: StorageError::CameraLeaseMismatch { .. },
+                ..
+            }
+        ));
+    }
 }
 
 #[cfg(test)]
