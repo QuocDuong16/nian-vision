@@ -112,6 +112,14 @@ impl NativeCredentialStore {
 }
 
 impl CredentialStore for NativeCredentialStore {
+    fn exists(&self, reference: &CredentialRef) -> Result<bool, CredentialStoreError> {
+        match Self::entry(reference)?.get_secret() {
+            Ok(_) => Ok(true),
+            Err(keyring::v1::Error::NoEntry) => Ok(false),
+            Err(_) => Err(CredentialStoreError::new("exists")),
+        }
+    }
+
     fn put(
         &self,
         reference: &CredentialRef,
@@ -315,6 +323,11 @@ fn map_camera_error(error: CameraServiceError) -> DesktopErrorDto {
         CameraServiceError::CredentialRollbackCleanup { .. } => DesktopErrorDto::new(
             "credential_rollback_cleanup",
             "credential rollback cleanup failed",
+        ),
+        CameraServiceError::CredentialRefGeneration(_)
+        | CameraServiceError::CredentialRefCollision => DesktopErrorDto::new(
+            "credential_identity",
+            "credential reference allocation failed",
         ),
         CameraServiceError::StorageNotConfigured => {
             DesktopErrorDto::new("storage_failed", "recording storage is not configured")

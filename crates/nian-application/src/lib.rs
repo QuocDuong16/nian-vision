@@ -20,8 +20,9 @@ pub mod supervisor;
 
 pub use camera_service::{
     ApplicationSettingsDto, CameraDraft, CameraMutation, CameraService, CameraServiceError,
-    CameraSummary, CameraWarning, CredentialStore, CredentialStoreError, MemoryCredentialStore,
-    PreparedProbe, SettingsRepository, SettingsRepositoryError,
+    CameraSummary, CameraWarning, CredentialRefGenerator, CredentialRefGeneratorError,
+    CredentialStore, CredentialStoreError, MemoryCredentialStore, PreparedProbe,
+    RandomCredentialRefGenerator, SettingsRepository, SettingsRepositoryError,
 };
 pub use config::{AppConfig, SegmentTargetDuration};
 pub use error::ApplicationError;

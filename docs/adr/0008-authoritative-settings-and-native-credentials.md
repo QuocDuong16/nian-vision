@@ -32,7 +32,17 @@ Nian Vision uses three independent ownership boundaries.
    configuration or credentials and remains rebuildable from footage.
 
 RTSP endpoints are persisted structurally (`host`, `port`, `path`, audio policy)
-with no userinfo. Credential replacement is versioned rather than in-place:
+with no userinfo. Credential references use collision-resistant random identity
+with the stable grammar `nian-vision/<camera-id>/<uuid-v4>`; UUID generation is
+owned by the application layer through an injectable `CredentialRefGenerator`,
+not by `nian-settings` and not by wall-clock/PID/process-local counters.
+
+The native credential store entry identifier is effectively a mutable key:
+`set_secret(existing identity)` updates the secret already stored at that
+identity. CredentialRef uniqueness is therefore a transaction-safety invariant,
+not cosmetic naming. Username/password material is never part of the reference.
+
+Credential replacement is versioned rather than in-place:
 
 ```text
 put NEW secret ref
@@ -44,6 +54,11 @@ Failure before the database commit leaves the old row/ref authoritative and the
 new ref is cleaned up. Failure after commit may leave only an orphan old secret;
 the committed camera continues to work. Delete performs the settings-row delete
 first and secret cleanup second; cleanup failure never resurrects a deleted row.
+Replacement allocation defensively rejects a candidate equal to the committed
+old ref before any keyring write, and rejects any other candidate already occupied
+in the native credential store before `set_secret`. Create also checks for a locally-known duplicate
+CameraId before writing a credential; the database UNIQUE constraint remains the
+authoritative arbiter for concurrent processes.
 
 For M5, desired recording state is intentionally **session-only**. Saved camera
 definitions and recorder/storage settings survive desktop restart, but recording

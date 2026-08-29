@@ -1,14 +1,16 @@
 // Integration tests use panicking assertions/setup helpers deliberately.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nian_application::{
     ApplicationSettingsDto, CameraDraft, CameraService, CameraServiceError, CameraWarning,
-    CredentialStore, CredentialStoreError, SettingsRepository, SettingsRepositoryError,
+    CredentialRefGenerator, CredentialRefGeneratorError, CredentialStore, CredentialStoreError,
+    RandomCredentialRefGenerator, SettingsRepository, SettingsRepositoryError,
 };
 use nian_domain::{
     AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Credentials,
@@ -24,6 +26,7 @@ struct RepoState {
     fail_insert: bool,
     fail_update: bool,
     fail_delete: bool,
+    hide_get_camera_once: bool,
 }
 
 #[derive(Clone)]
@@ -44,13 +47,12 @@ impl SettingsRepository for FakeRepo {
         &self,
         camera_id: &CameraId,
     ) -> Result<Option<CameraConfig>, SettingsRepositoryError> {
-        Ok(self
-            .0
-            .lock()
-            .unwrap()
-            .cameras
-            .get(camera_id.as_str())
-            .cloned())
+        let mut state = self.0.lock().unwrap();
+        if state.hide_get_camera_once {
+            state.hide_get_camera_once = false;
+            return Ok(None);
+        }
+        Ok(state.cameras.get(camera_id.as_str()).cloned())
     }
     fn insert_camera(&mut self, camera: &CameraConfig) -> Result<(), SettingsRepositoryError> {
         let mut state = self.0.lock().unwrap();
@@ -113,7 +115,61 @@ struct SecretState {
 #[derive(Default)]
 struct FakeSecrets(Mutex<SecretState>);
 
+struct DeterministicCredentialRefGenerator {
+    candidates: Mutex<VecDeque<CredentialRef>>,
+    calls: AtomicUsize,
+}
+
+impl DeterministicCredentialRefGenerator {
+    fn new(candidates: &[&str]) -> Self {
+        assert!(!candidates.is_empty());
+        Self {
+            candidates: Mutex::new(
+                candidates
+                    .iter()
+                    .map(|value| CredentialRef::parse(*value).unwrap())
+                    .collect(),
+            ),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl CredentialRefGenerator for DeterministicCredentialRefGenerator {
+    fn generate(
+        &self,
+        _camera_id: &CameraId,
+    ) -> Result<CredentialRef, CredentialRefGeneratorError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut candidates = self
+            .candidates
+            .lock()
+            .map_err(|_| CredentialRefGeneratorError)?;
+        match candidates.len() {
+            0 => Err(CredentialRefGeneratorError),
+            1 => candidates
+                .front()
+                .cloned()
+                .ok_or(CredentialRefGeneratorError),
+            _ => candidates.pop_front().ok_or(CredentialRefGeneratorError),
+        }
+    }
+}
+
 impl CredentialStore for FakeSecrets {
+    fn exists(&self, reference: &CredentialRef) -> Result<bool, CredentialStoreError> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(reference.as_str()))
+    }
+
     fn put(
         &self,
         reference: &CredentialRef,
@@ -505,6 +561,297 @@ fn oversized_rtsp_path_is_rejected_before_persistence_or_secret_write() {
     ));
     assert!(repo_state.lock().unwrap().cameras.is_empty());
     assert!(secrets.0.lock().unwrap().puts.is_empty());
+}
+
+#[test]
+fn generated_replacement_ref_equal_to_committed_ref_never_touches_old_secret() {
+    let committed_ref = "nian-vision/front-door/collision";
+    let (repo, repo_state) = FakeRepo::new();
+    repo_state
+        .lock()
+        .unwrap()
+        .cameras
+        .insert("front-door".into(), existing(committed_ref));
+    let secrets = Arc::new(FakeSecrets::default());
+    secrets.0.lock().unwrap().entries.insert(
+        committed_ref.into(),
+        Credentials::new("admin", "OLD_SECRET"),
+    );
+    let generator = Arc::new(DeterministicCredentialRefGenerator::new(&[committed_ref]));
+    let mut service = CameraService::with_credential_ref_generator(
+        Box::new(repo),
+        secrets.clone(),
+        generator.clone(),
+    );
+
+    let error = service
+        .update_camera(draft("Front door", Some("NEW_SECRET")), None)
+        .unwrap_err();
+    assert!(matches!(error, CameraServiceError::CredentialRefCollision));
+    assert!(
+        generator.calls() > 1,
+        "collision candidates should be retried"
+    );
+
+    let repo = repo_state.lock().unwrap();
+    assert_eq!(
+        repo.cameras
+            .get("front-door")
+            .unwrap()
+            .credential_ref()
+            .as_str(),
+        committed_ref
+    );
+    drop(repo);
+    let state = secrets.0.lock().unwrap();
+    assert!(state.puts.is_empty());
+    assert!(state.deletes.is_empty());
+    let old = state.entries.get(committed_ref).unwrap();
+    assert_eq!(old.password(), "OLD_SECRET");
+}
+
+#[test]
+fn replacement_generator_retries_collision_and_commits_distinct_ref() {
+    let committed_ref = "nian-vision/front-door/collision";
+    let distinct_ref = "nian-vision/front-door/00000000-0000-4000-8000-000000000002";
+    let (repo, repo_state) = FakeRepo::new();
+    repo_state
+        .lock()
+        .unwrap()
+        .cameras
+        .insert("front-door".into(), existing(committed_ref));
+    let secrets = Arc::new(FakeSecrets::default());
+    secrets.0.lock().unwrap().entries.insert(
+        committed_ref.into(),
+        Credentials::new("admin", "OLD_SECRET"),
+    );
+    let generator = Arc::new(DeterministicCredentialRefGenerator::new(&[
+        committed_ref,
+        distinct_ref,
+    ]));
+    let mut service = CameraService::with_credential_ref_generator(
+        Box::new(repo),
+        secrets.clone(),
+        generator.clone(),
+    );
+
+    service
+        .update_camera(draft("Front door", Some("NEW_SECRET")), None)
+        .unwrap();
+    assert_eq!(generator.calls(), 2);
+    assert_eq!(
+        repo_state
+            .lock()
+            .unwrap()
+            .cameras
+            .get("front-door")
+            .unwrap()
+            .credential_ref()
+            .as_str(),
+        distinct_ref
+    );
+    let state = secrets.0.lock().unwrap();
+    assert_eq!(state.puts, vec![distinct_ref]);
+    assert_eq!(state.deletes, vec![committed_ref]);
+    assert_eq!(
+        state.entries.get(distinct_ref).unwrap().password(),
+        "NEW_SECRET"
+    );
+}
+
+#[test]
+fn failed_update_rollback_deletes_only_distinct_transaction_owned_ref() {
+    let committed_ref = "nian-vision/front-door/collision";
+    let distinct_ref = "nian-vision/front-door/00000000-0000-4000-8000-000000000003";
+    let (repo, repo_state) = FakeRepo::new();
+    {
+        let mut repo = repo_state.lock().unwrap();
+        repo.cameras
+            .insert("front-door".into(), existing(committed_ref));
+        repo.fail_update = true;
+    }
+    let secrets = Arc::new(FakeSecrets::default());
+    secrets.0.lock().unwrap().entries.insert(
+        committed_ref.into(),
+        Credentials::new("admin", "OLD_SECRET"),
+    );
+    let generator = Arc::new(DeterministicCredentialRefGenerator::new(&[
+        committed_ref,
+        distinct_ref,
+    ]));
+    let mut service =
+        CameraService::with_credential_ref_generator(Box::new(repo), secrets.clone(), generator);
+
+    assert!(matches!(
+        service.update_camera(draft("Front door", Some("NEW_SECRET")), None),
+        Err(CameraServiceError::Settings)
+    ));
+    assert_eq!(
+        repo_state
+            .lock()
+            .unwrap()
+            .cameras
+            .get("front-door")
+            .unwrap()
+            .credential_ref()
+            .as_str(),
+        committed_ref
+    );
+    let state = secrets.0.lock().unwrap();
+    assert_eq!(state.puts, vec![distinct_ref]);
+    assert_eq!(state.deletes, vec![distinct_ref]);
+    assert_eq!(
+        state.entries.get(committed_ref).unwrap().password(),
+        "OLD_SECRET"
+    );
+    assert!(!state.entries.contains_key(distinct_ref));
+}
+
+#[test]
+fn duplicate_create_collision_never_deletes_winning_committed_credential() {
+    let collision_ref = "nian-vision/front-door/00000000-0000-4000-8000-000000000004";
+    let (repo, repo_state) = FakeRepo::new();
+    let secrets = Arc::new(FakeSecrets::default());
+
+    let winner_generator = Arc::new(DeterministicCredentialRefGenerator::new(&[collision_ref]));
+    let mut winner = CameraService::with_credential_ref_generator(
+        Box::new(repo.clone()),
+        secrets.clone(),
+        winner_generator,
+    );
+    winner
+        .create_camera(draft("Front door", Some("OLD_SECRET")))
+        .unwrap();
+
+    let loser_generator = Arc::new(DeterministicCredentialRefGenerator::new(&[collision_ref]));
+    let mut loser = CameraService::with_credential_ref_generator(
+        Box::new(repo),
+        secrets.clone(),
+        loser_generator.clone(),
+    );
+    assert!(matches!(
+        loser.create_camera(draft("Duplicate", Some("NEW_SECRET"))),
+        Err(CameraServiceError::DuplicateCamera)
+    ));
+    assert_eq!(
+        loser_generator.calls(),
+        0,
+        "a locally-known duplicate must fail before allocating or writing a credential ref"
+    );
+
+    assert_eq!(
+        repo_state
+            .lock()
+            .unwrap()
+            .cameras
+            .get("front-door")
+            .unwrap()
+            .credential_ref()
+            .as_str(),
+        collision_ref
+    );
+    let state = secrets.0.lock().unwrap();
+    assert_eq!(state.puts, vec![collision_ref]);
+    assert!(state.deletes.is_empty());
+    assert_eq!(
+        state.entries.get(collision_ref).unwrap().password(),
+        "OLD_SECRET"
+    );
+}
+
+#[test]
+fn duplicate_create_race_with_forced_ref_collision_never_overwrites_or_deletes_winner() {
+    let collision_ref = "nian-vision/front-door/00000000-0000-4000-8000-000000000007";
+    let loser_ref = "nian-vision/front-door/00000000-0000-4000-8000-000000000008";
+    let (repo, repo_state) = FakeRepo::new();
+    {
+        let mut state = repo_state.lock().unwrap();
+        state
+            .cameras
+            .insert("front-door".into(), existing(collision_ref));
+        // Model another process committing after this process's CREATE pre-check
+        // but before the authoritative INSERT. The INSERT still sees duplicate.
+        state.hide_get_camera_once = true;
+    }
+    let secrets = Arc::new(FakeSecrets::default());
+    secrets.0.lock().unwrap().entries.insert(
+        collision_ref.into(),
+        Credentials::new("admin", "OLD_SECRET"),
+    );
+    let generator = Arc::new(DeterministicCredentialRefGenerator::new(&[
+        collision_ref,
+        loser_ref,
+    ]));
+    let mut loser = CameraService::with_credential_ref_generator(
+        Box::new(repo),
+        secrets.clone(),
+        generator.clone(),
+    );
+
+    assert!(matches!(
+        loser.create_camera(draft("Duplicate", Some("NEW_SECRET"))),
+        Err(CameraServiceError::DuplicateCamera)
+    ));
+    assert_eq!(generator.calls(), 2);
+    assert_eq!(
+        repo_state
+            .lock()
+            .unwrap()
+            .cameras
+            .get("front-door")
+            .unwrap()
+            .credential_ref()
+            .as_str(),
+        collision_ref
+    );
+    let state = secrets.0.lock().unwrap();
+    assert_eq!(state.puts, vec![loser_ref]);
+    assert_eq!(state.deletes, vec![loser_ref]);
+    assert_eq!(
+        state.entries.get(collision_ref).unwrap().password(),
+        "OLD_SECRET"
+    );
+    assert!(!state.entries.contains_key(loser_ref));
+}
+
+#[test]
+fn random_production_credential_refs_use_camera_scoped_uuid_v4_grammar() {
+    let camera = CameraId::parse("front-door").unwrap();
+    let generator = RandomCredentialRefGenerator;
+    let first = generator.generate(&camera).unwrap();
+    let second = generator.generate(&camera).unwrap();
+    let prefix = "nian-vision/front-door/";
+
+    for reference in [&first, &second] {
+        let suffix = reference.as_str().strip_prefix(prefix).unwrap();
+        let parsed = uuid::Uuid::parse_str(suffix).unwrap();
+        assert_eq!(parsed.get_version_num(), 4);
+    }
+    assert_ne!(first, second);
+}
+
+#[test]
+fn persisted_camera_debug_contains_only_opaque_ref_not_credential_secret() {
+    let reference = "nian-vision/front-door/00000000-0000-4000-8000-000000000005";
+    let (repo, repo_state) = FakeRepo::new();
+    let secrets = Arc::new(FakeSecrets::default());
+    let generator = Arc::new(DeterministicCredentialRefGenerator::new(&[reference]));
+    let mut service =
+        CameraService::with_credential_ref_generator(Box::new(repo), secrets, generator);
+
+    service
+        .create_camera(draft("Front door", Some("DEBUG_SECRET_SENTINEL")))
+        .unwrap();
+    let saved = repo_state
+        .lock()
+        .unwrap()
+        .cameras
+        .get("front-door")
+        .cloned()
+        .unwrap();
+    let debug = format!("{saved:?}");
+    assert!(debug.contains(reference));
+    assert!(!debug.contains("DEBUG_SECRET_SENTINEL"));
 }
 
 #[test]

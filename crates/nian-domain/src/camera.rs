@@ -400,6 +400,18 @@ impl CameraConfig {
         credential_ref: CredentialRef,
     ) -> Result<Self, crate::error::DomainError> {
         let display_name = display_name.into();
+        Self::validate_display_name(&display_name)?;
+        Ok(Self {
+            camera_id,
+            display_name,
+            source,
+            audio_policy,
+            credential_ref,
+        })
+    }
+
+    /// Validates a user-facing display name without constructing a config.
+    pub fn validate_display_name(display_name: &str) -> Result<(), crate::error::DomainError> {
         if display_name.trim().is_empty() || display_name.len() > MAX_DISPLAY_NAME_LEN {
             return Err(crate::error::DomainError::InvalidEndpoint {
                 reason: format!(
@@ -412,13 +424,7 @@ impl CameraConfig {
                 reason: "display name contains control characters".to_owned(),
             });
         }
-        Ok(Self {
-            camera_id,
-            display_name,
-            source,
-            audio_policy,
-            credential_ref,
-        })
+        Ok(())
     }
 
     pub fn camera_id(&self) -> &crate::CameraId {

@@ -228,11 +228,18 @@ recording index it is never silently quarantined/rebuilt because its contents ar
 not reconstructable from footage.
 
 Credentials are owned by the `CredentialStore` abstraction. Production uses the
-native OS-backed keyring; tests use fakes/in-memory stores. Credential updates
-create a new versioned ref, commit the camera row to that ref, and only then clean
-the old ref. This makes pre-commit failure preserve the old authoritative secret
-and post-commit cleanup failure merely orphan the old secret. Passwords never
-return through Tauri DTOs and still reach the media worker only inside stdin IPC.
+native OS-backed keyring; tests use fakes/in-memory stores. Credential references
+are application-generated `nian-vision/<camera-id>/<uuid-v4>` identities via an
+injectable `CredentialRefGenerator`; they do not depend on wall clock, PID or a
+process-local counter. Native keyring entry identity behaves as a mutable key, so
+reference uniqueness is part of transaction safety. Credential updates allocate a
+distinct new ref, put the new secret, commit the camera row to that ref, and only
+then clean the old ref. A generated candidate equal to the committed old ref is
+rejected before any keyring write, and any other candidate already occupied in the
+native credential store is retried before `set_secret`. This makes pre-commit failure preserve the old
+authoritative secret and post-commit cleanup failure merely orphan the old secret.
+Passwords never return through Tauri DTOs and still reach the media worker only
+inside stdin IPC.
 
 Desktop commands are thin adapters over managed state. `CameraService` owns CRUD
 and settings validation; `RecordingController` wraps the existing M3

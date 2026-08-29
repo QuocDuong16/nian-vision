@@ -2,9 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use nian_domain::{
     AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Credentials,
@@ -13,14 +11,17 @@ use nian_domain::{
 use nian_settings::{ApplicationSettings, SettingsError, SettingsStore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::{AppConfig, DesiredRecording};
 
-static NEXT_CREDENTIAL_REF: AtomicU64 = AtomicU64::new(1);
+const MAX_CREDENTIAL_REF_GENERATION_ATTEMPTS: usize = 8;
 
 /// Native-secret-store abstraction. Implementations must keep all error text
 /// secret-safe: errors may describe an operation but never echo credentials.
 pub trait CredentialStore: Send + Sync {
+    /// Returns whether an identity is already occupied without exposing its secret.
+    fn exists(&self, reference: &CredentialRef) -> Result<bool, CredentialStoreError>;
     fn put(
         &self,
         reference: &CredentialRef,
@@ -42,6 +43,34 @@ impl CredentialStoreError {
     }
 }
 
+/// Secret-safe failure from the credential-reference identity source.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[error("credential reference generation failed")]
+pub struct CredentialRefGeneratorError;
+
+/// Application-owned credential identity source. Reference uniqueness is part
+/// of the credential transaction contract because native keyring identities
+/// are mutable keys: writing an existing identity replaces its secret.
+pub trait CredentialRefGenerator: Send + Sync {
+    fn generate(&self, camera_id: &CameraId) -> Result<CredentialRef, CredentialRefGeneratorError>;
+}
+
+/// Production generator. UUID v4 identity does not depend on wall-clock, PID,
+/// process lifetime, or a process-local counter.
+#[derive(Debug, Default)]
+pub struct RandomCredentialRefGenerator;
+
+impl CredentialRefGenerator for RandomCredentialRefGenerator {
+    fn generate(&self, camera_id: &CameraId) -> Result<CredentialRef, CredentialRefGeneratorError> {
+        CredentialRef::parse(format!(
+            "nian-vision/{}/{}",
+            camera_id.as_str(),
+            Uuid::new_v4()
+        ))
+        .map_err(|_| CredentialRefGeneratorError)
+    }
+}
+
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum SettingsRepositoryError {
     #[error("camera already exists")]
@@ -57,6 +86,14 @@ pub struct MemoryCredentialStore {
 }
 
 impl CredentialStore for MemoryCredentialStore {
+    fn exists(&self, reference: &CredentialRef) -> Result<bool, CredentialStoreError> {
+        Ok(self
+            .entries
+            .lock()
+            .map_err(|_| CredentialStoreError::new("lock"))?
+            .contains_key(reference.as_str()))
+    }
+
     fn put(
         &self,
         reference: &CredentialRef,
@@ -207,6 +244,10 @@ pub enum CameraServiceError {
     Settings,
     #[error("credential rollback cleanup failed after {operation}")]
     CredentialRollbackCleanup { operation: &'static str },
+    #[error("credential reference generation failed")]
+    CredentialRefGeneration(#[from] CredentialRefGeneratorError),
+    #[error("could not allocate a distinct credential reference")]
+    CredentialRefCollision,
     #[error("recording storage is not configured")]
     StorageNotConfigured,
 }
@@ -254,6 +295,7 @@ impl std::fmt::Debug for PreparedProbe {
 pub struct CameraService {
     repository: Box<dyn SettingsRepository>,
     credentials: Arc<dyn CredentialStore>,
+    credential_refs: Arc<dyn CredentialRefGenerator>,
 }
 
 impl std::fmt::Debug for CameraService {
@@ -267,9 +309,22 @@ impl CameraService {
         repository: Box<dyn SettingsRepository>,
         credentials: Arc<dyn CredentialStore>,
     ) -> Self {
+        Self::with_credential_ref_generator(
+            repository,
+            credentials,
+            Arc::new(RandomCredentialRefGenerator),
+        )
+    }
+
+    pub fn with_credential_ref_generator(
+        repository: Box<dyn SettingsRepository>,
+        credentials: Arc<dyn CredentialStore>,
+        credential_refs: Arc<dyn CredentialRefGenerator>,
+    ) -> Self {
         Self {
             repository,
             credentials,
+            credential_refs,
         }
     }
 
@@ -302,10 +357,30 @@ impl CameraService {
         validate_credentials(&credentials)?;
 
         let camera_id = parse_camera_id(&draft.camera_id)?;
-        let credential_ref = next_credential_ref(&camera_id)?;
-        // Construct the complete validated config before the first secret-store
-        // side effect. Generating the opaque reference above is side-effect free.
-        let config = config_from_draft(&draft, camera_id, credential_ref.clone())?;
+        let endpoint = endpoint_from_draft(&draft)?;
+        validate_display_name(&draft.display_name)?;
+
+        // Safety optimization only. The settings DB UNIQUE constraint remains
+        // authoritative for cross-process races, but a locally-known duplicate
+        // must never write or later roll back a credential owned by that row.
+        if self
+            .repository
+            .get_camera(&camera_id)
+            .map_err(map_repository_service_error)?
+            .is_some()
+        {
+            return Err(CameraServiceError::DuplicateCamera);
+        }
+
+        let credential_ref = self.allocate_credential_ref(&camera_id, None)?;
+        let config = CameraConfig::new(
+            camera_id,
+            draft.display_name,
+            CameraSource::Rtsp(endpoint),
+            draft.audio_policy,
+            credential_ref.clone(),
+        )
+        .map_err(|error| CameraServiceError::Validation(error.to_string()))?;
 
         self.credentials.put(&credential_ref, &credentials)?;
         if let Err(error) = self.repository.insert_camera(&config) {
@@ -337,6 +412,7 @@ impl CameraService {
             .ok_or(CameraServiceError::CameraNotFound)?;
 
         let endpoint = endpoint_from_draft(&draft)?;
+        validate_display_name(&draft.display_name)?;
         if let Some(credentials) = &draft.replacement_credentials {
             validate_credentials(credentials)?;
         }
@@ -350,7 +426,7 @@ impl CameraService {
 
         let replacing_credentials = draft.replacement_credentials.is_some();
         let credential_ref = if replacing_credentials {
-            next_credential_ref(&camera_id)?
+            self.allocate_credential_ref(&camera_id, Some(previous.credential_ref()))?
         } else {
             previous.credential_ref().clone()
         };
@@ -594,6 +670,27 @@ impl CameraService {
         };
         prepared_probe(camera_id.as_str(), &endpoint, &credentials, timeout_ms)
     }
+
+    fn allocate_credential_ref(
+        &self,
+        camera_id: &CameraId,
+        forbidden: Option<&CredentialRef>,
+    ) -> Result<CredentialRef, CameraServiceError> {
+        for _ in 0..MAX_CREDENTIAL_REF_GENERATION_ATTEMPTS {
+            let candidate = self.credential_refs.generate(camera_id)?;
+            if forbidden == Some(&candidate) {
+                continue;
+            }
+            // Native credential identities are mutable keys. Never call put on
+            // a candidate that is already occupied, even if a deterministic
+            // generator or astronomically unlikely UUID collision produces it.
+            if self.credentials.exists(&candidate)? {
+                continue;
+            }
+            return Ok(candidate);
+        }
+        Err(CameraServiceError::CredentialRefCollision)
+    }
 }
 
 impl From<crate::ApplicationError> for CameraServiceError {
@@ -669,30 +766,7 @@ fn endpoint_from_draft(draft: &CameraDraft) -> Result<CameraEndpoint, CameraServ
         .map_err(|error| CameraServiceError::Validation(error.to_string()))
 }
 
-fn config_from_draft(
-    draft: &CameraDraft,
-    camera_id: CameraId,
-    credential_ref: CredentialRef,
-) -> Result<CameraConfig, CameraServiceError> {
-    CameraConfig::new(
-        camera_id,
-        draft.display_name.clone(),
-        CameraSource::Rtsp(endpoint_from_draft(draft)?),
-        draft.audio_policy,
-        credential_ref,
-    )
-    .map_err(|error| CameraServiceError::Validation(error.to_string()))
-}
-
-fn next_credential_ref(camera_id: &CameraId) -> Result<CredentialRef, CameraServiceError> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let counter = NEXT_CREDENTIAL_REF.fetch_add(1, Ordering::Relaxed);
-    CredentialRef::parse(format!(
-        "nian-vision/{}/{nanos:x}-{counter:x}",
-        camera_id.as_str()
-    ))
-    .map_err(|error| CameraServiceError::Validation(error.to_string()))
+fn validate_display_name(display_name: &str) -> Result<(), CameraServiceError> {
+    CameraConfig::validate_display_name(display_name)
+        .map_err(|error| CameraServiceError::Validation(error.to_string()))
 }

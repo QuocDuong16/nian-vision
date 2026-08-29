@@ -365,6 +365,9 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
+    static PROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     struct BlockingRunner {
         entered: Arc<Barrier>,
         release: Arc<(Mutex<bool>, Condvar)>,
@@ -471,6 +474,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reader_setup_failure_after_spawn_reaps_child() {
+        let _process_guard = PROCESS_TEST_LOCK.lock().unwrap();
         let (_dir, program) = probe_worker_script(HELLO_OK);
         let reaped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let setup = TestSetup {
@@ -489,6 +493,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn initial_request_send_failure_after_spawn_reaps_child() {
+        let _process_guard = PROCESS_TEST_LOCK.lock().unwrap();
         let (_dir, program) = probe_worker_script(HELLO_OK);
         let reaped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let setup = TestSetup {
@@ -507,6 +512,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn protocol_failure_after_spawn_reaps_child() {
+        let _process_guard = PROCESS_TEST_LOCK.lock().unwrap();
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();

@@ -323,10 +323,16 @@ machine timezone.
 ### Desktop camera-management integration tests (M5)
 
 M5 adds keychain-independent tests around every cross-store failure boundary.
-`camera_service.rs` injects fake settings and credential stores to prove: a new
-secret written before a failed camera insert is cleaned up; a failed update keeps
-the old credential ref authoritative; a committed update survives failure to
-clean the old ref; and a committed delete stays deleted when secret cleanup
+`camera_service.rs` injects fake settings, credential stores and deterministic
+credential-ref generators to prove: UUID-v4 production refs use the stable
+`nian-vision/<camera-id>/<uuid-v4>` grammar; a replacement candidate equal to the
+committed ref is retried or fails before any secret write; failed update rollback
+deletes only the distinct ref allocated by that transaction; and a duplicate
+create with a forced ref collision, including a race-shaped hidden pre-check,
+never overwrites or deletes the winning committed secret. A
+new secret written before a failed camera insert is cleaned up; a failed update
+keeps the old credential ref authoritative; a committed update survives failure
+to clean the old ref; and a committed delete stays deleted when secret cleanup
 fails. Active recordings reject critical edit/delete while display-name-only edit
 keeps the same `CameraId`. Password sentinels are absent from safe list DTOs,
 Debug output, and the complete M4 recording-index SQLite family (`.sqlite3`, WAL,

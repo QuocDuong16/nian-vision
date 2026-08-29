@@ -4,8 +4,8 @@
 use std::fs;
 
 use nian_domain::{
-    AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Host,
-    RetentionPolicy, StorageQuota,
+    AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Credentials,
+    Host, RetentionPolicy, StorageQuota,
 };
 use nian_settings::{ApplicationSettings, SettingsError, SettingsStore};
 use rusqlite::Connection;
@@ -118,18 +118,32 @@ fn failed_migration_does_not_advance_schema_version() {
 }
 
 #[test]
-fn settings_database_never_contains_password_sentinel() {
+fn credential_ref_debug_and_settings_persistence_remain_non_secret() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.sqlite3");
     let sentinel = "UNIQUE_SENTINEL_PASSWORD_DO_NOT_PERSIST";
+    let reference = "nian-vision/front-door/00000000-0000-4000-8000-000000000006";
+    let credentials = Credentials::new("admin", sentinel);
+    let configured = camera("Front door", reference);
+
+    let debug = format!("{:?}", configured.credential_ref());
+    assert!(debug.contains(reference));
+    assert!(!debug.contains(credentials.password()));
+
     {
         let mut store = SettingsStore::open(&path).unwrap();
-        // Credential references are opaque identifiers, never credential material.
-        store
-            .insert_camera(&camera("Front door", "cred-front-door-v1"))
-            .unwrap();
+        // Settings accepts only the opaque ref; the Credentials value above has
+        // no persistence path through this API.
+        store.insert_camera(&configured).unwrap();
+        let saved = store.get_camera(configured.camera_id()).unwrap().unwrap();
+        assert_eq!(saved.credential_ref().as_str(), reference);
     }
     let bytes = fs::read(&path).unwrap();
+    assert!(
+        bytes
+            .windows(reference.len())
+            .any(|window| window == reference.as_bytes())
+    );
     assert!(
         !bytes
             .windows(sentinel.len())

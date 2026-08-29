@@ -464,8 +464,11 @@ mod tests {
         controller
             .start(CameraId::parse("cam-a").unwrap(), desired())
             .unwrap();
-        // Polling reaps the immediate successful run.
-        for _ in 0..100 {
+        // Polling reaps the immediate successful run. Use a bounded wall-clock
+        // deadline rather than a fixed yield count; the scheduler owes tests no
+        // particular number of turns under the full parallel workspace suite.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
             if controller.status().unwrap().state == RecordingState::Stopped {
                 return;
             }
