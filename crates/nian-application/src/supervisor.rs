@@ -54,7 +54,7 @@
 
 use std::io::Write;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use nian_domain::ReconnectBackoff;
@@ -156,6 +156,8 @@ pub struct DesiredRecording {
     pub source_json: serde_json::Value,
     /// Segment target seconds.
     pub segment_target_secs: u64,
+    /// Whether all audio streams accompany the primary video stream.
+    pub copy_audio: bool,
 }
 
 impl std::fmt::Debug for DesiredRecording {
@@ -164,6 +166,7 @@ impl std::fmt::Debug for DesiredRecording {
             .field("camera", &self.camera)
             .field("storage_root", &self.storage_root)
             .field("segment_target_secs", &self.segment_target_secs)
+            .field("copy_audio", &self.copy_audio)
             .finish_non_exhaustive() // source_json deliberately omitted
     }
 }
@@ -175,6 +178,7 @@ impl DesiredRecording {
             "storage": self.storage_root,
             "source": self.source_json,
             "segment_target_secs": self.segment_target_secs,
+            "copy_audio": self.copy_audio,
         })
     }
 }
@@ -336,6 +340,9 @@ fn classify_start_refusal(code: String) -> Flow {
     }
 }
 
+/// Secret-safe observer invoked with canonical `recording.status` payloads.
+pub type StatusObserver = Arc<dyn Fn(&serde_json::Value) + Send + Sync>;
+
 /// Supervises worker episodes with crash-restart + state restoration.
 pub struct WorkerSupervisor<L: WorkerLauncher> {
     launcher: L,
@@ -346,6 +353,8 @@ pub struct WorkerSupervisor<L: WorkerLauncher> {
     /// Latest observed terminal job state within the current/last episode
     /// (§7 observability seam for hosts).
     last_job_terminal: Option<JobTerminal>,
+    /// Optional host observer for secret-safe recording.status payloads.
+    status_observer: Option<StatusObserver>,
 }
 
 impl<L: WorkerLauncher> WorkerSupervisor<L> {
@@ -363,7 +372,14 @@ impl<L: WorkerLauncher> WorkerSupervisor<L> {
             desired_recording: None,
             consecutive_fast_deaths: 0,
             last_job_terminal: None,
+            status_observer: None,
         }
+    }
+
+    /// Installs a secret-safe status observer for desktop/application hosts.
+    /// Worker status payloads are contractually credential-free.
+    pub fn set_status_observer(&mut self, observer: StatusObserver) {
+        self.status_observer = Some(observer);
     }
 
     /// Sets/updates the enforced recording state; resets episode economics.
@@ -714,6 +730,9 @@ impl<L: WorkerLauncher> WorkerSupervisor<L> {
                         } = *envelope
                             && reply_id == poll_id
                         {
+                            if let Some(observer) = &self.status_observer {
+                                observer(&result);
+                            }
                             // Final safety remediation §7: a payload that
                             // CLAIMS finished=true but carries an unknown
                             // end_kind or a missing/invalid failure

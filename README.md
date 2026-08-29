@@ -4,33 +4,36 @@ Local-first desktop NVR (network video recorder) for IP cameras. The first
 supported camera is the TP-Link Tapo C200 over RTSP, with a camera-agnostic
 domain so other RTSP/ONVIF cameras can follow.
 
-**Status**: milestone **M4 (SQLite reconciliation and retention)** is
-implemented and ready for review on top of M0–M3. Finalized normal and
-recovered recordings are indexed in a rebuildable SQLite catalog at
-`<storage_root>/.nian/recordings.sqlite3`; the filesystem remains the source
-of survival, so deleting or corrupting the database never deletes footage.
-SQLite startup verifies WAL + foreign-key pragmas, and corruption is healed
-from disk even when it surfaces after the manager initially opened. A pending
-quarantine marker makes DB/WAL/SHM quarantine convergent across interrupted
-filesystem moves. Deterministic reconciliation repairs missing/stale index
-rows and fails the retention-ready gate closed on any failed pass. Partials
-stay lease-aware; settled historical recovered transactions can be retained
-while the same camera records continuously, but only after exact v2 evidence
-and `NotFound`-only original absence are revalidated immediately before the
-filesystem-first delete. M3 resilience remains unchanged:
-worker crashes, reconnects and crash-leftover partial recovery are still
-owned by the supervised media worker rather than by the database layer.
+**Status**: milestone **M5 (desktop camera management)** is implemented on top
+of M0–M4. The desktop persists camera definitions and recorder/storage settings
+in an authoritative platform app-data `settings.sqlite3`, while camera passwords
+remain in the operating system credential store. The M4 recording catalog at
+`<storage_root>/.nian/recordings.sqlite3` remains disposable and rebuildable from
+footage. Users can add/edit/delete saved RTSP cameras, test a connection through
+the media worker, start/stop the single M5 active recording, and observe typed
+recording/reconnect state. Multiple camera definitions may be saved, but M5
+allows at most one active desired recording. Recording desired state is
+session-only in M5: saved configuration survives restart, recording itself does
+not auto-start. Playback/timeline and live video remain M6 scope.
 
 ## What it does today
 
-* Tauri 2 desktop shell (React/TypeScript/Vite UI) that builds and runs on
-  Linux and Windows.
+* Tauri 2 desktop application (React/TypeScript/Vite UI) with managed M5 state:
+  camera CRUD, pre-save connection testing, Start/Stop controls, typed recording
+  status, delete confirmation and persisted storage/retention settings. The
+  webview has no RTSP/network privilege; privileged work flows through narrow
+  Tauri commands.
+* Authoritative application settings (`nian-settings`) live in the platform
+  app-data directory, separate from recording storage. Camera credentials live
+  in the native OS credential store behind `CredentialStore`; neither SQLite
+  database contains passwords.
 * An isolated `nian-media-worker` process that talks FFmpeg through FFI:
   * `nian-media-worker probe <file|credential-free-rtsp-url>` prints stream
     information (codec, resolution, duration);
   * `nian-media-worker run` serves a versioned NDJSON IPC protocol on
     stdin/stdout with the `recording.*` namespace (one supervised job per
-    worker; start/stop/status plus typed reconnect events);
+    worker; start/stop/status plus typed reconnect events) and bounded
+    `camera.probe` source-only connection tests;
   * `nian-media-worker record --storage <DIR> --camera <ID> ...` is the
     manual smoke path with explicit stop modes (`--duration N`,
     `--until-stdin-eof`, or Ctrl+C-only) recording from
@@ -63,16 +66,19 @@ owned by the supervised media worker rather than by the database layer.
 ## Architecture
 
 ```text
-React UI ─ Tauri commands ─ nian-desktop host
-                                │ NDJSON IPC (stdio)
-                            nian-media-worker
+React UI ─ typed Tauri commands ─ nian-desktop host
+                 │                  │
+                 │                  ├─ platform app-data/settings.sqlite3
+                 │                  ├─ native OS credential store
+                 │                  │ NDJSON IPC (stdio)
+                 │              nian-media-worker
                                 │ FFmpeg FFI (dynamic, LGPL)
                             RTSP cameras
 ```
 
 See `docs/architecture.md` and `docs/adr/` for the decisions behind this
 layout (process isolation, FFmpeg strategy, container choice, storage
-model).
+model, authoritative-settings/native-secret split).
 
 ## Requirements
 

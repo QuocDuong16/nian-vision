@@ -13,7 +13,7 @@ describe("App shell", () => {
     }
 
     expect(screen.getByText("No cameras configured")).toBeTruthy();
-    expect(screen.getByText(/milestone M5/)).toBeTruthy();
+    expect(screen.getByText(/Add an RTSP camera/)).toBeTruthy();
   });
 
   it("switches screens when navigation is clicked", () => {

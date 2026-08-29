@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::secret::Secret;
 
+/// Maximum user-facing camera display-name length in bytes.
+pub const MAX_DISPLAY_NAME_LEN: usize = 128;
+
 /// Default RTSP port.
 pub const DEFAULT_RTSP_PORT: u16 = 554;
 
@@ -284,6 +287,124 @@ impl CameraEndpoint {
                 self.path
             ),
         }
+    }
+}
+
+/// Which audio streams are recorded alongside the primary video stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioPolicy {
+    /// Stream-copy every discovered audio stream.
+    #[default]
+    CopyAll,
+    /// Record video only.
+    Exclude,
+}
+
+impl AudioPolicy {
+    /// Stable value persisted in settings and used by desktop DTOs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CopyAll => "copy_all",
+            Self::Exclude => "exclude",
+        }
+    }
+
+    /// Parses the stable persisted value.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "copy_all" => Some(Self::CopyAll),
+            "exclude" => Some(Self::Exclude),
+            _ => None,
+        }
+    }
+}
+
+/// Opaque reference to credentials stored outside ordinary application files.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CredentialRef(String);
+
+impl CredentialRef {
+    /// Validates a non-empty bounded credential reference.
+    pub fn parse(value: impl Into<String>) -> Result<Self, crate::error::DomainError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > 255 || value.bytes().any(|b| b.is_ascii_control()) {
+            return Err(crate::error::DomainError::InvalidEndpoint {
+                reason: "invalid credential reference".to_owned(),
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// Borrows the opaque reference.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Persisted non-secret camera source definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CameraSource {
+    /// RTSP endpoint without userinfo/password material.
+    Rtsp(CameraEndpoint),
+}
+
+/// Authoritative persisted camera configuration. Credentials are represented
+/// only by an opaque reference into the native credential store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraConfig {
+    camera_id: crate::CameraId,
+    display_name: String,
+    source: CameraSource,
+    audio_policy: AudioPolicy,
+    credential_ref: CredentialRef,
+}
+
+impl CameraConfig {
+    /// Creates and validates a camera configuration.
+    pub fn new(
+        camera_id: crate::CameraId,
+        display_name: impl Into<String>,
+        source: CameraSource,
+        audio_policy: AudioPolicy,
+        credential_ref: CredentialRef,
+    ) -> Result<Self, crate::error::DomainError> {
+        let display_name = display_name.into();
+        if display_name.trim().is_empty() || display_name.len() > MAX_DISPLAY_NAME_LEN {
+            return Err(crate::error::DomainError::InvalidEndpoint {
+                reason: format!(
+                    "display name must be non-empty and at most {MAX_DISPLAY_NAME_LEN} bytes"
+                ),
+            });
+        }
+        if display_name.bytes().any(|b| b.is_ascii_control()) {
+            return Err(crate::error::DomainError::InvalidEndpoint {
+                reason: "display name contains control characters".to_owned(),
+            });
+        }
+        Ok(Self {
+            camera_id,
+            display_name,
+            source,
+            audio_policy,
+            credential_ref,
+        })
+    }
+
+    pub fn camera_id(&self) -> &crate::CameraId {
+        &self.camera_id
+    }
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+    pub fn source(&self) -> &CameraSource {
+        &self.source
+    }
+    pub fn audio_policy(&self) -> AudioPolicy {
+        self.audio_policy
+    }
+    pub fn credential_ref(&self) -> &CredentialRef {
+        &self.credential_ref
     }
 }
 

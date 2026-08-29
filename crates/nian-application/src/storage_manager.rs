@@ -204,8 +204,12 @@ impl StorageManager {
             let existing = indexed_by_path
                 .get(recording.relative_path.as_str())
                 .copied();
-            let upsert =
-                recording_to_upsert(recording, existing.and_then(|row| row.media_duration_ms));
+            let trusted_duration = existing.and_then(|row| {
+                same_filesystem_recording(row, recording)
+                    .then_some(row.media_duration_ms)
+                    .flatten()
+            });
+            let upsert = recording_to_upsert(recording, trusted_duration);
             match existing {
                 None => {
                     report.inserted += 1;
@@ -696,6 +700,22 @@ fn same_indexed_recording(row: &IndexedRecording, expected: &RecordingUpsert) ->
         && row.started_at == expected.started_at
         && row.sequence == expected.sequence
         && row.size_bytes == expected.size_bytes
+}
+
+fn same_filesystem_recording(row: &IndexedRecording, recording: &InventoryRecording) -> bool {
+    let kind = match recording.kind {
+        RecordingFileKind::NormalRecording => RecordingKind::Normal,
+        RecordingFileKind::RecoveredRecording => RecordingKind::Recovered,
+        _ => return false,
+    };
+
+    row.camera_id == recording.camera_id
+        && row.relative_path == recording.relative_path
+        && row.kind == kind
+        && row.state == nian_domain::RecordingState::Complete
+        && row.started_at == recording.started_at
+        && row.sequence == recording.sequence
+        && row.size_bytes == recording.size_bytes
 }
 
 fn classify_partials_by_lease(

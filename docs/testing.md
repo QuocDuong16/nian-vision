@@ -11,6 +11,8 @@ Testing is part of the definition of done for every milestone (master spec
 |---|---|
 | `nian-domain` | camera-id path safety, credential redaction, URL encoding, retention validation, quota watermarks, backoff schedule, time-base math |
 | `nian-application` | config validation bounds, UI-safe error messages; stub-worker supervision matrix: crash-before-hello retryable, wedged-hello deadline-bounded, version mismatch permanent, transient refusal retries, configuration refusal stops, failed-job-observed-while-alive, shutdown interrupts backoff waits |
+| `nian-application` (M5) | camera CRUD/service validation, versioned credential-ref transaction failure boundaries, safe DTO/Debug output, storage-settings validation, single-active `RecordingController` transitions and probe admission |
+| `nian-settings` (M5) | schema v1 creation, reopen persistence, stable CameraId across rename, duplicate rejection, future-schema preservation, migration rollback, validated HIGH/LOW quota round-trip + corrupt/mismatched quota rejection, camera delete leaves footage untouched, password sentinel absent from DB bytes |
 | `nian-application` (M4) | `StorageManager`: reconciliation idempotency + fail-closed retention gate, startup/runtime corruption repair, convergent SQLite-family quarantine, lease-aware partial classification, whole-second incremental finalized upsert, age/quota OR semantics + target observability, settled-recovered retention during active recording, recovered transaction commit revalidation, filesystem-first crash convergence, conservative artifact cleanup |
 | `nian-index` (M4) | schema v1 migration/reopen, future-version refusal, migration rollback, verified WAL + `foreign_keys=ON`, timeline index, idempotent upsert/query, atomic snapshot replacement, random-byte/runtime corruption classification |
 | `nian-storage` | recordings layout, partial/final naming round-trip, traversal rejection, exclusive claims (incl. sub-second clock regression), no-replace publication (success, collision refusal, recoverable abandoned partials) |
@@ -318,6 +320,40 @@ foreign-key startup invariants, timeline-index and rollback assertions. No test
 shells out to `sqlite3`, sleeps for age cutoffs or depends on changing the
 machine timezone.
 
+### Desktop camera-management integration tests (M5)
+
+M5 adds keychain-independent tests around every cross-store failure boundary.
+`camera_service.rs` injects fake settings and credential stores to prove: a new
+secret written before a failed camera insert is cleaned up; a failed update keeps
+the old credential ref authoritative; a committed update survives failure to
+clean the old ref; and a committed delete stays deleted when secret cleanup
+fails. Active recordings reject critical edit/delete while display-name-only edit
+keeps the same `CameraId`. Password sentinels are absent from safe list DTOs,
+Debug output, and the complete M4 recording-index SQLite family (`.sqlite3`, WAL,
+SHM) even when the application service holds the secret. Unsaved probes use form
+credentials without persistence; edited
+probes can reuse a committed secret without exposing it to the caller.
+
+`recording_controller.rs` uses fake runners, no camera/network, to assert
+Starting→Recording, graceful Stopping→Stopped, permanent Failed, second-camera
+rejection and secret-free desired-recording Debug output. `ProbeController` has a
+blocking fake-runner regression proving a concurrent second probe is rejected as
+`Busy` rather than launching another worker. Existing M3 real-worker
+crash/restart tests remain the authority for restart semantics underneath this
+controller.
+
+`apps/nian-media-worker/tests/worker_integration.rs` drives the real stdin/stdout
+protocol against committed media fixtures. `camera.probe` reports a video stream
+for local media, unreachable RTSP produces a bounded typed source failure, probe
+creates no recording artifacts, and existing sentinel-credential output tests
+continue to prove native FFmpeg diagnostics do not leak secrets. The worker is
+spawned as only `nian-media-worker run`; credential-bearing source data travels
+through framed stdin, never argv or environment.
+
+The production native credential store is not exercised in CI. `CredentialStore`
+fakes/in-memory implementations keep Linux/macOS CI independent of a logged-in
+graphical keychain.
+
 ### CLI/IPC smoke checks (manual, seconds)
 
 ```bash
@@ -332,15 +368,20 @@ must refuse `job_already_active` → `shutdown` after segments appear.
 
 ### Frontend (`ui/`)
 
-Vitest + Testing Library: navigation shell renders honest empty states and
-switches screens; formatting utilities. Lint (`eslint`) and `tsc --noEmit`
-gate everything.
+Vitest + Testing Library covers the M5 camera screen without a physical
+camera/network: empty state, create validation, list rendering, password never
+rendered after save, unsaved Test Connection loading/result, Start/Stop state
+transitions from backend responses, backend error display, delete confirmation
+and critical-field/delete lock while recording. Storage/settings tests cover the
+paired HIGH/LOW watermark requirement, LOW < HIGH validation, and a valid persisted
+update through the typed Tauri client boundary. Lint (`eslint`), `tsc --noEmit`,
+Vitest and Vite build gate the frontend.
 
 ## Planned per milestone
 
-* **M5+**: camera configuration persistence/UI, playback/timeline UI,
-  desktop production behavior, distribution, multi-camera orchestration,
-  ONVIF and later features remain intentionally out of M4 scope.
+* **M6+**: playback/timeline/live-view work, then M7 tray/autostart/power
+  lifecycle, M8 distribution, M9 simultaneous multi-camera orchestration and M10
+  ONVIF. None is part of M5.
 * **Hardware/manual** (never in CI): real Tapo C200 via
   `NIAN_VISION_RTSP_URL` with
   `nian-media-worker record --rtsp-from-env ...` and/or an IPC-driven

@@ -174,7 +174,8 @@ fn cmd_run() -> Result<(), String> {
     // must exit non-zero instead of serving IPC traffic. Serving anyway would
     // make `hello`/`describe` report `ffmpeg: null` and every later call fail
     // mid-session, hiding an installation problem that is knowable up front.
-    FfmpegBackend::new().map_err(|error| format!("ffmpeg startup validation failed: {error}"))?;
+    let media = FfmpegBackend::new()
+        .map_err(|error| format!("ffmpeg startup validation failed: {error}"))?;
 
     // Same fail-fast invariant for the version read-out: after a successful
     // init the ABI check is guaranteed to succeed, so an error here is a real
@@ -199,6 +200,7 @@ fn cmd_run() -> Result<(), String> {
     let mut handler = WorkerHandler {
         versions,
         jobs: job::RecordingJobManager::new(),
+        media,
     };
     serve(std::io::stdin().lock(), stdout.lock(), &mut handler)
         .map_err(|error| error.to_string())?;
@@ -632,6 +634,7 @@ fn print_recording_event(event: &nian_recorder::RecordingEvent) {
 struct WorkerHandler {
     versions: RuntimeVersions,
     jobs: job::RecordingJobManager,
+    media: FfmpegBackend,
 }
 
 /// Names served by the recording namespace (kept next to their payloads).
@@ -639,6 +642,10 @@ pub mod recording_method {
     pub const START: &str = "recording.start";
     pub const STOP: &str = "recording.stop";
     pub const STATUS: &str = "recording.status";
+}
+
+pub mod camera_method {
+    pub const PROBE: &str = "camera.probe";
 }
 
 impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
@@ -696,6 +703,41 @@ impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
                 // this serves.
                 nian_ipc::Dispatch::Reply(Ok(self.jobs.status().to_json()))
             }
+            camera_method::PROBE => match probe_params(params) {
+                Ok((source, timeout)) => match self.media.probe_with_timeout(&source, timeout) {
+                    Ok(report) => {
+                        let video = report.video_stream();
+                        let audio_stream_count = report
+                            .streams
+                            .iter()
+                            .filter(|stream| stream.media_type == nian_domain::MediaType::Audio)
+                            .count();
+                        nian_ipc::Dispatch::Reply(Ok(json!({
+                            "reachable": true,
+                            "video_stream_found": video.is_some(),
+                            "codec": video.map(|stream| stream.codec_name.clone()),
+                            "width": video.and_then(|stream| stream.width),
+                            "height": video.and_then(|stream| stream.height),
+                            "audio_stream_count": audio_stream_count,
+                        })))
+                    }
+                    Err(error) => {
+                        let code = if error.is_timed_out() {
+                            "source_timeout"
+                        } else if error.is_interrupted() {
+                            "cancelled"
+                        } else if matches!(error, nian_media::MediaError::OpenFailed { .. }) {
+                            "source_open_failed"
+                        } else {
+                            "source_probe_failed"
+                        };
+                        nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(code)))
+                    }
+                },
+                Err(reason) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(
+                    with_reason(job::code::INVALID_PARAMS, reason),
+                ))),
+            },
             method::SHUTDOWN => {
                 // Final remediation §4: process shutdown is its OWN
                 // orchestration — one IDEMPOTENT graceful request here; the
@@ -709,6 +751,43 @@ impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
             _ => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new("method_not_found"))),
         }
     }
+}
+
+fn probe_params(
+    params: &serde_json::Value,
+) -> Result<(MediaSource, std::time::Duration), &'static str> {
+    let source = params.get("source").ok_or("missing 'source'")?;
+    let kind = source
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing 'source.kind'")?;
+    let source = match kind {
+        "file" => {
+            let path = source
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("missing 'source.path'")?;
+            MediaSource::File(PathBuf::from(path))
+        }
+        "rtsp" => {
+            let url = source
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("missing 'source.url'")?;
+            MediaSource::Rtsp {
+                url: RtspUrl::new(url.to_owned()),
+            }
+        }
+        _ => return Err("unknown 'source.kind' (file|rtsp)"),
+    };
+    let timeout_ms = params
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(10_000);
+    if !(100..=60_000).contains(&timeout_ms) {
+        return Err("'timeout_ms' must be between 100 and 60000");
+    }
+    Ok((source, std::time::Duration::from_millis(timeout_ms)))
 }
 
 /// Combines a stable error code with a short, secret-free reason so hosts

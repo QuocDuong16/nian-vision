@@ -16,8 +16,9 @@ TP-Link Tapo C200 over RTSP). This page is the map; the ADRs record why.
 │       nian-desktop host      │
 │      (apps/nian-desktop)     │
 │                              │
-│  Camera Manager      (M5)    │
-│  Recording Manager   (M2+)   │
+│  CameraService       (M5) ✓  │
+│  RecordingController (M5) ✓  │
+│  ProbeController     (M5) ✓  │
 │  Storage Manager     (M4) ✓  │
 │  Worker Supervisor   (M3) ✓  │
 │    (nian-application)        │
@@ -56,16 +57,17 @@ Key properties:
 | Crate | Role | Notes |
 |---|---|---|
 | `nian-domain` | Camera/Recording/Media vocabulary | path-safe IDs, redacted credentials, backoff schedule |
-| `nian-application` | config validation, orchestration policies, worker supervision | `AppConfig`, `WorkerSupervisor` (M3), `StorageManager` reconciliation/rebuild/retention orchestration (M4) |
-| `nian-index` | rebuildable SQLite recording catalog | bundled SQLite, schema v1 migrations, WAL, timeline queries; no media/filesystem ownership (M4) |
+| `nian-application` | config validation and orchestration policies | `WorkerSupervisor` (M3), `StorageManager` (M4), M5 `CameraService` + single-active `RecordingController` + serialized `ProbeController` |
+| `nian-index` | rebuildable SQLite recording catalog | bundled SQLite, schema v1 migrations, WAL, timeline queries; no camera settings or credentials (M4) |
+| `nian-settings` | authoritative non-secret desktop configuration | app-data `settings.sqlite3`, schema v1 camera/storage settings; no FFmpeg/Tauri/process logic (M5) |
 | `nian-storage` | recordings layout, claiming, publication, inventory/transaction facts | traversal-proof paths, race-safe `claim_segment`, atomic no-replace publish, lease-aware partial primitives, symlink-safe deterministic inventory (M4) |
 | `nian-ipc` | NDJSON protocol + serve loop | versioned envelopes, size-capped framing; handlers may emit events mid-request (M3) |
 | `nian-media` | backend-agnostic facade | `Probe`, `MediaSource`; errors distinguish cancellation vs timeout (M3); packets travel as backend-owned types |
 | `nian-media-ffmpeg` | safe FFmpeg wrapper | input/muxer/packet/interrupt/ABI guard; operation-scoped RAII deadlines + typed abort causes (M3) |
 | `nian-recorder` | segmented recording engine + supervision | keyframe rotation, durable finalize/publish; camera reconnect supervisor, partial recovery (M3) |
 | `nian-ffmpeg-sys` | raw FFI (generated) | committed bindings from vendored 8.0.3 headers |
-| `apps/nian-desktop` | Tauri 2 host | window + commands |
-| `apps/nian-media-worker` | media process | `probe` CLI, `run` IPC loop with `recording.*` namespace, manual `record` smoke command |
+| `apps/nian-desktop` | Tauri 2 host | managed M5 state, platform app-data resolution, native credential-store adapter, thin typed commands |
+| `apps/nian-media-worker` | media process | `probe` CLI, `run` IPC with `recording.*` plus bounded `camera.probe`, manual `record` smoke command |
 
 ## Recording data flow
 
@@ -198,6 +200,66 @@ the tombstone is verified once more before tombstone cleanup, and the index row
 is removed last. Any failed revalidation skips that candidate and preserves
 media/evidence. Quota cleanup continues to later eligible candidates and reports
 whether the LOW watermark was actually reached.
+
+## Desktop camera management (M5)
+
+M5 adds authoritative user configuration without changing M4 filesystem truth:
+
+```text
+platform app-data/
+  settings.sqlite3                 # authoritative, NOT disposable
+
+recordings storage root/
+  .nian/recordings.sqlite3         # disposable/rebuildable M4 index
+  <camera-id>/.../*.mkv            # footage survives camera config deletion
+
+native OS credential store
+  credential refs -> username/password
+```
+
+`nian-settings` persists structured, non-secret RTSP endpoint data (`host`,
+`port`, `path`), display name, stable `CameraId`, audio policy, credential ref and
+recorder/storage settings. Storage quota configuration preserves the M4 invariant
+that the retention HIGH watermark equals `StorageQuota.max_bytes` and requires an
+explicit lower cleanup target; the settings layer validates this on both read and
+write. The Tauri host alone resolves the platform app-data path. A corrupt/future
+settings database fails safely in place; unlike the M4
+recording index it is never silently quarantined/rebuilt because its contents are
+not reconstructable from footage.
+
+Credentials are owned by the `CredentialStore` abstraction. Production uses the
+native OS-backed keyring; tests use fakes/in-memory stores. Credential updates
+create a new versioned ref, commit the camera row to that ref, and only then clean
+the old ref. This makes pre-commit failure preserve the old authoritative secret
+and post-commit cleanup failure merely orphan the old secret. Passwords never
+return through Tauri DTOs and still reach the media worker only inside stdin IPC.
+
+Desktop commands are thin adapters over managed state. `CameraService` owns CRUD
+and settings validation; `RecordingController` wraps the existing M3
+`WorkerSupervisor` asynchronously; `ProbeController` admits at most one bounded
+source-only probe process at a time. M5 has multiple **saved** cameras but at
+most one active desired recording. Starting camera B while A is active is a typed
+error. Active cameras reject endpoint/credential/audio mutation and deletion; a
+display-name-only edit remains legal because `CameraId` and the recording tree do
+not change.
+
+Normal Stop is graceful: the controller sets `Stopping`, asks the existing
+supervisor to shut down, and ownership is released only after worker teardown.
+The UI polls the stable application status DTO (`Starting`, `Recovering`,
+`Connecting`, `Recording`, `Backoff`, `Stopping`, `Stopped`, `Failed`) rather than
+assuming optimistic state.
+
+`camera.probe` is implemented in `nian-media-worker`, not Tauri. It opens only the
+source under a bounded deadline, returns safe stream summary fields, then closes;
+it never acquires a camera recording lease or touches storage. The desktop can
+probe an unsaved form. An edit with blank password can reuse the committed secret
+to test a changed non-secret endpoint without exposing that secret to React.
+
+M5 deliberately chooses **session-only desired recording state**. Camera and
+storage configuration is restored after desktop restart, but recording does not
+auto-start. Native tray/autostart/power lifecycle belongs to M7. Playback, live
+view, thumbnails and timeline behavior have not been started; they remain M6.
+See ADR-0008.
 
 ## Failure model
 

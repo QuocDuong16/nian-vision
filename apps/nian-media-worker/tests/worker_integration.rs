@@ -148,3 +148,103 @@ fn failed_probe_prints_no_report() {
         "failed probe must not print a report"
     );
 }
+
+fn request_with_params(id: u64, name: &str, params: serde_json::Value) -> String {
+    serde_json::json!({
+        "type": "request",
+        "v": PROTOCOL_VERSION,
+        "id": id,
+        "method": name,
+        "params": params,
+    })
+    .to_string()
+        + "\n"
+}
+
+#[test]
+fn ipc_camera_probe_reports_local_video_without_creating_recording_artifacts() {
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/nian-media-ffmpeg/tests/fixtures/sample_av.mkv");
+    let temp = tempfile::tempdir().unwrap();
+    let before = std::fs::read_dir(temp.path()).unwrap().count();
+
+    let mut child = spawn_run();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut stdin = child.stdin.take().unwrap();
+    let _hello = read_message(&mut reader);
+
+    stdin
+        .write_all(
+            request_with_params(
+                1,
+                "camera.probe",
+                serde_json::json!({
+                    "source": {"kind":"file", "path": fixture},
+                    "timeout_ms": 5_000,
+                }),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let Envelope::Response { id, ok, result, .. } = read_message(&mut reader) else {
+        panic!("expected probe response");
+    };
+    assert_eq!(id, 1);
+    assert!(ok);
+    assert_eq!(result["reachable"], true);
+    assert_eq!(result["video_stream_found"], true);
+    assert!(result["codec"].is_string());
+    assert!(result["width"].is_u64());
+    assert!(result["height"].is_u64());
+
+    stdin
+        .write_all(request(2, method::SHUTDOWN).as_bytes())
+        .unwrap();
+    let _ = read_message(&mut reader);
+    assert!(child.wait().unwrap().success());
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), before);
+}
+
+#[test]
+fn ipc_camera_probe_unreachable_source_returns_typed_bounded_failure() {
+    let mut child = spawn_run();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut stdin = child.stdin.take().unwrap();
+    let _hello = read_message(&mut reader);
+
+    let started = std::time::Instant::now();
+    stdin
+        .write_all(
+            request_with_params(
+                1,
+                "camera.probe",
+                serde_json::json!({
+                    "source": {"kind":"rtsp", "url":"rtsp://127.0.0.1:9/stream1"},
+                    "timeout_ms": 1_000,
+                }),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let Envelope::Response {
+        id, ok, error_code, ..
+    } = read_message(&mut reader)
+    else {
+        panic!("expected probe failure response");
+    };
+    assert_eq!(id, 1);
+    assert!(!ok);
+    assert!(matches!(
+        error_code.as_deref(),
+        Some("source_open_failed" | "source_timeout")
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+
+    stdin
+        .write_all(request(2, method::SHUTDOWN).as_bytes())
+        .unwrap();
+    let _ = read_message(&mut reader);
+    assert!(child.wait().unwrap().success());
+}

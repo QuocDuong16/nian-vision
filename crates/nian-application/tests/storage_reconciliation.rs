@@ -226,6 +226,33 @@ fn incremental_upsert_records_trusted_duration_without_owning_publication() {
 }
 
 #[test]
+fn reconciliation_clears_trusted_duration_when_same_path_file_generation_changes() {
+    let (_temp, layout, camera) = fixture();
+    let started_at = at("2026-08-29T08:30:00");
+    let media = recording(&layout, &camera, started_at, "08-30-00.mkv", 123);
+    let mut manager = manager(layout);
+
+    manager
+        .upsert_finalized(&camera, &media, started_at, 123, Some(9_876))
+        .unwrap();
+    assert_eq!(
+        manager.list_camera(&camera).unwrap()[0].media_duration_ms,
+        Some(9_876)
+    );
+
+    // Same canonical path, but filesystem metadata proves the bytes were
+    // replaced. Reconciliation must not attach the previous generation's
+    // trusted duration to the new file and must not invoke FFmpeg to guess it.
+    std::fs::write(&media, vec![0_u8; 321]).unwrap();
+    let report = manager.reconcile().unwrap();
+
+    assert_eq!(report.updated, 1);
+    let rows = manager.list_camera(&camera).unwrap();
+    assert_eq!(rows[0].size_bytes, 321);
+    assert_eq!(rows[0].media_duration_ms, None);
+}
+
+#[test]
 fn incremental_upsert_normalizes_subsecond_normal_recording_identity() {
     let (_temp, layout, camera) = fixture();
     let event_started_at = at_fractional("2026-08-29T08:30:00.877123456");

@@ -129,6 +129,7 @@ fn desired(camera: &str) -> DesiredRecording {
         storage_root: "/tmp".to_owned(),
         source_json: serde_json::json!({"kind": "file", "path": "/dev/null"}),
         segment_target_secs: 300,
+        copy_audio: true,
     }
 }
 

@@ -134,6 +134,7 @@ fn supervisor_restarts_crashed_worker_and_restores_recording_state() -> Result<(
         storage_root: storage.to_string_lossy().into_owned(),
         source_json: serde_json::json!({ "kind": "file", "path": fixture }),
         segment_target_secs: 5,
+        copy_audio: true,
     });
 
     // ---- Episode 1: killed mid-recording => retryable episode -------------
@@ -251,6 +252,7 @@ fn real_worker_file_eof_is_job_completed_cleanly_through_status() {
         storage_root: temp.path().join("rec").to_string_lossy().into_owned(),
         source_json: serde_json::json!({ "kind": "file", "path": fixture }),
         segment_target_secs: 5,
+        copy_audio: true,
     });
 
     let started = Instant::now();
@@ -312,6 +314,7 @@ fn real_worker_permanent_job_failure_observed_while_process_alive() {
             "path": "/nonexistent/nian-vision-missing-source.mkv"
         }),
         segment_target_secs: 5,
+        copy_audio: true,
     });
 
     match supervisor.run_one_episode(&|| false) {

@@ -17,6 +17,22 @@ pub const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 pub struct FfmpegBackend;
 
 impl FfmpegBackend {
+    /// Probes with a caller-supplied bounded deadline.
+    pub fn probe_with_timeout(
+        &self,
+        source: &MediaSource,
+        timeout: Duration,
+    ) -> Result<MediaProbeReport, MediaError> {
+        let interrupt = InterruptHandle::new();
+        let _deadline = interrupt.scoped_deadline(timeout);
+        let input = MediaInput::open(source, &interrupt)?;
+        Ok(MediaProbeReport {
+            format_name: input.format_name(),
+            duration: input.duration(),
+            streams: input.streams(),
+        })
+    }
+
     /// Validates the loaded FFmpeg runtime against the compiled-in ABI and
     /// initializes the network layer.
     ///
@@ -30,19 +46,6 @@ impl FfmpegBackend {
 
 impl Probe for FfmpegBackend {
     fn probe(&self, source: &MediaSource) -> Result<MediaProbeReport, MediaError> {
-        let interrupt = InterruptHandle::new();
-        // RAII-scoped so the deadline cannot outlive the probe (M3 §5).
-        let _deadline = interrupt.scoped_deadline(PROBE_DEADLINE);
-
-        let input = MediaInput::open(source, &interrupt)?;
-        let format_name = input.format_name();
-        let duration = input.duration();
-        let streams = input.streams();
-
-        Ok(MediaProbeReport {
-            format_name,
-            duration,
-            streams,
-        })
+        self.probe_with_timeout(source, PROBE_DEADLINE)
     }
 }

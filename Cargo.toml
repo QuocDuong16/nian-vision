@@ -11,6 +11,7 @@ members = [
     "crates/nian-media",
     "crates/nian-media-ffmpeg",
     "crates/nian-recorder",
+    "crates/nian-settings",
     "crates/nian-storage",
     "tools/bindgen-gen",
 ]
@@ -27,6 +28,7 @@ default-members = [
     "crates/nian-media",
     "crates/nian-media-ffmpeg",
     "crates/nian-recorder",
+    "crates/nian-settings",
     "crates/nian-storage",
 ]
 
@@ -55,8 +57,10 @@ nian-index = { path = "crates/nian-index" }
 nian-media = { path = "crates/nian-media" }
 nian-media-ffmpeg = { path = "crates/nian-media-ffmpeg" }
 nian-recorder = { path = "crates/nian-recorder" }
+nian-settings = { path = "crates/nian-settings" }
 nian-storage = { path = "crates/nian-storage" }
 
+keyring = { version = "=4.1.6", default-features = true }
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
 # Two-stage Ctrl+C handling for the manual recording smoke command.
 ctrlc = "=3.5.2"

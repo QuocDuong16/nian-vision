@@ -142,3 +142,212 @@ body {
   background: #1e293b;
   color: #94a3b8;
 }
+
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  padding: 8px 12px;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  background: #172033;
+  color: #cbd5e1;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: #1e293b;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.primary-button {
+  border-color: #0369a1;
+  background: #075985;
+  color: #e0f2fe;
+}
+
+.primary-button:hover:not(:disabled) {
+  background: #0369a1;
+}
+
+.danger-button {
+  border-color: #991b1b;
+  background: #7f1d1d;
+  color: #fee2e2;
+}
+
+.screen-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.screen-toolbar,
+.panel-heading,
+.camera-card-head,
+.button-row,
+.form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.screen-toolbar h2,
+.panel h3,
+.camera-card h3 {
+  margin: 0;
+}
+
+.screen-toolbar p,
+.panel-heading p,
+.camera-metrics {
+  margin: 4px 0 0;
+}
+
+.camera-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+.camera-card,
+.panel {
+  border: 1px solid #293548;
+  border-radius: 12px;
+  background: #111a2b;
+  padding: 16px;
+}
+
+.camera-card code,
+.panel code {
+  color: #94a3b8;
+  overflow-wrap: anywhere;
+}
+
+.camera-placeholder {
+  display: grid;
+  place-items: center;
+  min-height: 120px;
+  margin: 16px 0;
+  border: 1px dashed #334155;
+  border-radius: 10px;
+  color: #475569;
+  background: #0d1524;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.form-grid .panel-heading,
+.form-grid .warning-message,
+.form-grid .success-message,
+.form-grid .form-actions,
+.full-width {
+  grid-column: 1 / -1;
+}
+
+.form-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: #cbd5e1;
+  font-size: 13px;
+}
+
+.form-grid input,
+.form-grid select {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  background: #0b1220;
+  color: #e2e8f0;
+}
+
+.form-grid input:focus,
+.form-grid select:focus {
+  outline: 2px solid #0369a1;
+  outline-offset: 1px;
+}
+
+.error-banner,
+.warning-message,
+.success-message {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+}
+
+.error-banner {
+  border: 1px solid #7f1d1d;
+  background: #2b1015;
+  color: #fecaca;
+}
+
+.warning-message {
+  border: 1px solid #92400e;
+  background: #2b1a08;
+  color: #fde68a;
+}
+
+.success-message {
+  border: 1px solid #166534;
+  background: #082b19;
+  color: #bbf7d0;
+}
+
+.confirmation {
+  border-color: #7f1d1d;
+}
+
+.chip-stopped {
+  background: #1e293b;
+  color: #94a3b8;
+}
+
+.chip-starting,
+.chip-recovering,
+.chip-connecting,
+.chip-backoff,
+.chip-stopping {
+  background: #451a03;
+  color: #fbbf24;
+}
+
+.chip-failed {
+  background: #450a0a;
+  color: #f87171;
+}
+
+@media (max-width: 720px) {
+  .sidebar {
+    width: 150px;
+  }
+
+  .app-content {
+    padding: 20px;
+  }
+
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .screen-toolbar,
+  .camera-card-head,
+  .panel-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

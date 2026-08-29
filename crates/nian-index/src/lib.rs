@@ -370,18 +370,14 @@ impl RecordingIndex {
                     started_at=excluded.started_at,
                     sequence=excluded.sequence,
                     size_bytes=excluded.size_bytes,
-                    media_duration_ms=COALESCE(
-                        excluded.media_duration_ms,
-                        recordings.media_duration_ms
-                    )
+                    media_duration_ms=excluded.media_duration_ms
                  WHERE camera_id != excluded.camera_id
                     OR kind != excluded.kind
                     OR state != excluded.state
                     OR started_at != excluded.started_at
                     OR sequence != excluded.sequence
                     OR size_bytes != excluded.size_bytes
-                    OR (excluded.media_duration_ms IS NOT NULL
-                        AND media_duration_ms IS NOT excluded.media_duration_ms)",
+                    OR media_duration_ms IS NOT excluded.media_duration_ms",
                 params![
                     recording.camera_id.as_str(),
                     recording.relative_path,

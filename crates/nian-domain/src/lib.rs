@@ -30,7 +30,10 @@ pub mod retention;
 pub mod secret;
 
 pub use backoff::ReconnectBackoff;
-pub use camera::{CameraEndpoint, CameraState, Credentials};
+pub use camera::{
+    AudioPolicy, CameraConfig, CameraEndpoint, CameraSource, CameraState, CredentialRef,
+    Credentials, Host,
+};
 pub use error::DomainError;
 pub use ids::{CameraId, RecordingId};
 pub use media::{MediaPacketMetadata, MediaProbeReport, MediaRational, MediaStreamInfo, MediaType};

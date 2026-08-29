@@ -179,13 +179,7 @@ impl RecorderConfig {
 }
 
 /// Which streams accompany the primary video stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioPolicy {
-    /// Stream-copy every audio stream found next to the video stream.
-    CopyAll,
-    /// Record video only.
-    Exclude,
-}
+pub use nian_domain::AudioPolicy;
 
 /// How a recording loop ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
