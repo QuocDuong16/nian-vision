@@ -10,7 +10,7 @@ use nian_domain::{
     AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Credentials,
     Host, RetentionPolicy, StorageQuota,
 };
-use nian_settings::{ApplicationSettings, SettingsStore};
+use nian_settings::{ApplicationSettings, SettingsError, SettingsStore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -40,6 +40,14 @@ impl CredentialStoreError {
     pub const fn new(operation: &'static str) -> Self {
         Self { operation }
     }
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum SettingsRepositoryError {
+    #[error("camera already exists")]
+    DuplicateCamera,
+    #[error("settings repository operation failed")]
+    Persistence,
 }
 
 /// CI/test credential store that never reaches a graphical/native keychain.
@@ -82,36 +90,54 @@ impl CredentialStore for MemoryCredentialStore {
 /// Persistence seam used by fault-injection tests. Production is backed by
 /// `nian-settings`, whose database lives in platform app-data, not footage.
 pub trait SettingsRepository: Send {
-    fn list_cameras(&self) -> Result<Vec<CameraConfig>, String>;
-    fn get_camera(&self, camera_id: &CameraId) -> Result<Option<CameraConfig>, String>;
-    fn insert_camera(&mut self, camera: &CameraConfig) -> Result<(), String>;
-    fn update_camera(&mut self, camera: &CameraConfig) -> Result<bool, String>;
-    fn delete_camera(&mut self, camera_id: &CameraId) -> Result<bool, String>;
-    fn application_settings(&self) -> Result<ApplicationSettings, String>;
-    fn save_application_settings(&mut self, settings: &ApplicationSettings) -> Result<(), String>;
+    fn list_cameras(&self) -> Result<Vec<CameraConfig>, SettingsRepositoryError>;
+    fn get_camera(
+        &self,
+        camera_id: &CameraId,
+    ) -> Result<Option<CameraConfig>, SettingsRepositoryError>;
+    fn insert_camera(&mut self, camera: &CameraConfig) -> Result<(), SettingsRepositoryError>;
+    fn update_camera(&mut self, camera: &CameraConfig) -> Result<bool, SettingsRepositoryError>;
+    fn delete_camera(&mut self, camera_id: &CameraId) -> Result<bool, SettingsRepositoryError>;
+    fn application_settings(&self) -> Result<ApplicationSettings, SettingsRepositoryError>;
+    fn save_application_settings(
+        &mut self,
+        settings: &ApplicationSettings,
+    ) -> Result<(), SettingsRepositoryError>;
 }
 
 impl SettingsRepository for SettingsStore {
-    fn list_cameras(&self) -> Result<Vec<CameraConfig>, String> {
-        SettingsStore::list_cameras(self).map_err(|error| error.to_string())
+    fn list_cameras(&self) -> Result<Vec<CameraConfig>, SettingsRepositoryError> {
+        SettingsStore::list_cameras(self).map_err(repository_error)
     }
-    fn get_camera(&self, camera_id: &CameraId) -> Result<Option<CameraConfig>, String> {
-        SettingsStore::get_camera(self, camera_id).map_err(|error| error.to_string())
+
+    fn get_camera(
+        &self,
+        camera_id: &CameraId,
+    ) -> Result<Option<CameraConfig>, SettingsRepositoryError> {
+        SettingsStore::get_camera(self, camera_id).map_err(repository_error)
     }
-    fn insert_camera(&mut self, camera: &CameraConfig) -> Result<(), String> {
-        SettingsStore::insert_camera(self, camera).map_err(|error| error.to_string())
+
+    fn insert_camera(&mut self, camera: &CameraConfig) -> Result<(), SettingsRepositoryError> {
+        SettingsStore::insert_camera(self, camera).map_err(repository_error)
     }
-    fn update_camera(&mut self, camera: &CameraConfig) -> Result<bool, String> {
-        SettingsStore::update_camera(self, camera).map_err(|error| error.to_string())
+
+    fn update_camera(&mut self, camera: &CameraConfig) -> Result<bool, SettingsRepositoryError> {
+        SettingsStore::update_camera(self, camera).map_err(repository_error)
     }
-    fn delete_camera(&mut self, camera_id: &CameraId) -> Result<bool, String> {
-        SettingsStore::delete_camera(self, camera_id).map_err(|error| error.to_string())
+
+    fn delete_camera(&mut self, camera_id: &CameraId) -> Result<bool, SettingsRepositoryError> {
+        SettingsStore::delete_camera(self, camera_id).map_err(repository_error)
     }
-    fn application_settings(&self) -> Result<ApplicationSettings, String> {
-        SettingsStore::application_settings(self).map_err(|error| error.to_string())
+
+    fn application_settings(&self) -> Result<ApplicationSettings, SettingsRepositoryError> {
+        SettingsStore::application_settings(self).map_err(repository_error)
     }
-    fn save_application_settings(&mut self, settings: &ApplicationSettings) -> Result<(), String> {
-        SettingsStore::save_application_settings(self, settings).map_err(|error| error.to_string())
+
+    fn save_application_settings(
+        &mut self,
+        settings: &ApplicationSettings,
+    ) -> Result<(), SettingsRepositoryError> {
+        SettingsStore::save_application_settings(self, settings).map_err(repository_error)
     }
 }
 
@@ -171,12 +197,16 @@ pub enum CameraServiceError {
     Validation(String),
     #[error("camera not found")]
     CameraNotFound,
+    #[error("camera already exists")]
+    DuplicateCamera,
     #[error("camera is actively recording")]
     CameraBusy,
     #[error("credential store unavailable")]
     CredentialStore(#[from] CredentialStoreError),
     #[error("settings persistence failed")]
     Settings,
+    #[error("credential rollback cleanup failed after {operation}")]
+    CredentialRollbackCleanup { operation: &'static str },
     #[error("recording storage is not configured")]
     StorageNotConfigured,
 }
@@ -246,7 +276,7 @@ impl CameraService {
     pub fn list_cameras(&self) -> Result<Vec<CameraSummary>, CameraServiceError> {
         self.repository
             .list_cameras()
-            .map_err(|_| CameraServiceError::Settings)
+            .map_err(map_repository_service_error)
             .map(|rows| rows.iter().map(CameraSummary::from).collect())
     }
 
@@ -254,7 +284,7 @@ impl CameraService {
         let id = parse_camera_id(camera_id)?;
         self.repository
             .get_camera(&id)
-            .map_err(|_| CameraServiceError::Settings)?
+            .map_err(map_repository_service_error)?
             .as_ref()
             .map(CameraSummary::from)
             .ok_or(CameraServiceError::CameraNotFound)
@@ -269,19 +299,23 @@ impl CameraService {
                 "username/password are required when creating a camera".to_owned(),
             )
         })?;
-        if credentials.username.trim().is_empty() {
-            return Err(CameraServiceError::Validation(
-                "username must not be empty".to_owned(),
-            ));
-        }
+        validate_credentials(&credentials)?;
+
         let camera_id = parse_camera_id(&draft.camera_id)?;
         let credential_ref = next_credential_ref(&camera_id)?;
+        // Construct the complete validated config before the first secret-store
+        // side effect. Generating the opaque reference above is side-effect free.
         let config = config_from_draft(&draft, camera_id, credential_ref.clone())?;
 
         self.credentials.put(&credential_ref, &credentials)?;
-        if self.repository.insert_camera(&config).is_err() {
-            let _ = self.credentials.delete(&credential_ref);
-            return Err(CameraServiceError::Settings);
+        if let Err(error) = self.repository.insert_camera(&config) {
+            let original = map_repository_service_error(error);
+            return Err(rollback_new_credential(
+                self.credentials.as_ref(),
+                &credential_ref,
+                "create",
+                original,
+            ));
         }
 
         Ok(CameraMutation {
@@ -299,10 +333,14 @@ impl CameraService {
         let previous = self
             .repository
             .get_camera(&camera_id)
-            .map_err(|_| CameraServiceError::Settings)?
+            .map_err(map_repository_service_error)?
             .ok_or(CameraServiceError::CameraNotFound)?;
 
         let endpoint = endpoint_from_draft(&draft)?;
+        if let Some(credentials) = &draft.replacement_credentials {
+            validate_credentials(credentials)?;
+        }
+
         let critical_change = previous.source() != &CameraSource::Rtsp(endpoint.clone())
             || previous.audio_policy() != draft.audio_policy
             || draft.replacement_credentials.is_some();
@@ -310,42 +348,55 @@ impl CameraService {
             return Err(CameraServiceError::CameraBusy);
         }
 
-        let (credential_ref, old_ref, wrote_new_secret) =
-            if let Some(credentials) = &draft.replacement_credentials {
-                if credentials.username.trim().is_empty() {
-                    return Err(CameraServiceError::Validation(
-                        "username must not be empty".to_owned(),
-                    ));
-                }
-                let new_ref = next_credential_ref(&camera_id)?;
-                self.credentials.put(&new_ref, credentials)?;
-                (new_ref, Some(previous.credential_ref().clone()), true)
-            } else {
-                (previous.credential_ref().clone(), None, false)
-            };
-
+        let replacing_credentials = draft.replacement_credentials.is_some();
+        let credential_ref = if replacing_credentials {
+            next_credential_ref(&camera_id)?
+        } else {
+            previous.credential_ref().clone()
+        };
+        // Validate every ordinary camera field before mutating the credential
+        // store, so malformed requests cannot orphan a freshly-written secret.
         let updated = CameraConfig::new(
-            camera_id.clone(),
-            draft.display_name,
+            camera_id,
+            draft.display_name.clone(),
             CameraSource::Rtsp(endpoint),
             draft.audio_policy,
             credential_ref.clone(),
         )
         .map_err(|error| CameraServiceError::Validation(error.to_string()))?;
 
+        let old_ref = replacing_credentials.then(|| previous.credential_ref().clone());
+        if let Some(credentials) = &draft.replacement_credentials {
+            self.credentials.put(&credential_ref, credentials)?;
+        }
+
         match self.repository.update_camera(&updated) {
             Ok(true) => {}
             Ok(false) => {
-                if wrote_new_secret {
-                    let _ = self.credentials.delete(&credential_ref);
-                }
-                return Err(CameraServiceError::CameraNotFound);
+                let error = CameraServiceError::CameraNotFound;
+                return Err(if replacing_credentials {
+                    rollback_new_credential(
+                        self.credentials.as_ref(),
+                        &credential_ref,
+                        "update",
+                        error,
+                    )
+                } else {
+                    error
+                });
             }
-            Err(_) => {
-                if wrote_new_secret {
-                    let _ = self.credentials.delete(&credential_ref);
-                }
-                return Err(CameraServiceError::Settings);
+            Err(repository_error) => {
+                let error = map_repository_service_error(repository_error);
+                return Err(if replacing_credentials {
+                    rollback_new_credential(
+                        self.credentials.as_ref(),
+                        &credential_ref,
+                        "update",
+                        error,
+                    )
+                } else {
+                    error
+                });
             }
         }
 
@@ -373,12 +424,12 @@ impl CameraService {
         let existing = self
             .repository
             .get_camera(&camera_id)
-            .map_err(|_| CameraServiceError::Settings)?
+            .map_err(map_repository_service_error)?
             .ok_or(CameraServiceError::CameraNotFound)?;
         if !self
             .repository
             .delete_camera(&camera_id)
-            .map_err(|_| CameraServiceError::Settings)?
+            .map_err(map_repository_service_error)?
         {
             return Err(CameraServiceError::CameraNotFound);
         }
@@ -397,7 +448,7 @@ impl CameraService {
         self.repository
             .application_settings()
             .map(ApplicationSettingsDto::from)
-            .map_err(|_| CameraServiceError::Settings)
+            .map_err(map_repository_service_error)
     }
 
     pub fn save_application_settings(
@@ -453,7 +504,7 @@ impl CameraService {
         };
         self.repository
             .save_application_settings(&settings)
-            .map_err(|_| CameraServiceError::Settings)?;
+            .map_err(map_repository_service_error)?;
         Ok(settings.into())
     }
 
@@ -465,13 +516,14 @@ impl CameraService {
         let camera = self
             .repository
             .get_camera(&camera_id)
-            .map_err(|_| CameraServiceError::Settings)?
+            .map_err(map_repository_service_error)?
             .ok_or(CameraServiceError::CameraNotFound)?;
         let credentials = self.credentials.get(camera.credential_ref())?;
+        validate_credentials(&credentials)?;
         let settings = self
             .repository
             .application_settings()
-            .map_err(|_| CameraServiceError::Settings)?;
+            .map_err(map_repository_service_error)?;
         let storage_root = settings
             .storage_root
             .ok_or(CameraServiceError::StorageNotConfigured)?;
@@ -501,9 +553,10 @@ impl CameraService {
         let camera = self
             .repository
             .get_camera(&camera_id)
-            .map_err(|_| CameraServiceError::Settings)?
+            .map_err(map_repository_service_error)?
             .ok_or(CameraServiceError::CameraNotFound)?;
         let credentials = self.credentials.get(camera.credential_ref())?;
+        validate_credentials(&credentials)?;
         let CameraSource::Rtsp(endpoint) = camera.source();
         prepared_probe(camera_id.as_str(), endpoint, &credentials, timeout_ms)
     }
@@ -521,25 +574,22 @@ impl CameraService {
         let endpoint = endpoint_from_draft(draft)?;
         let credentials = match &draft.replacement_credentials {
             Some(credentials) => {
-                if credentials.username.trim().is_empty() {
-                    return Err(CameraServiceError::Validation(
-                        "username must not be empty when testing replacement credentials"
-                            .to_owned(),
-                    ));
-                }
+                validate_credentials(credentials)?;
                 credentials.clone()
             }
             None => {
                 let existing = self
                     .repository
                     .get_camera(&camera_id)
-                    .map_err(|_| CameraServiceError::Settings)?
+                    .map_err(map_repository_service_error)?
                     .ok_or_else(|| {
                         CameraServiceError::Validation(
                             "username/password are required when testing a new camera".to_owned(),
                         )
                     })?;
-                self.credentials.get(existing.credential_ref())?
+                let credentials = self.credentials.get(existing.credential_ref())?;
+                validate_credentials(&credentials)?;
+                credentials
             }
         };
         prepared_probe(camera_id.as_str(), &endpoint, &credentials, timeout_ms)
@@ -549,6 +599,41 @@ impl CameraService {
 impl From<crate::ApplicationError> for CameraServiceError {
     fn from(value: crate::ApplicationError) -> Self {
         Self::Validation(value.to_string())
+    }
+}
+
+fn validate_credentials(credentials: &Credentials) -> Result<(), CameraServiceError> {
+    credentials
+        .validate()
+        .map_err(|error| CameraServiceError::Validation(error.to_string()))
+}
+
+fn rollback_new_credential(
+    store: &dyn CredentialStore,
+    reference: &CredentialRef,
+    operation: &'static str,
+    original: CameraServiceError,
+) -> CameraServiceError {
+    if store.delete(reference).is_err() {
+        CameraServiceError::CredentialRollbackCleanup { operation }
+    } else {
+        original
+    }
+}
+
+fn repository_error(error: SettingsError) -> SettingsRepositoryError {
+    match error {
+        SettingsError::DuplicateCamera(_) => SettingsRepositoryError::DuplicateCamera,
+        SettingsError::Database(_)
+        | SettingsError::FutureSchema { .. }
+        | SettingsError::InvalidData(_) => SettingsRepositoryError::Persistence,
+    }
+}
+
+fn map_repository_service_error(error: SettingsRepositoryError) -> CameraServiceError {
+    match error {
+        SettingsRepositoryError::DuplicateCamera => CameraServiceError::DuplicateCamera,
+        SettingsRepositoryError::Persistence => CameraServiceError::Settings,
     }
 }
 

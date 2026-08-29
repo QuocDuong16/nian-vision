@@ -61,13 +61,18 @@ struct CameraCommandInput {
 }
 
 impl CameraCommandInput {
-    fn into_draft(self) -> CameraDraft {
-        let replacement_credentials = if self.password.is_empty() {
-            None
-        } else {
-            Some(Credentials::new(self.username, self.password))
+    fn into_draft(self) -> Result<CameraDraft, DesktopErrorDto> {
+        let replacement_credentials = match (self.username.is_empty(), self.password.is_empty()) {
+            (true, true) => None,
+            (false, false) => Some(Credentials::new(self.username, self.password)),
+            _ => {
+                return Err(DesktopErrorDto::new(
+                    "validation",
+                    "username and password must be supplied together",
+                ));
+            }
         };
-        CameraDraft {
+        Ok(CameraDraft {
             camera_id: self.camera_id,
             display_name: self.display_name,
             host: self.host,
@@ -75,7 +80,7 @@ impl CameraCommandInput {
             path: self.path,
             audio_policy: self.audio_policy,
             replacement_credentials,
-        }
+        })
     }
 }
 
@@ -177,7 +182,7 @@ fn camera_create(
 ) -> Result<nian_application::CameraMutation<CameraSummary>, DesktopErrorDto> {
     let _gate = lock(&state.control_gate)?;
     lock(&state.camera_service)?
-        .create_camera(input.into_draft())
+        .create_camera(input.into_draft()?)
         .map_err(map_camera_error)
 }
 
@@ -191,7 +196,7 @@ fn camera_update(
         .active_camera()
         .map_err(map_recording_error)?;
     lock(&state.camera_service)?
-        .update_camera(input.into_draft(), active.as_ref())
+        .update_camera(input.into_draft()?, active.as_ref())
         .map_err(map_camera_error)
 }
 
@@ -216,7 +221,7 @@ fn camera_probe(
 ) -> Result<ProbeResult, DesktopErrorDto> {
     // Prepare a secret-bearing immutable snapshot while holding the service
     // lock, then release it before the bounded worker process does network I/O.
-    let draft = input.camera.into_draft();
+    let draft = input.camera.into_draft()?;
     let request = lock(&state.camera_service)?
         .prepare_probe_draft(&draft, input.timeout_ms)
         .map_err(map_camera_error)?;
@@ -298,12 +303,19 @@ fn map_camera_error(error: CameraServiceError) -> DesktopErrorDto {
         CameraServiceError::CameraNotFound => {
             DesktopErrorDto::new("camera_not_found", "camera was not found")
         }
+        CameraServiceError::DuplicateCamera => {
+            DesktopErrorDto::new("duplicate_camera", "camera ID already exists")
+        }
         CameraServiceError::CameraBusy => {
             DesktopErrorDto::new("camera_busy", "camera is actively recording")
         }
         CameraServiceError::CredentialStore(_) => {
             DesktopErrorDto::new("credential_store", "credential store operation failed")
         }
+        CameraServiceError::CredentialRollbackCleanup { .. } => DesktopErrorDto::new(
+            "credential_rollback_cleanup",
+            "credential rollback cleanup failed",
+        ),
         CameraServiceError::StorageNotConfigured => {
             DesktopErrorDto::new("storage_failed", "recording storage is not configured")
         }
@@ -414,5 +426,54 @@ pub fn run() {
             eprintln!("nian-desktop: fatal: {error}");
         }
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn input(username: &str, password: &str) -> CameraCommandInput {
+        CameraCommandInput {
+            camera_id: "front-door".to_owned(),
+            display_name: "Front door".to_owned(),
+            host: "192.168.1.50".to_owned(),
+            port: 554,
+            path: "/stream1".to_owned(),
+            audio_policy: AudioPolicy::CopyAll,
+            username: username.to_owned(),
+            password: password.to_owned(),
+        }
+    }
+
+    #[test]
+    fn credential_fields_must_be_both_empty_or_both_supplied() {
+        assert!(
+            input("", "")
+                .into_draft()
+                .unwrap()
+                .replacement_credentials
+                .is_none()
+        );
+
+        let replacement = input("admin", "password")
+            .into_draft()
+            .unwrap()
+            .replacement_credentials
+            .unwrap();
+        assert_eq!(replacement.username, "admin");
+        assert_eq!(replacement.password(), "password");
+
+        let username_only = match input("admin", "").into_draft() {
+            Ok(_) => panic!("username-only credentials must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(username_only.code, "validation");
+        let password_only = match input("", "password").into_draft() {
+            Ok(_) => panic!("password-only credentials must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(password_only.code, "validation");
     }
 }

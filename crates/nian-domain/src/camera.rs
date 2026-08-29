@@ -8,6 +8,12 @@ use crate::secret::Secret;
 
 /// Maximum user-facing camera display-name length in bytes.
 pub const MAX_DISPLAY_NAME_LEN: usize = 128;
+/// Maximum persisted RTSP path length in bytes.
+pub const MAX_RTSP_PATH_LEN: usize = 4 * 1024;
+/// Maximum camera username length in bytes.
+pub const MAX_CAMERA_USERNAME_LEN: usize = 256;
+/// Maximum camera password length in bytes.
+pub const MAX_CAMERA_PASSWORD_LEN: usize = 512;
 
 /// Default RTSP port.
 pub const DEFAULT_RTSP_PORT: u16 = 554;
@@ -57,6 +63,25 @@ impl Credentials {
     /// Grants access to the password for connection attempts only.
     pub fn password(&self) -> &str {
         self.password.expose()
+    }
+
+    /// Validates credentials before they can be persisted or sent over IPC.
+    pub fn validate(&self) -> Result<(), crate::error::DomainError> {
+        if self.username.trim().is_empty() || self.username.len() > MAX_CAMERA_USERNAME_LEN {
+            return Err(crate::error::DomainError::InvalidEndpoint {
+                reason: format!(
+                    "camera username must be non-empty and at most {MAX_CAMERA_USERNAME_LEN} bytes"
+                ),
+            });
+        }
+        if self.password().is_empty() || self.password().len() > MAX_CAMERA_PASSWORD_LEN {
+            return Err(crate::error::DomainError::InvalidEndpoint {
+                reason: format!(
+                    "camera password must be non-empty and at most {MAX_CAMERA_PASSWORD_LEN} bytes"
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -217,6 +242,11 @@ impl CameraEndpoint {
         if port == 0 {
             return Err(crate::error::DomainError::InvalidEndpoint {
                 reason: "port must be between 1 and 65535".to_owned(),
+            });
+        }
+        if path.len() > MAX_RTSP_PATH_LEN {
+            return Err(crate::error::DomainError::InvalidEndpoint {
+                reason: format!("stream path must be at most {MAX_RTSP_PATH_LEN} bytes"),
             });
         }
         if !path.starts_with('/') {
@@ -485,6 +515,23 @@ mod tests {
         assert!(Host::parse("host/path").is_err());
         assert!(CameraEndpoint::rtsp(Host::parse("h1").unwrap(), "no-slash").is_err());
         assert!(CameraEndpoint::rtsp(Host::parse("h1").unwrap(), "/a@b").is_err());
+        let oversized_path = format!("/{}", "a".repeat(MAX_RTSP_PATH_LEN));
+        assert!(CameraEndpoint::rtsp(Host::parse("h1").unwrap(), oversized_path).is_err());
+    }
+
+    #[test]
+    fn credential_lengths_are_bounded_well_below_ipc_limit() {
+        assert!(Credentials::new("admin", "password").validate().is_ok());
+        assert!(
+            Credentials::new("u".repeat(MAX_CAMERA_USERNAME_LEN + 1), "password")
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Credentials::new("admin", "p".repeat(MAX_CAMERA_PASSWORD_LEN + 1))
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

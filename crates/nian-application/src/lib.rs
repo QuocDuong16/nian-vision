@@ -21,7 +21,7 @@ pub mod supervisor;
 pub use camera_service::{
     ApplicationSettingsDto, CameraDraft, CameraMutation, CameraService, CameraServiceError,
     CameraSummary, CameraWarning, CredentialStore, CredentialStoreError, MemoryCredentialStore,
-    PreparedProbe, SettingsRepository,
+    PreparedProbe, SettingsRepository, SettingsRepositoryError,
 };
 pub use config::{AppConfig, SegmentTargetDuration};
 pub use error::ApplicationError;
@@ -30,7 +30,8 @@ pub use probe_controller::{
 };
 pub use recording_controller::{
     RecordingController, RecordingControllerError, RecordingRunFailure, RecordingRunner,
-    RecordingState, RecordingStatus, SupervisorRecordingRunner,
+    RecordingState, RecordingStatus, RecordingThreadSpawner, StdRecordingThreadSpawner,
+    SupervisorRecordingRunner,
 };
 pub use storage_manager::{
     ArtifactCleanupReport, ReconciliationFailure, ReconciliationFailureKind, ReconciliationReport,

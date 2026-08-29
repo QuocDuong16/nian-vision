@@ -32,7 +32,8 @@ pub mod secret;
 pub use backoff::ReconnectBackoff;
 pub use camera::{
     AudioPolicy, CameraConfig, CameraEndpoint, CameraSource, CameraState, CredentialRef,
-    Credentials, Host,
+    Credentials, Host, MAX_CAMERA_PASSWORD_LEN, MAX_CAMERA_USERNAME_LEN, MAX_DISPLAY_NAME_LEN,
+    MAX_RTSP_PATH_LEN,
 };
 pub use error::DomainError;
 pub use ids::{CameraId, RecordingId};

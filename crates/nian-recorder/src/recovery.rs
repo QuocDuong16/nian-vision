@@ -1885,6 +1885,16 @@ mod fault_injection_tests {
             .unwrap_or(0)
     }
 
+    fn claimed_scratches_for(dir: &Path) -> Vec<PathBuf> {
+        HOOK_SCRATCHES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|path| path.parent() == Some(dir))
+            .cloned()
+            .collect()
+    }
+
     fn seed_original(storage: &Storage) -> (String, PathBuf) {
         let name = __recovery_canonical_name(chrono::Local::now().naive_local());
         let path = storage.day_dir.join(&name);
@@ -2485,10 +2495,7 @@ mod fault_injection_tests {
 
         // Both attempts wrote DISTINCT scratch pathnames — never a shared
         // writable path that could be unlinked under a live writer.
-        let scratches = HOOK_SCRATCHES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let scratches = claimed_scratches_for(&storage.day_dir);
         assert_eq!(scratches.len(), 2, "{scratches:?}");
         assert_ne!(scratches[0], scratches[1]);
         assert!(
@@ -2584,10 +2591,7 @@ mod fault_injection_tests {
         );
         // The probe never completed: NO scratch was ever claimed.
         assert!(
-            HOOK_SCRATCHES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
+            claimed_scratches_for(&storage.day_dir).is_empty(),
             "the alignment phase must exit before scratch acquisition"
         );
         // Original stays safely recoverable; no recovered final; no scratch.
@@ -2669,13 +2673,7 @@ mod fault_injection_tests {
         assert!(!failures[0].error.is_infrastructure());
         assert!(outcomes.is_empty(), "{outcomes:?}");
         // The claim happened (one scratch), but its cleanup removed it.
-        assert_eq!(
-            HOOK_SCRATCHES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            1
-        );
+        assert_eq!(claimed_scratches_for(&storage.day_dir).len(), 1);
         assert_eq!(count_files(&storage.day_dir, false), 0);
         assert_eq!(count_files(&storage.day_dir, true), 1, "original intact");
     }
@@ -2840,7 +2838,7 @@ mod fault_injection_tests {
             .collect::<Vec<_>>();
         assert_eq!(kept, vec![original_path.clone()], "{outcomes:?}");
         assert!(original_path.is_file(), "the original must survive");
-        assert!(HOOK_SCRATCHES.lock().unwrap().is_empty());
+        assert!(claimed_scratches_for(&storage.day_dir).is_empty());
         assert_eq!(count_recordings(&storage.day_dir), 0);
     }
 
@@ -2898,7 +2896,7 @@ mod fault_injection_tests {
             "nothing may publish after the stop: {outcomes:?}"
         );
         assert!(original_path.is_file(), "the original must survive");
-        assert!(HOOK_SCRATCHES.lock().unwrap().is_empty());
+        assert!(claimed_scratches_for(&storage.day_dir).is_empty());
         assert_eq!(count_recordings(&storage.day_dir), 0);
     }
 

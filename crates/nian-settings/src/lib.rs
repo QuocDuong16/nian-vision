@@ -266,7 +266,7 @@ impl SettingsStore {
                     .map_err(|_| SettingsError::InvalidData("cleanup target too large".to_owned()))
             })
             .transpose()?;
-        self.connection.execute(
+        let affected = self.connection.execute(
             "UPDATE application_settings SET storage_root=?1, segment_target_secs=?2, \
              max_age_days=?3, max_storage_bytes=?4, cleanup_target_bytes=?5 WHERE singleton_id=1",
             params![
@@ -280,6 +280,11 @@ impl SettingsStore {
                 cleanup_target
             ],
         )?;
+        if affected != 1 {
+            return Err(SettingsError::InvalidData(format!(
+                "application_settings singleton update affected {affected} rows"
+            )));
+        }
         Ok(())
     }
 }

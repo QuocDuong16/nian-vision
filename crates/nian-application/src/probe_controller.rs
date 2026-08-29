@@ -1,7 +1,7 @@
 //! Serialized one-shot camera probing through the media worker process.
 
 use std::io::BufReader;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -88,20 +88,67 @@ enum ReaderMessage {
     Error,
 }
 
-fn run_worker_probe(program: &str, request: PreparedProbe) -> Result<ProbeResult, ProbeError> {
-    let mut child = Command::new(program)
-        .arg("run")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| ProbeError::WorkerUnavailable)?;
-    let mut stdin = child.stdin.take().ok_or(ProbeError::Protocol)?;
-    let stdout = child.stdout.take().ok_or(ProbeError::Protocol)?;
-    let (tx, rx) = mpsc::channel();
-    std::thread::Builder::new()
-        .name("camera-probe-worker-stdout".to_owned())
-        .spawn(move || {
+trait ProbeSetup: Send + Sync {
+    fn spawn_reader(
+        &self,
+        task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<std::thread::JoinHandle<()>, ProbeError>;
+
+    fn send_request(&self, stdin: &mut ChildStdin, frame: &Envelope) -> Result<(), ProbeError>;
+
+    fn on_reaped(&self, _pid: u32) {}
+}
+
+struct DefaultProbeSetup;
+
+impl ProbeSetup for DefaultProbeSetup {
+    fn spawn_reader(
+        &self,
+        task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<std::thread::JoinHandle<()>, ProbeError> {
+        std::thread::Builder::new()
+            .name("camera-probe-worker-stdout".to_owned())
+            .spawn(task)
+            .map_err(|_| ProbeError::WorkerUnavailable)
+    }
+
+    fn send_request(&self, stdin: &mut ChildStdin, frame: &Envelope) -> Result<(), ProbeError> {
+        FramedWriter::new(stdin)
+            .send(frame)
+            .map_err(|_| ProbeError::WorkerUnavailable)
+    }
+}
+
+struct ProbeChildGuard<'a, S: ProbeSetup> {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    setup: &'a S,
+    cleaned: bool,
+}
+
+impl<'a, S: ProbeSetup> ProbeChildGuard<'a, S> {
+    fn new(mut child: Child, setup: &'a S) -> Self {
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        Self {
+            child,
+            stdin,
+            stdout,
+            reader: None,
+            setup,
+            cleaned: false,
+        }
+    }
+
+    fn stdin_mut(&mut self) -> Result<&mut ChildStdin, ProbeError> {
+        self.stdin.as_mut().ok_or(ProbeError::Protocol)
+    }
+
+    fn start_reader(&mut self, tx: mpsc::Sender<ReaderMessage>) -> Result<(), ProbeError> {
+        let stdout = self.stdout.take().ok_or(ProbeError::Protocol)?;
+        let task = Box::new(move || {
             let mut reader = FramedReader::new(BufReader::new(stdout));
             loop {
                 match reader.next_message() {
@@ -120,8 +167,83 @@ fn run_worker_probe(program: &str, request: PreparedProbe) -> Result<ProbeResult
                     }
                 }
             }
-        })
+        });
+        self.reader = Some(self.setup.spawn_reader(task)?);
+        Ok(())
+    }
+
+    fn cleanup(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        self.cleaned = true;
+        let pid = self.child.id();
+
+        if let Some(stdin) = self.stdin.as_mut() {
+            let shutdown = Envelope::request(2, method::SHUTDOWN);
+            let _ = FramedWriter::new(stdin).send(&shutdown);
+        }
+        // EOF is part of the graceful shutdown contract and also guarantees a
+        // child that ignores the shutdown request cannot wait on our stdin.
+        self.stdin.take();
+        self.stdout.take();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut reaped = false;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    reaped = true;
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+        if !reaped {
+            let _ = self.child.kill();
+            reaped = self.child.wait().is_ok();
+        }
+        if reaped {
+            self.setup.on_reaped(pid);
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+impl<S: ProbeSetup> Drop for ProbeChildGuard<'_, S> {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+fn run_worker_probe(program: &str, request: PreparedProbe) -> Result<ProbeResult, ProbeError> {
+    run_worker_probe_with(program, request, &DefaultProbeSetup)
+}
+
+fn run_worker_probe_with<S: ProbeSetup>(
+    program: &str,
+    request: PreparedProbe,
+    setup: &S,
+) -> Result<ProbeResult, ProbeError> {
+    let child = Command::new(program)
+        .arg("run")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|_| ProbeError::WorkerUnavailable)?;
+    // From this point onward the guard is authoritative for bounded child
+    // cleanup/reap on every return path, including setup/send failures.
+    let mut worker = ProbeChildGuard::new(child, setup);
+    if worker.stdin.is_none() || worker.stdout.is_none() {
+        return Err(ProbeError::Protocol);
+    }
+
+    let (tx, rx) = mpsc::channel();
+    worker.start_reader(tx)?;
 
     let hello_deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -129,14 +251,12 @@ fn run_worker_probe(program: &str, request: PreparedProbe) -> Result<ProbeResult
         match rx.recv_timeout(remaining) {
             Ok(ReaderMessage::Frame(Envelope::Event { v, name, .. })) if name == event::HELLO => {
                 if v != PROTOCOL_VERSION {
-                    cleanup_child(&mut child, &mut stdin);
                     return Err(ProbeError::Protocol);
                 }
                 break;
             }
             Ok(ReaderMessage::Frame(_)) => {}
             Ok(ReaderMessage::Eof | ReaderMessage::Error) | Err(_) => {
-                cleanup_child(&mut child, &mut stdin);
                 return Err(ProbeError::WorkerUnavailable);
             }
         }
@@ -151,9 +271,7 @@ fn run_worker_probe(program: &str, request: PreparedProbe) -> Result<ProbeResult
             "timeout_ms": request.timeout_ms,
         }),
     };
-    FramedWriter::new(&mut stdin)
-        .send(&frame)
-        .map_err(|_| ProbeError::WorkerUnavailable)?;
+    setup.send_request(worker.stdin_mut()?, &frame)?;
 
     let response_deadline =
         Instant::now() + Duration::from_millis(request.timeout_ms) + Duration::from_secs(2);
@@ -195,7 +313,7 @@ fn run_worker_probe(program: &str, request: PreparedProbe) -> Result<ProbeResult
         }
     };
 
-    cleanup_child(&mut child, &mut stdin);
+    worker.cleanup();
     outcome
 }
 
@@ -239,21 +357,6 @@ fn map_probe_code(code: &str) -> ProbeError {
         "source_probe_failed" => ProbeError::SourceProbeFailed,
         _ => ProbeError::Protocol,
     }
-}
-
-fn cleanup_child(child: &mut std::process::Child, stdin: &mut std::process::ChildStdin) {
-    let shutdown = Envelope::request(2, method::SHUTDOWN);
-    let _ = FramedWriter::new(stdin).send(&shutdown);
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(_) => break,
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -313,5 +416,119 @@ mod tests {
         *lock.lock().unwrap() = true;
         condvar.notify_all();
         assert!(first.join().unwrap().is_ok());
+    }
+
+    #[cfg(unix)]
+    struct TestSetup {
+        fail_reader: bool,
+        fail_send: bool,
+        reaped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(unix)]
+    impl ProbeSetup for TestSetup {
+        fn spawn_reader(
+            &self,
+            task: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Result<std::thread::JoinHandle<()>, ProbeError> {
+            if self.fail_reader {
+                Err(ProbeError::WorkerUnavailable)
+            } else {
+                DefaultProbeSetup.spawn_reader(task)
+            }
+        }
+
+        fn send_request(&self, stdin: &mut ChildStdin, frame: &Envelope) -> Result<(), ProbeError> {
+            if self.fail_send {
+                Err(ProbeError::WorkerUnavailable)
+            } else {
+                DefaultProbeSetup.send_request(stdin, frame)
+            }
+        }
+
+        fn on_reaped(&self, _pid: u32) {
+            self.reaped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(unix)]
+    fn probe_worker_script(hello: &str) -> (tempfile::TempDir, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe-worker.sh");
+        let script = format!("#!/bin/sh\nprintf '%s\\n' '{hello}'\ncat >/dev/null\n");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (dir, path.to_string_lossy().into_owned())
+    }
+
+    #[cfg(unix)]
+    const HELLO_OK: &str =
+        r#"{"type":"event","v":1,"name":"hello","data":{"worker":"stub","protocol":1}}"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_setup_failure_after_spawn_reaps_child() {
+        let (_dir, program) = probe_worker_script(HELLO_OK);
+        let reaped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let setup = TestSetup {
+            fail_reader: true,
+            fail_send: false,
+            reaped: Arc::clone(&reaped),
+        };
+
+        assert_eq!(
+            run_worker_probe_with(&program, request(), &setup),
+            Err(ProbeError::WorkerUnavailable)
+        );
+        assert_eq!(reaped.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_request_send_failure_after_spawn_reaps_child() {
+        let (_dir, program) = probe_worker_script(HELLO_OK);
+        let reaped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let setup = TestSetup {
+            fail_reader: false,
+            fail_send: true,
+            reaped: Arc::clone(&reaped),
+        };
+
+        assert_eq!(
+            run_worker_probe_with(&program, request(), &setup),
+            Err(ProbeError::WorkerUnavailable)
+        );
+        assert_eq!(reaped.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protocol_failure_after_spawn_reaps_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe-protocol-worker.sh");
+        let malformed_result = r#"{"type":"response","v":1,"id":1,"ok":true,"result":{}}"#;
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' '{HELLO_OK}'\nIFS= read -r _request\nprintf '%s\\n' '{malformed_result}'\ncat >/dev/null\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let program = path.to_string_lossy().into_owned();
+        let reaped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let setup = TestSetup {
+            fail_reader: false,
+            fail_send: false,
+            reaped: Arc::clone(&reaped),
+        };
+
+        assert_eq!(
+            run_worker_probe_with(&program, request(), &setup),
+            Err(ProbeError::Protocol)
+        );
+        assert_eq!(reaped.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

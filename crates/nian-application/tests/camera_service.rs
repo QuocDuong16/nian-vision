@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use nian_application::{
     ApplicationSettingsDto, CameraDraft, CameraService, CameraServiceError, CameraWarning,
-    CredentialStore, CredentialStoreError, SettingsRepository,
+    CredentialStore, CredentialStoreError, SettingsRepository, SettingsRepositoryError,
 };
 use nian_domain::{
     AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Credentials,
@@ -37,10 +37,13 @@ impl FakeRepo {
 }
 
 impl SettingsRepository for FakeRepo {
-    fn list_cameras(&self) -> Result<Vec<CameraConfig>, String> {
+    fn list_cameras(&self) -> Result<Vec<CameraConfig>, SettingsRepositoryError> {
         Ok(self.0.lock().unwrap().cameras.values().cloned().collect())
     }
-    fn get_camera(&self, camera_id: &CameraId) -> Result<Option<CameraConfig>, String> {
+    fn get_camera(
+        &self,
+        camera_id: &CameraId,
+    ) -> Result<Option<CameraConfig>, SettingsRepositoryError> {
         Ok(self
             .0
             .lock()
@@ -49,23 +52,23 @@ impl SettingsRepository for FakeRepo {
             .get(camera_id.as_str())
             .cloned())
     }
-    fn insert_camera(&mut self, camera: &CameraConfig) -> Result<(), String> {
+    fn insert_camera(&mut self, camera: &CameraConfig) -> Result<(), SettingsRepositoryError> {
         let mut state = self.0.lock().unwrap();
         if state.fail_insert {
-            return Err("injected insert failure".into());
+            return Err(SettingsRepositoryError::Persistence);
         }
         if state.cameras.contains_key(camera.camera_id().as_str()) {
-            return Err("duplicate".into());
+            return Err(SettingsRepositoryError::DuplicateCamera);
         }
         state
             .cameras
             .insert(camera.camera_id().as_str().to_owned(), camera.clone());
         Ok(())
     }
-    fn update_camera(&mut self, camera: &CameraConfig) -> Result<bool, String> {
+    fn update_camera(&mut self, camera: &CameraConfig) -> Result<bool, SettingsRepositoryError> {
         let mut state = self.0.lock().unwrap();
         if state.fail_update {
-            return Err("injected update failure".into());
+            return Err(SettingsRepositoryError::Persistence);
         }
         if !state.cameras.contains_key(camera.camera_id().as_str()) {
             return Ok(false);
@@ -75,14 +78,14 @@ impl SettingsRepository for FakeRepo {
             .insert(camera.camera_id().as_str().to_owned(), camera.clone());
         Ok(true)
     }
-    fn delete_camera(&mut self, camera_id: &CameraId) -> Result<bool, String> {
+    fn delete_camera(&mut self, camera_id: &CameraId) -> Result<bool, SettingsRepositoryError> {
         let mut state = self.0.lock().unwrap();
         if state.fail_delete {
-            return Err("injected delete failure".into());
+            return Err(SettingsRepositoryError::Persistence);
         }
         Ok(state.cameras.remove(camera_id.as_str()).is_some())
     }
-    fn application_settings(&self) -> Result<ApplicationSettings, String> {
+    fn application_settings(&self) -> Result<ApplicationSettings, SettingsRepositoryError> {
         Ok(ApplicationSettings {
             storage_root: Some(PathBuf::from("/tmp/nian-camera-service-test")),
             segment_target_secs: 300,
@@ -90,7 +93,10 @@ impl SettingsRepository for FakeRepo {
             quota: None,
         })
     }
-    fn save_application_settings(&mut self, _settings: &ApplicationSettings) -> Result<(), String> {
+    fn save_application_settings(
+        &mut self,
+        _settings: &ApplicationSettings,
+    ) -> Result<(), SettingsRepositoryError> {
         Ok(())
     }
 }
@@ -101,6 +107,7 @@ struct SecretState {
     puts: Vec<String>,
     deletes: Vec<String>,
     fail_delete_refs: Vec<String>,
+    fail_all_deletes: bool,
 }
 
 #[derive(Default)]
@@ -131,10 +138,11 @@ impl CredentialStore for FakeSecrets {
     fn delete(&self, reference: &CredentialRef) -> Result<(), CredentialStoreError> {
         let mut state = self.0.lock().unwrap();
         state.deletes.push(reference.as_str().to_owned());
-        if state
-            .fail_delete_refs
-            .iter()
-            .any(|value| value == reference.as_str())
+        if state.fail_all_deletes
+            || state
+                .fail_delete_refs
+                .iter()
+                .any(|value| value == reference.as_str())
         {
             return Err(CredentialStoreError::new("delete"));
         }
@@ -378,6 +386,125 @@ fn edited_probe_with_blank_password_reuses_committed_secret_for_new_endpoint() {
     assert!(wire.contains("/stream2"));
     assert!(wire.contains("old-password"));
     assert!(!format!("{probe:?}").contains("old-password"));
+}
+
+#[test]
+fn invalid_display_name_with_replacement_password_writes_no_new_secret() {
+    let (mut service, _repo, secrets) = seeded();
+    let invalid_name = "x".repeat(nian_domain::MAX_DISPLAY_NAME_LEN + 1);
+
+    let error = service
+        .update_camera(draft(&invalid_name, Some("new-password")), None)
+        .unwrap_err();
+    assert!(matches!(error, CameraServiceError::Validation(_)));
+    let state = secrets.0.lock().unwrap();
+    assert!(state.puts.is_empty());
+    assert_eq!(state.entries.len(), 1);
+    assert!(state.entries.contains_key("old-ref"));
+}
+
+#[test]
+fn create_db_failure_and_secret_rollback_failure_is_observable() {
+    let (repo, repo_state) = FakeRepo::new();
+    repo_state.lock().unwrap().fail_insert = true;
+    let secrets = Arc::new(FakeSecrets::default());
+    secrets.0.lock().unwrap().fail_all_deletes = true;
+    let mut service = CameraService::new(Box::new(repo), secrets.clone());
+
+    let error = service
+        .create_camera(draft("Front door", Some("new-password")))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CameraServiceError::CredentialRollbackCleanup {
+            operation: "create"
+        }
+    ));
+    assert!(repo_state.lock().unwrap().cameras.is_empty());
+    assert_eq!(secrets.0.lock().unwrap().entries.len(), 1);
+}
+
+#[test]
+fn update_db_failure_and_secret_rollback_failure_is_observable() {
+    let (mut service, repo, secrets) = seeded();
+    repo.lock().unwrap().fail_update = true;
+    secrets.0.lock().unwrap().fail_all_deletes = true;
+
+    let error = service
+        .update_camera(draft("Front door", Some("new-password")), None)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CameraServiceError::CredentialRollbackCleanup {
+            operation: "update"
+        }
+    ));
+    assert_eq!(
+        repo.lock()
+            .unwrap()
+            .cameras
+            .get("front-door")
+            .unwrap()
+            .credential_ref()
+            .as_str(),
+        "old-ref"
+    );
+}
+
+#[test]
+fn duplicate_camera_id_remains_a_typed_application_error() {
+    let (repo, repo_state) = FakeRepo::new();
+    repo_state
+        .lock()
+        .unwrap()
+        .cameras
+        .insert("front-door".into(), existing("existing-ref"));
+    let secrets = Arc::new(FakeSecrets::default());
+    let mut service = CameraService::new(Box::new(repo), secrets);
+
+    assert!(matches!(
+        service.create_camera(draft("Duplicate", Some("new-password"))),
+        Err(CameraServiceError::DuplicateCamera)
+    ));
+}
+
+#[test]
+fn one_sided_replacement_credentials_are_rejected() {
+    let (mut service, _repo, secrets) = seeded();
+    let mut missing_password = draft("Front door", None);
+    missing_password.replacement_credentials = Some(Credentials::new("new-user", ""));
+    assert!(matches!(
+        service.update_camera(missing_password, None),
+        Err(CameraServiceError::Validation(_))
+    ));
+
+    let mut missing_username = draft("Front door", None);
+    missing_username.replacement_credentials = Some(Credentials::new("", "new-password"));
+    assert!(matches!(
+        service.update_camera(missing_username.clone(), None),
+        Err(CameraServiceError::Validation(_))
+    ));
+    assert!(matches!(
+        service.prepare_probe_draft(&missing_username, 2_000),
+        Err(CameraServiceError::Validation(_))
+    ));
+    assert!(secrets.0.lock().unwrap().puts.is_empty());
+}
+
+#[test]
+fn oversized_rtsp_path_is_rejected_before_persistence_or_secret_write() {
+    let (repo, repo_state) = FakeRepo::new();
+    let secrets = Arc::new(FakeSecrets::default());
+    let mut service = CameraService::new(Box::new(repo), secrets.clone());
+    let mut oversized = draft("Front door", Some("password"));
+    oversized.path = format!("/{}", "a".repeat(nian_domain::MAX_RTSP_PATH_LEN));
+
+    assert!(matches!(
+        service.create_camera(oversized),
+        Err(CameraServiceError::Validation(_))
+    ));
+    assert!(repo_state.lock().unwrap().cameras.is_empty());
+    assert!(secrets.0.lock().unwrap().puts.is_empty());
 }
 
 #[test]

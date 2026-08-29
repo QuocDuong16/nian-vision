@@ -228,3 +228,33 @@ fn incomplete_persisted_quota_is_rejected_instead_of_silently_accepted() {
         Err(SettingsError::InvalidData(_))
     ));
 }
+
+#[test]
+fn missing_singleton_row_makes_save_fail() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.sqlite3");
+    drop(SettingsStore::open(&path).unwrap());
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute("DELETE FROM application_settings WHERE singleton_id=1", [])
+        .unwrap();
+    drop(connection);
+
+    let mut store = SettingsStore::open(&path).unwrap();
+    let error = store
+        .save_application_settings(&ApplicationSettings::default())
+        .unwrap_err();
+    assert!(matches!(error, SettingsError::InvalidData(_)));
+}
+
+#[test]
+fn corrupt_database_bytes_survive_failed_open_unchanged() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.sqlite3");
+    let original = b"not-a-sqlite-database\0authoritative-user-data".to_vec();
+    fs::write(&path, &original).unwrap();
+
+    assert!(SettingsStore::open(&path).is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+}

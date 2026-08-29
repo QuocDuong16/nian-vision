@@ -50,8 +50,12 @@ function validateCamera(form: CameraFormState, creating: boolean): string | null
   if (!form.host.trim()) return "Host or IP address is required.";
   if (!Number.isInteger(form.port) || form.port < 1 || form.port > 65535) return "RTSP port must be between 1 and 65535.";
   if (!form.path.startsWith("/") || /\s|@/.test(form.path)) return "RTSP path must start with / and contain no spaces or @.";
+  if (form.path.length > 4096) return "RTSP path is too long.";
+  if (form.username.length > 256) return "Username is too long.";
+  if (form.password.length > 512) return "Password is too long.";
   if (creating && (!form.username.trim() || !form.password)) return "Username and password are required for a new camera.";
   if (form.password && !form.username.trim()) return "Username is required when replacing the password.";
+  if (form.username.trim() && !form.password) return "Password is required when replacing the username.";
   return null;
 }
 
@@ -327,13 +331,13 @@ export function CamerasScreen() {
             <input aria-label="RTSP port" type="number" min={1} max={65535} value={form.port} disabled={criticalFieldsDisabled} onChange={(e) => patchForm("port", Number(e.target.value))} />
           </label>
           <label>RTSP path
-            <input aria-label="RTSP path" value={form.path} disabled={criticalFieldsDisabled} onChange={(e) => patchForm("path", e.target.value)} />
+            <input aria-label="RTSP path" value={form.path} maxLength={4096} disabled={criticalFieldsDisabled} onChange={(e) => patchForm("path", e.target.value)} />
           </label>
           <label>Username
-            <input aria-label="Username" autoComplete="off" value={form.username} disabled={criticalFieldsDisabled} onChange={(e) => patchForm("username", e.target.value)} placeholder={creating ? "Camera username" : "Leave blank to keep saved credentials"} />
+            <input aria-label="Username" autoComplete="off" value={form.username} maxLength={256} disabled={criticalFieldsDisabled} onChange={(e) => patchForm("username", e.target.value)} placeholder={creating ? "Camera username" : "Leave blank to keep saved credentials"} />
           </label>
           <label>Password
-            <input aria-label="Password" type="password" autoComplete="new-password" value={form.password} disabled={criticalFieldsDisabled} onChange={(e) => patchForm("password", e.target.value)} placeholder={creating ? "Camera password" : "Leave blank to keep saved credentials"} />
+            <input aria-label="Password" type="password" autoComplete="new-password" value={form.password} maxLength={512} disabled={criticalFieldsDisabled} onChange={(e) => patchForm("password", e.target.value)} placeholder={creating ? "Camera password" : "Leave blank to keep saved credentials"} />
           </label>
           <label>Audio policy
             <select aria-label="Audio policy" value={form.audio_policy} disabled={criticalFieldsDisabled} onChange={(e) => patchForm("audio_policy", e.target.value as CameraFormState["audio_policy"])}>
