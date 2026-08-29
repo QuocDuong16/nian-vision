@@ -39,10 +39,13 @@ pub use inventory::{
     inventory_recordings,
 };
 pub use lease::{CAMERA_LEASE_FILE_NAME, CameraLease};
-pub use paths::{RecordingsLayout, SEGMENT_EXTENSION, SEGMENT_PARTIAL_SUFFIX};
+pub use paths::{
+    RecordingsLayout, SEGMENT_EXTENSION, SEGMENT_PARTIAL_SUFFIX, filesystem_identity_datetime,
+};
 pub use recovery::{PartialDisposition, PartialFile, scan_camera_partials};
 pub use transaction::{
-    RECOVERY_TOMBSTONE_MAGIC, RecoveredRetentionState, RecoveryTombstone, RecoveryTransactionPaths,
-    inspect_recovered_retention, parse_recovery_tombstone, published_final_matches,
-    recovery_tombstone_matches, recovery_tombstone_payload, recovery_transaction_paths,
+    PathPresence, RECOVERY_TOMBSTONE_MAGIC, RecoveredRetentionState, RecoveryTombstone,
+    RecoveryTransactionPaths, inspect_path_presence, inspect_recovered_retention,
+    parse_recovery_tombstone, published_final_matches, recovery_tombstone_matches,
+    recovery_tombstone_payload, recovery_transaction_paths,
 };

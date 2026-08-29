@@ -3,14 +3,19 @@
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDateTime;
-use nian_application::StorageManager;
+use nian_application::{StorageManager, StorageManagerError};
 use nian_domain::{CameraId, RetentionPolicy};
+use nian_index::test_hooks;
 use nian_storage::{CameraLease, RecordingsLayout};
 
 const TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 
 fn at(value: &str) -> NaiveDateTime {
     NaiveDateTime::parse_from_str(value, TIME_FORMAT).unwrap()
+}
+
+fn at_fractional(value: &str) -> NaiveDateTime {
+    NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f").unwrap()
 }
 
 fn fixture() -> (tempfile::TempDir, RecordingsLayout, CameraId) {
@@ -218,4 +223,91 @@ fn incremental_upsert_records_trusted_duration_without_owning_publication() {
     let rows = manager.list_camera(&camera).unwrap();
     assert_eq!(rows[0].media_duration_ms, Some(9_876));
     assert!(media.exists());
+}
+
+#[test]
+fn incremental_upsert_normalizes_subsecond_normal_recording_identity() {
+    let (_temp, layout, camera) = fixture();
+    let event_started_at = at_fractional("2026-08-29T08:30:00.877123456");
+    let canonical_started_at = at("2026-08-29T08:30:00");
+    let media = recording(&layout, &camera, canonical_started_at, "08-30-00.mkv", 123);
+    let mut manager = manager(layout);
+
+    assert!(
+        manager
+            .upsert_finalized(&camera, &media, event_started_at, 123, Some(9_876))
+            .unwrap()
+    );
+    let rows = manager.list_camera(&camera).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].started_at, canonical_started_at);
+}
+
+#[test]
+fn incremental_upsert_normalizes_subsecond_recovered_recording_identity() {
+    let (_temp, layout, camera) = fixture();
+    let event_started_at = at_fractional("2026-08-29T08:30:00.877123456");
+    let canonical_started_at = at("2026-08-29T08:30:00");
+    let media = recording(
+        &layout,
+        &camera,
+        canonical_started_at,
+        "08-30-00.recovered.mkv",
+        321,
+    );
+    let mut manager = manager(layout);
+
+    assert!(
+        manager
+            .upsert_finalized(&camera, &media, event_started_at, 321, None)
+            .unwrap()
+    );
+    let rows = manager.list_camera(&camera).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].started_at, canonical_started_at);
+}
+
+#[test]
+fn failed_reconciliation_closes_retention_gate_then_success_restores_it() {
+    let (_temp, layout, camera) = fixture();
+    recording(
+        &layout,
+        &camera,
+        at("2026-08-29T08:30:00"),
+        "08-30-00.mkv",
+        10,
+    );
+    let mut manager = manager(layout);
+    manager.reconcile().unwrap();
+
+    test_hooks::fail_next_list_all(&manager.layout().recording_index_path());
+    assert!(manager.reconcile().is_err());
+    assert!(matches!(
+        manager.run_retention(at("2026-08-29T12:00:00")),
+        Err(StorageManagerError::NotReconciled)
+    ));
+
+    manager.reconcile().unwrap();
+    assert!(manager.run_retention(at("2026-08-29T12:00:00")).is_ok());
+}
+
+#[test]
+fn corruption_after_manager_open_is_repaired_from_filesystem() {
+    let (_temp, layout, camera) = fixture();
+    let media = recording(
+        &layout,
+        &camera,
+        at("2026-08-29T08:30:00"),
+        "08-30-00.mkv",
+        77,
+    );
+    let mut manager = manager(layout.clone());
+    manager.reconcile().unwrap();
+
+    test_hooks::fail_next_list_all_with_corruption(&manager.layout().recording_index_path());
+    let report = manager.reconcile().unwrap();
+    assert_eq!(report.inserted, 1);
+    assert!(manager.was_rebuilt_after_corruption());
+    assert_eq!(manager.list_camera(&camera).unwrap().len(), 1);
+    assert_eq!(std::fs::metadata(&media).unwrap().len(), 77);
 }

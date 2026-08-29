@@ -1,5 +1,7 @@
 //! Non-media recovery transaction evidence shared by recorder and retention.
 
+use std::fs::Metadata;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::{RecordingFileKind, classify_recording_file};
@@ -13,6 +15,31 @@ pub struct RecoveryTombstone {
     pub original: String,
     pub final_name: String,
     pub size_bytes: u64,
+}
+
+/// Typed result of inspecting one transaction path without following symlinks.
+/// Only `Absent` proves the path does not exist.
+#[derive(Debug)]
+pub enum PathPresence {
+    Present(Metadata),
+    Absent,
+    Uninspectable(std::io::Error),
+}
+
+/// Inspects a path while preserving `NotFound` versus all other I/O errors.
+pub fn inspect_path_presence(path: &Path) -> PathPresence {
+    inspect_path_presence_with(path, &|candidate| std::fs::symlink_metadata(candidate))
+}
+
+fn inspect_path_presence_with<F>(path: &Path, metadata: &F) -> PathPresence
+where
+    F: Fn(&Path) -> std::io::Result<Metadata>,
+{
+    match metadata(path) {
+        Ok(metadata) => PathPresence::Present(metadata),
+        Err(error) if error.kind() == ErrorKind::NotFound => PathPresence::Absent,
+        Err(error) => PathPresence::Uninspectable(error),
+    }
 }
 
 /// Serializes the v2 tombstone payload.
@@ -94,34 +121,76 @@ pub enum RecoveredRetentionState {
     },
     /// Transaction is unresolved; preservation wins.
     Blocked { reason: &'static str },
+    /// A required filesystem fact could not be inspected. This is never
+    /// interpreted as absence and therefore never authorizes deletion.
+    InspectionError { path: PathBuf, kind: ErrorKind },
 }
 
 /// Inspects only filesystem transaction evidence. It never mutates media.
 pub fn inspect_recovered_retention(recovered_final: &Path) -> RecoveredRetentionState {
+    inspect_recovered_retention_with(recovered_final, &|candidate| {
+        std::fs::symlink_metadata(candidate)
+    })
+}
+
+fn inspect_recovered_retention_with<F>(
+    recovered_final: &Path,
+    metadata: &F,
+) -> RecoveredRetentionState
+where
+    F: Fn(&Path) -> std::io::Result<Metadata>,
+{
     let Some(paths) = recovery_transaction_paths(recovered_final) else {
         return RecoveredRetentionState::Blocked {
             reason: "not a canonical recovered recording",
         };
     };
-    let Ok(final_metadata) = std::fs::symlink_metadata(&paths.recovered_final) else {
-        return RecoveredRetentionState::Blocked {
-            reason: "recovered final is missing",
-        };
+    let final_metadata = match inspect_path_presence_with(&paths.recovered_final, metadata) {
+        PathPresence::Present(metadata) => metadata,
+        PathPresence::Absent => {
+            return RecoveredRetentionState::Blocked {
+                reason: "recovered final is missing",
+            };
+        }
+        PathPresence::Uninspectable(error) => {
+            return RecoveredRetentionState::InspectionError {
+                path: paths.recovered_final,
+                kind: error.kind(),
+            };
+        }
     };
     if !final_metadata.is_file() {
         return RecoveredRetentionState::Blocked {
             reason: "recovered final is not a regular file",
         };
     }
-    if std::fs::symlink_metadata(&paths.original_partial).is_ok() {
-        return RecoveredRetentionState::Blocked {
-            reason: "original partial still exists",
-        };
+    match inspect_path_presence_with(&paths.original_partial, metadata) {
+        PathPresence::Present(_) => {
+            return RecoveredRetentionState::Blocked {
+                reason: "original partial still exists",
+            };
+        }
+        PathPresence::Absent => {}
+        PathPresence::Uninspectable(error) => {
+            return RecoveredRetentionState::InspectionError {
+                path: paths.original_partial,
+                kind: error.kind(),
+            };
+        }
     }
-    let Ok(tombstone_metadata) = std::fs::symlink_metadata(&paths.tombstone) else {
-        return RecoveredRetentionState::Blocked {
-            reason: "trusted tombstone is missing",
-        };
+    let tombstone_metadata = match inspect_path_presence_with(&paths.tombstone, metadata) {
+        PathPresence::Present(metadata) => metadata,
+        PathPresence::Absent => {
+            return RecoveredRetentionState::Blocked {
+                reason: "trusted tombstone is missing",
+            };
+        }
+        PathPresence::Uninspectable(error) => {
+            return RecoveredRetentionState::InspectionError {
+                path: paths.tombstone,
+                kind: error.kind(),
+            };
+        }
     };
     if !tombstone_metadata.is_file() {
         return RecoveredRetentionState::Blocked {
@@ -146,10 +215,21 @@ pub fn inspect_recovered_retention(recovered_final: &Path) -> RecoveredRetention
             reason: "original partial name is not UTF-8",
         };
     };
-    let Some(transaction) = std::fs::read(&paths.tombstone)
-        .ok()
-        .and_then(|bytes| parse_recovery_tombstone(&bytes))
-    else {
+    let tombstone_bytes = match std::fs::read(&paths.tombstone) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return RecoveredRetentionState::Blocked {
+                reason: "trusted tombstone disappeared during inspection",
+            };
+        }
+        Err(error) => {
+            return RecoveredRetentionState::InspectionError {
+                path: paths.tombstone,
+                kind: error.kind(),
+            };
+        }
+    };
+    let Some(transaction) = parse_recovery_tombstone(&tombstone_bytes) else {
         return RecoveredRetentionState::Blocked {
             reason: "tombstone is malformed or untrusted",
         };
@@ -209,5 +289,40 @@ mod tests {
             inspect_recovered_retention(&final_path),
             RecoveredRetentionState::Blocked { .. }
         ));
+    }
+
+    #[test]
+    fn original_metadata_errors_never_authorize_settled_retention() {
+        let temp = tempfile::tempdir().unwrap();
+        let final_path = temp.path().join("08-30-00.recovered.mkv");
+        let original = temp.path().join("08-30-00.partial.mkv");
+        let tombstone = temp.path().join("08-30-00.recovered.mkv.done");
+        std::fs::write(&final_path, b"footage").unwrap();
+        std::fs::write(
+            &tombstone,
+            recovery_tombstone_payload("08-30-00.partial.mkv", "08-30-00.recovered.mkv", 7),
+        )
+        .unwrap();
+
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::Other] {
+            let state = inspect_recovered_retention_with(&final_path, &|candidate| {
+                if candidate == original {
+                    Err(std::io::Error::from(kind))
+                } else {
+                    std::fs::symlink_metadata(candidate)
+                }
+            });
+            assert!(matches!(
+                state,
+                RecoveredRetentionState::InspectionError {
+                    ref path,
+                    kind: observed,
+                } if path == &original && observed == kind
+            ));
+            assert!(
+                final_path.is_file(),
+                "inspection failure must preserve footage"
+            );
+        }
     }
 }

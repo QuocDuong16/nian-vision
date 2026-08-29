@@ -328,7 +328,8 @@ impl RecordingsLayout {
         camera: &CameraId,
         started_at: NaiveDateTime,
     ) -> Result<ClaimedSegment, StorageError> {
-        let day_dir = self.day_dir(camera, started_at.date());
+        let filesystem_started_at = filesystem_identity_datetime(started_at);
+        let day_dir = self.day_dir(camera, filesystem_started_at.date());
         std::fs::create_dir_all(&day_dir).map_err(|source| StorageError::Io {
             path: day_dir.clone(),
             source,
@@ -336,7 +337,7 @@ impl RecordingsLayout {
 
         // The single normalization point for the filesystem identity
         // (sub-second identity remediation §1).
-        let identity_time = whole_seconds(started_at.time());
+        let identity_time = filesystem_started_at.time();
 
         loop {
             let sequence = allocate_segment_sequence(&day_dir, identity_time)?;
@@ -687,6 +688,14 @@ pub fn allocate_segment_sequence(
         })?;
     }
     Ok(sequence)
+}
+
+/// Canonical local wall-clock timestamp encoded by recording paths.
+///
+/// Filesystem identities have whole-second precision; sub-second event time
+/// must never be persisted as if the filename could reproduce it.
+pub fn filesystem_identity_datetime(started_at: NaiveDateTime) -> NaiveDateTime {
+    NaiveDateTime::new(started_at.date(), whole_seconds(started_at.time()))
 }
 
 /// Drops sub-second components so live-clock timestamps compare equal to

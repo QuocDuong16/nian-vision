@@ -1,6 +1,7 @@
 //! Filesystem/SQLite reconciliation and retention orchestration for M4.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 
 use chrono::{Duration as ChronoDuration, NaiveDateTime};
@@ -8,10 +9,11 @@ use nian_domain::{CameraId, RetentionPolicy, StorageQuota};
 use nian_index::{IndexError, IndexedRecording, RecordingIndex, RecordingKind, RecordingUpsert};
 use nian_storage::classification::owned_recording_name;
 use nian_storage::{
-    CameraLease, FilesystemInventory, InventoryRecording, RecordingFileKind, RecordingsLayout,
-    RecoveredRetentionState, StorageError, classify_recording_file, inspect_recovered_retention,
-    inventory_recordings, parse_recovery_tombstone, recovery_tombstone_matches,
-    recovery_transaction_paths,
+    CameraLease, FilesystemInventory, InventoryRecording, PathPresence, RecordingFileKind,
+    RecordingsLayout, RecoveredRetentionState, RecoveryTombstone, StorageError,
+    classify_recording_file, filesystem_identity_datetime, inspect_path_presence,
+    inspect_recovered_retention, inventory_recordings, parse_recovery_tombstone,
+    recovery_tombstone_matches, recovery_transaction_paths,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -26,6 +28,8 @@ pub enum StorageManagerError {
     NotReconciled,
     #[error("invalid finalized recording metadata: {0}")]
     InvalidFinalizedRecording(String),
+    #[error("recording index is temporarily unavailable during repair")]
+    IndexUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +64,7 @@ impl ReconciliationReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetentionFailureKind {
     Revalidation,
-    RecoveryOwnership,
+    RecoveryInspection,
     FilesystemDelete,
     TombstoneRevalidation,
     TombstoneCleanup,
@@ -84,6 +88,10 @@ pub struct RetentionReport {
     pub skipped_active: usize,
     pub blocked_recovery_transactions: usize,
     pub missing: usize,
+    pub quota_triggered: bool,
+    pub usage_before: u64,
+    pub usage_after: u64,
+    pub quota_target_reached: bool,
     pub failed: Vec<RetentionFailure>,
 }
 
@@ -93,6 +101,7 @@ pub struct ArtifactCleanupReport {
     pub removed_tombstones: usize,
     pub skipped_owned_elsewhere: usize,
     pub preserved_ambiguous: usize,
+    pub inspection_failures: usize,
     pub failed: usize,
 }
 
@@ -103,7 +112,7 @@ pub struct ArtifactCleanupReport {
 #[derive(Debug)]
 pub struct StorageManager {
     layout: RecordingsLayout,
-    index: RecordingIndex,
+    index: Option<RecordingIndex>,
     retention_policy: RetentionPolicy,
     storage_quota: Option<StorageQuota>,
     reconciled: bool,
@@ -119,11 +128,12 @@ impl StorageManager {
         validate_retention(retention_policy, storage_quota)?;
         layout.ensure_control_dir()?;
         let index_path = layout.recording_index_path();
+        prepare_index_family(&index_path)?;
 
         match RecordingIndex::open(&index_path) {
             Ok(index) => Ok(Self {
                 layout,
-                index,
+                index: Some(index),
                 retention_policy,
                 storage_quota,
                 reconciled: false,
@@ -134,7 +144,7 @@ impl StorageManager {
                 let index = RecordingIndex::open(&index_path)?;
                 let mut manager = Self {
                     layout,
-                    index,
+                    index: Some(index),
                     retention_policy,
                     storage_quota,
                     reconciled: false,
@@ -155,9 +165,28 @@ impl StorageManager {
         self.rebuilt_after_corruption
     }
 
+    fn index(&self) -> Result<&RecordingIndex, StorageManagerError> {
+        self.index
+            .as_ref()
+            .ok_or(StorageManagerError::IndexUnavailable)
+    }
+
+    fn index_mut(&mut self) -> Result<&mut RecordingIndex, StorageManagerError> {
+        self.index
+            .as_mut()
+            .ok_or(StorageManagerError::IndexUnavailable)
+    }
+
     pub fn reconcile(&mut self) -> Result<ReconciliationReport, StorageManagerError> {
+        self.reconciled = false;
         let inventory = inventory_recordings(&self.layout)?;
-        let indexed = self.index.list_all()?;
+        let indexed = match self.index()?.list_all() {
+            Ok(indexed) => indexed,
+            Err(error) if error.is_corruption() => {
+                return self.repair_reconciliation(inventory);
+            }
+            Err(error) => return Err(error.into()),
+        };
         let indexed_by_path: HashMap<&str, &IndexedRecording> = indexed
             .iter()
             .map(|recording| (recording.relative_path.as_str(), recording))
@@ -199,7 +228,13 @@ impl StorageManager {
         }
 
         classify_partials_by_lease(&self.layout, &inventory, &mut report);
-        self.index.apply_reconciliation(&upserts, &removals)?;
+        match self.index_mut()?.apply_reconciliation(&upserts, &removals) {
+            Ok(()) => {}
+            Err(error) if error.is_corruption() => {
+                return self.repair_reconciliation(inventory);
+            }
+            Err(error) => return Err(error.into()),
+        }
         self.reconciled = true;
         Ok(report)
     }
@@ -209,14 +244,67 @@ impl StorageManager {
     /// Media duration is deliberately left NULL because filenames and file
     /// sizes do not prove duration.
     pub fn rebuild(&mut self) -> Result<usize, StorageManagerError> {
+        self.reconciled = false;
         let inventory = inventory_recordings(&self.layout)?;
         let rows: Vec<_> = inventory
             .recordings
             .iter()
             .map(|recording| recording_to_upsert(recording, None))
             .collect();
-        self.index.replace_from_snapshot(&rows)?;
+        match self.index_mut()?.replace_from_snapshot(&rows) {
+            Ok(()) => {}
+            Err(error) if error.is_corruption() => {
+                return self.repair_index_from_inventory(&inventory);
+            }
+            Err(error) => return Err(error.into()),
+        }
         self.reconciled = true;
+        Ok(rows.len())
+    }
+
+    /// Explicit application-level repair path for a disposable/corrupt index.
+    pub fn repair_index(&mut self) -> Result<usize, StorageManagerError> {
+        self.reconciled = false;
+        let inventory = inventory_recordings(&self.layout)?;
+        self.repair_index_from_inventory(&inventory)
+    }
+
+    fn repair_reconciliation(
+        &mut self,
+        inventory: FilesystemInventory,
+    ) -> Result<ReconciliationReport, StorageManagerError> {
+        let inserted = self.repair_index_from_inventory(&inventory)?;
+        let mut report = ReconciliationReport {
+            inserted,
+            ignored_foreign: inventory.ignored_foreign,
+            ..ReconciliationReport::default()
+        };
+        classify_partials_by_lease(&self.layout, &inventory, &mut report);
+        Ok(report)
+    }
+
+    fn repair_index_from_inventory(
+        &mut self,
+        inventory: &FilesystemInventory,
+    ) -> Result<usize, StorageManagerError> {
+        self.reconciled = false;
+        let rows: Vec<_> = inventory
+            .recordings
+            .iter()
+            .map(|recording| recording_to_upsert(recording, None))
+            .collect();
+        let index_path = self.layout.recording_index_path();
+
+        drop(self.index.take());
+        quarantine_corrupt_index(&index_path)?;
+        let mut index = RecordingIndex::open(&index_path)?;
+        if let Err(error) = index.replace_from_snapshot(&rows) {
+            self.index = Some(index);
+            return Err(error.into());
+        }
+        self.index = Some(index);
+        self.reconciled = true;
+        self.rebuilt_after_corruption = true;
         Ok(rows.len())
     }
 
@@ -224,7 +312,7 @@ impl StorageManager {
         &self,
         camera_id: &CameraId,
     ) -> Result<Vec<IndexedRecording>, StorageManagerError> {
-        Ok(self.index.list_camera(camera_id)?)
+        Ok(self.index()?.list_camera(camera_id)?)
     }
 
     pub fn query_time_range(
@@ -233,11 +321,11 @@ impl StorageManager {
         start: NaiveDateTime,
         end: NaiveDateTime,
     ) -> Result<Vec<IndexedRecording>, StorageManagerError> {
-        Ok(self.index.query_time_range(camera_id, start, end)?)
+        Ok(self.index()?.query_time_range(camera_id, start, end)?)
     }
 
     pub fn total_indexed_recording_bytes(&self) -> Result<u64, StorageManagerError> {
-        Ok(self.index.total_recording_bytes()?)
+        Ok(self.index()?.total_recording_bytes()?)
     }
 
     /// Incrementally indexes a finalized file without making publication depend
@@ -250,6 +338,7 @@ impl StorageManager {
         size_bytes: u64,
         media_duration_ms: Option<u64>,
     ) -> Result<bool, StorageManagerError> {
+        let filesystem_started_at = filesystem_identity_datetime(started_at);
         let kind = match classify_recording_file(final_path) {
             RecordingFileKind::NormalRecording => RecordingKind::Normal,
             RecordingFileKind::RecoveredRecording => RecordingKind::Recovered,
@@ -259,7 +348,7 @@ impl StorageManager {
                 )));
             }
         };
-        let expected_parent = self.layout.day_dir(camera_id, started_at.date());
+        let expected_parent = self.layout.day_dir(camera_id, filesystem_started_at.date());
         if final_path.parent() != Some(expected_parent.as_path()) {
             return Err(StorageManagerError::InvalidFinalizedRecording(
                 "final path does not match camera/date layout".to_owned(),
@@ -275,7 +364,7 @@ impl StorageManager {
                 "final filename has no canonical identity".to_owned(),
             ));
         };
-        if identity.started_at != started_at.time() {
+        if identity.started_at != filesystem_started_at.time() {
             return Err(StorageManagerError::InvalidFinalizedRecording(
                 "started_at does not match canonical filename".to_owned(),
             ));
@@ -302,12 +391,20 @@ impl StorageManager {
             relative_path: relative_path(&self.layout, final_path)?,
             kind,
             state: nian_domain::RecordingState::Complete,
-            started_at,
+            started_at: filesystem_started_at,
             sequence: identity.sequence,
             size_bytes,
             media_duration_ms,
         };
-        Ok(self.index.upsert(&upsert)?)
+        match self.index_mut()?.upsert(&upsert) {
+            Ok(changed) => Ok(changed),
+            Err(error) => {
+                if error.is_corruption() {
+                    self.reconciled = false;
+                }
+                Err(error.into())
+            }
+        }
     }
 
     /// Runs age/quota retention using an injected local naive wall-clock time.
@@ -332,17 +429,22 @@ impl StorageManager {
             ))
         });
 
-        let mut report = RetentionReport {
-            examined: recordings.len(),
-            ..RetentionReport::default()
-        };
-        let mut usage: u64 = recordings
+        let usage_before: u64 = recordings
             .iter()
             .map(|recording| recording.size_bytes)
             .sum();
+        let mut usage = usage_before;
         let quota_triggered = self
             .storage_quota
             .is_some_and(|quota| usage > quota.max_bytes);
+        let mut report = RetentionReport {
+            examined: recordings.len(),
+            quota_triggered,
+            usage_before,
+            usage_after: usage_before,
+            quota_target_reached: !quota_triggered,
+            ..RetentionReport::default()
+        };
         let age_cutoff = self
             .retention_policy
             .max_age_days
@@ -362,6 +464,7 @@ impl StorageManager {
                 Ok(()) => {}
                 Err(Revalidation::Missing) => {
                     report.missing += 1;
+                    usage = usage.saturating_sub(candidate.size_bytes);
                     continue;
                 }
                 Err(Revalidation::Changed(detail)) => {
@@ -374,36 +477,36 @@ impl StorageManager {
                 }
             }
 
-            let (tombstone, recovery_lease) =
-                if candidate.kind == RecordingFileKind::RecoveredRecording {
-                    let lease = match CameraLease::try_acquire(&self.layout, &candidate.camera_id) {
-                        Ok(lease) => lease,
-                        Err(StorageError::CameraAlreadyActive { .. }) => {
-                            report.skipped_active += 1;
-                            continue;
-                        }
-                        Err(error) => {
-                            report.failed.push(RetentionFailure {
-                                relative_path: candidate.relative_path.clone(),
-                                kind: RetentionFailureKind::RecoveryOwnership,
-                                detail: error.to_string(),
-                            });
-                            continue;
-                        }
-                    };
-                    match inspect_recovered_retention(&candidate.path) {
-                        RecoveredRetentionState::Settled {
-                            tombstone,
-                            evidence,
-                        } => (Some((tombstone, evidence)), Some(lease)),
-                        RecoveredRetentionState::Blocked { .. } => {
-                            report.blocked_recovery_transactions += 1;
-                            continue;
-                        }
+            let recovery_transaction = if candidate.kind == RecordingFileKind::RecoveredRecording {
+                match inspect_recovered_retention(&candidate.path) {
+                    RecoveredRetentionState::Settled {
+                        tombstone,
+                        evidence,
+                    } => Some((tombstone, evidence)),
+                    RecoveredRetentionState::Blocked { .. } => {
+                        report.blocked_recovery_transactions += 1;
+                        continue;
                     }
-                } else {
-                    (None, None)
-                };
+                    RecoveredRetentionState::InspectionError { path, kind } => {
+                        report.failed.push(RetentionFailure {
+                            relative_path: candidate.relative_path.clone(),
+                            kind: RetentionFailureKind::RecoveryInspection,
+                            detail: format!("cannot inspect recovery path {path:?}: {kind:?}"),
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some((ref tombstone, ref evidence)) = recovery_transaction
+                && let Err(failure) =
+                    revalidate_recovered_commit(&self.layout, &candidate, tombstone, evidence)
+            {
+                report.failed.push(failure);
+                continue;
+            }
 
             if let Err(error) = std::fs::remove_file(&candidate.path) {
                 report.failed.push(RetentionFailure {
@@ -424,7 +527,7 @@ impl StorageManager {
                 report.quota_deleted += 1;
             }
 
-            if let Some((tombstone, evidence)) = tombstone {
+            if let Some((tombstone, evidence)) = recovery_transaction {
                 if !recovery_tombstone_matches(&tombstone, &evidence) {
                     report.failed.push(RetentionFailure {
                         relative_path: candidate.relative_path.clone(),
@@ -445,16 +548,26 @@ impl StorageManager {
                 }
             }
 
-            if let Err(error) = self.index.remove_relative_path(&candidate.relative_path) {
+            let index_delete = self
+                .index_mut()?
+                .remove_relative_path(&candidate.relative_path);
+            if let Err(error) = index_delete {
+                if error.is_corruption() {
+                    self.reconciled = false;
+                }
                 report.failed.push(RetentionFailure {
                     relative_path: candidate.relative_path.clone(),
                     kind: RetentionFailureKind::IndexDelete,
                     detail: error.to_string(),
                 });
             }
-            drop(recovery_lease);
         }
 
+        report.usage_after = usage;
+        report.quota_target_reached = match self.storage_quota {
+            Some(quota) if quota_triggered => usage <= quota.cleanup_target_bytes,
+            _ => true,
+        };
         Ok(report)
     }
 
@@ -507,10 +620,15 @@ impl StorageManager {
                         }
                     }
                     RecordingFileKind::RecoveryTombstone => {
-                        if cleanup_stale_tombstone(&artifact.path) {
-                            report.removed_tombstones += 1;
-                        } else {
-                            report.preserved_ambiguous += 1;
+                        match cleanup_stale_tombstone(&artifact.path) {
+                            TombstoneCleanupOutcome::Removed => report.removed_tombstones += 1,
+                            TombstoneCleanupOutcome::PreservedAmbiguous => {
+                                report.preserved_ambiguous += 1
+                            }
+                            TombstoneCleanupOutcome::InspectionFailure => {
+                                report.inspection_failures += 1
+                            }
+                            TombstoneCleanupOutcome::RemoveFailed => report.failed += 1,
                         }
                     }
                     _ => report.preserved_ambiguous += 1,
@@ -663,6 +781,52 @@ fn revalidate_candidate(
     Ok(())
 }
 
+fn revalidate_recovered_commit(
+    layout: &RecordingsLayout,
+    candidate: &InventoryRecording,
+    expected_tombstone: &Path,
+    expected_evidence: &RecoveryTombstone,
+) -> Result<(), RetentionFailure> {
+    if let Err(error) = revalidate_candidate(layout, candidate) {
+        let detail = match error {
+            Revalidation::Missing => "recovered final disappeared before commit".to_owned(),
+            Revalidation::Changed(detail) => detail,
+        };
+        return Err(RetentionFailure {
+            relative_path: candidate.relative_path.clone(),
+            kind: RetentionFailureKind::Revalidation,
+            detail,
+        });
+    }
+
+    match inspect_recovered_retention(&candidate.path) {
+        RecoveredRetentionState::Settled {
+            tombstone,
+            evidence,
+        } if tombstone == expected_tombstone
+            && evidence == *expected_evidence
+            && evidence.size_bytes == candidate.size_bytes =>
+        {
+            Ok(())
+        }
+        RecoveredRetentionState::Settled { .. } => Err(RetentionFailure {
+            relative_path: candidate.relative_path.clone(),
+            kind: RetentionFailureKind::TombstoneRevalidation,
+            detail: "recovery transaction evidence changed before final deletion".to_owned(),
+        }),
+        RecoveredRetentionState::Blocked { reason } => Err(RetentionFailure {
+            relative_path: candidate.relative_path.clone(),
+            kind: RetentionFailureKind::TombstoneRevalidation,
+            detail: format!("recovery transaction became blocked before commit: {reason}"),
+        }),
+        RecoveredRetentionState::InspectionError { path, kind } => Err(RetentionFailure {
+            relative_path: candidate.relative_path.clone(),
+            kind: RetentionFailureKind::RecoveryInspection,
+            detail: format!("cannot re-inspect recovery path {path:?}: {kind:?}"),
+        }),
+    }
+}
+
 fn relative_path(
     layout: &RecordingsLayout,
     absolute: &Path,
@@ -689,55 +853,151 @@ fn relative_path(
     Ok(parts.join("/"))
 }
 
+fn prepare_index_family(index_path: &Path) -> Result<(), StorageManagerError> {
+    let wal = sqlite_sidecar_path(index_path, "-wal")?;
+    let shm = sqlite_sidecar_path(index_path, "-shm")?;
+    let marker = quarantine_pending_marker(index_path)?;
+
+    let marker_present = control_path_present(&marker)?;
+    let main_present = control_path_present(index_path)?;
+    let wal_present = control_path_present(&wal)?;
+    let shm_present = control_path_present(&shm)?;
+    if marker_present || (!main_present && (wal_present || shm_present)) {
+        quarantine_corrupt_index(index_path)?;
+    }
+    Ok(())
+}
+
+fn control_path_present(path: &Path) -> Result<bool, StorageManagerError> {
+    match inspect_path_presence(path) {
+        PathPresence::Present(_) => Ok(true),
+        PathPresence::Absent => Ok(false),
+        PathPresence::Uninspectable(source) => {
+            Err(StorageManagerError::Storage(StorageError::Io {
+                path: path.to_path_buf(),
+                source,
+            }))
+        }
+    }
+}
+
+fn storage_io(path: &Path, source: std::io::Error) -> StorageManagerError {
+    StorageManagerError::Storage(StorageError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn quarantine_pending_marker(index_path: &Path) -> Result<PathBuf, StorageManagerError> {
+    sqlite_sidecar_path(index_path, ".quarantine-pending")
+}
+
+fn ensure_quarantine_marker(marker: &Path) -> Result<(), StorageManagerError> {
+    match inspect_path_presence(marker) {
+        PathPresence::Present(metadata) if metadata.is_file() => Ok(()),
+        PathPresence::Present(_) => Err(StorageManagerError::Policy(
+            "SQLite quarantine marker is not a regular file".to_owned(),
+        )),
+        PathPresence::Uninspectable(source) => Err(storage_io(marker, source)),
+        PathPresence::Absent => {
+            let opened = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(marker);
+            let mut file = match opened {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return match inspect_path_presence(marker) {
+                        PathPresence::Present(metadata) if metadata.is_file() => Ok(()),
+                        PathPresence::Present(_) => Err(StorageManagerError::Policy(
+                            "SQLite quarantine marker is not a regular file".to_owned(),
+                        )),
+                        PathPresence::Absent => Err(storage_io(marker, error)),
+                        PathPresence::Uninspectable(source) => Err(storage_io(marker, source)),
+                    };
+                }
+                Err(source) => return Err(storage_io(marker, source)),
+            };
+            file.write_all(b"pending\n")
+                .and_then(|()| file.sync_all())
+                .map_err(|source| storage_io(marker, source))
+        }
+    }
+}
+
+fn corrupt_target_path(source: &Path, serial: u32) -> Result<PathBuf, StorageManagerError> {
+    let Some(file_name) = source.file_name() else {
+        return Err(StorageManagerError::Policy(
+            "SQLite control path has no filename".to_owned(),
+        ));
+    };
+    let mut name = file_name.to_os_string();
+    name.push(format!(".corrupt-{serial}"));
+    Ok(source.with_file_name(name))
+}
+
+fn allocate_corrupt_serial(sources: &[PathBuf]) -> Result<u32, StorageManagerError> {
+    'serial: for serial in 1..=u32::MAX {
+        for source in sources {
+            let target = corrupt_target_path(source, serial)?;
+            match inspect_path_presence(&target) {
+                PathPresence::Absent => {}
+                PathPresence::Present(_) => continue 'serial,
+                PathPresence::Uninspectable(source_error) => {
+                    return Err(StorageManagerError::Storage(StorageError::Io {
+                        path: target,
+                        source: source_error,
+                    }));
+                }
+            }
+        }
+        return Ok(serial);
+    }
+    Err(StorageManagerError::Policy(
+        "cannot allocate corruption backup name".to_owned(),
+    ))
+}
+
 fn quarantine_corrupt_index(index_path: &Path) -> Result<(), StorageManagerError> {
     let wal = sqlite_sidecar_path(index_path, "-wal")?;
     let shm = sqlite_sidecar_path(index_path, "-shm")?;
     let sources = [index_path.to_path_buf(), wal, shm];
+    let marker = quarantine_pending_marker(index_path)?;
+    ensure_quarantine_marker(&marker)?;
+    let serial = allocate_corrupt_serial(&sources)?;
 
-    let serial = (1_u32..)
-        .find(|serial| {
-            sources.iter().all(|source| {
-                let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
-                    return false;
-                };
-                !source
-                    .with_file_name(format!("{name}.corrupt-{serial}"))
-                    .exists()
-            })
-        })
-        .ok_or_else(|| {
-            StorageManagerError::Policy("cannot allocate corruption backup name".to_owned())
-        })?;
-
-    for source in sources {
-        match std::fs::symlink_metadata(&source) {
-            Ok(_) => {
-                let name = source
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .ok_or_else(|| {
-                        StorageManagerError::Policy(
-                            "SQLite control filename is not UTF-8".to_owned(),
-                        )
-                    })?;
-                let target = source.with_file_name(format!("{name}.corrupt-{serial}"));
-                std::fs::rename(&source, &target).map_err(|io| {
-                    StorageManagerError::Storage(StorageError::Io {
-                        path: source.clone(),
-                        source: io,
-                    })
-                })?;
+    for source in &sources {
+        match inspect_path_presence(source) {
+            PathPresence::Present(_) => {
+                let target = corrupt_target_path(source, serial)?;
+                nian_storage::paths::publish_no_replace(source, &target)?;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source_error) => {
-                return Err(StorageManagerError::Storage(StorageError::Io {
-                    path: source,
-                    source: source_error,
-                }));
+            PathPresence::Absent => {}
+            PathPresence::Uninspectable(source_error) => {
+                return Err(storage_io(source, source_error));
             }
         }
     }
-    Ok(())
+
+    for source in &sources {
+        match inspect_path_presence(source) {
+            PathPresence::Absent => {}
+            PathPresence::Present(_) => {
+                return Err(StorageManagerError::Policy(format!(
+                    "canonical SQLite family member remained after quarantine: {source:?}"
+                )));
+            }
+            PathPresence::Uninspectable(source_error) => {
+                return Err(storage_io(source, source_error));
+            }
+        }
+    }
+
+    match std::fs::remove_file(&marker) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(storage_io(&marker, source)),
+    }
 }
 
 fn sqlite_sidecar_path(index_path: &Path, suffix: &str) -> Result<PathBuf, StorageManagerError> {
@@ -751,47 +1011,75 @@ fn sqlite_sidecar_path(index_path: &Path, suffix: &str) -> Result<PathBuf, Stora
     Ok(index_path.with_file_name(sidecar_name))
 }
 
-fn cleanup_stale_tombstone(path: &Path) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TombstoneCleanupOutcome {
+    Removed,
+    PreservedAmbiguous,
+    InspectionFailure,
+    RemoveFailed,
+}
+
+fn cleanup_stale_tombstone(path: &Path) -> TombstoneCleanupOutcome {
+    cleanup_stale_tombstone_with(path, &|candidate| inspect_path_presence(candidate))
+}
+
+fn cleanup_stale_tombstone_with<F>(path: &Path, presence: &F) -> TombstoneCleanupOutcome
+where
+    F: Fn(&Path) -> PathPresence,
+{
     let Some(final_name) = path
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| name.strip_suffix(".done"))
     else {
-        return false;
+        return TombstoneCleanupOutcome::PreservedAmbiguous;
     };
     let final_path = path.with_file_name(final_name);
     let Some(paths) = recovery_transaction_paths(&final_path) else {
-        return false;
+        return TombstoneCleanupOutcome::PreservedAmbiguous;
     };
-    if std::fs::symlink_metadata(&paths.recovered_final).is_ok()
-        || std::fs::symlink_metadata(&paths.original_partial).is_ok()
-    {
-        return false;
+
+    for candidate in [&paths.recovered_final, &paths.original_partial] {
+        match presence(candidate) {
+            PathPresence::Present(_) => return TombstoneCleanupOutcome::PreservedAmbiguous,
+            PathPresence::Absent => {}
+            PathPresence::Uninspectable(_) => {
+                return TombstoneCleanupOutcome::InspectionFailure;
+            }
+        }
     }
-    let Some(transaction) = std::fs::read(path)
-        .ok()
-        .and_then(|bytes| parse_recovery_tombstone(&bytes))
-    else {
-        return false;
+
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return TombstoneCleanupOutcome::PreservedAmbiguous;
+        }
+        Err(_) => return TombstoneCleanupOutcome::InspectionFailure,
+    };
+    let Some(transaction) = parse_recovery_tombstone(&bytes) else {
+        return TombstoneCleanupOutcome::PreservedAmbiguous;
     };
     let Some(original_name) = paths
         .original_partial
         .file_name()
         .and_then(|name| name.to_str())
     else {
-        return false;
+        return TombstoneCleanupOutcome::PreservedAmbiguous;
     };
     let Some(recovered_name) = paths
         .recovered_final
         .file_name()
         .and_then(|name| name.to_str())
     else {
-        return false;
+        return TombstoneCleanupOutcome::PreservedAmbiguous;
     };
     if transaction.original != original_name || transaction.final_name != recovered_name {
-        return false;
+        return TombstoneCleanupOutcome::PreservedAmbiguous;
     }
-    std::fs::remove_file(path).is_ok()
+    match std::fs::remove_file(path) {
+        Ok(()) => TombstoneCleanupOutcome::Removed,
+        Err(_) => TombstoneCleanupOutcome::RemoveFailed,
+    }
 }
 
 #[cfg(test)]
@@ -828,5 +1116,65 @@ mod tests {
             Err(Revalidation::Changed(_))
         ));
         assert_eq!(std::fs::read(outside).unwrap(), b"must survive");
+    }
+
+    #[test]
+    fn stale_tombstone_inspection_error_preserves_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let tombstone = temp.path().join("08-30-00.recovered.mkv.done");
+        std::fs::write(
+            &tombstone,
+            nian_storage::recovery_tombstone_payload(
+                "08-30-00.partial.mkv",
+                "08-30-00.recovered.mkv",
+                7,
+            ),
+        )
+        .unwrap();
+        let final_path = temp.path().join("08-30-00.recovered.mkv");
+
+        let outcome = cleanup_stale_tombstone_with(&tombstone, &|candidate| {
+            if candidate == final_path {
+                PathPresence::Uninspectable(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                ))
+            } else {
+                inspect_path_presence(candidate)
+            }
+        });
+
+        assert_eq!(outcome, TombstoneCleanupOutcome::InspectionFailure);
+        assert!(tombstone.is_file());
+    }
+
+    #[test]
+    fn half_quarantined_sqlite_family_converges_before_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let index_path = temp.path().join("recordings.sqlite3");
+        let wal = sqlite_sidecar_path(&index_path, "-wal").unwrap();
+        let shm = sqlite_sidecar_path(&index_path, "-shm").unwrap();
+        let marker = quarantine_pending_marker(&index_path).unwrap();
+
+        let main_corrupt_1 = corrupt_target_path(&index_path, 1).unwrap();
+        std::fs::write(&main_corrupt_1, b"old main evidence").unwrap();
+        std::fs::write(&wal, b"old wal").unwrap();
+        std::fs::write(&shm, b"old shm").unwrap();
+        std::fs::write(&marker, b"pending\n").unwrap();
+
+        prepare_index_family(&index_path).unwrap();
+
+        assert!(!index_path.exists());
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+        assert!(!marker.exists());
+        assert_eq!(std::fs::read(main_corrupt_1).unwrap(), b"old main evidence");
+        assert_eq!(
+            std::fs::read(corrupt_target_path(&wal, 2).unwrap()).unwrap(),
+            b"old wal"
+        );
+        assert_eq!(
+            std::fs::read(corrupt_target_path(&shm, 2).unwrap()).unwrap(),
+            b"old shm"
+        );
     }
 }

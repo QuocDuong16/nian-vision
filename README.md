@@ -9,9 +9,15 @@ implemented and ready for review on top of M0–M3. Finalized normal and
 recovered recordings are indexed in a rebuildable SQLite catalog at
 `<storage_root>/.nian/recordings.sqlite3`; the filesystem remains the source
 of survival, so deleting or corrupting the database never deletes footage.
-Deterministic reconciliation repairs missing/stale index rows, partials stay
-lease-aware, and age/quota retention deletes only revalidated finalized
-recordings with filesystem-first ordering. M3 resilience remains unchanged:
+SQLite startup verifies WAL + foreign-key pragmas, and corruption is healed
+from disk even when it surfaces after the manager initially opened. A pending
+quarantine marker makes DB/WAL/SHM quarantine convergent across interrupted
+filesystem moves. Deterministic reconciliation repairs missing/stale index
+rows and fails the retention-ready gate closed on any failed pass. Partials
+stay lease-aware; settled historical recovered transactions can be retained
+while the same camera records continuously, but only after exact v2 evidence
+and `NotFound`-only original absence are revalidated immediately before the
+filesystem-first delete. M3 resilience remains unchanged:
 worker crashes, reconnects and crash-leftover partial recovery are still
 owned by the supervised media worker rather than by the database layer.
 
@@ -45,7 +51,10 @@ owned by the supervised media worker rather than by the database layer.
   inventory and recovery-transaction facts, `nian-index` owns bundled
   SQLite persistence/migrations, and `nian-application::StorageManager`
   orchestrates reconciliation, rebuild/query seams and age + high/low
-  watermark retention. SQLite failures never roll back a published media file.
+  watermark retention. Retention reports quota trigger/usage/target status;
+  sub-second finalization events are normalized to the same whole-second local
+  identity encoded by filenames. SQLite failures never roll back a published
+  media file.
 * Clean crate boundaries with `unsafe` confined to the FFmpeg layers (plus
   one audited Windows publication primitive), a race-safe storage layout,
   credential redaction, and a full quality-gate setup (fmt/clippy/tests,

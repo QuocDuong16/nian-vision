@@ -137,6 +137,10 @@ fn quota_below_high_watermark_does_not_delete() {
     manager.reconcile().unwrap();
     let report = manager.run_retention(at("2026-08-29T12:00:00")).unwrap();
     assert_eq!(report.deleted, 0);
+    assert!(!report.quota_triggered);
+    assert_eq!(report.usage_before, 2 * MIB);
+    assert_eq!(report.usage_after, 2 * MIB);
+    assert!(report.quota_target_reached);
     assert!(a.exists() && b.exists());
 }
 
@@ -170,6 +174,10 @@ fn quota_crossing_deletes_oldest_until_low_watermark() {
     let report = manager.run_retention(at("2026-08-29T12:00:00")).unwrap();
     assert_eq!(report.deleted, 2);
     assert_eq!(report.quota_deleted, 2);
+    assert!(report.quota_triggered);
+    assert_eq!(report.usage_before, 6 * MIB);
+    assert_eq!(report.usage_after, 2 * MIB);
+    assert!(report.quota_target_reached);
     assert!(!oldest.exists());
     assert!(!middle.exists());
     assert!(newest.exists());
@@ -378,4 +386,152 @@ fn quota_policy_requires_explicit_matching_high_and_low_watermarks() {
     )
     .unwrap_err();
     assert!(matches!(error, StorageManagerError::Policy(_)));
+}
+
+#[test]
+fn active_camera_lease_does_not_block_old_settled_recovered_retention() {
+    let (_temp, layout, camera) = fixture();
+    let recovered = recording(
+        &layout,
+        &camera,
+        at("2026-08-20T08:30:00"),
+        "08-30-00.recovered.mkv",
+        10,
+    );
+    let tombstone = recovered.with_file_name("08-30-00.recovered.mkv.done");
+    std::fs::write(
+        &tombstone,
+        recovery_tombstone_payload("08-30-00.partial.mkv", "08-30-00.recovered.mkv", 10),
+    )
+    .unwrap();
+    let mut manager = age_manager(layout.clone(), 1);
+    manager.reconcile().unwrap();
+    let lease = CameraLease::try_acquire(&layout, &camera).unwrap();
+
+    let report = manager.run_retention(at("2026-08-29T12:00:00")).unwrap();
+    assert_eq!(report.deleted, 1);
+    assert!(!recovered.exists());
+    assert!(!tombstone.exists());
+    drop(lease);
+}
+
+#[test]
+fn active_camera_lease_still_blocks_recovered_with_original_partial() {
+    let (_temp, layout, camera) = fixture();
+    let recovered = recording(
+        &layout,
+        &camera,
+        at("2026-08-20T08:30:00"),
+        "08-30-00.recovered.mkv",
+        10,
+    );
+    let original = recovered.parent().unwrap().join("08-30-00.partial.mkv");
+    std::fs::write(&original, b"still unresolved").unwrap();
+    let mut manager = age_manager(layout.clone(), 1);
+    manager.reconcile().unwrap();
+    let lease = CameraLease::try_acquire(&layout, &camera).unwrap();
+
+    let report = manager.run_retention(at("2026-08-29T12:00:00")).unwrap();
+    assert_eq!(report.deleted, 0);
+    assert_eq!(report.blocked_recovery_transactions, 1);
+    assert!(recovered.exists());
+    assert!(original.exists());
+    drop(lease);
+}
+
+#[test]
+fn active_camera_lease_still_blocks_untrusted_recovered_transaction() {
+    let (_temp, layout, camera) = fixture();
+    let recovered = recording(
+        &layout,
+        &camera,
+        at("2026-08-20T08:30:00"),
+        "08-30-00.recovered.mkv",
+        10,
+    );
+    let tombstone = recovered.with_file_name("08-30-00.recovered.mkv.done");
+    std::fs::write(&tombstone, b"not a trusted tombstone").unwrap();
+    let mut manager = age_manager(layout.clone(), 1);
+    manager.reconcile().unwrap();
+    let lease = CameraLease::try_acquire(&layout, &camera).unwrap();
+
+    let report = manager.run_retention(at("2026-08-29T12:00:00")).unwrap();
+    assert_eq!(report.deleted, 0);
+    assert_eq!(report.blocked_recovery_transactions, 1);
+    assert!(recovered.exists());
+    assert!(tombstone.exists());
+    drop(lease);
+}
+
+#[test]
+fn settled_recovered_contributes_to_quota_cleanup_while_camera_is_active() {
+    let (_temp, layout, camera) = fixture();
+    let recovered = recording(
+        &layout,
+        &camera,
+        at("2026-08-20T08:30:00"),
+        "08-30-00.recovered.mkv",
+        3 * MIB,
+    );
+    let tombstone = recovered.with_file_name("08-30-00.recovered.mkv.done");
+    std::fs::write(
+        &tombstone,
+        recovery_tombstone_payload("08-30-00.partial.mkv", "08-30-00.recovered.mkv", 3 * MIB),
+    )
+    .unwrap();
+    let normal = recording(
+        &layout,
+        &camera,
+        at("2026-08-21T08:30:00"),
+        "08-30-00.mkv",
+        2 * MIB,
+    );
+    let mut manager = quota_manager(layout.clone(), 4 * MIB, 2 * MIB);
+    manager.reconcile().unwrap();
+    let lease = CameraLease::try_acquire(&layout, &camera).unwrap();
+
+    let report = manager.run_retention(at("2026-08-29T12:00:00")).unwrap();
+    assert!(report.quota_triggered);
+    assert!(report.quota_target_reached);
+    assert_eq!(report.usage_before, 5 * MIB);
+    assert_eq!(report.usage_after, 2 * MIB);
+    assert!(!recovered.exists());
+    assert!(!tombstone.exists());
+    assert!(normal.exists());
+    drop(lease);
+}
+
+#[test]
+fn blocked_recovered_transaction_reports_unreached_quota_target() {
+    let (_temp, layout, camera) = fixture();
+    let recovered = recording(
+        &layout,
+        &camera,
+        at("2026-08-20T08:30:00"),
+        "08-30-00.recovered.mkv",
+        3 * MIB,
+    );
+    let original = recovered.parent().unwrap().join("08-30-00.partial.mkv");
+    std::fs::write(&original, b"unresolved").unwrap();
+    let normal = recording(
+        &layout,
+        &camera,
+        at("2026-08-21T08:30:00"),
+        "08-30-00.mkv",
+        2 * MIB,
+    );
+    let mut manager = quota_manager(layout.clone(), 4 * MIB, MIB);
+    manager.reconcile().unwrap();
+    let lease = CameraLease::try_acquire(&layout, &camera).unwrap();
+
+    let report = manager.run_retention(at("2026-08-29T12:00:00")).unwrap();
+    assert!(report.quota_triggered);
+    assert!(!report.quota_target_reached);
+    assert_eq!(report.usage_before, 5 * MIB);
+    assert_eq!(report.usage_after, 3 * MIB);
+    assert_eq!(report.blocked_recovery_transactions, 1);
+    assert!(recovered.exists());
+    assert!(original.exists());
+    assert!(!normal.exists());
+    drop(lease);
 }

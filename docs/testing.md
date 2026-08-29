@@ -11,10 +11,10 @@ Testing is part of the definition of done for every milestone (master spec
 |---|---|
 | `nian-domain` | camera-id path safety, credential redaction, URL encoding, retention validation, quota watermarks, backoff schedule, time-base math |
 | `nian-application` | config validation bounds, UI-safe error messages; stub-worker supervision matrix: crash-before-hello retryable, wedged-hello deadline-bounded, version mismatch permanent, transient refusal retries, configuration refusal stops, failed-job-observed-while-alive, shutdown interrupts backoff waits |
-| `nian-application` (M4) | `StorageManager`: reconciliation idempotency, rebuild/corruption recovery, lease-aware partial classification, incremental finalized upsert, age/quota OR semantics, high/low watermarks, recovered-transaction blocking, filesystem-first crash convergence, artifact cleanup ownership |
-| `nian-index` (M4) | schema v1 migration/reopen, future-version refusal, migration rollback, WAL + timeline index, idempotent upsert/query, atomic snapshot replacement, random-byte corruption detection |
+| `nian-application` (M4) | `StorageManager`: reconciliation idempotency + fail-closed retention gate, startup/runtime corruption repair, convergent SQLite-family quarantine, lease-aware partial classification, whole-second incremental finalized upsert, age/quota OR semantics + target observability, settled-recovered retention during active recording, recovered transaction commit revalidation, filesystem-first crash convergence, conservative artifact cleanup |
+| `nian-index` (M4) | schema v1 migration/reopen, future-version refusal, migration rollback, verified WAL + `foreign_keys=ON`, timeline index, idempotent upsert/query, atomic snapshot replacement, random-byte/runtime corruption classification |
 | `nian-storage` | recordings layout, partial/final naming round-trip, traversal rejection, exclusive claims (incl. sub-second clock regression), no-replace publication (success, collision refusal, recoverable abandoned partials) |
-| `nian-storage` (M3/M4) | partial-file classification plus deterministic exact-grammar filesystem inventory; normal + recovered first-class recordings; foreign/control artifacts excluded; recording-looking symlinks never followed; shared strict recovery-tombstone v2 validation |
+| `nian-storage` (M3/M4) | partial-file classification plus deterministic exact-grammar filesystem inventory; normal + recovered first-class recordings; foreign/control artifacts excluded; recording-looking symlinks never followed; shared strict recovery-tombstone v2 validation; typed path-presence semantics where only `NotFound` proves absence; shared whole-second filesystem identity normalization |
 | `nian-ipc` | envelope round-trips, framing limits (1 MiB cap, CRLF, truncation), dispatch loop (ping/describe/shutdown/unknown), protocol version guard, handler event emission through the writer before replies (M3) |
 | `nian-media` | RTSP URL redaction invariants |
 | `nian-media` errors (M3) | timeout vs cancellation category matrix: every error maps to exactly one typed `FailureCategory`; retryability is exactly the source-side set; local output/storage/config never loops |
@@ -282,25 +282,41 @@ the filesystem/SQLite boundary without FFmpeg or an installed `sqlite3` CLI:
   can be acquired; a held kernel lease makes them active and untouched;
 * deleting SQLite and calling rebuild restores finalized recordings with
   unknown duration left NULL; random/corrupt DB bytes are quarantined and
-  rebuilt without touching media;
+  rebuilt without touching media; corruption injected after manager startup is
+  automatically repaired from filesystem truth, and an interrupted DB/WAL/SHM
+  quarantine converges before the next canonical database open;
+* a failed reconciliation clears the retention-ready safety gate; a later
+  successful reconciliation restores it;
+* incremental finalized upserts accept sub-second event timestamps for normal
+  and recovered filenames but persist the canonical whole-second filesystem
+  identity;
 * age-only, quota-only and combined OR retention are deterministic under an
   injected local naive clock; quota triggers only above HIGH and deletes
-  oldest-first until LOW;
+  oldest-first until LOW; blocked candidates do not stop later eligible cleanup,
+  and the report exposes trigger state, usage before/after and whether LOW was
+  actually reached;
 * partials/control artifacts never become quota candidates, while recovered
   recordings do consume recording bytes;
-* a live camera lease does not block deletion of an old normal finalized MKV;
-* unresolved recovered transactions are preserved; a settled v2 transaction
-  removes recovered final, then tombstone, then index row;
+* a live camera lease does not block deletion of an old normal finalized MKV or
+  an old fully settled recovered transaction; the same lease still protects
+  unresolved partial/scratch state;
+* unresolved/malformed recovered transactions are preserved. Only `NotFound`
+  proves original-partial absence; deterministic PermissionDenied/generic IO
+  metadata faults are inspection failures and preserve the recovered final;
+* a settled v2 transaction is revalidated immediately before commit and removes
+  recovered final, then reverified tombstone, then index row;
 * filesystem delete failure preserves both media and its DB row; a file-first
   crash boundary (media gone, stale row left) converges on the next
   reconciliation;
 * recording-looking symlinks are neither counted nor followed; stale recovery
   scratch cleanup requires the matching camera lease and remains separate from
-  retention accounting.
+  retention accounting; stale tombstone metadata inspection errors preserve the
+  marker rather than treating the path as absent.
 
-The M4 migration tests use `rusqlite` directly for user-version, WAL/index and
-rollback assertions. No test shells out to `sqlite3`, sleeps for age cutoffs or
-depends on changing the machine timezone.
+The M4 migration tests use `rusqlite` directly for user-version, verified WAL +
+foreign-key startup invariants, timeline-index and rollback assertions. No test
+shells out to `sqlite3`, sleeps for age cutoffs or depends on changing the
+machine timezone.
 
 ### CLI/IPC smoke checks (manual, seconds)
 

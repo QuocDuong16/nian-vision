@@ -146,6 +146,9 @@ local naive wall-clock `started_at`, sequence, size and optional media duration;
 `(camera_id, started_at, sequence)` is a real SQLite timeline index. SQLite runs
 WAL + `foreign_keys=ON`, a 2 s busy timeout and `synchronous=NORMAL` because the
 catalog is disposable while media is not.
+Startup requests WAL and then queries `journal_mode` again; anything other than
+`wal` is a typed startup failure. `foreign_keys` is likewise queried back and
+must equal `1`.
 
 `nian-application::StorageManager` performs:
 
@@ -154,16 +157,24 @@ catalog is disposable while media is not.
 3. one SQLite transaction for index upserts/removal of missing rows.
 
 A second reconciliation without filesystem changes produces zero DB mutations.
-A database deletion triggers an explicit filesystem rebuild; SQLite corruption
-is quarantined with its WAL/SHM sidecars and a fresh index is reconstructed
-without probing media through FFmpeg. `media_duration_ms` remains NULL when disk
-facts cannot prove it.
+A retention-ready gate is fail-closed: every reconciliation/rebuild starts by
+marking the manager unreconciled and sets it ready again only after the complete
+inventory + SQLite operation succeeds. A database deletion triggers an explicit
+filesystem rebuild. SQLite corruption discovered either during initial open or
+later reconciliation closes the live connection, quarantines the database with
+its WAL/SHM sidecars, opens a fresh schema and rebuilds from authoritative disk
+facts without probing media through FFmpeg. A `.quarantine-pending` marker makes
+an interrupted three-file quarantine convergent on the next startup, so an old
+WAL/SHM can never be attached to a newly-created canonical database.
+`media_duration_ms` remains NULL when disk facts cannot prove it.
 
 Partials preserve M3 ownership: a camera lease held by another process makes a
 partial active and untouchable; an immediately acquirable lease proves only that
 it is abandoned/recovery-pending. M4 never remuxes it. Scratch cleanup likewise
-requires the camera lease. Old **normal finalized** recordings do not require the
-camera-wide lease, so 24/7 recording cannot disable retention.
+requires the camera lease. Old **normal finalized** recordings and fully
+**settled recovered** recordings do not require the camera-wide lease, so 24/7
+recording cannot disable historical retention. Unresolved partial/scratch work
+continues to require M3 ownership.
 
 Retention plans from filesystem facts and an injected local wall-clock time.
 Age and quota use OR semantics. Quota cleanup starts only above the explicit
@@ -175,11 +186,18 @@ size. Deletion is deliberately **filesystem first, SQLite second**. A crash afte
 file removal therefore leaves only a stale cache row, which the next
 reconciliation removes.
 
-Recovered recordings add one more guard: retention deletes a recovered final
-only when the shared v2 tombstone parser proves the exact original→final
-transaction, the current final still matches the published size, and the
-original partial is already absent. Otherwise it reports a blocked recovery
-transaction and preserves the footage, avoiding a recovery-resurrection loop.
+Recovered recordings add stronger resurrection guards. Filesystem absence is a
+typed fact: only `NotFound` proves absence; permission/IO failures are
+uninspectable and therefore preserve footage/evidence. A recovered final becomes
+settled only when the shared strict v2 tombstone proves the exact original→final
+transaction, the final is a canonical regular file with the trusted size, and
+the original partial is proven absent. Immediately before deleting the final,
+retention revalidates that final identity/size, the exact tombstone evidence and
+that the original partial is **still** `NotFound`. The final is then deleted,
+the tombstone is verified once more before tombstone cleanup, and the index row
+is removed last. Any failed revalidation skips that candidate and preserves
+media/evidence. Quota cleanup continues to later eligible candidates and reports
+whether the LOW watermark was actually reached.
 
 ## Failure model
 

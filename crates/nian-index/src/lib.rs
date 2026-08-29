@@ -19,6 +19,11 @@ const TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 
 #[cfg(any(test, feature = "test-hooks"))]
 static FAIL_NEXT_REMOVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(any(test, feature = "test-hooks"))]
+static FAIL_NEXT_LIST_ALL_CORRUPTION: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+#[cfg(any(test, feature = "test-hooks"))]
+static FAIL_NEXT_LIST_ALL_ERROR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod test_hooks {
@@ -29,8 +34,48 @@ pub mod test_hooks {
         super::FAIL_NEXT_REMOVE.store(true, Ordering::SeqCst);
     }
 
+    pub fn fail_next_list_all_with_corruption(path: &std::path::Path) {
+        let mut armed = match super::FAIL_NEXT_LIST_ALL_CORRUPTION.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *armed = Some(path.to_path_buf());
+    }
+
+    pub fn fail_next_list_all(path: &std::path::Path) {
+        let mut armed = match super::FAIL_NEXT_LIST_ALL_ERROR.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *armed = Some(path.to_path_buf());
+    }
+
     pub(crate) fn take_remove_failure() -> bool {
         super::FAIL_NEXT_REMOVE.swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn take_list_all_corruption(path: &std::path::Path) -> bool {
+        let mut armed = match super::FAIL_NEXT_LIST_ALL_CORRUPTION.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if armed.as_deref() != Some(path) {
+            return false;
+        }
+        *armed = None;
+        true
+    }
+
+    pub(crate) fn take_list_all_error(path: &std::path::Path) -> bool {
+        let mut armed = match super::FAIL_NEXT_LIST_ALL_ERROR.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if armed.as_deref() != Some(path) {
+            return false;
+        }
+        *armed = None;
+        true
     }
 }
 
@@ -40,17 +85,33 @@ pub enum IndexError {
     Sqlite(#[from] rusqlite::Error),
     #[error("index schema version {found} is newer than supported version {supported}")]
     FutureSchema { found: i32, supported: i32 },
+    #[error("SQLite WAL journal mode is unavailable (actual mode: {mode})")]
+    WalUnavailable { mode: String },
+    #[error("SQLite foreign_keys pragma could not be enabled")]
+    ForeignKeysUnavailable,
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[error("injected SQLite corruption")]
+    InjectedCorruption,
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[error("injected SQLite operation failure")]
+    InjectedFailure,
     #[error("invalid indexed data: {0}")]
     InvalidData(String),
 }
 
 impl IndexError {
     pub fn is_corruption(&self) -> bool {
-        matches!(
-            self,
-            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _))
-                if matches!(error.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
-        )
+        match self {
+            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _)) => {
+                matches!(
+                    error.code,
+                    ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase
+                )
+            }
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::InjectedCorruption => true,
+            _ => false,
+        }
     }
 }
 
@@ -118,7 +179,8 @@ impl RecordingIndex {
         reject_future_schema(&connection)?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        verify_foreign_keys(&connection)?;
+        enable_and_verify_wal(&connection)?;
         // Rebuildable cache: NORMAL is sufficient; media files remain authoritative.
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         migrate(&connection)?;
@@ -204,6 +266,14 @@ impl RecordingIndex {
     }
 
     pub fn list_all(&self) -> Result<Vec<IndexedRecording>, IndexError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if test_hooks::take_list_all_corruption(&self.path) {
+            return Err(IndexError::InjectedCorruption);
+        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        if test_hooks::take_list_all_error(&self.path) {
+            return Err(IndexError::InjectedFailure);
+        }
         self.query_many(
             &format!("{SELECT_SQL} ORDER BY camera_id, started_at, sequence, relative_path"),
             [],
@@ -422,6 +492,33 @@ fn parse_state(value: &str) -> Result<RecordingState, IndexError> {
     }
 }
 
+fn verify_foreign_keys(connection: &Connection) -> Result<(), IndexError> {
+    let enabled: i64 = connection.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    if enabled == 1 {
+        Ok(())
+    } else {
+        Err(IndexError::ForeignKeysUnavailable)
+    }
+}
+
+fn enable_and_verify_wal(connection: &Connection) -> Result<(), IndexError> {
+    let requested: String =
+        connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    verify_wal_mode(&requested)?;
+    let current: String = connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    verify_wal_mode(&current)
+}
+
+fn verify_wal_mode(mode: &str) -> Result<(), IndexError> {
+    if mode.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(IndexError::WalUnavailable {
+            mode: mode.to_owned(),
+        })
+    }
+}
+
 fn schema_version(connection: &Connection) -> Result<i32, IndexError> {
     Ok(connection.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
@@ -547,6 +644,11 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
         assert_eq!(mode.to_ascii_lowercase(), "wal");
+        let foreign_keys: i64 = index
+            .connection
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
         let count: i64 = index
             .connection
             .query_row(
@@ -557,6 +659,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn wal_mode_verifier_rejects_any_non_wal_result() {
+        assert!(verify_wal_mode("wal").is_ok());
+        assert!(verify_wal_mode("WAL").is_ok());
+        assert!(matches!(
+            verify_wal_mode("delete"),
+            Err(IndexError::WalUnavailable { ref mode }) if mode == "delete"
+        ));
     }
 
     #[test]
