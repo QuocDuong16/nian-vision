@@ -419,6 +419,17 @@ impl StorageManager {
         &mut self,
         now: NaiveDateTime,
     ) -> Result<RetentionReport, StorageManagerError> {
+        self.run_retention_with_delete(now, |path| std::fs::remove_file(path))
+    }
+
+    fn run_retention_with_delete<F>(
+        &mut self,
+        now: NaiveDateTime,
+        remove_file: F,
+    ) -> Result<RetentionReport, StorageManagerError>
+    where
+        F: Fn(&Path) -> std::io::Result<()>,
+    {
         if !self.reconciled {
             return Err(StorageManagerError::NotReconciled);
         }
@@ -512,7 +523,7 @@ impl StorageManager {
                 continue;
             }
 
-            if let Err(error) = std::fs::remove_file(&candidate.path) {
+            if let Err(error) = remove_file(&candidate.path) {
                 report.failed.push(RetentionFailure {
                     relative_path: candidate.relative_path.clone(),
                     kind: RetentionFailureKind::FilesystemDelete,
@@ -1105,7 +1116,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, NaiveDateTime};
 
     #[cfg(unix)]
     #[test]
@@ -1136,6 +1147,48 @@ mod tests {
             Err(Revalidation::Changed(_))
         ));
         assert_eq!(std::fs::read(outside).unwrap(), b"must survive");
+    }
+
+    #[test]
+    fn filesystem_deletion_failure_keeps_index_row_and_media() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = RecordingsLayout::new(temp.path().join("recordings")).unwrap();
+        let camera = CameraId::parse("cam-a").unwrap();
+        let started_at =
+            NaiveDateTime::parse_from_str("2026-08-20T08:30:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let media = layout
+            .day_dir(&camera, started_at.date())
+            .join("08-30-00.mkv");
+        std::fs::create_dir_all(media.parent().unwrap()).unwrap();
+        std::fs::write(&media, b"footage").unwrap();
+
+        let mut manager = StorageManager::open(
+            layout,
+            RetentionPolicy {
+                max_age_days: Some(1),
+                max_storage_bytes: None,
+            },
+            None,
+        )
+        .unwrap();
+        manager.reconcile().unwrap();
+
+        let report = manager
+            .run_retention_with_delete(
+                NaiveDateTime::parse_from_str("2026-08-29T12:00:00", "%Y-%m-%dT%H:%M:%S").unwrap(),
+                |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            )
+            .unwrap();
+
+        assert_eq!(report.deleted, 0);
+        assert!(
+            report
+                .failed
+                .iter()
+                .any(|failure| failure.kind == RetentionFailureKind::FilesystemDelete)
+        );
+        assert!(media.exists());
+        assert_eq!(manager.list_camera(&camera).unwrap().len(), 1);
     }
 
     #[test]

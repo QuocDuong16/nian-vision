@@ -46,28 +46,6 @@ fn age_manager(layout: RecordingsLayout) -> StorageManager {
 
 #[cfg(unix)]
 #[test]
-fn filesystem_deletion_failure_keeps_index_row_and_media() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let (_temp, layout, camera) = fixture();
-    let media = recording(&layout, &camera, at("2026-08-20T08:30:00"), "08-30-00.mkv");
-    let day = media.parent().unwrap().to_path_buf();
-    let mut manager = age_manager(layout);
-    manager.reconcile().unwrap();
-
-    let original_mode = std::fs::metadata(&day).unwrap().permissions().mode();
-    std::fs::set_permissions(&day, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let report = manager.run_retention(at("2026-08-29T12:00:00")).unwrap();
-    std::fs::set_permissions(&day, std::fs::Permissions::from_mode(original_mode)).unwrap();
-
-    assert_eq!(report.deleted, 0);
-    assert!(!report.failed.is_empty());
-    assert!(media.exists());
-    assert_eq!(manager.list_camera(&camera).unwrap().len(), 1);
-}
-
-#[cfg(unix)]
-#[test]
 fn recording_looking_symlink_is_not_counted_or_deleted() {
     use std::os::unix::fs::symlink;
 
