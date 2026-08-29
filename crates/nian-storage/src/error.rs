@@ -2,9 +2,29 @@
 
 use std::path::PathBuf;
 
+use nian_domain::CameraId;
+
 /// Errors raised while building or interpreting storage paths.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    /// Another process already owns the camera's kernel-backed lease.
+    #[error("camera {camera_id} is already active (lease {lock_path:?})")]
+    CameraAlreadyActive {
+        /// Camera whose recording job is already owned elsewhere.
+        camera_id: CameraId,
+        /// Stable lock-file pathname. Path existence itself is not ownership.
+        lock_path: PathBuf,
+    },
+
+    /// A recovery caller supplied a lease for another camera/layout.
+    #[error("camera lease does not authorize {camera_id} at {lock_path:?}")]
+    CameraLeaseMismatch {
+        /// Camera recovery attempted to touch.
+        camera_id: CameraId,
+        /// Expected stable lock path for that camera/layout.
+        lock_path: PathBuf,
+    },
+
     /// A path component failed the traversal-safety check.
     #[error("unsafe path component rejected: {component:?}")]
     UnsafeComponent {

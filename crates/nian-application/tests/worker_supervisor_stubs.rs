@@ -335,6 +335,48 @@ fn storage_failed_job_never_spawns_another_worker() {
 }
 
 #[test]
+fn camera_in_use_job_never_spawns_another_worker() {
+    let temp = tempfile::tempdir().unwrap();
+    let failed = response(3, &terminal_status_json("failed", "camera_in_use"));
+    let body = format!(
+        "printf '%s\n' '{HELLO_OK}'\n\
+         while read -r req; do\n\
+           case \"$req\" in\n\
+             *'\"id\":1,'*) printf '%s\\n' '{START_ACK}' ;;\n\
+             *'shutdown'*) printf '%s\\n' '{SHUTDOWN_ACK}' ;;\n\
+             *) printf '%s\\n' '{failed}' ;;\n\
+           esac\n\
+         done\n"
+    );
+    let prog = script(temp.path(), "camera-in-use-no-restart", &body);
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let mut supervisor = WorkerSupervisor::with_deadlines(
+        CountingLauncher {
+            inner: ScriptLauncher { program: prog },
+            spawns: Arc::clone(&spawns),
+        },
+        fixture_deadlines(),
+    );
+    supervisor.set_desired_recording(desired("cam-owned-elsewhere"));
+    let outcome = supervisor.run_forever(&|| false, &|_| {});
+    match outcome {
+        Err(ApplicationError::PermanentRecordingFailure { category }) => {
+            assert_eq!(category, "camera_in_use");
+        }
+        other => panic!("camera_in_use must stop supervision, got {other:?}"),
+    }
+    assert_eq!(
+        supervisor.last_job_terminal(),
+        Some(&JobTerminal::Failed("camera_in_use".to_owned()))
+    );
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        1,
+        "camera ownership conflict must never churn worker restarts"
+    );
+}
+
+#[test]
 fn silent_after_start_ack_becomes_unresponsive_monitor_and_retries() {
     // Final remediation §3: a worker that acks recording.start and then
     // goes COMPLETELY SILENT (alive, never answering status polls) must be

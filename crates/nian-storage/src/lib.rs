@@ -22,6 +22,7 @@
 
 pub mod classification;
 pub mod error;
+pub mod lease;
 pub mod paths;
 pub mod recovery;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -31,5 +32,6 @@ pub use classification::{
     RecordingFileKind, classify_recording_file, classify_recording_file_name,
 };
 pub use error::StorageError;
+pub use lease::{CAMERA_LEASE_FILE_NAME, CameraLease};
 pub use paths::{RecordingsLayout, SEGMENT_EXTENSION, SEGMENT_PARTIAL_SUFFIX};
 pub use recovery::{PartialDisposition, PartialFile, scan_camera_partials};

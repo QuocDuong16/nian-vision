@@ -320,21 +320,19 @@ invariant `finals_after == finals_before`.
 
 ### Async startup recovery + typed classification (reviews §6/§7/§8)
 
-`recording.start` validates CHEAP parameters, runs a storage pre-flight
-(`RecordingsLayout::ensure_camera_dir` — the only synchronous place
-`storage_unavailable` can be refused, and only for genuine infrastructure
-failure), and replies promptly. The job thread then runs
-`recovering → connecting → recording`: recovery is asynchronous, its
-summary (`recovered / quarantined / failed / infrastructure_failures`)
-rides the status snapshot, and stop/shutdown interrupt it in a bounded way
-(recovery observes a shared interrupt handle; `recover_camera_partials_
-with_interrupt` aborts blocked demux/mux I/O and stops between files).
-Failures are TYPED: `RecoveryError::Storage` is infrastructure (may fail
-the job permanently when nothing was recovered), `Unreadable` is a
-per-file content verdict (quarantine; recording continues), `Cancelled`
-is neither. The parent classifies `storage_unavailable` as a PERMANENT
-start refusal (no worker restart loop); `start_failed` (thread spawn) is
-the only transient refusal code.
+`recording.start` validates CHEAP parameters and replies promptly. The job
+thread then acquires the per-camera kernel lease before filesystem pre-flight
+or recovery, and runs `pre-flight → recovering → connecting → recording`.
+Recovery is asynchronous; its summary (`recovered / quarantined / failed /
+infrastructure_failures`) rides the status snapshot, and stop/shutdown
+interrupt it in a bounded way (recovery observes a shared interrupt handle;
+`recover_camera_partials_with_interrupt` aborts blocked demux/mux I/O and
+stops between files). Failures are TYPED: recovery infrastructure errors may
+fail the job permanently, `Unreadable` is a per-file content verdict
+(quarantine; recording continues), and `Cancelled` is neither. The parent
+still accepts the legacy permanent `storage_unavailable` start refusal, while
+new workers report post-ack pre-flight failure as terminal `storage_failed`.
+`start_failed` (thread spawn) remains the only transient refusal code.
 
 ## Amendment (M3 final correctness remediation, 2026-08-28)
 
@@ -430,7 +428,20 @@ existence: after `create_dir_all`, a uniquely-named probe file
 (`.nian-write-probe-<pid>-<n>.tmp`, reserved non-recording name,
 classify-`Unknown`) is created with `create_new`, closed, and removed.
 It never overwrites user data; creation failure surfaces a genuine
-storage error (the worker's permanent `storage_unavailable` refusal).
+storage error (terminal `storage_failed` in the lease-owning worker job).
+
+### Per-camera live-partial ownership lease (M3 live-partial remediation)
+
+Each camera tree owns a stable `.nian-camera.lock` control file. The file may
+remain forever; ownership is exclusively the OS lock held by the open
+`std::fs::File`. The job thread acquires it with non-blocking `try_lock()`
+before storage pre-flight, partial scanning, recovery, or session creation,
+and holds it through Connecting, Recording, Backoff, reconnects, graceful
+Stopping, and final thread exit. `WouldBlock` becomes terminal
+`camera_in_use`, so the parent does not churn worker restarts. Process death
+closes the handle and releases the lease automatically, making the previous
+owner's canonical partials valid crash-recovery candidates for the next job.
+The lock file classifies `Unknown` and never reserves recording identity.
 
 ## Amendment 4 — M3 final safety remediation (2026-08-28)
 

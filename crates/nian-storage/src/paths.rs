@@ -104,8 +104,8 @@ impl RecordingsLayout {
     /// FRESH probe identity instead of condemning the storage root. The
     /// reserved probe name never parses as a segment/recording/recovery
     /// name (always classifies `Unknown`). Failure surfaces a genuine
-    /// storage error — the worker's start pre-flight maps it to the
-    /// permanent `storage_unavailable` refusal.
+    /// storage error — the worker job maps it to terminal `storage_failed`
+    /// while still holding the camera lease.
     pub fn ensure_camera_dir(&self, camera: &CameraId) -> Result<PathBuf, StorageError> {
         let dir = self.camera_dir(camera);
         std::fs::create_dir_all(&dir).map_err(|source| StorageError::Io {

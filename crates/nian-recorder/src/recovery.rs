@@ -138,7 +138,8 @@ use nian_domain::{CameraId, MediaRational};
 use nian_media_ffmpeg::{InterruptHandle, MatroskaMuxer, MediaInput};
 use nian_storage::paths::publish_no_replace;
 use nian_storage::{
-    PartialDisposition, PartialFile, RecordingsLayout, StorageError, scan_camera_partials,
+    CameraLease, PartialDisposition, PartialFile, RecordingsLayout, StorageError,
+    scan_camera_partials,
 };
 
 use crate::StopFlag;
@@ -997,6 +998,13 @@ fn publish_hold_wait() {
 
 /// Recovers all classifiable partials of one camera.
 ///
+/// Standalone callers acquire the same kernel-backed [`CameraLease`] used by
+/// production before scanning. If another process owns the camera, recovery
+/// returns a typed infrastructure failure without touching the camera tree.
+/// Production jobs that already hold the lease use
+/// [`recover_camera_partials_with_interrupt`] so ownership remains held across
+/// recovery, connecting, recording, backoff, reconnects, and shutdown.
+///
 /// Conservative per-file containment: one failure does not abort other
 /// files' recovery. Returns outcomes in deterministic (scan) order plus the
 /// failures encountered. Nothing outside the canonical layout tree is ever
@@ -1005,8 +1013,23 @@ pub fn recover_camera_partials(
     layout: &RecordingsLayout,
     camera: &CameraId,
 ) -> (Vec<RecoveryOutcome>, Vec<RecoveryFailure>) {
+    let lease = match CameraLease::try_acquire(layout, camera) {
+        Ok(lease) => lease,
+        Err(source) => {
+            return (
+                Vec::new(),
+                vec![RecoveryFailure {
+                    partial_path: layout.camera_dir(camera),
+                    error: RecoveryError::Infrastructure {
+                        operation: "acquire camera lease",
+                        source,
+                    },
+                }],
+            );
+        }
+    };
     let interrupt = InterruptHandle::new();
-    recover_camera_partials_with_interrupt(layout, camera, &interrupt, None)
+    recover_camera_partials_with_interrupt(layout, camera, &lease, &interrupt, None)
 }
 
 /// Like [`recover_camera_partials`], but observes BOTH stop domains (final
@@ -1024,13 +1047,53 @@ pub fn recover_camera_partials(
 pub fn recover_camera_partials_with_interrupt(
     layout: &RecordingsLayout,
     camera: &CameraId,
+    lease: &CameraLease,
+    interrupt: &InterruptHandle,
+    graceful_stop: Option<&StopFlag>,
+) -> (Vec<RecoveryOutcome>, Vec<RecoveryFailure>) {
+    if let Err(source) = lease.verify(layout, camera) {
+        return (
+            Vec::new(),
+            vec![RecoveryFailure {
+                partial_path: layout.camera_dir(camera),
+                error: RecoveryError::Infrastructure {
+                    operation: "validate camera lease",
+                    source,
+                },
+            }],
+        );
+    }
+
+    let partials = scan_camera_partials(layout, camera, lease);
+    recover_camera_partials_from_scan(layout, camera, partials, interrupt, graceful_stop)
+}
+
+/// Recovery engine below the ownership boundary. Production code must enter
+/// through a lease-checking wrapper; unit tests use this only for deliberate
+/// transaction-race coverage that predates the camera-wide lease.
+#[cfg(test)]
+fn recover_camera_partials_unleased_with_interrupt(
+    layout: &RecordingsLayout,
+    camera: &CameraId,
+    interrupt: &InterruptHandle,
+    graceful_stop: Option<&StopFlag>,
+) -> (Vec<RecoveryOutcome>, Vec<RecoveryFailure>) {
+    let partials =
+        nian_storage::recovery::scan_camera_partials_without_lease_for_test(layout, camera);
+    recover_camera_partials_from_scan(layout, camera, partials, interrupt, graceful_stop)
+}
+
+fn recover_camera_partials_from_scan(
+    layout: &RecordingsLayout,
+    camera: &CameraId,
+    partials: Result<Vec<PartialFile>, StorageError>,
     interrupt: &InterruptHandle,
     graceful_stop: Option<&StopFlag>,
 ) -> (Vec<RecoveryOutcome>, Vec<RecoveryFailure>) {
     let mut outcomes = Vec::new();
     let mut failures = Vec::new();
 
-    let partials = match scan_camera_partials(layout, camera) {
+    let partials = match partials {
         Ok(partials) => partials,
         Err(source) => {
             failures.push(RecoveryFailure {
@@ -2203,14 +2266,22 @@ mod fault_injection_tests {
 
         let layout = storage.layout.clone();
         let camera = storage.camera.clone();
-        let winner = std::thread::spawn(move || recover_camera_partials(&layout, &camera));
+        let winner = std::thread::spawn(move || {
+            let interrupt = InterruptHandle::new();
+            recover_camera_partials_unleased_with_interrupt(&layout, &camera, &interrupt, None)
+        });
 
         // The winner has PUBLISHED and is parked BEFORE its tombstone.
         hold.wait_arrived();
 
         // The loser observes the destination INSIDE the no-evidence window.
-        let (loser_outcomes, loser_failures) =
-            recover_camera_partials(&storage.layout, &storage.camera);
+        let loser_interrupt = InterruptHandle::new();
+        let (loser_outcomes, loser_failures) = recover_camera_partials_unleased_with_interrupt(
+            &storage.layout,
+            &storage.camera,
+            &loser_interrupt,
+            None,
+        );
         assert!(loser_failures.is_empty(), "{loser_failures:?}");
         assert!(
             loser_outcomes
@@ -2319,10 +2390,19 @@ mod fault_injection_tests {
         let layout = storage.layout.clone();
         let camera = storage.camera.clone();
         let handle = {
-            let attempt = move || recover_camera_partials(&layout, &camera);
+            let attempt = move || {
+                let interrupt = InterruptHandle::new();
+                recover_camera_partials_unleased_with_interrupt(&layout, &camera, &interrupt, None)
+            };
             std::thread::spawn(attempt)
         };
-        let res_a = recover_camera_partials(&storage.layout, &storage.camera);
+        let interrupt_a = InterruptHandle::new();
+        let res_a = recover_camera_partials_unleased_with_interrupt(
+            &storage.layout,
+            &storage.camera,
+            &interrupt_a,
+            None,
+        );
         let res_b = handle.join().unwrap();
 
         let mut recovered = 0usize;
@@ -2442,9 +2522,11 @@ mod fault_injection_tests {
         let camera = storage.camera.clone();
         let worker = std::thread::spawn(move || {
             let interrupt = InterruptHandle::new();
+            let lease = CameraLease::try_acquire(&layout, &camera).unwrap();
             recover_camera_partials_with_interrupt(
                 &layout,
                 &camera,
+                &lease,
                 &interrupt,
                 Some(&stop_for_worker),
             )
@@ -2748,9 +2830,11 @@ mod fault_injection_tests {
         let camera = storage.camera.clone();
         let worker = std::thread::spawn(move || {
             let interrupt = InterruptHandle::new();
+            let lease = CameraLease::try_acquire(&layout, &camera).unwrap();
             recover_camera_partials_with_interrupt(
                 &layout,
                 &camera,
+                &lease,
                 &interrupt,
                 Some(&stop_for_worker),
             )
@@ -2803,9 +2887,11 @@ mod fault_injection_tests {
         let camera = storage.camera.clone();
         let worker = std::thread::spawn(move || {
             let interrupt = InterruptHandle::new();
+            let lease = CameraLease::try_acquire(&layout, &camera).unwrap();
             recover_camera_partials_with_interrupt(
                 &layout,
                 &camera,
+                &lease,
                 &interrupt,
                 Some(&stop_for_worker),
             )

@@ -26,6 +26,7 @@ use chrono::{NaiveDate, NaiveDateTime};
 use nian_domain::CameraId;
 
 use crate::error::StorageError;
+use crate::lease::CameraLease;
 use crate::paths::{ParsedSegmentName, parse_segment_file_name};
 
 /// Minimum number of bytes for a partial file to be worth media-level
@@ -127,6 +128,11 @@ fn dir_date(day_dir: &Path) -> Option<NaiveDate> {
 
 /// Scans ONE camera's recording tree for leftover partial files.
 ///
+/// The caller must hold the matching camera-wide kernel lease. This makes the
+/// ownership precondition mechanical at the storage boundary: production code
+/// cannot enumerate canonical partials without proving that no live recorder
+/// owns them.
+///
 /// Only canonical layout paths under `<root>/<camera-id>/**/` are visited —
 /// arbitrary user-supplied filenames are never trusted, every candidate must
 /// pass [`parse_segment_file_name`] with `is_partial == true`. Files whose
@@ -137,6 +143,27 @@ fn dir_date(day_dir: &Path) -> Option<NaiveDate> {
 /// Returns candidates sorted deterministically (by path) so recovery runs
 /// are reproducible. The scan creates and deletes nothing.
 pub fn scan_camera_partials(
+    layout: &crate::paths::RecordingsLayout,
+    camera: &CameraId,
+    lease: &CameraLease,
+) -> Result<Vec<PartialFile>, StorageError> {
+    lease.verify(layout, camera)?;
+    scan_camera_partials_unchecked(layout, camera)
+}
+
+/// Test-only escape hatch for deliberate transaction-race coverage below the
+/// production ownership boundary. Never available in an ordinary production
+/// build; callers must explicitly enable `test-hooks`.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub fn scan_camera_partials_without_lease_for_test(
+    layout: &crate::paths::RecordingsLayout,
+    camera: &CameraId,
+) -> Result<Vec<PartialFile>, StorageError> {
+    scan_camera_partials_unchecked(layout, camera)
+}
+
+fn scan_camera_partials_unchecked(
     layout: &crate::paths::RecordingsLayout,
     camera: &CameraId,
 ) -> Result<Vec<PartialFile>, StorageError> {
@@ -291,6 +318,14 @@ mod tests {
         RecordingsLayout::new(root).unwrap()
     }
 
+    fn scan(
+        layout: &RecordingsLayout,
+        camera: &CameraId,
+    ) -> Result<Vec<PartialFile>, StorageError> {
+        let lease = CameraLease::try_acquire(layout, camera).unwrap();
+        scan_camera_partials(layout, camera, &lease)
+    }
+
     const CAMERA: &str = "cam-1";
 
     /// Writes a minimal fake "matroska-shaped" payload: EBML magic at 0,
@@ -326,7 +361,7 @@ mod tests {
         std::fs::write(day.join("08-30-00.partial.mkv"), b"").unwrap();
         write_shaped(&day.join("08-30-01.partial.mkv"), false, 8); // < MIN bytes
 
-        let found = scan_camera_partials(&layout, &CameraId::parse(CAMERA).unwrap()).unwrap();
+        let found = scan(&layout, &CameraId::parse(CAMERA).unwrap()).unwrap();
         assert_eq!(found.len(), 2);
         assert!(
             found
@@ -345,7 +380,7 @@ mod tests {
         // The sequenced partial stays truncated (no Cues) on purpose.
         write_shaped(&day.join("09-05-00-2.partial.mkv"), false, 8000);
 
-        let found = scan_camera_partials(&layout, &CameraId::parse(CAMERA).unwrap()).unwrap();
+        let found = scan(&layout, &CameraId::parse(CAMERA).unwrap()).unwrap();
         assert_eq!(found.len(), 2);
         for partial in &found {
             match &partial.disposition {
@@ -365,7 +400,7 @@ mod tests {
 
         write_shaped(&day.join("10-00-00.partial.mkv"), true, 9000);
 
-        let found = scan_camera_partials(&layout, &CameraId::parse(CAMERA).unwrap()).unwrap();
+        let found = scan(&layout, &CameraId::parse(CAMERA).unwrap()).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(
             found[0].disposition,
@@ -389,7 +424,7 @@ mod tests {
 
         std::fs::write(day.join("11-00-00.partial.mkv"), vec![0x07_u8; 512]).unwrap();
 
-        let found = scan_camera_partials(&layout, &CameraId::parse(CAMERA).unwrap()).unwrap();
+        let found = scan(&layout, &CameraId::parse(CAMERA).unwrap()).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(
             found[0].disposition,
@@ -407,7 +442,7 @@ mod tests {
         std::fs::write(day.join("12-00-00.mkv"), b"a finished recording").unwrap();
         std::fs::write(day.join("not-a-segment.mkv"), [0x1A_u8, 0x45].repeat(150)).unwrap();
 
-        let found = scan_camera_partials(&layout, &CameraId::parse(CAMERA).unwrap()).unwrap();
+        let found = scan(&layout, &CameraId::parse(CAMERA).unwrap()).unwrap();
         assert!(
             found.is_empty(),
             "foreign/final files must be invisible to reconciliation"
@@ -421,7 +456,7 @@ mod tests {
     fn missing_camera_tree_scans_to_nothing() {
         let temp = tempfile::tempdir().unwrap();
         let layout = layout_in(temp.path());
-        let found = scan_camera_partials(&layout, &CameraId::parse("ghost-cam").unwrap()).unwrap();
+        let found = scan(&layout, &CameraId::parse("ghost-cam").unwrap()).unwrap();
         assert!(found.is_empty());
     }
 
@@ -432,7 +467,7 @@ mod tests {
         let day = day_dir(&layout);
 
         write_shaped(&day.join("13-45-30.partial.mkv"), false, 200);
-        let found = scan_camera_partials(&layout, &CameraId::parse(CAMERA).unwrap()).unwrap();
+        let found = scan(&layout, &CameraId::parse(CAMERA).unwrap()).unwrap();
         assert_eq!(found.len(), 1);
 
         let started = found[0].started_at().unwrap();
@@ -460,7 +495,7 @@ mod tests {
         std::fs::create_dir_all(&day2_root).unwrap();
         write_shaped(&day2_root.join("23-59-59.partial.mkv"), false, 200);
 
-        let found = scan_camera_partials(&layout, &CameraId::parse(CAMERA).unwrap()).unwrap();
+        let found = scan(&layout, &CameraId::parse(CAMERA).unwrap()).unwrap();
         let names: Vec<String> = found
             .iter()
             .map(|p| p.partial_path.to_string_lossy().into_owned())

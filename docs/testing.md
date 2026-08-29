@@ -121,8 +121,8 @@ categories): crash-before-hello → retryable; wedged hello → bounded
 unhealthy; protocol-version mismatch → permanent; `start_failed` refusal
 → transient retry; `storage_unavailable`/`invalid_params` refusals →
 permanent (spawn-count proves no second worker); terminal
-`storage_failed` job status → typed permanent error and NO respawn
-(`run_forever` + spawn counter); start-ack-then-total-silence →
+`storage_failed` and `camera_in_use` job statuses → typed permanent errors
+and NO respawn (`run_forever` + spawn counter); start-ack-then-total-silence →
 `Unresponsive{phase:"monitor"}` within the missed-poll bound, then
 restartable; backoff waits interrupted by operator shutdown.
 

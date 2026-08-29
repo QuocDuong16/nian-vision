@@ -303,6 +303,7 @@ mod tests {
     fn foreign_and_probe_names_are_unknown() {
         assert_eq!(kind_of("notes.txt"), RecordingFileKind::Unknown);
         assert_eq!(kind_of("not-a-segment.mkv"), RecordingFileKind::Unknown);
+        assert_eq!(kind_of(".nian-camera.lock"), RecordingFileKind::Unknown);
         assert_eq!(
             kind_of("12-00-00.recovered.mkv.doneX"),
             RecordingFileKind::Unknown

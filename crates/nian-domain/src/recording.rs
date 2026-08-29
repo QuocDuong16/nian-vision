@@ -77,6 +77,10 @@ pub enum FailureCategory {
     /// retried automatically: a broken storage root requires operator
     /// attention, and retrying could churn the filesystem forever.
     StorageFailed,
+    /// Another Nian Vision process owns the camera-wide recording lease.
+    /// Permanent for this worker job: the parent must not churn worker
+    /// restarts while the legitimate owner is recording or reconnecting.
+    CameraInUse,
     /// Permanent, non-retryable failure: invalid recorder configuration, no
     /// usable video stream/time base, FFmpeg ABI mismatch or media
     /// initialization failure. Retrying cannot succeed.
@@ -99,6 +103,7 @@ impl FailureCategory {
             Self::SourceTimedOut => "source_timed_out",
             Self::OutputWriteFailed => "output_write_failed",
             Self::StorageFailed => "storage_failed",
+            Self::CameraInUse => "camera_in_use",
             Self::PermanentConfiguration => "permanent_configuration",
         }
     }
@@ -116,6 +121,7 @@ impl FailureCategory {
             "source_timed_out" => Self::SourceTimedOut,
             "output_write_failed" => Self::OutputWriteFailed,
             "storage_failed" => Self::StorageFailed,
+            "camera_in_use" => Self::CameraInUse,
             "permanent_configuration" => Self::PermanentConfiguration,
             _ => return None,
         };
@@ -128,7 +134,7 @@ mod failure_category_tests {
     use super::*;
 
     /// Every category must round-trip through the stable wire values, and
-    /// the wire vocabulary must stay EXACTLY these nine strings (final
+    /// the wire vocabulary must stay EXACTLY these ten strings (final
     /// safety remediation §7: the parent rejects anything else as a
     /// protocol violation).
     #[test]
@@ -142,9 +148,10 @@ mod failure_category_tests {
             FailureCategory::SourceTimedOut,
             FailureCategory::OutputWriteFailed,
             FailureCategory::StorageFailed,
+            FailureCategory::CameraInUse,
             FailureCategory::PermanentConfiguration,
         ];
-        assert_eq!(all.len(), 9);
+        assert_eq!(all.len(), 10);
         for category in all {
             assert_eq!(
                 FailureCategory::from_wire(category.as_str()),

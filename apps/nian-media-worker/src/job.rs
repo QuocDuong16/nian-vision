@@ -62,10 +62,10 @@ use nian_recorder::{
 ///
 /// # Start-refusal contract (final remediation §8)
 ///
-/// `invalid_params`, `job_already_active` and `storage_unavailable` are
-/// PERMANENT refusals: the parent must never restart the worker expecting a
-/// different answer. `start_failed` is the only transient refusal (the job
-/// thread could not be spawned — retrying is meaningful).
+/// `invalid_params` and `job_already_active` are PERMANENT refusals: the
+/// parent must never restart the worker expecting a different answer.
+/// `start_failed` is the only transient refusal (the job thread could not be
+/// spawned — retrying is meaningful).
 pub mod code {
     /// A start request arrived while this worker already has/had its job.
     pub const JOB_ALREADY_ACTIVE: &str = "job_already_active";
@@ -73,11 +73,6 @@ pub mod code {
     pub const NO_ACTIVE_JOB: &str = "no_active_job";
     /// Start parameters failed validation (bad camera id/storage/source).
     pub const INVALID_PARAMS: &str = "invalid_params";
-    /// Genuine storage-infrastructure failure detected at the cheap
-    /// pre-flight (the camera directory could not be created). PERMANENT.
-    /// Async recovery infrastructure failures surface as terminal job
-    /// state (`failed`/`storage_failed`) instead of a refusal.
-    pub const STORAGE_UNAVAILABLE: &str = "storage_unavailable";
     /// The job thread could not be spawned. The only TRANSIENT refusal.
     pub const START_FAILED: &str = "start_failed";
 }
@@ -485,16 +480,15 @@ impl RecordingJobManager {
     }
 
     /// Starts a supervised job from a validated spec. Only CHEAP validation
-    /// happens here (final remediation §6): parameter checks, the storage
-    /// pre-flight and building the supervisor objects — no media work, no
-    /// recovery. The job thread then runs `recovering` → connection →
-    /// recording asynchronously, so `recording.start` acks promptly even
-    /// when large crash files need remuxing.
+    /// happens here (final remediation §6): parameter checks and building the
+    /// supervisor objects — no filesystem ownership, media work, or recovery.
+    /// The job thread acquires the camera lease FIRST, then runs storage
+    /// pre-flight → recovery → connection → recording asynchronously, so
+    /// `recording.start` acks promptly even when large crash files need remuxing.
     ///
     /// Fails with `job_already_active` when this worker already has/had a
     /// job (one job per worker lifetime keeps recovery boundaries clean),
-    /// `storage_unavailable` ONLY for genuine infrastructure failure at the
-    /// pre-flight, or `start_failed` when the thread cannot spawn.
+    /// or `start_failed` when the thread cannot spawn.
     pub fn start(&mut self, spec: JobSpec) -> Result<(), &'static str> {
         if self.started_once || self.active.is_some() {
             return Err(code::JOB_ALREADY_ACTIVE);
@@ -502,16 +496,6 @@ impl RecordingJobManager {
 
         let layout = nian_storage::RecordingsLayout::new(spec.storage_root.clone())
             .map_err(|_| code::INVALID_PARAMS)?;
-
-        // Cheap storage pre-flight (§7/§8): creating the camera directory is
-        // the smallest operation that proves the storage root is USABLE at
-        // all. Its failure is genuine infrastructure trouble → permanent
-        // refusal. Per-file content problems are NOT visible here; they are
-        // quarantined by the asynchronous recovery below.
-        layout
-            .ensure_camera_dir(&spec.camera)
-            .map_err(|_| code::STORAGE_UNAVAILABLE)?;
-
         *self.shared.status.lock().unwrap() = JobStatus {
             camera_id: spec.camera.as_str().to_owned(),
             state: "recovering".to_owned(),
@@ -767,6 +751,15 @@ fn job_seed() -> u64 {
         .unwrap_or(0x9E37_79B9_7F4A_7C15)
 }
 
+fn finish_job_failed(shared: &Arc<SharedState>, category: nian_recorder::FailureCategory) {
+    let mut slot = shared.status.lock().unwrap();
+    slot.state = "failed".to_owned();
+    slot.finished = true;
+    slot.end_kind = "failed".to_owned();
+    slot.failure_category = category.as_str().to_owned();
+    shared.done.store(true, Ordering::SeqCst);
+}
+
 /// Job-thread body (final remediation §6): asynchronous startup recovery
 /// FIRST — observable as `recovering`, cooperatively stoppable through the
 /// run-level graceful-stop flag AND interruptible via the deposited
@@ -784,6 +777,28 @@ fn run_recovering_then_supervising<
     camera: CameraId,
     run_stop: &StopFlag,
 ) {
+    // Camera-wide ownership is acquired INSIDE the asynchronous job and held
+    // by this stack frame until every recovery/connect/record/backoff/stop path
+    // has ended. A reconnect never relinquishes ownership.
+    let lease = match nian_storage::CameraLease::try_acquire(&layout, &camera) {
+        Ok(lease) => lease,
+        Err(nian_storage::StorageError::CameraAlreadyActive { .. }) => {
+            finish_job_failed(&shared, nian_recorder::FailureCategory::CameraInUse);
+            return;
+        }
+        Err(_) => {
+            finish_job_failed(&shared, nian_recorder::FailureCategory::StorageFailed);
+            return;
+        }
+    };
+
+    // The ordinary write/delete pre-flight comes AFTER ownership. Therefore a
+    // second process cannot scan or mutate partials merely to test storage.
+    if layout.ensure_camera_dir(&camera).is_err() {
+        finish_job_failed(&shared, nian_recorder::FailureCategory::StorageFailed);
+        return;
+    }
+
     // The recovery pass deposits ITS interrupt handle in the same slot the
     // session attempts use, so a force-cancel aborts blocked recovery I/O
     // in a bounded way (§6).
@@ -796,6 +811,7 @@ fn run_recovering_then_supervising<
     let (outcomes, failures) = nian_recorder::recover_camera_partials_with_interrupt(
         &layout,
         &camera,
+        &lease,
         &recovery_interrupt,
         Some(run_stop),
     );
@@ -1201,6 +1217,118 @@ mod tests {
         // Stop quickly to keep this test bounded (fixture is short).
         let _ = manager.stop();
         assert!(wait_finished(&manager, 30));
+    }
+
+    #[test]
+    fn live_partial_is_untouched_while_another_camera_lease_is_held() {
+        let _hooks = nian_recorder::test_hooks::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixtures = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/nian-media-ffmpeg/tests/fixtures/sample_av.mkv"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("rec");
+        let layout = nian_storage::RecordingsLayout::new(root.clone()).unwrap();
+        let camera = CameraId::parse("cam-live-lease").unwrap();
+
+        // Holder A owns the camera before it creates the live canonical
+        // partial, matching the production invariant. The claim token and
+        // lease both stay alive while worker B attempts to start.
+        let holder_lease = nian_storage::CameraLease::try_acquire(&layout, &camera).unwrap();
+        let claim = layout
+            .claim_segment(&camera, chrono::Local::now().naive_local())
+            .unwrap();
+        let active_partial = claim.partial_path().to_path_buf();
+        let active_bytes = std::fs::read(fixtures).unwrap();
+        std::fs::write(&active_partial, &active_bytes).unwrap();
+
+        let mut blocked_manager = RecordingJobManager::new();
+        blocked_manager
+            .start(JobSpec {
+                camera: camera.clone(),
+                storage_root: root.clone(),
+                // If the worker ever crossed the ownership fence into media
+                // open, this deliberately-invalid source would fail with a
+                // source category instead of `camera_in_use`.
+                source: JobSource::File(temp.path().join("must-not-open.mkv")),
+                segment_target: Duration::from_secs(300),
+                copy_audio: true,
+            })
+            .expect("recording.start still acks asynchronously");
+
+        assert!(
+            wait_finished(&blocked_manager, 10),
+            "ownership conflict must terminate without retrying"
+        );
+        let blocked = blocked_manager.status();
+        assert_eq!(blocked.end_kind, "failed");
+        assert_eq!(blocked.failure_category, "camera_in_use");
+        assert_eq!(
+            blocked.recovery, None,
+            "no lease means startup recovery must not even begin"
+        );
+        assert_eq!(
+            std::fs::read(&active_partial).unwrap(),
+            active_bytes,
+            "the live partial must remain byte-identical"
+        );
+
+        let day_dir = active_partial.parent().unwrap();
+        let blocked_names: Vec<String> = std::fs::read_dir(day_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            blocked_names
+                .iter()
+                .all(|name| !name.contains(".recovered.mkv")),
+            "B must not publish recovery output while A owns the lease: {blocked_names:?}"
+        );
+        assert!(
+            blocked_names
+                .iter()
+                .all(|name| !name.contains(".recovery-")),
+            "B must not create recovery scratch while A owns the lease: {blocked_names:?}"
+        );
+        assert!(
+            blocked_names.iter().all(|name| !name.ends_with(".done")),
+            "B must not create a recovery tombstone while A owns the lease: {blocked_names:?}"
+        );
+
+        // Once holder A is genuinely gone, the SAME bytes become abandoned
+        // crash state. A fresh worker may take ownership, recover them once,
+        // then continue into normal recording.
+        drop(claim);
+        drop(holder_lease);
+
+        let mut recovery_manager = RecordingJobManager::new();
+        recovery_manager
+            .start(JobSpec {
+                camera,
+                storage_root: root,
+                source: JobSource::File(PathBuf::from(fixtures)),
+                segment_target: Duration::from_secs(300),
+                copy_audio: true,
+            })
+            .expect("fresh worker starts after old holder releases ownership");
+        assert!(
+            wait_finished(&recovery_manager, 60),
+            "fresh worker must recover and complete"
+        );
+        let recovered = recovery_manager.status();
+        let summary = recovered.recovery.expect("startup recovery must run");
+        assert_eq!(
+            summary.recovered, 1,
+            "the abandoned partial is recovered once"
+        );
+        assert!(
+            !active_partial.exists(),
+            "successful recovery removes the abandoned original only after publication"
+        );
+        assert_eq!(recovered.end_kind, "completed");
     }
 
     #[test]
