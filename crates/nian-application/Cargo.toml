@@ -8,13 +8,17 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono = { workspace = true }
 nian-domain = { workspace = true }
+nian-index = { workspace = true }
 nian-ipc = { workspace = true }
+nian-storage = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+nian-index = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }
 
 [lints]

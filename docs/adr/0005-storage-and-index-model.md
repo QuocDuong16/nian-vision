@@ -11,62 +11,142 @@ the only place a recording's existence is known.
 
 ## Decision
 
-**Filesystem is the source of survival; SQLite is a rebuildable index.**
+**Filesystem is the source of survival; SQLite is a disposable, rebuildable
+query/index cache.** Recording publication never depends on database health.
 
-Layout (master spec §10), implemented in `nian-storage::RecordingsLayout`:
+The canonical media layout remains owned by `nian-storage::RecordingsLayout`:
 
 ```text
 <storage_root>/<camera-id>/<year>/<month>/<day>/HH-MM-SS[-N].mkv
+<storage_root>/<camera-id>/<year>/<month>/<day>/HH-MM-SS[-N].recovered.mkv
 ```
 
-* `<camera-id>` is a validated `CameraId` (`[a-z0-9][a-z0-9_-]{0,63}`) —
-  user-provided display names never touch the filesystem. Every path
-  component passes a traversal check (`checked_component`) that rejects
-  separators, control characters, `.` and `..`.
-* Open segments carry `.partial.mkv`; finalization is an atomic,
-  never-replacing publication (`publish_no_replace`).
-* The optional `-N` suffix (from `-2` on) disambiguates segments that start
-  within the same second (rapid reconnect/restart). `allocate_segment`
-  picks the smallest sequence with no existing partial or finalized file,
-  so an existing recording is never truncated or overwritten; the parser
-  accepts exactly the canonical forms the allocator emits.
-* Segment acquisition is race-safe, not scan-then-open: the recorder claims
-  a slot with `claim_segment`, which creates the partial file with
-  exclusive semantics (`create_new`/O_EXCL) and rescans on a lost race, so
-  duplicate workers can never share or truncate each other's segments. The
-  open file handle is the claim token. Occupancy matching is
-  second-granular (names encode whole seconds; live clocks carry
-  nanoseconds).
-* Finalization publishes atomically **without replacement** via
-  `publish_no_replace`, which refuses any collision (`DestinationExists`)
-  — unlike a plain rename, which silently replaces on Unix. Platform
-  strategy:
-  * Unix: `renameat2(RENAME_NOREPLACE)` through rustix's safe API
-    (macOS maps onto `renamex_np(RENAME_EXCL)`), falling back to hard-link
-    + unlink where the kernel/filesystem cannot provide it;
-  * Windows: `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` — the
-    native same-volume no-replace move that works on NTFS/FAT/exFAT where
-    hard links do not exist (this is nian-storage's single sanctioned
-    unsafe block);
-  * the hard-link fallback stays no-replace everywhere and surfaces a plain
-    error on filesystems without link support instead of ever degrading to
-    an overwrite-capable rename.
-  `MatroskaMuxer::create` must receive the already claimed partial path
-  (open-after-claim is safe; claim-after-open would be a TOCTOU bug).
-* Startup reconciliation (M4) scans the tree and repairs the index:
-  * DB entry without file → mark `missing`, then delete entry;
-  * `.partial.mkv` file → inspect, mark `recovering`/`corrupted`;
-  * file without DB entry → index it.
-* SQLite (M4) runs with WAL mode, migrations from day one, and an index on
-  `(camera_id, started_at)` for timeline queries. No media blobs in the DB.
-* Retention (M4) supports `max_age_days` + `max_storage_bytes` with
-  high/low watermarks (`StorageQuota`): cleanup triggers above the high
-  watermark and deletes oldest **finalized** segments until the low one.
-  Active/exporting/locked segments are never deleted.
+SQLite control state is centralized under a reserved directory that cannot
+parse as `CameraId`:
+
+```text
+<storage_root>/.nian/recordings.sqlite3
+```
+
+WAL/SHM sidecars stay beside that database. `.nian` is never a camera tree,
+never scanned as footage, never counted toward recording quota and never
+removed by recording retention.
+
+### Filesystem ownership
+
+* `<camera-id>` is a validated `CameraId`; display names never become paths.
+* Finalized normal and recovered MKVs are first-class recordings. Canonical
+  partials, exact recovery scratch, recovery tombstones, camera lease files,
+  write probes and Unknown files are not recordings.
+* Deterministic inventory traverses only the exact
+  `<camera>/<YYYY>/<MM>/<DD>/<file>` grammar. `symlink_metadata` is used at
+  trust boundaries and directory/file symlinks are never followed.
+* Segment claims and publication keep the M2/M3 race-safe rules: exclusive
+  claim, whole-second identity + sequence, post-claim identity fence and
+  atomic no-replace publication.
+* `CameraLease` continues to mean kernel lock ownership, never lock-file
+  existence. M4 uses a temporary non-blocking lease only when inspecting or
+  cleaning partial/recovery artifacts. Old normal finalized recordings do not
+  require the camera-wide lease for retention.
+
+### SQLite boundary
+
+`nian-index` is the only SQLite persistence crate. It forbids project unsafe
+code, has no FFmpeg/Tauri/credential dependency, and uses pinned
+`rusqlite 0.40.2` with bundled SQLite.
+
+Schema v1 stores row id, validated camera id, UNIQUE relative recording path,
+kind (`normal`/`recovered`), state, local naive wall-clock `started_at`,
+sequence, size and nullable media duration. The timeline index is
+`(camera_id, started_at, sequence)`. Absolute media paths and media blobs are
+not stored.
+
+Migrations are versioned through `PRAGMA user_version`, ordered and
+transactional. A future schema version fails loudly. Runtime pragmas are WAL,
+`foreign_keys=ON`, a bounded 2 s busy timeout, and `synchronous=NORMAL`. The
+last choice is intentional: SQLite transactions must be atomic, but index
+bytes do not deserve stronger durability than the footage they can rebuild
+from.
+
+The filename timestamp is local naive wall-clock time, not UTC. M4 preserves
+that semantic explicitly rather than inventing an offset the filesystem never
+encoded.
+
+### Reconciliation and rebuild
+
+`nian-application::StorageManager` owns orchestration:
+
+```text
+filesystem inventory + SQLite snapshot
+                 ↓
+       reconciliation plan
+                 ↓
+      SQLite transaction
+```
+
+File-without-row is inserted; stale metadata is updated; row-without-file is
+removed/reported missing; matching entries are no-ops. Partials are reported
+active when another process holds the camera lease, or recovery-pending when a
+temporary lease can be acquired. M4 never remuxes media.
+
+Reconciliation is idempotent. Deleting the database and rebuilding from the
+filesystem restores all finalized normal + recovered recordings; duration may
+remain NULL. SQLite corruption is quarantined for diagnosis where practical,
+including sidecars, then a fresh schema is rebuilt from disk. Corrupt database
+state is never authority for deleting media.
+
+Incremental finalized-recording upsert is an optimization seam only. If it
+fails, the media remains published and later reconciliation repairs the cache.
+
+### Retention and crash ordering
+
+Age and quota eligibility combine with OR semantics. The quota high watermark
+is explicitly `RetentionPolicy.max_storage_bytes == StorageQuota.max_bytes`;
+a separate lower `cleanup_target_bytes` is mandatory when quota retention is
+configured. Cleanup starts only when usage is above HIGH and deletes oldest
+finalized recordings until usage is at or below LOW. Stable ordering is
+`started_at → sequence → relative path`.
+
+Immediately before deletion, retention revalidates that the candidate is still
+inside the canonical root, is the same canonical recording kind/identity, is a
+regular non-symlink file and still has the planned size. Control/recovery
+artifacts and Unknown files neither count toward quota nor become candidates.
+
+Filesystem and SQLite cannot form one atomic transaction. Therefore deletion
+ordering is deliberately:
+
+```text
+revalidate media → remove media file → cleanup proven tombstone if applicable
+                 → remove SQLite row
+```
+
+A filesystem deletion failure leaves the DB row. A crash after media deletion
+but before DB deletion leaves a stale row that the next reconciliation removes.
+For inserts/upserts, the filesystem object already exists before the SQLite
+transaction. Every interrupted boundary converges toward filesystem truth.
+
+Recovered recordings require extra resurrection protection. The v2 tombstone
+parser/validator lives in `nian-storage` and is shared with `nian-recorder`.
+Retention deletes a recovered final only when the current final is the trusted
+regular object bound by the tombstone and the original partial is already
+absent. Then the recovered final is removed first, the tombstone is cleaned,
+and the DB row is removed last. If the original partial remains or evidence is
+ambiguous, the recording is preserved and reported as a blocked recovery
+transaction.
+
+Stale recovery scratch cleanup is a separate pass and requires successfully
+acquiring the matching `CameraLease`. Tombstones are removed only in
+conservative, resolved stale-marker states. Unknown files are never deleted.
 
 ## Consequences
 
-* Losing or corrupting the database degrades search, not footage.
-* Deletion is oldest-first by segment, keeping the timeline honest (gaps
-  from retention look identical to gaps from outages — by design).
-* Path logic is pure and unit-tested without touching a filesystem.
+* Losing, deleting or corrupting SQLite degrades query availability, not
+  footage; a filesystem rebuild restores the catalog without FFmpeg.
+* SQLite is not allowed to roll back or invalidate already-published media.
+* Retention remains available during continuous recording because old normal
+  finalized files do not require the live camera lease.
+* Recovery artifacts require stronger evidence than normal finals; ambiguous
+  transactions deliberately leak storage rather than risk footage loss or
+  resurrection loops.
+* The filesystem/DB boundary is intentionally eventually consistent after a
+  crash, with reconciliation as the convergence mechanism.

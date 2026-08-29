@@ -18,7 +18,7 @@ TP-Link Tapo C200 over RTSP). This page is the map; the ADRs record why.
 │                              │
 │  Camera Manager      (M5)    │
 │  Recording Manager   (M2+)   │
-│  Storage Manager     (M4)    │
+│  Storage Manager     (M4) ✓  │
 │  Worker Supervisor   (M3) ✓  │
 │    (nian-application)        │
 └──────────────┬───────────────┘
@@ -56,8 +56,9 @@ Key properties:
 | Crate | Role | Notes |
 |---|---|---|
 | `nian-domain` | Camera/Recording/Media vocabulary | path-safe IDs, redacted credentials, backoff schedule |
-| `nian-application` | config validation, policies, worker supervision | `AppConfig`, `WorkerSupervisor` (spawn/handshake/crash-restart, M3) |
-| `nian-storage` | recordings layout, claiming, publication, partial scan | traversal-proof paths, race-safe `claim_segment`, atomic no-replace publish, canonical partial classification (`scan_camera_partials`, M3) |
+| `nian-application` | config validation, orchestration policies, worker supervision | `AppConfig`, `WorkerSupervisor` (M3), `StorageManager` reconciliation/rebuild/retention orchestration (M4) |
+| `nian-index` | rebuildable SQLite recording catalog | bundled SQLite, schema v1 migrations, WAL, timeline queries; no media/filesystem ownership (M4) |
+| `nian-storage` | recordings layout, claiming, publication, inventory/transaction facts | traversal-proof paths, race-safe `claim_segment`, atomic no-replace publish, lease-aware partial primitives, symlink-safe deterministic inventory (M4) |
 | `nian-ipc` | NDJSON protocol + serve loop | versioned envelopes, size-capped framing; handlers may emit events mid-request (M3) |
 | `nian-media` | backend-agnostic facade | `Probe`, `MediaSource`; errors distinguish cancellation vs timeout (M3); packets travel as backend-owned types |
 | `nian-media-ffmpeg` | safe FFmpeg wrapper | input/muxer/packet/interrupt/ABI guard; operation-scoped RAII deadlines + typed abort causes (M3) |
@@ -124,6 +125,61 @@ readability by remuxing readable packets — keyframe-aligned — into a fresh
 exclusively-claimed output, finalizing durably and publishing no-replace
 before removing the original. Unprovable leftovers stay quarantined,
 never renamed, never invented into recordings (ADR-0007).
+
+## Storage catalog and retention (M4)
+
+```text
+<storage_root>/
+  .nian/
+    recordings.sqlite3          # rebuildable cache; WAL/SHM live here
+  <camera-id>/<YYYY>/<MM>/<DD>/
+    HH-MM-SS[-N].mkv
+    HH-MM-SS[-N].recovered.mkv
+```
+
+`nian-storage` owns filesystem truth: canonical paths, exact recording-file
+classification, `CameraLease`, deterministic inventory and recovery tombstone
+validation. Inventory follows only the exact camera/date grammar, refuses
+symlink traversal, and never descends into `.nian`. `nian-index` owns only
+SQLite persistence. Its schema v1 stores relative paths, recording kind/state,
+local naive wall-clock `started_at`, sequence, size and optional media duration;
+`(camera_id, started_at, sequence)` is a real SQLite timeline index. SQLite runs
+WAL + `foreign_keys=ON`, a 2 s busy timeout and `synchronous=NORMAL` because the
+catalog is disposable while media is not.
+
+`nian-application::StorageManager` performs:
+
+1. filesystem inventory + database snapshot;
+2. a deterministic reconciliation plan;
+3. one SQLite transaction for index upserts/removal of missing rows.
+
+A second reconciliation without filesystem changes produces zero DB mutations.
+A database deletion triggers an explicit filesystem rebuild; SQLite corruption
+is quarantined with its WAL/SHM sidecars and a fresh index is reconstructed
+without probing media through FFmpeg. `media_duration_ms` remains NULL when disk
+facts cannot prove it.
+
+Partials preserve M3 ownership: a camera lease held by another process makes a
+partial active and untouchable; an immediately acquirable lease proves only that
+it is abandoned/recovery-pending. M4 never remuxes it. Scratch cleanup likewise
+requires the camera lease. Old **normal finalized** recordings do not require the
+camera-wide lease, so 24/7 recording cannot disable retention.
+
+Retention plans from filesystem facts and an injected local wall-clock time.
+Age and quota use OR semantics. Quota cleanup starts only above the explicit
+high watermark (`RetentionPolicy.max_storage_bytes == StorageQuota.max_bytes`)
+and stops at the lower `cleanup_target_bytes`; candidates are ordered by
+`started_at → sequence → relative path`. Immediately before each deletion the
+file is revalidated as the same canonical regular recording with the expected
+size. Deletion is deliberately **filesystem first, SQLite second**. A crash after
+file removal therefore leaves only a stale cache row, which the next
+reconciliation removes.
+
+Recovered recordings add one more guard: retention deletes a recovered final
+only when the shared v2 tombstone parser proves the exact original→final
+transaction, the current final still matches the published size, and the
+original partial is already absent. Otherwise it reports a blocked recovery
+transaction and preserves the footage, avoiding a recovery-resurrection loop.
 
 ## Failure model
 

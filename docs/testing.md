@@ -11,8 +11,10 @@ Testing is part of the definition of done for every milestone (master spec
 |---|---|
 | `nian-domain` | camera-id path safety, credential redaction, URL encoding, retention validation, quota watermarks, backoff schedule, time-base math |
 | `nian-application` | config validation bounds, UI-safe error messages; stub-worker supervision matrix: crash-before-hello retryable, wedged-hello deadline-bounded, version mismatch permanent, transient refusal retries, configuration refusal stops, failed-job-observed-while-alive, shutdown interrupts backoff waits |
+| `nian-application` (M4) | `StorageManager`: reconciliation idempotency, rebuild/corruption recovery, lease-aware partial classification, incremental finalized upsert, age/quota OR semantics, high/low watermarks, recovered-transaction blocking, filesystem-first crash convergence, artifact cleanup ownership |
+| `nian-index` (M4) | schema v1 migration/reopen, future-version refusal, migration rollback, WAL + timeline index, idempotent upsert/query, atomic snapshot replacement, random-byte corruption detection |
 | `nian-storage` | recordings layout, partial/final naming round-trip, traversal rejection, exclusive claims (incl. sub-second clock regression), no-replace publication (success, collision refusal, recoverable abandoned partials) |
-| `nian-storage` (M3) | partial-file classification: empty/header-only, truncated media, finalized-but-unpublished sniffing; canonical-only scanning; foreign names ignored; deterministic ordering |
+| `nian-storage` (M3/M4) | partial-file classification plus deterministic exact-grammar filesystem inventory; normal + recovered first-class recordings; foreign/control artifacts excluded; recording-looking symlinks never followed; shared strict recovery-tombstone v2 validation |
 | `nian-ipc` | envelope round-trips, framing limits (1 MiB cap, CRLF, truncation), dispatch loop (ping/describe/shutdown/unknown), protocol version guard, handler event emission through the writer before replies (M3) |
 | `nian-media` | RTSP URL redaction invariants |
 | `nian-media` errors (M3) | timeout vs cancellation category matrix: every error maps to exactly one typed `FailureCategory`; retryability is exactly the source-side set; local output/storage/config never loops |
@@ -267,6 +269,39 @@ restartable; backoff waits interrupted by operator shutdown.
   press counter; shutdown during recovery ends bounded without
   connecting.
 
+### Storage/index integration tests (M4)
+
+`nian-application/tests/storage_reconciliation.rs` and
+`storage_retention*.rs` build temporary canonical recording trees and exercise
+the filesystem/SQLite boundary without FFmpeg or an installed `sqlite3` CLI:
+
+* normal + recovered files are indexed first-class; changed sizes update,
+  missing files remove stale rows, and an unchanged second pass has zero DB
+  mutations;
+* canonical partials are recovery-pending only when a temporary camera lease
+  can be acquired; a held kernel lease makes them active and untouched;
+* deleting SQLite and calling rebuild restores finalized recordings with
+  unknown duration left NULL; random/corrupt DB bytes are quarantined and
+  rebuilt without touching media;
+* age-only, quota-only and combined OR retention are deterministic under an
+  injected local naive clock; quota triggers only above HIGH and deletes
+  oldest-first until LOW;
+* partials/control artifacts never become quota candidates, while recovered
+  recordings do consume recording bytes;
+* a live camera lease does not block deletion of an old normal finalized MKV;
+* unresolved recovered transactions are preserved; a settled v2 transaction
+  removes recovered final, then tombstone, then index row;
+* filesystem delete failure preserves both media and its DB row; a file-first
+  crash boundary (media gone, stale row left) converges on the next
+  reconciliation;
+* recording-looking symlinks are neither counted nor followed; stale recovery
+  scratch cleanup requires the matching camera lease and remains separate from
+  retention accounting.
+
+The M4 migration tests use `rusqlite` directly for user-version, WAL/index and
+rollback assertions. No test shells out to `sqlite3`, sleeps for age cutoffs or
+depends on changing the machine timezone.
+
 ### CLI/IPC smoke checks (manual, seconds)
 
 ```bash
@@ -287,8 +322,9 @@ gate everything.
 
 ## Planned per milestone
 
-* **M4**: retention engine property tests, reconciliation against a seeded
-  tree, disk-full behavior, quarantine cleanup policies.
+* **M5+**: camera configuration persistence/UI, playback/timeline UI,
+  desktop production behavior, distribution, multi-camera orchestration,
+  ONVIF and later features remain intentionally out of M4 scope.
 * **Hardware/manual** (never in CI): real Tapo C200 via
   `NIAN_VISION_RTSP_URL` with
   `nian-media-worker record --rtsp-from-env ...` and/or an IPC-driven

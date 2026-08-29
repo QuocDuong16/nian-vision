@@ -7,6 +7,7 @@ members = [
     "crates/nian-domain",
     "crates/nian-ffmpeg-sys",
     "crates/nian-ipc",
+    "crates/nian-index",
     "crates/nian-media",
     "crates/nian-media-ffmpeg",
     "crates/nian-recorder",
@@ -22,6 +23,7 @@ default-members = [
     "crates/nian-domain",
     "crates/nian-ffmpeg-sys",
     "crates/nian-ipc",
+    "crates/nian-index",
     "crates/nian-media",
     "crates/nian-media-ffmpeg",
     "crates/nian-recorder",
@@ -49,6 +51,7 @@ nian-application = { path = "crates/nian-application" }
 nian-domain = { path = "crates/nian-domain" }
 nian-ffmpeg-sys = { path = "crates/nian-ffmpeg-sys" }
 nian-ipc = { path = "crates/nian-ipc" }
+nian-index = { path = "crates/nian-index" }
 nian-media = { path = "crates/nian-media" }
 nian-media-ffmpeg = { path = "crates/nian-media-ffmpeg" }
 nian-recorder = { path = "crates/nian-recorder" }
@@ -57,6 +60,7 @@ nian-storage = { path = "crates/nian-storage" }
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
 # Two-stage Ctrl+C handling for the manual recording smoke command.
 ctrlc = "=3.5.2"
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 tempfile = "=3.27.0"

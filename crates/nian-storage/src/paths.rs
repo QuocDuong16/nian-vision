@@ -28,6 +28,10 @@ static PROBE_REMOVE_FAILS: AtomicBool = AtomicBool::new(false);
 /// (parallel unit tests share these statics).
 static PREFLIGHT_FAULT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Reserved storage-control directory; cannot parse as a CameraId.
+pub const CONTROL_DIRECTORY_NAME: &str = ".nian";
+/// Rebuildable recording index filename inside the control directory.
+pub const RECORDING_INDEX_FILE_NAME: &str = "recordings.sqlite3";
 /// File extension used for finalized recording segments.
 pub const SEGMENT_EXTENSION: &str = "mkv";
 
@@ -74,6 +78,44 @@ impl RecordingsLayout {
     /// The validated storage root.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// `<root>/.nian`, reserved for rebuildable/control state rather than footage.
+    pub fn control_dir(&self) -> PathBuf {
+        self.root.join(CONTROL_DIRECTORY_NAME)
+    }
+
+    /// Centralized path of the rebuildable SQLite recording index.
+    pub fn recording_index_path(&self) -> PathBuf {
+        self.control_dir().join(RECORDING_INDEX_FILE_NAME)
+    }
+
+    /// Creates the reserved control directory without accepting a symlink in
+    /// its place. Recording inventory and retention never descend into it.
+    pub fn ensure_control_dir(&self) -> Result<PathBuf, StorageError> {
+        let control = self.control_dir();
+        match std::fs::symlink_metadata(&control) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err(StorageError::InvalidRoot {
+                        reason: format!("control path {control:?} is not a real directory"),
+                    });
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&control).map_err(|source| StorageError::Io {
+                    path: control.clone(),
+                    source,
+                })?;
+            }
+            Err(source) => {
+                return Err(StorageError::Io {
+                    path: control.clone(),
+                    source,
+                });
+            }
+        }
+        Ok(control)
     }
 
     /// `<root>/<camera-id>`

@@ -4,18 +4,16 @@ Local-first desktop NVR (network video recorder) for IP cameras. The first
 supported camera is the TP-Link Tapo C200 over RTSP, with a camera-agnostic
 domain so other RTSP/ONVIF cameras can follow.
 
-**Status**: milestone **M3 (resilience and supervision)** is implemented
-and ready for review on top of M0–M2: recordings now survive camera/
-network failures (typed timeout-vs-cancellation, operation-scoped read and
-connect deadlines, a reconnect supervisor reusing the 2s→60s backoff with
-stability-gated resets) and worker process crashes (parent-side
-supervision with handshake verification, bounded restart backoff and
-desired-state restoration). Crash-leftover `.partial.mkv` files are
-recovered conservatively: classified from filesystem facts, remuxed
-keyframe-aligned into fresh no-replace published segments — originals kept
-whenever recoverability cannot be proven. M2 delivered the segmented
-recording pipeline itself (keyframe-aware rotation, exclusive claiming,
-durable finalize + atomic no-replace publication).
+**Status**: milestone **M4 (SQLite reconciliation and retention)** is
+implemented and ready for review on top of M0–M3. Finalized normal and
+recovered recordings are indexed in a rebuildable SQLite catalog at
+`<storage_root>/.nian/recordings.sqlite3`; the filesystem remains the source
+of survival, so deleting or corrupting the database never deletes footage.
+Deterministic reconciliation repairs missing/stale index rows, partials stay
+lease-aware, and age/quota retention deletes only revalidated finalized
+recordings with filesystem-first ordering. M3 resilience remains unchanged:
+worker crashes, reconnects and crash-leftover partial recovery are still
+owned by the supervised media worker rather than by the database layer.
 
 ## What it does today
 
@@ -43,6 +41,11 @@ durable finalize + atomic no-replace publication).
   only), partial recovery proves readability through the real demuxer, and
   `nian-application`'s `WorkerSupervisor` restarts crashed workers without
   ever putting credentials in argv.
+* Storage/index management (M4): `nian-storage` owns canonical filesystem
+  inventory and recovery-transaction facts, `nian-index` owns bundled
+  SQLite persistence/migrations, and `nian-application::StorageManager`
+  orchestrates reconciliation, rebuild/query seams and age + high/low
+  watermark retention. SQLite failures never roll back a published media file.
 * Clean crate boundaries with `unsafe` confined to the FFmpeg layers (plus
   one audited Windows publication primitive), a race-safe storage layout,
   credential redaction, and a full quality-gate setup (fmt/clippy/tests,

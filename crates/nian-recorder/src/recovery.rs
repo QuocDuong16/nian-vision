@@ -692,66 +692,19 @@ fn recovery_identity(partial_path: &Path) -> Option<RecoveryIdentity> {
     })
 }
 
-/// Magic first line of a TRUSTED tombstone (final safety remediation §1;
-/// v2 size binding: identity safety remediation §1). A `.done` file
-/// without exactly this structure is foreign content, never transaction
-/// evidence. v1 markers are deliberately NOT trusted: they bound only
-/// names, not the object at the final pathname, and this pre-v1 project
-/// never silently upgrades old evidence.
-const TOMBSTONE_MAGIC: &str = "NIAN-RECOVERY-TOMBSTONE v2";
-
-/// The transaction record a tombstone must carry to be trusted: the magic
-/// version line, the ORIGINAL canonical file name, the FINAL file name and
-/// the PUBLISHED FINAL SIZE in bytes. Anything else — empty files, foreign
-/// markers, wrong names, missing size — fails validation and yields a
-/// preserved conflict instead of a deletion.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TombstoneTransaction {
-    original: String,
-    final_name: String,
-    size_bytes: u64,
-}
+/// Shared storage-layer tombstone contract; recorder and retention use one parser.
+type TombstoneTransaction = nian_storage::RecoveryTombstone;
 
 fn tombstone_payload(original_name: &str, final_name: &str, size_bytes: u64) -> String {
-    format!(
-        "{TOMBSTONE_MAGIC}\noriginal: {original_name}\nfinal: {final_name}\nsize: {size_bytes}\n"
-    )
+    nian_storage::recovery_tombstone_payload(original_name, final_name, size_bytes)
 }
 
-/// Strictly parses tombstone bytes; `None` for any malformed/foreign
-/// content (wrong magic/version — including legacy v1 — missing or
-/// mismatched fields, non-numeric size, extra content).
 fn parse_tombstone(bytes: &[u8]) -> Option<TombstoneTransaction> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let mut lines = text.lines();
-    if lines.next()? != TOMBSTONE_MAGIC {
-        return None;
-    }
-    let original = lines.next()?.strip_prefix("original: ")?;
-    let final_name = lines.next()?.strip_prefix("final: ")?;
-    let size = lines.next()?.strip_prefix("size: ")?;
-    if original.is_empty() || final_name.is_empty() || size.is_empty() || lines.next().is_some() {
-        return None;
-    }
-    let size_bytes = size.parse::<u64>().ok()?;
-    Some(TombstoneTransaction {
-        original: original.to_owned(),
-        final_name: final_name.to_owned(),
-        size_bytes,
-    })
+    nian_storage::parse_recovery_tombstone(bytes)
 }
 
-/// Whether the object CURRENTLY at the deterministic final path is still
-/// the regular file the transaction published (identity safety remediation
-/// §1): the deterministic final exists, is a REGULAR file (`symlink_metadata`
-/// deliberately refuses symlinks), and its size still matches the recorded
-/// published size. A directory, a zero-byte/truncated replacement, or any
-/// other object at that pathname fails this binding.
 fn published_final_matches(final_path: &Path, expected_size: u64) -> bool {
-    match std::fs::symlink_metadata(final_path) {
-        Ok(metadata) => metadata.is_file() && metadata.len() == expected_size,
-        Err(_) => false,
-    }
+    nian_storage::published_final_matches(final_path, expected_size)
 }
 
 /// Whether the tombstone next to the deterministic final TRUSTEDLY proves

@@ -22,16 +22,27 @@
 
 pub mod classification;
 pub mod error;
+pub mod inventory;
 pub mod lease;
 pub mod paths;
 pub mod recovery;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod test_hooks;
+pub mod transaction;
 
 pub use classification::{
     RecordingFileKind, classify_recording_file, classify_recording_file_name,
 };
 pub use error::StorageError;
+pub use inventory::{
+    FilesystemInventory, InventoryArtifact, InventoryPartial, InventoryRecording,
+    inventory_recordings,
+};
 pub use lease::{CAMERA_LEASE_FILE_NAME, CameraLease};
 pub use paths::{RecordingsLayout, SEGMENT_EXTENSION, SEGMENT_PARTIAL_SUFFIX};
 pub use recovery::{PartialDisposition, PartialFile, scan_camera_partials};
+pub use transaction::{
+    RECOVERY_TOMBSTONE_MAGIC, RecoveredRetentionState, RecoveryTombstone, RecoveryTransactionPaths,
+    inspect_recovered_retention, parse_recovery_tombstone, published_final_matches,
+    recovery_tombstone_matches, recovery_tombstone_payload, recovery_transaction_paths,
+};

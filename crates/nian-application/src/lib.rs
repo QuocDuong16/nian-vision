@@ -12,10 +12,15 @@
 
 pub mod config;
 pub mod error;
+pub mod storage_manager;
 pub mod supervisor;
 
 pub use config::{AppConfig, SegmentTargetDuration};
 pub use error::ApplicationError;
+pub use storage_manager::{
+    ArtifactCleanupReport, ReconciliationFailure, ReconciliationFailureKind, ReconciliationReport,
+    RetentionFailure, RetentionFailureKind, RetentionReport, StorageManager, StorageManagerError,
+};
 pub use supervisor::{
     BinaryLauncher, DesiredRecording, JobTerminal, SupervisorDeadlines, WorkerEnd, WorkerLauncher,
     WorkerSupervisor,
