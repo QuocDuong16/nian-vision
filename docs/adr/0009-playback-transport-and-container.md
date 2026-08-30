@@ -55,10 +55,28 @@ or encoder. Packets are copied into a fragmented MP4 using:
 frag_keyframe + empty_moov + default_base_moof + global_sidx
 ```
 
-The MP4 is created under a unique application cache session directory with
-exclusive ownership. It is outside the recording tree, never indexed as footage,
-never retention-managed, and removed when the session closes/expires. Startup
-also removes stale `session-*` cache directories.
+The MP4 is created under a process-owned cache instance:
+
+```text
+playback-cache/
+  instance-<uuid>/
+    .nian-playback-instance.lock
+    session-<uuid>/
+      media.mp4
+```
+
+The desktop holds an exclusive OS file lock on the instance lock file for the
+controller lifetime, and each admitted playback session holds a shared handle to
+that same locked file so an in-flight HTTP request can extend the lock safely
+through controller shutdown. Startup stale cleanup serializes instance creation/cleanup
+with a cache-root coordination lock, then removes an instance only if its
+instance lock can be acquired. A lock held by another live desktop process is
+authoritative and keeps that process's active sessions untouched. PID files,
+timestamps and marker ownership are not used. Session directories remain random
+and exclusively created. All cache media stays outside the recording tree, is
+never indexed as footage, never retention-managed, and is removed when its
+session closes/expires or when a later process safely reclaims an abandoned
+instance.
 
 This first implementation prepares the complete finalized recording once when a
 session opens. That trades open latency and temporary cache bytes for a simple,
@@ -83,6 +101,36 @@ single HTTP byte range; invalid ranges return 416.
 
 The NDJSON channel carries only lifecycle/metadata/errors. Video/audio bytes are
 never encoded into `Envelope` messages.
+
+The Tauri CSP permits this transport narrowly with
+`media-src 'self' http://127.0.0.1:*`. `media-src *`, broad `http:` defaults and
+LAN origins are intentionally not allowed. The HTTP server remains bound only to
+`127.0.0.1`; CSP is an additional WebView boundary, not a replacement for the
+server's Host/Origin checks or UUID session capability.
+
+### Timeline refresh
+
+Timeline/day/adjacency reads remain SQLite queries and do not rescan the tree.
+`PlaybackController::refresh_index()` is the explicit filesystem-authoritative
+refresh boundary and delegates to M4 reconciliation. The Timeline screen invokes
+it when a camera becomes active and when the user presses Refresh, then rereads
+available days/range rows. Newly finalized normal and recovered files therefore
+appear without a desktop restart, while active partials remain excluded by the
+existing CameraLease-aware reconciliation rules. Refresh does not media-probe
+new discoveries, so duration remains unknown until lazy playback inspection.
+
+### Storage settings transaction
+
+Playback storage reconfiguration is two phase. The application first validates a
+`PreparedApplicationSettings` value and prepares a candidate playback
+`StorageManager` by opening its layout/index and reconciling it without touching
+the active controller storage. Only after candidate preparation succeeds are the
+authoritative settings persisted. A successful settings commit is followed by an
+effectively infallible swap of the already-prepared playback storage, which also
+closes old playback sessions. Candidate failure or settings-persistence failure
+discards the candidate and leaves the old settings/playback storage aligned.
+Disabling storage is represented by the same prepared configuration shape rather
+than by a post-commit special case.
 
 ### Seeking
 
@@ -126,6 +174,20 @@ change becomes a deferred close until the last active request finishes. New
 requests are rejected once close is requested. The final request guard releases
 the session and pin deterministically.
 
+### Preparation responsiveness
+
+`playback_open` remains synchronous in M6. The desktop command therefore holds
+the controller mutex while the one-shot media worker packet-copies the recording.
+That intentionally serializes `playback_close` and storage-settings swaps behind
+an in-flight open, but the wait is bounded rather than deadlocking: the worker
+receives a 60-second media deadline, the host response wait adds only a small
+bounded envelope margin, and `WorkerGuard` is installed immediately after spawn.
+Every return path therefore sends shutdown when possible and otherwise kills,
+waits and joins the reader before releasing the guard. Playback pin and cache
+directory ownership are RAII, so timeout/protocol/media failure cannot leave a
+permanent pin or session cache. Moving preparation outside the controller-wide
+mutex remains a future optimization, not a correctness dependency for M6.
+
 ## Consequences
 
 Positive:
@@ -144,6 +206,8 @@ Costs/trade-offs:
 * unsupported video codecs fail rather than transcode in M6;
 * unsupported audio may be omitted;
 * frame-perfect seeking and live RTSP preview remain outside M6.
+* synchronous preparation can serialize close/settings commands for the bounded
+  worker preparation window.
 
 ## Rejected alternatives
 

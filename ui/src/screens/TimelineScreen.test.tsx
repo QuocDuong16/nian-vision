@@ -36,11 +36,55 @@ const recovered: RecordingDto = {
   media_duration_ms: null,
   end_at: null,
 };
+const late: RecordingDto = {
+  recording_id: "front-door/2026/08/29/23-59-00.mkv",
+  camera_id: camera.camera_id,
+  kind: "normal",
+  started_at: "2026-08-29T23:59:00.000",
+  sequence: 1,
+  size_bytes: 3_000,
+  media_duration_ms: 60_000,
+  end_at: "2026-08-30T00:00:00.000",
+};
+const early: RecordingDto = {
+  recording_id: "front-door/2026/08/30/00-01-00.mkv",
+  camera_id: camera.camera_id,
+  kind: "normal",
+  started_at: "2026-08-30T00:01:00.000",
+  sequence: 1,
+  size_bytes: 4_000,
+  media_duration_ms: 60_000,
+  end_at: "2026-08-30T00:02:00.000",
+};
+
+function opened(
+  recording: RecordingDto,
+  sessionId: string,
+  previous: RecordingDto | null,
+  next: RecordingDto | null,
+): PlaybackOpenDto {
+  return {
+    session_id: sessionId,
+    url: `http://127.0.0.1:43210/playback/${sessionId}`,
+    recording,
+    inspect: {
+      duration_ms: recording.media_duration_ms,
+      video_codec: "h264",
+      width: 1920,
+      height: 1080,
+      audio_available: true,
+      container_compatibility: "fragmented_mp4",
+      seekable: true,
+    },
+    adjacent: { previous, next },
+  };
+}
 
 function installDesktop(timeline: RecordingDto[] = [first, recovered]) {
   Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
   vi.mocked(invoke).mockImplementation(async (command) => {
     if (command === "camera_list") return [camera];
+    if (command === "recordings_refresh") return undefined;
     if (command === "recording_days") return ["2026-08-29"];
     if (command === "recording_timeline") return timeline;
     if (command === "playback_close") return undefined;
@@ -62,6 +106,7 @@ describe("TimelineScreen", () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
     vi.mocked(invoke).mockImplementation(async (command) => {
       if (command === "camera_list") return [camera];
+      if (command === "recordings_refresh") return undefined;
       if (command === "recording_days") return [];
       throw new Error(`unexpected command ${command}`);
     });
@@ -104,6 +149,7 @@ describe("TimelineScreen", () => {
     };
     vi.mocked(invoke).mockImplementation(async (command) => {
       if (command === "camera_list") return [camera];
+      if (command === "recordings_refresh") return undefined;
       if (command === "recording_days") return ["2026-08-29"];
       if (command === "recording_timeline") return [first, recovered];
       if (command === "playback_open") return opened;
@@ -127,6 +173,7 @@ describe("TimelineScreen", () => {
     let timelineCalls = 0;
     vi.mocked(invoke).mockImplementation(async (command) => {
       if (command === "camera_list") return [camera];
+      if (command === "recordings_refresh") return undefined;
       if (command === "recording_days") return ["2026-08-29"];
       if (command === "recording_timeline") {
         timelineCalls += 1;
@@ -150,4 +197,115 @@ describe("TimelineScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     expect(await screen.findByText("No recordings on this day")).toBeTruthy();
   });
+  it("keeps the newly opened session when Next crosses midnight", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    const lateOpen = opened(late, "22222222-2222-4222-8222-222222222222", null, early);
+    const earlyOpen = opened(early, "33333333-3333-4333-8333-333333333333", late, null);
+    const closed: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "camera_list") return [camera];
+      if (command === "recordings_refresh") return undefined;
+      if (command === "recording_days") return ["2026-08-29", "2026-08-30"];
+      if (command === "recording_timeline") {
+        return (args as { start: string }).start.startsWith("2026-08-29") ? [late] : [early];
+      }
+      if (command === "playback_open") {
+        return (args as { recordingId: string }).recordingId === late.recording_id ? lateOpen : earlyOpen;
+      }
+      if (command === "playback_close") {
+        closed.push((args as { sessionId: string }).sessionId);
+        return undefined;
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<TimelineScreen />);
+    await screen.findByText("1 finalized recording");
+    fireEvent.change(screen.getByRole("combobox", { name: "Recording day" }), {
+      target: { value: "2026-08-29" },
+    });
+    await screen.findByRole("button", { name: /23:59:00/ });
+    fireEvent.click(screen.getByRole("button", { name: /23:59:00/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Open recording" }));
+    await waitFor(() => expect(document.querySelector("video")?.getAttribute("src")).toBe(lateOpen.url));
+    fireEvent.click(screen.getByRole("button", { name: "Next recording" }));
+    await waitFor(() => expect(document.querySelector("video")?.getAttribute("src")).toBe(earlyOpen.url));
+    expect((screen.getByRole("combobox", { name: "Recording day" }) as HTMLSelectElement).value).toBe("2026-08-30");
+    expect(screen.getByRole("button", { name: /00:01:00/ }).className).toContain("selected");
+    expect(closed).toContain(lateOpen.session_id);
+    expect(closed).not.toContain(earlyOpen.session_id);
+  });
+
+  it("keeps the newly opened session when Previous crosses midnight", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    const lateOpen = opened(late, "44444444-4444-4444-8444-444444444444", null, early);
+    const earlyOpen = opened(early, "55555555-5555-4555-8555-555555555555", late, null);
+    const closed: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "camera_list") return [camera];
+      if (command === "recordings_refresh") return undefined;
+      if (command === "recording_days") return ["2026-08-29", "2026-08-30"];
+      if (command === "recording_timeline") {
+        return (args as { start: string }).start.startsWith("2026-08-29") ? [late] : [early];
+      }
+      if (command === "playback_open") {
+        return (args as { recordingId: string }).recordingId === late.recording_id ? lateOpen : earlyOpen;
+      }
+      if (command === "playback_close") {
+        closed.push((args as { sessionId: string }).sessionId);
+        return undefined;
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<TimelineScreen />);
+    await screen.findByRole("button", { name: /00:01:00/ });
+    fireEvent.click(screen.getByRole("button", { name: /00:01:00/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Open recording" }));
+    await waitFor(() => expect(document.querySelector("video")?.getAttribute("src")).toBe(earlyOpen.url));
+    fireEvent.click(screen.getByRole("button", { name: "Previous recording" }));
+    await waitFor(() => expect(document.querySelector("video")?.getAttribute("src")).toBe(lateOpen.url));
+    expect((screen.getByRole("combobox", { name: "Recording day" }) as HTMLSelectElement).value).toBe("2026-08-29");
+    expect(screen.getByRole("button", { name: /23:59:00/ }).className).toContain("selected");
+    expect(closed).toContain(earlyOpen.session_id);
+    expect(closed).not.toContain(lateOpen.session_id);
+  });
+
+  it("shows a recoverable error and releases the session when the media element fails", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    let openCount = 0;
+    const closed: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "camera_list") return [camera];
+      if (command === "recordings_refresh") return undefined;
+      if (command === "recording_days") return ["2026-08-29"];
+      if (command === "recording_timeline") return [first];
+      if (command === "playback_open") {
+        openCount += 1;
+        return opened(first, `66666666-6666-4666-8666-66666666666${openCount}`, null, null);
+      }
+      if (command === "playback_close") {
+        closed.push((args as { sessionId: string }).sessionId);
+        return undefined;
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<TimelineScreen />);
+    await screen.findByRole("button", { name: /08:00:00/ });
+    fireEvent.click(screen.getByRole("button", { name: /08:00:00/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Open recording" }));
+    await waitFor(() => expect(document.querySelector("video")).not.toBeNull());
+
+    const failedSrc = document.querySelector("video")?.getAttribute("src");
+    fireEvent.error(document.querySelector("video") as HTMLVideoElement);
+    expect(await screen.findByText(/could not be loaded or decoded/i)).toBeTruthy();
+    expect(document.querySelector("video")).toBeNull();
+    expect(closed).toContain(failedSrc?.split("/").at(-1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    await waitFor(() => expect(document.querySelector("video")).not.toBeNull());
+    expect(openCount).toBe(2);
+  });
+
 });

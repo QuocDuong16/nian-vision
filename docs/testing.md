@@ -16,7 +16,7 @@ Testing is part of the definition of done for every milestone (master spec
 | `nian-application` (M4) | `StorageManager`: reconciliation idempotency + fail-closed retention gate, startup/runtime corruption repair, convergent SQLite-family quarantine, lease-aware partial classification, whole-second incremental finalized upsert, age/quota OR semantics + target observability, settled-recovered retention during active recording, recovered transaction commit revalidation, filesystem-first crash convergence, conservative artifact cleanup |
 | `nian-index` (M4) | schema v1 migration/reopen, future-version refusal, migration rollback, verified WAL + `foreign_keys=ON`, timeline index, idempotent upsert/query, atomic snapshot replacement, random-byte/runtime corruption classification |
 | `nian-index` (M6) | complete-only camera range queries, start-inclusive/end-exclusive boundaries, normal + recovered ordering, same-second sequence ordering, available days, previous/next, duration writeback fenced by stable filesystem identity |
-| `nian-application` (M6) | playback path revalidation, session expiry/token handling, full/middle/suffix HTTP Range, 416/403/410 transport failures, rebuild-stable recording identity, lazy duration enrichment, symlink rejection, playback-pin retention skip and deterministic plan→pin→delete race closure |
+| `nian-application` (M6) | playback path revalidation, explicit filesystem→index refresh, normal/recovered freshness with active-partial exclusion, session expiry/token handling, full/middle/suffix HTTP Range, 416/403/410 transport failures, rebuild-stable recording identity, lazy duration enrichment, symlink rejection, cross-process playback-cache instance locking, playback-pin retention skip and deterministic plan→pin→delete race closure |
 | `nian-storage` | recordings layout, partial/final naming round-trip, traversal rejection, exclusive claims (incl. sub-second clock regression), no-replace publication (success, collision refusal, recoverable abandoned partials) |
 | `nian-storage` (M3/M4) | partial-file classification plus deterministic exact-grammar filesystem inventory; normal + recovered first-class recordings; foreign/control artifacts excluded; recording-looking symlinks never followed; shared strict recovery-tombstone v2 validation; typed path-presence semantics where only `NotFound` proves absence; shared whole-second filesystem identity normalization |
 | `nian-ipc` | envelope round-trips, framing limits (1 MiB cap, CRLF, truncation), dispatch loop (ping/describe/shutdown/unknown), protocol version guard, handler event emission through the writer before replies (M3) |
@@ -376,9 +376,23 @@ Range responses, invalid Range → 416, non-loopback Host → 403, unknown/expir
 token → 410, session timeout releasing its pin, active-request deferral so idle
 expiry/explicit close cannot release a pin mid-response, recovered/normal
 ordering, duration enrichment, rebuild-stable recording IDs, missing files and
-symlink replacement. Retention tests use a deterministic pre-delete TEST GATE: retention
+symlink replacement. Freshness coverage starts with only A indexed, publishes
+canonical normal B plus a recovered final and an actively leased `.partial.mkv`,
+then proves `refresh_index()` discovers only the two finalized additions without
+probing duration. The cache ownership regression spawns a child process that owns
+an instance lock and session/media, signals READY, then proves cleanup from a
+second process leaves it intact until the holder is terminated; the next cleanup
+acquires the abandoned instance lock and removes it. No PID/timestamp ownership
+or arbitrary sleeps participate in correctness. Retention tests use a
+deterministic pre-delete TEST GATE: retention
 selects the candidate, playback pins it, the gate resumes, and immediate commit
 revalidation skips deletion even on Unix where unlinking an open file is legal.
+
+Production `playback_open` responsiveness is audited separately from the fake
+backend tests: worker preparation has a 60-second media timeout plus a bounded
+host response margin, `WorkerGuard` is created immediately after spawn and
+kill/reaps on every error/timeout path, and the existing failed-prepare regression
+proves cache-session and playback-pin RAII cleanup after preparation failure.
 
 The production native credential store is not exercised in CI. `CredentialStore`
 fakes/in-memory implementations keep Linux/macOS CI independent of a logged-in
@@ -410,8 +424,27 @@ M6 timeline tests mock only the typed Tauri boundary and cover: no-recordings
 state; chronological normal/recovered rendering; explicit known gaps; unknown
 duration; playback open/loading result; previous/next navigation; EOF warning;
 typed stale playback errors that remain visible while the timeline refreshes; and
-a retained/deleted recording disappearing after refresh. Lint (`eslint`),
-`tsc --noEmit`, Vitest and Vite build gate the frontend.
+a retained/deleted recording disappearing after refresh. Remediation coverage
+also proves Timeline invokes the explicit `recordings_refresh` boundary, Next
+from a 23:59 recording into the next day and Previous from 00:01 into the prior
+day both keep the newly opened session/video URL alive, the day selector follows
+the adjacent recording, and an HTML media-element error becomes a visible
+user-safe state that releases the failed session and allows Reopen. Lint
+(`eslint`), `tsc --noEmit`, Vitest and Vite build gate the frontend.
+
+Desktop configuration tests parse the committed `tauri.conf.json` and assert the
+CSP contains the narrow playback allowance
+`media-src 'self' http://127.0.0.1:*` while not allowing `media-src *`, broad
+`default-src http:` or LAN origins. jsdom does not enforce CSP, so this remains a
+configuration regression rather than a WebView proof.
+
+The desktop settings transaction tests fault-inject all three phases: candidate
+playback storage preparation failure leaves authoritative settings and active
+playback storage on A; successful candidate preparation followed by settings
+persistence failure also leaves both on A; successful preparation + persistence
+then swaps the already-prepared playback storage to B. The success case also
+prepares a real camera recording request after the commit and asserts its
+`storage_root` is B, proving recording and timeline/playback configuration converge.
 
 ## Planned per milestone
 
@@ -424,6 +457,17 @@ a retained/deleted recording disappearing after refresh. Lint (`eslint`),
   supervised job (see development.md); checklist in the master spec §17
   (unplug, reboot, sleep/wake, disk near-full, corrupt files). Windows
   run of the MoveFileExW publication path remains manually validated.
+* **Windows Tauri/WebView playback CSP smoke** (required for M6 remediation,
+  because jsdom cannot enforce CSP): build/run the real desktop app on Windows,
+  configure a recordings root containing the committed/known-good H.264 recording
+  shape, open Recordings/Timeline, press Refresh, open a finalized recording and
+  verify the `<video>` loads from an
+  `http://127.0.0.1:<ephemeral>/playback/<uuid>` URL, plays, seeks and issues no
+  CSP media-src violation in WebView developer diagnostics. Verify the playback
+  server is listening only on 127.0.0.1 and that substituting a LAN-host media URL
+  is rejected by CSP/server policy. Close/Reopen once to confirm the failed/closed
+  session lifecycle releases cleanly. Record this smoke result with the release or
+  review evidence; it is intentionally not faked by jsdom.
 
 ## Environment variables
 

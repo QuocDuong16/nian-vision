@@ -5,7 +5,7 @@
 //! are exposed. React receives only opaque recording/session identities.
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -34,6 +34,9 @@ const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const WORKER_PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+const CACHE_INSTANCE_PREFIX: &str = "instance-";
+const CACHE_INSTANCE_LOCK: &str = ".nian-playback-instance.lock";
+const CACHE_COORDINATION_LOCK: &str = ".nian-playback-cache.lock";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -163,6 +166,114 @@ impl PlaybackBackend for WorkerPlaybackBackend {
     }
 }
 
+#[derive(Debug)]
+struct PlaybackCacheInstance {
+    path: PathBuf,
+    lock_file: Arc<File>,
+}
+
+impl PlaybackCacheInstance {
+    fn create(cache_root: &Path) -> Result<Self, PlaybackError> {
+        std::fs::create_dir_all(cache_root).map_err(|_| PlaybackError::Internal)?;
+        let coordination = open_cache_lock(cache_root)?;
+        coordination.lock().map_err(|_| PlaybackError::Internal)?;
+        cleanup_stale_cache_locked(cache_root);
+
+        for _ in 0..8 {
+            let path = cache_root.join(format!("{CACHE_INSTANCE_PREFIX}{}", Uuid::new_v4()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    let lock_path = path.join(CACHE_INSTANCE_LOCK);
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(&lock_path)
+                        .map_err(|_| PlaybackError::Internal)?;
+                    file.lock().map_err(|_| PlaybackError::Internal)?;
+                    drop(coordination);
+                    return Ok(Self {
+                        path,
+                        lock_file: Arc::new(file),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(PlaybackError::Internal),
+            }
+        }
+        Err(PlaybackError::Internal)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn lease(&self) -> Arc<File> {
+        self.lock_file.clone()
+    }
+}
+
+fn open_cache_lock(cache_root: &Path) -> Result<File, PlaybackError> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(cache_root.join(CACHE_COORDINATION_LOCK))
+        .map_err(|_| PlaybackError::Internal)
+}
+
+#[cfg(test)]
+fn cleanup_stale_cache(cache_root: &Path) -> Result<(), PlaybackError> {
+    std::fs::create_dir_all(cache_root).map_err(|_| PlaybackError::Internal)?;
+    let coordination = open_cache_lock(cache_root)?;
+    coordination.lock().map_err(|_| PlaybackError::Internal)?;
+    cleanup_stale_cache_locked(cache_root);
+    Ok(())
+}
+
+fn cleanup_stale_cache_locked(cache_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(cache_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(CACHE_INSTANCE_PREFIX) {
+            continue;
+        }
+        let instance = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&instance) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let lock_path = instance.join(CACHE_INSTANCE_LOCK);
+        let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_dir_all(&instance);
+                continue;
+            }
+            Err(_) => continue,
+        };
+        let Ok(lock_metadata) = std::fs::symlink_metadata(&lock_path) else {
+            continue;
+        };
+        if !lock_metadata.is_file() || lock_metadata.file_type().is_symlink() {
+            continue;
+        }
+        match file.try_lock() {
+            Ok(()) => {
+                drop(file);
+                let _ = std::fs::remove_dir_all(&instance);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(_)) => {}
+        }
+    }
+}
+
 struct PlaybackCacheDir {
     path: PathBuf,
     cleanup_on_drop: bool,
@@ -198,6 +309,7 @@ impl Drop for PlaybackCacheDir {
 struct PlaybackSession {
     layout: RecordingsLayout,
     indexed: IndexedRecording,
+    _cache_instance_lease: Arc<File>,
     source_path: PathBuf,
     _source_handle: File,
     _pin: PlaybackPin,
@@ -219,13 +331,17 @@ struct PlaybackRuntime {
     sessions: HashMap<String, PlaybackSession>,
 }
 
+pub struct PreparedPlaybackStorage {
+    storage: Option<StorageManager>,
+}
+
 pub struct PlaybackController {
     storage: Option<StorageManager>,
     pins: PlaybackPins,
     backend: Arc<dyn PlaybackBackend>,
     runtime: Arc<Mutex<PlaybackRuntime>>,
     server: PlaybackHttpServer,
-    cache_root: PathBuf,
+    cache_instance: PlaybackCacheInstance,
 }
 
 impl std::fmt::Debug for PlaybackController {
@@ -249,8 +365,7 @@ impl PlaybackController {
         backend: Arc<dyn PlaybackBackend>,
         cache_root: PathBuf,
     ) -> Result<Self, PlaybackError> {
-        std::fs::create_dir_all(&cache_root).map_err(|_| PlaybackError::Internal)?;
-        cleanup_stale_cache(&cache_root);
+        let cache_instance = PlaybackCacheInstance::create(&cache_root)?;
         let runtime = Arc::new(Mutex::new(PlaybackRuntime::default()));
         let server = PlaybackHttpServer::start(runtime.clone())?;
         Ok(Self {
@@ -259,7 +374,7 @@ impl PlaybackController {
             backend,
             runtime,
             server,
-            cache_root,
+            cache_instance,
         })
     }
 
@@ -269,10 +384,19 @@ impl PlaybackController {
         retention_policy: RetentionPolicy,
         storage_quota: Option<StorageQuota>,
     ) -> Result<(), PlaybackError> {
-        self.close_all();
+        let prepared = self.prepare_storage(storage_root, retention_policy, storage_quota)?;
+        self.commit_prepared_storage(prepared);
+        Ok(())
+    }
+
+    pub fn prepare_storage(
+        &self,
+        storage_root: Option<PathBuf>,
+        retention_policy: RetentionPolicy,
+        storage_quota: Option<StorageQuota>,
+    ) -> Result<PreparedPlaybackStorage, PlaybackError> {
         let Some(storage_root) = storage_root else {
-            self.storage = None;
-            return Ok(());
+            return Ok(PreparedPlaybackStorage { storage: None });
         };
         let layout = RecordingsLayout::new(storage_root).map_err(|_| PlaybackError::Internal)?;
         let mut storage = StorageManager::open_with_playback_pins(
@@ -283,8 +407,24 @@ impl PlaybackController {
         )
         .map_err(|_| PlaybackError::Internal)?;
         storage.reconcile().map_err(|_| PlaybackError::Internal)?;
-        self.storage = Some(storage);
+        Ok(PreparedPlaybackStorage {
+            storage: Some(storage),
+        })
+    }
+
+    pub fn commit_prepared_storage(&mut self, prepared: PreparedPlaybackStorage) {
+        self.close_all();
+        self.storage = prepared.storage;
+    }
+
+    pub fn refresh_index(&mut self) -> Result<(), PlaybackError> {
+        let storage = self.storage.as_mut().ok_or(PlaybackError::Internal)?;
+        storage.reconcile().map_err(|_| PlaybackError::Internal)?;
         Ok(())
+    }
+
+    pub fn configured_storage_root(&self) -> Option<&Path> {
+        self.storage.as_ref().map(|storage| storage.layout().root())
     }
 
     pub fn recording_days(&self, camera_id: &CameraId) -> Result<Vec<String>, PlaybackError> {
@@ -367,7 +507,8 @@ impl PlaybackController {
         revalidate(&validated)?;
 
         let token = Uuid::new_v4().to_string();
-        let temp_dir = PlaybackCacheDir::create(self.cache_root.join(format!("session-{token}")))?;
+        let temp_dir =
+            PlaybackCacheDir::create(self.cache_instance.path().join(format!("session-{token}")))?;
         let media_path = temp_dir.path().join("media.mp4");
 
         let inspect = self.backend.prepare(&validated.path, &media_path)?;
@@ -410,6 +551,7 @@ impl PlaybackController {
         let session = PlaybackSession {
             layout,
             indexed: indexed.clone(),
+            _cache_instance_lease: self.cache_instance.lease(),
             source_path: validated.path,
             _source_handle: source_handle,
             _pin: pin,
@@ -542,18 +684,6 @@ fn revalidate(validated: &ValidatedRecording) -> Result<(), PlaybackError> {
         Ok(())
     } else {
         Err(PlaybackError::RecordingStale)
-    }
-}
-
-fn cleanup_stale_cache(cache_root: &Path) {
-    let Ok(entries) = std::fs::read_dir(cache_root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with("session-") {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
     }
 }
 
@@ -1127,6 +1257,42 @@ mod tests {
         }
     }
 
+    const CACHE_CHILD_ENV: &str = "NIAN_PLAYBACK_CACHE_TEST_CHILD";
+    const CACHE_ROOT_ENV: &str = "NIAN_PLAYBACK_CACHE_TEST_ROOT";
+    const RECORDING_ROOT_ENV: &str = "NIAN_PLAYBACK_CACHE_TEST_RECORDINGS";
+
+    #[test]
+    #[ignore = "spawned explicitly by live_cache_instance_is_not_cleaned_by_another_process"]
+    #[allow(clippy::print_stdout)]
+    fn cache_instance_child() {
+        use std::io::Write as _;
+
+        if std::env::var_os(CACHE_CHILD_ENV).is_none() {
+            return;
+        }
+        let cache_root = PathBuf::from(std::env::var_os(CACHE_ROOT_ENV).unwrap());
+        let recording_root = PathBuf::from(std::env::var_os(RECORDING_ROOT_ENV).unwrap());
+        let relative = "cam-a/2026/08/29/08-30-00.mkv";
+        let backend: Arc<dyn PlaybackBackend> = Arc::new(FakeBackend {
+            bytes: b"child-prepared-media".to_vec(),
+            duration_ms: Some(5_000),
+        });
+        let mut controller = PlaybackController::with_backend(backend, cache_root).unwrap();
+        controller
+            .configure_storage(Some(recording_root), RetentionPolicy::default(), None)
+            .unwrap();
+        let opened = controller.open(relative).unwrap();
+        let media = controller
+            .cache_instance
+            .path()
+            .join(format!("session-{}/media.mp4", opened.session_id));
+        assert!(media.exists());
+        println!("CACHE_READY");
+        std::io::stdout().flush().unwrap();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+
     fn controller_with_files(files: &[(&str, &[u8])]) -> (tempfile::TempDir, PlaybackController) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("recordings");
@@ -1206,7 +1372,138 @@ mod tests {
             Err(PlaybackError::MediaUnreadable)
         ));
         assert!(!controller.pins.is_pinned(relative));
-        assert_eq!(std::fs::read_dir(cache_root).unwrap().count(), 0);
+        assert!(
+            std::fs::read_dir(controller.cache_instance.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with("session-"))
+        );
+    }
+
+    #[test]
+    fn refresh_index_discovers_new_finalized_normal_and_recovered_but_not_active_partial() {
+        let first = "cam-a/2026/08/29/08-30-00.mkv";
+        let second = "cam-a/2026/08/29/08-40-00.mkv";
+        let recovered = "cam-a/2026/08/29/08-50-00.recovered.mkv";
+        let partial = "cam-a/2026/08/29/09-00-00.partial.mkv";
+        let (temp, mut controller) = controller_with_files(&[(first, b"a")]);
+        let root = temp.path().join("recordings");
+        let camera = CameraId::parse("cam-a").unwrap();
+        let layout = RecordingsLayout::new(root.clone()).unwrap();
+        let _lease = nian_storage::CameraLease::try_acquire(&layout, &camera).unwrap();
+        for (relative, bytes) in [
+            (second, b"b".as_slice()),
+            (recovered, b"r".as_slice()),
+            (partial, b"p".as_slice()),
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let start =
+            NaiveDateTime::parse_from_str("2026-08-29T00:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let end =
+            NaiveDateTime::parse_from_str("2026-08-30T00:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+
+        assert_eq!(controller.timeline(&camera, start, end).unwrap().len(), 1);
+        controller.refresh_index().unwrap();
+        let rows = controller.timeline(&camera, start, end).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.recording_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first, second, recovered]
+        );
+        assert_eq!(rows[2].kind, TimelineRecordingKind::Recovered);
+        assert!(rows.iter().all(|row| row.media_duration_ms.is_none()));
+        assert!(!rows.iter().any(|row| row.recording_id == partial));
+    }
+
+    #[test]
+    fn live_cache_instance_is_not_cleaned_by_another_process_but_stale_instance_is() {
+        use std::io::BufRead as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let recording_root = temp.path().join("recordings");
+        let relative = "cam-a/2026/08/29/08-30-00.mkv";
+        let source = recording_root.join(relative);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"recording").unwrap();
+        let cache_root = temp.path().join("playback-cache");
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("cache_instance_child")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(CACHE_CHILD_ENV, "1")
+            .env(CACHE_ROOT_ENV, &cache_root)
+            .env(RECORDING_ROOT_ENV, &recording_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut lines = BufReader::new(stdout).lines();
+            let ready = lines.any(|line| line.is_ok_and(|line| line.contains("CACHE_READY")));
+            let _ = ready_tx.send(ready);
+        });
+        assert!(ready_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+
+        let instance = std::fs::read_dir(&cache_root)
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(CACHE_INSTANCE_PREFIX)
+            })
+            .unwrap()
+            .path();
+        assert!(
+            std::fs::read_dir(&instance)
+                .unwrap()
+                .flatten()
+                .any(|entry| {
+                    entry.file_name().to_string_lossy().starts_with("session-")
+                        && entry.path().join("media.mp4").is_file()
+                })
+        );
+
+        cleanup_stale_cache(&cache_root).unwrap();
+        assert!(
+            instance.exists(),
+            "live process cache must remain untouched"
+        );
+
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        reader.join().unwrap();
+        cleanup_stale_cache(&cache_root).unwrap();
+        assert!(
+            !instance.exists(),
+            "abandoned cache must be cleanable after process death"
+        );
+    }
+
+    #[test]
+    fn cache_instance_lock_outlives_controller_owner_while_a_session_lease_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().join("playback-cache");
+        let instance = PlaybackCacheInstance::create(&cache_root).unwrap();
+        let instance_path = instance.path().to_path_buf();
+        let session_lease = instance.lease();
+
+        drop(instance);
+        cleanup_stale_cache(&cache_root).unwrap();
+        assert!(instance_path.exists());
+
+        drop(session_lease);
+        cleanup_stale_cache(&cache_root).unwrap();
+        assert!(!instance_path.exists());
     }
 
     #[test]

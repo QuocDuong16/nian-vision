@@ -261,6 +261,17 @@ pub struct ApplicationSettingsDto {
     pub cleanup_target_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedApplicationSettings {
+    settings: ApplicationSettings,
+}
+
+impl PreparedApplicationSettings {
+    pub fn dto(&self) -> ApplicationSettingsDto {
+        self.settings.clone().into()
+    }
+}
+
 impl From<ApplicationSettings> for ApplicationSettingsDto {
     fn from(value: ApplicationSettings) -> Self {
         Self {
@@ -532,6 +543,15 @@ impl CameraService {
         dto: ApplicationSettingsDto,
         recording_active: bool,
     ) -> Result<ApplicationSettingsDto, CameraServiceError> {
+        let prepared = self.prepare_application_settings(dto, recording_active)?;
+        self.commit_application_settings(prepared)
+    }
+
+    pub fn prepare_application_settings(
+        &self,
+        dto: ApplicationSettingsDto,
+        recording_active: bool,
+    ) -> Result<PreparedApplicationSettings, CameraServiceError> {
         if recording_active {
             return Err(CameraServiceError::CameraBusy);
         }
@@ -572,12 +592,21 @@ impl CameraService {
                 "segment target duration must be between 5 and 3600 seconds".to_owned(),
             ));
         }
-        let settings = ApplicationSettings {
-            storage_root,
-            segment_target_secs: dto.segment_target_secs,
-            retention,
-            quota,
-        };
+        Ok(PreparedApplicationSettings {
+            settings: ApplicationSettings {
+                storage_root,
+                segment_target_secs: dto.segment_target_secs,
+                retention,
+                quota,
+            },
+        })
+    }
+
+    pub fn commit_application_settings(
+        &mut self,
+        prepared: PreparedApplicationSettings,
+    ) -> Result<ApplicationSettingsDto, CameraServiceError> {
+        let settings = prepared.settings;
         self.repository
             .save_application_settings(&settings)
             .map_err(map_repository_service_error)?;

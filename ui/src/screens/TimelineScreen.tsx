@@ -46,6 +46,11 @@ function knownGap(previous: RecordingDto, current: RecordingDto): number | null 
   return Number.isFinite(gap) && gap > 1000 ? gap : null;
 }
 
+type TimelineLoadOptions = {
+  preserveError?: boolean;
+  keepSessionForRecordingId?: string | null;
+};
+
 export function TimelineScreen() {
   const [cameras, setCameras] = useState<CameraSummary[]>([]);
   const [cameraId, setCameraId] = useState("");
@@ -58,13 +63,17 @@ export function TimelineScreen() {
   const [playbackLoading, setPlaybackLoading] = useState(false);
   const [ended, setEnded] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
   const sessionRef = useRef<string | null>(null);
+  const sessionRecordingRef = useRef<string | null>(null);
 
-  const closePlayback = useCallback(async () => {
+  const closePlayback = useCallback(async (clearPlaybackError = true) => {
     const sessionId = sessionRef.current;
     sessionRef.current = null;
+    sessionRecordingRef.current = null;
     setPlayback(null);
     setEnded(false);
+    if (clearPlaybackError) setPlaybackError(null);
     if (!sessionId || !isTauri()) return;
     try {
       await invokeDesktop<void>("playback_close", { sessionId });
@@ -76,14 +85,14 @@ export function TimelineScreen() {
   const loadTimeline = useCallback(async (
     nextCameraId: string,
     nextDay: string,
-    preserveError = false,
+    options: TimelineLoadOptions = {},
   ) => {
     if (!isTauri() || !nextCameraId || !nextDay) {
       setRecordings([]);
       return;
     }
     setLoading(true);
-    if (!preserveError) setError(null);
+    if (!options.preserveError) setError(null);
     try {
       const rows = await invokeDesktop<RecordingDto[]>("recording_timeline", {
         cameraId: nextCameraId,
@@ -92,7 +101,14 @@ export function TimelineScreen() {
       });
       setRecordings(rows);
       setSelectedId((current) => (current && rows.some((row) => row.recording_id === current) ? current : null));
-      if (sessionRef.current && !rows.some((row) => row.recording_id === selectedId)) {
+      const activeRecordingId = sessionRecordingRef.current;
+      const keepSession = options.keepSessionForRecordingId;
+      if (
+        sessionRef.current
+        && activeRecordingId
+        && activeRecordingId !== keepSession
+        && !rows.some((row) => row.recording_id === activeRecordingId)
+      ) {
         void closePlayback();
       }
     } catch (cause) {
@@ -101,7 +117,7 @@ export function TimelineScreen() {
     } finally {
       setLoading(false);
     }
-  }, [closePlayback, selectedId]);
+  }, [closePlayback]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -131,23 +147,27 @@ export function TimelineScreen() {
     void closePlayback();
     setSelectedId(null);
     setError(null);
-    void invokeDesktop<string[]>("recording_days", { cameraId })
-      .then((available) => {
+    void (async () => {
+      try {
+        await invokeDesktop<void>("recordings_refresh");
+        const available = await invokeDesktop<string[]>("recording_days", { cameraId });
         if (cancelled) return;
         setDays(available);
-        setDay(available.at(-1) ?? "");
-      })
-      .catch((cause) => {
+        const latest = available.at(-1) ?? "";
+        setDay(latest);
+        if (latest) {
+          await loadTimeline(cameraId, latest);
+        } else {
+          setRecordings([]);
+        }
+      } catch (cause) {
         if (!cancelled) setError(desktopError(cause).message);
-      });
+      }
+    })();
     return () => {
       cancelled = true;
     };
-  }, [cameraId, closePlayback]);
-
-  useEffect(() => {
-    void loadTimeline(cameraId, day);
-  }, [cameraId, day, loadTimeline]);
+  }, [cameraId, closePlayback, loadTimeline]);
 
   useEffect(() => () => {
     const sessionId = sessionRef.current;
@@ -161,31 +181,81 @@ export function TimelineScreen() {
     [recordings, selectedId],
   );
 
+  const refreshVisible = useCallback(async () => {
+    if (!isTauri() || !cameraId) return;
+    setError(null);
+    try {
+      await invokeDesktop<void>("recordings_refresh");
+      const available = await invokeDesktop<string[]>("recording_days", { cameraId });
+      setDays(available);
+      const targetDay = day && available.includes(day) ? day : (available.at(-1) ?? "");
+      setDay(targetDay);
+      if (targetDay) {
+        await loadTimeline(cameraId, targetDay);
+      } else {
+        setRecordings([]);
+        setSelectedId(null);
+        await closePlayback();
+      }
+    } catch (cause) {
+      setError(desktopError(cause).message);
+    }
+  }, [cameraId, closePlayback, day, loadTimeline]);
+
+  const selectDay = useCallback(async (nextDay: string) => {
+    if (!nextDay || nextDay === day) return;
+    await closePlayback();
+    setSelectedId(null);
+    setDay(nextDay);
+    await loadTimeline(cameraId, nextDay);
+  }, [cameraId, closePlayback, day, loadTimeline]);
+
   const openRecording = useCallback(async (recordingId: string) => {
     if (!isTauri()) return;
     setPlaybackLoading(true);
     setError(null);
+    setPlaybackError(null);
     setEnded(false);
     await closePlayback();
     try {
       const opened = await invokeDesktop<PlaybackOpenDto>("playback_open", { recordingId });
       sessionRef.current = opened.session_id;
+      sessionRecordingRef.current = opened.recording.recording_id;
       setPlayback(opened);
       setSelectedId(opened.recording.recording_id);
-      setRecordings((current) =>
-        current.map((row) => row.recording_id === opened.recording.recording_id ? opened.recording : row),
-      );
-      void loadTimeline(opened.recording.camera_id, opened.recording.started_at.slice(0, 10));
+      const openedDay = opened.recording.started_at.slice(0, 10);
+      setDays((current) => current.includes(openedDay) ? current : [...current, openedDay].sort());
+      setDay(openedDay);
+      await loadTimeline(opened.recording.camera_id, openedDay, {
+        keepSessionForRecordingId: opened.recording.recording_id,
+      });
     } catch (cause) {
       const failure = desktopError(cause);
       setError(failure.message);
       if (["recording_missing", "recording_stale", "recording_not_found"].includes(failure.code)) {
-        void loadTimeline(cameraId, day, true);
+        try {
+          await invokeDesktop<void>("recordings_refresh");
+        } catch {
+          // Preserve the original typed playback failure; refresh is best effort here.
+        }
+        await loadTimeline(cameraId, day, { preserveError: true });
       }
     } finally {
       setPlaybackLoading(false);
     }
   }, [cameraId, closePlayback, day, loadTimeline]);
+
+  const handlePlaybackMediaError = useCallback(() => {
+    const sessionId = sessionRef.current;
+    sessionRef.current = null;
+    sessionRecordingRef.current = null;
+    setPlayback(null);
+    setEnded(false);
+    setPlaybackError("Playback could not be loaded or decoded by the desktop webview. Reopen the recording to try again.");
+    if (sessionId && isTauri()) {
+      void invokeDesktop<void>("playback_close", { sessionId }).catch(() => undefined);
+    }
+  }, []);
 
   const dayIndex = days.indexOf(day);
   const previousDay = dayIndex > 0 ? days[dayIndex - 1] : null;
@@ -207,12 +277,13 @@ export function TimelineScreen() {
           <h2>Recordings / Timeline</h2>
           <p className="muted">Finalized local recordings only. Gaps are shown instead of being politely lied about.</p>
         </div>
-        <button type="button" disabled={!cameraId || !day || loading} onClick={() => void loadTimeline(cameraId, day)}>
+        <button type="button" disabled={!cameraId || loading} onClick={() => void refreshVisible()}>
           Refresh
         </button>
       </div>
 
       {error && <p className="error-banner" role="alert">{error}</p>}
+      {playbackError && <p className="error-banner" role="alert">{playbackError}</p>}
 
       <div className="panel timeline-filters">
         <label>
@@ -225,13 +296,13 @@ export function TimelineScreen() {
         </label>
         <label>
           Recording day
-          <select value={day} onChange={(event) => setDay(event.target.value)} disabled={days.length === 0}>
+          <select value={day} onChange={(event) => void selectDay(event.target.value)} disabled={days.length === 0}>
             {days.map((availableDay) => <option key={availableDay} value={availableDay}>{availableDay}</option>)}
           </select>
         </label>
         <div className="button-row timeline-day-nav">
-          <button type="button" disabled={!previousDay} onClick={() => previousDay && setDay(previousDay)}>Previous day</button>
-          <button type="button" disabled={!nextDay} onClick={() => nextDay && setDay(nextDay)}>Next day</button>
+          <button type="button" disabled={!previousDay} onClick={() => previousDay && void selectDay(previousDay)}>Previous day</button>
+          <button type="button" disabled={!nextDay} onClick={() => nextDay && void selectDay(nextDay)}>Next day</button>
         </div>
       </div>
 
@@ -291,7 +362,7 @@ export function TimelineScreen() {
             disabled={!selected || playbackLoading}
             onClick={() => selected && void openRecording(selected.recording_id)}
           >
-            {playbackLoading ? "Preparing…" : playback?.recording.recording_id === selected?.recording_id ? "Reopen" : "Open recording"}
+            {playbackLoading ? "Preparing…" : playbackError || (playback !== null && playback.recording.recording_id === selected?.recording_id) ? "Reopen" : "Open recording"}
           </button>
         </div>
 
@@ -304,6 +375,7 @@ export function TimelineScreen() {
               controls
               preload="metadata"
               onEnded={() => setEnded(true)}
+              onError={handlePlaybackMediaError}
             />
             <div className="playback-meta">
               <span>{playback.inspect.video_codec.toUpperCase()}</span>

@@ -301,6 +301,12 @@ Timeline reads are database queries, not per-request tree rescans. `nian-index`
 provides available days, `[start,end)` camera range queries and previous/next
 lookups with stable ordering `started_at → sequence → relative_path`; only complete
 recordings participate. Normal and recovered finals use the same timeline DTO.
+Filesystem freshness is explicit: `PlaybackController::refresh_index()` delegates
+to M4 reconciliation when the Timeline first activates for a camera and when the
+user presses Refresh. Newly finalized normal/recovered files therefore appear
+without restarting the desktop, while active partials remain protected by the
+existing CameraLease-aware reconciliation rules. Refresh discovers metadata from
+the filesystem only; it does not media-probe duration.
 Known duration produces `end_at = started_at + media_duration`; unknown duration
 stays NULL and renders honestly. When a recording is opened, `playback.prepare`
 may discover duration through libav. The application writes it back only while the
@@ -311,12 +317,21 @@ to unknown.
 `PlaybackController` is application-owned state rather than state hidden inside
 individual Tauri commands. It bounds active sessions, owns the loopback server and
 temporary playback cache, tracks activity, closes/expunges abandoned sessions
-after a bounded idle timeout, and cleans stale `session-*` cache directories at
-startup. Each session has an unguessable UUID token mapping to exactly one
+after a bounded idle timeout, and owns a per-process `instance-<uuid>` cache
+directory whose `.nian-playback-instance.lock` is held with an exclusive kernel
+file lock for the controller lifetime. Each playback session also retains a
+shared handle to that locked file, so an in-flight HTTP request can extend the
+instance lease safely through controller shutdown. Startup cleanup removes another instance
+only when that instance lock can be acquired, so a second live desktop process
+cannot delete active prepared media. A cache-root coordination lock closes the
+instance-creation/cleanup race; PID files and timestamps are not ownership.
+Each session has an unguessable UUID token mapping to exactly one
 validated recording. The server binds `127.0.0.1` on an ephemeral port, serves no
 directory listing or arbitrary path parameter, validates Host/Origin where
 practical, limits request/header/buffer sizes, and supports GET/HEAD plus single
-HTTP byte ranges. It never binds `0.0.0.0` or creates a LAN video server.
+HTTP byte ranges. It never binds `0.0.0.0` or creates a LAN video server. Tauri's
+CSP independently permits media only from `'self'` and `http://127.0.0.1:*`, not
+arbitrary HTTP/LAN origins.
 
 Recorded footage remains canonical MKV packet-copy media. For the current Tapo
 C200 target, the worker accepts H.264 video and copies AAC audio when present; an
@@ -327,6 +342,25 @@ unique cache `media.mp4` with
 `frag_keyframe+empty_moov+default_base_moof+global_sidx`. No decoder or encoder is
 used. The MP4 lives outside the recording tree, is never indexed or retention-
 managed, and is deleted with the session.
+
+Storage reconfiguration is prepared before authoritative settings are committed.
+The candidate `StorageManager` opens its layout/index and reconciles independently
+of the active playback controller. Candidate failure leaves both settings and
+playback storage unchanged. If settings persistence fails, the prepared candidate
+is discarded and playback stays on the old root. Only after settings commit does
+the controller swap the already-prepared candidate and close old sessions; that
+final swap performs no fallible I/O and therefore cannot create a settings/root
+split-brain state.
+
+`playback_open` remains synchronous in M6 and the desktop command holds the
+controller mutex during bounded worker preparation. Close and settings operations
+may therefore queue behind a long packet-copy, but there is no unbounded wait:
+the worker has a 60-second media deadline plus a small bounded host response
+margin. `WorkerGuard` owns the child immediately after spawn and shuts down or
+kills/reaps it on every return path. Playback pins and cache session directories
+are RAII-owned, so timeout or preparation failure cannot leave permanent playback
+ownership artifacts. Moving preparation outside the controller mutex is an
+optimization deferred beyond this remediation, not an M6 correctness dependency.
 
 Seeking in this M6 implementation is therefore a two-stage contract: libav builds
 the keyframe-fragmented MP4 and global segment index once, then WebView2/browser

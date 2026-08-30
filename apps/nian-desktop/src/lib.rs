@@ -280,6 +280,13 @@ fn recording_status(
 }
 
 #[tauri::command]
+fn recordings_refresh(state: tauri::State<'_, DesktopState>) -> Result<(), DesktopErrorDto> {
+    lock(&state.playback_controller)?
+        .refresh_index()
+        .map_err(map_playback_error)
+}
+
+#[tauri::command]
 fn recording_days(
     state: tauri::State<'_, DesktopState>,
     camera_id: String,
@@ -370,13 +377,29 @@ fn settings_update(
         .map_err(map_recording_error)?
         .state
         .is_active();
-    let saved = lock(&state.camera_service)?
-        .save_application_settings(settings, active)
+    let mut camera_service = lock(&state.camera_service)?;
+    let mut playback = lock(&state.playback_controller)?;
+    update_settings_transaction(&mut camera_service, &mut playback, settings, active)
+}
+
+fn update_settings_transaction(
+    camera_service: &mut CameraService,
+    playback: &mut PlaybackController,
+    settings: ApplicationSettingsDto,
+    recording_active: bool,
+) -> Result<ApplicationSettingsDto, DesktopErrorDto> {
+    let prepared_settings = camera_service
+        .prepare_application_settings(settings, recording_active)
         .map_err(map_camera_error)?;
-    let (storage_root, retention, quota) = playback_storage_config(&saved)?;
-    lock(&state.playback_controller)?
-        .configure_storage(storage_root, retention, quota)
+    let prepared_dto = prepared_settings.dto();
+    let (storage_root, retention, quota) = playback_storage_config(&prepared_dto)?;
+    let prepared_playback = playback
+        .prepare_storage(storage_root, retention, quota)
         .map_err(map_playback_error)?;
+    let saved = camera_service
+        .commit_application_settings(prepared_settings)
+        .map_err(map_camera_error)?;
+    playback.commit_prepared_storage(prepared_playback);
     Ok(saved)
 }
 
@@ -593,6 +616,7 @@ pub fn run() {
             recording_start,
             recording_stop,
             recording_status,
+            recordings_refresh,
             recording_days,
             recording_timeline,
             playback_open,
@@ -616,6 +640,126 @@ pub fn run() {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    #[derive(Debug)]
+    struct TestRepositoryState {
+        settings: nian_settings::ApplicationSettings,
+        fail_save: bool,
+        camera: Option<nian_domain::CameraConfig>,
+    }
+
+    #[derive(Clone)]
+    struct TestRepository {
+        state: Arc<Mutex<TestRepositoryState>>,
+    }
+
+    impl nian_application::SettingsRepository for TestRepository {
+        fn list_cameras(
+            &self,
+        ) -> Result<Vec<nian_domain::CameraConfig>, nian_application::SettingsRepositoryError>
+        {
+            Ok(self.state.lock().unwrap().camera.iter().cloned().collect())
+        }
+
+        fn get_camera(
+            &self,
+            camera_id: &CameraId,
+        ) -> Result<Option<nian_domain::CameraConfig>, nian_application::SettingsRepositoryError>
+        {
+            Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .camera
+                .as_ref()
+                .filter(|camera| camera.camera_id() == camera_id)
+                .cloned())
+        }
+
+        fn insert_camera(
+            &mut self,
+            _camera: &nian_domain::CameraConfig,
+        ) -> Result<(), nian_application::SettingsRepositoryError> {
+            Ok(())
+        }
+
+        fn update_camera(
+            &mut self,
+            _camera: &nian_domain::CameraConfig,
+        ) -> Result<bool, nian_application::SettingsRepositoryError> {
+            Ok(false)
+        }
+
+        fn delete_camera(
+            &mut self,
+            _camera_id: &CameraId,
+        ) -> Result<bool, nian_application::SettingsRepositoryError> {
+            Ok(false)
+        }
+
+        fn application_settings(
+            &self,
+        ) -> Result<nian_settings::ApplicationSettings, nian_application::SettingsRepositoryError>
+        {
+            Ok(self.state.lock().unwrap().settings.clone())
+        }
+
+        fn save_application_settings(
+            &mut self,
+            settings: &nian_settings::ApplicationSettings,
+        ) -> Result<(), nian_application::SettingsRepositoryError> {
+            let mut state = self.state.lock().unwrap();
+            if state.fail_save {
+                return Err(nian_application::SettingsRepositoryError::Persistence);
+            }
+            state.settings = settings.clone();
+            Ok(())
+        }
+    }
+
+    fn test_service(
+        root: &std::path::Path,
+    ) -> (
+        CameraService,
+        Arc<Mutex<TestRepositoryState>>,
+        Arc<nian_application::MemoryCredentialStore>,
+    ) {
+        let state = Arc::new(Mutex::new(TestRepositoryState {
+            settings: nian_settings::ApplicationSettings {
+                storage_root: Some(root.to_path_buf()),
+                segment_target_secs: 300,
+                retention: RetentionPolicy::default(),
+                quota: None,
+            },
+            fail_save: false,
+            camera: None,
+        }));
+        let repository = TestRepository {
+            state: state.clone(),
+        };
+        let credentials = Arc::new(nian_application::MemoryCredentialStore::default());
+        let service = CameraService::new(Box::new(repository), credentials.clone());
+        (service, state, credentials)
+    }
+
+    fn settings_for(root: &std::path::Path) -> ApplicationSettingsDto {
+        ApplicationSettingsDto {
+            storage_root: Some(root.to_string_lossy().into_owned()),
+            segment_target_secs: 300,
+            max_age_days: None,
+            max_storage_bytes: None,
+            cleanup_target_bytes: None,
+        }
+    }
+
+    fn configured_playback(root: &std::path::Path, cache_root: PathBuf) -> PlaybackController {
+        std::fs::create_dir_all(root).unwrap();
+        let mut playback =
+            PlaybackController::new("unused-test-worker".to_owned(), cache_root).unwrap();
+        playback
+            .configure_storage(Some(root.to_path_buf()), RetentionPolicy::default(), None)
+            .unwrap();
+        playback
+    }
 
     fn input(username: &str, password: &str) -> CameraCommandInput {
         CameraCommandInput {
@@ -628,6 +772,133 @@ mod tests {
             username: username.to_owned(),
             password: password.to_owned(),
         }
+    }
+
+    #[test]
+    fn desktop_csp_allows_only_loopback_playback_media() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let csp = config["app"]["security"]["csp"].as_str().unwrap();
+        let media = csp
+            .split(';')
+            .map(str::trim)
+            .find(|directive| directive.starts_with("media-src "))
+            .unwrap();
+        assert_eq!(media, "media-src 'self' http://127.0.0.1:*");
+        assert!(!media.split_whitespace().any(|source| source == "*"));
+        assert!(!csp.contains("192.168."));
+        assert!(!csp.contains("default-src http:"));
+    }
+
+    #[test]
+    fn failed_playback_candidate_does_not_commit_settings_or_swap_active_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("recordings-a");
+        let bad_root_b = temp.path().join("recordings-b-file");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::write(&bad_root_b, b"not a directory").unwrap();
+        let (mut service, _state, _credentials) = test_service(&root_a);
+        let mut playback = configured_playback(&root_a, temp.path().join("cache"));
+
+        assert!(
+            update_settings_transaction(
+                &mut service,
+                &mut playback,
+                settings_for(&bad_root_b),
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            service
+                .application_settings()
+                .unwrap()
+                .storage_root
+                .as_deref(),
+            Some(root_a.to_string_lossy().as_ref())
+        );
+        assert_eq!(playback.configured_storage_root(), Some(root_a.as_path()));
+    }
+
+    #[test]
+    fn failed_settings_persistence_discards_prepared_playback_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("recordings-a");
+        let root_b = temp.path().join("recordings-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let (mut service, state, _credentials) = test_service(&root_a);
+        state.lock().unwrap().fail_save = true;
+        let mut playback = configured_playback(&root_a, temp.path().join("cache"));
+
+        assert!(
+            update_settings_transaction(&mut service, &mut playback, settings_for(&root_b), false,)
+                .is_err()
+        );
+        assert_eq!(
+            service
+                .application_settings()
+                .unwrap()
+                .storage_root
+                .as_deref(),
+            Some(root_a.to_string_lossy().as_ref())
+        );
+        assert_eq!(playback.configured_storage_root(), Some(root_a.as_path()));
+    }
+
+    #[test]
+    fn successful_settings_transaction_commits_then_swaps_playback_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("recordings-a");
+        let root_b = temp.path().join("recordings-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let (mut service, state, credentials) = test_service(&root_a);
+        let credential_ref = CredentialRef::parse("settings-test-ref").unwrap();
+        credentials
+            .put(&credential_ref, &Credentials::new("admin", "secret"))
+            .unwrap();
+        state.lock().unwrap().camera = Some(
+            nian_domain::CameraConfig::new(
+                CameraId::parse("front-door").unwrap(),
+                "Front door",
+                nian_domain::CameraSource::Rtsp(
+                    nian_domain::CameraEndpoint::new(
+                        nian_domain::Host::parse("192.168.1.50").unwrap(),
+                        554,
+                        "/stream1",
+                    )
+                    .unwrap(),
+                ),
+                AudioPolicy::CopyAll,
+                credential_ref,
+            )
+            .unwrap(),
+        );
+        let mut playback = configured_playback(&root_a, temp.path().join("cache"));
+
+        let saved =
+            update_settings_transaction(&mut service, &mut playback, settings_for(&root_b), false)
+                .unwrap();
+        assert_eq!(
+            saved.storage_root.as_deref(),
+            Some(root_b.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            service
+                .application_settings()
+                .unwrap()
+                .storage_root
+                .as_deref(),
+            Some(root_b.to_string_lossy().as_ref())
+        );
+        assert_eq!(playback.configured_storage_root(), Some(root_b.as_path()));
+        let desired = service.prepare_recording("front-door").unwrap();
+        assert_eq!(
+            PathBuf::from(desired.storage_root),
+            root_b,
+            "recording and playback must converge on the committed root",
+        );
     }
 
     #[test]

@@ -22,15 +22,15 @@ pub mod supervisor;
 pub use camera_service::{
     ApplicationSettingsDto, CameraDraft, CameraMutation, CameraService, CameraServiceError,
     CameraSummary, CameraWarning, CredentialRefGenerator, CredentialRefGeneratorError,
-    CredentialStore, CredentialStoreError, MemoryCredentialStore, PreparedProbe,
-    RandomCredentialRefGenerator, SettingsRepository, SettingsRepositoryError,
+    CredentialStore, CredentialStoreError, MemoryCredentialStore, PreparedApplicationSettings,
+    PreparedProbe, RandomCredentialRefGenerator, SettingsRepository, SettingsRepositoryError,
 };
 pub use config::{AppConfig, SegmentTargetDuration};
 pub use error::ApplicationError;
 pub use playback::{
     AdjacentRecordingsDto, PlaybackController, PlaybackError, PlaybackErrorCode,
-    PlaybackInspectDto, PlaybackOpenDto, RecordingDto, TimelineRecordingKind,
-    WorkerPlaybackBackend,
+    PlaybackInspectDto, PlaybackOpenDto, PreparedPlaybackStorage, RecordingDto,
+    TimelineRecordingKind, WorkerPlaybackBackend,
 };
 pub use probe_controller::{
     ProbeController, ProbeError, ProbeResult, ProbeRunner, WorkerProbeRunner,
