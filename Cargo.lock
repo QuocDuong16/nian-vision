@@ -2368,6 +2368,7 @@ dependencies = [
 name = "nian-desktop"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "keyring",
  "nian-application",
  "nian-domain",

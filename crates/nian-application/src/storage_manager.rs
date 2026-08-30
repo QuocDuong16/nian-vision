@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use chrono::{Duration as ChronoDuration, NaiveDateTime};
+use chrono::{Duration as ChronoDuration, NaiveDate, NaiveDateTime};
 use nian_domain::{CameraId, RetentionPolicy, StorageQuota};
 use nian_index::{IndexError, IndexedRecording, RecordingIndex, RecordingKind, RecordingUpsert};
 use nian_storage::classification::owned_recording_name;
@@ -15,6 +16,15 @@ use nian_storage::{
     inspect_recovered_retention, inventory_recordings, parse_recovery_tombstone,
     recovery_tombstone_matches, recovery_transaction_paths,
 };
+
+#[cfg(test)]
+struct RetentionTestGate {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static RETENTION_PRE_DELETE_GATE: Mutex<Option<RetentionTestGate>> = Mutex::new(None);
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageManagerError {
@@ -30,6 +40,27 @@ pub enum StorageManagerError {
     InvalidFinalizedRecording(String),
     #[error("recording index is temporarily unavailable during repair")]
     IndexUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordingLookupError {
+    NotFound,
+    Missing,
+    Stale(String),
+    NotFinalized,
+    Index(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedRecording {
+    pub indexed: IndexedRecording,
+    pub path: PathBuf,
+}
+
+impl From<IndexError> for RecordingLookupError {
+    fn from(error: IndexError) -> Self {
+        Self::Index(error.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +117,7 @@ pub struct RetentionReport {
     pub age_deleted: usize,
     pub quota_deleted: usize,
     pub skipped_active: usize,
+    pub skipped_playback: usize,
     pub blocked_recovery_transactions: usize,
     pub missing: usize,
     pub quota_triggered: bool,
@@ -93,6 +125,60 @@ pub struct RetentionReport {
     pub usage_after: u64,
     pub quota_target_reached: bool,
     pub failed: Vec<RetentionFailure>,
+}
+
+/// Application-level pins for finalized recordings currently used by playback.
+/// This is deliberately separate from `CameraLease`: playback never owns or
+/// mutates the live recording namespace.
+#[derive(Debug, Clone, Default)]
+pub struct PlaybackPins {
+    inner: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl PlaybackPins {
+    pub fn pin(&self, relative_path: impl Into<String>) -> PlaybackPin {
+        let relative_path = relative_path.into();
+        let mut pins = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *pins.entry(relative_path.clone()).or_default() += 1;
+        drop(pins);
+        PlaybackPin {
+            pins: self.clone(),
+            relative_path,
+        }
+    }
+
+    pub fn is_pinned(&self, relative_path: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(relative_path)
+            .is_some_and(|count| *count > 0)
+    }
+}
+
+#[derive(Debug)]
+pub struct PlaybackPin {
+    pins: PlaybackPins,
+    relative_path: String,
+}
+
+impl Drop for PlaybackPin {
+    fn drop(&mut self) {
+        let mut pins = self
+            .pins
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = pins.get_mut(&self.relative_path) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                pins.remove(&self.relative_path);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -117,6 +203,7 @@ pub struct StorageManager {
     storage_quota: Option<StorageQuota>,
     reconciled: bool,
     rebuilt_after_corruption: bool,
+    playback_pins: PlaybackPins,
 }
 
 impl StorageManager {
@@ -124,6 +211,20 @@ impl StorageManager {
         layout: RecordingsLayout,
         retention_policy: RetentionPolicy,
         storage_quota: Option<StorageQuota>,
+    ) -> Result<Self, StorageManagerError> {
+        Self::open_with_playback_pins(
+            layout,
+            retention_policy,
+            storage_quota,
+            PlaybackPins::default(),
+        )
+    }
+
+    pub fn open_with_playback_pins(
+        layout: RecordingsLayout,
+        retention_policy: RetentionPolicy,
+        storage_quota: Option<StorageQuota>,
+        playback_pins: PlaybackPins,
     ) -> Result<Self, StorageManagerError> {
         validate_retention(retention_policy, storage_quota)?;
         layout.ensure_control_dir()?;
@@ -138,6 +239,7 @@ impl StorageManager {
                 storage_quota,
                 reconciled: false,
                 rebuilt_after_corruption: false,
+                playback_pins,
             }),
             Err(error) if error.is_corruption() => {
                 quarantine_corrupt_index(&index_path)?;
@@ -149,6 +251,7 @@ impl StorageManager {
                     storage_quota,
                     reconciled: false,
                     rebuilt_after_corruption: true,
+                    playback_pins,
                 };
                 manager.rebuild()?;
                 Ok(manager)
@@ -328,6 +431,61 @@ impl StorageManager {
         Ok(self.index()?.query_time_range(camera_id, start, end)?)
     }
 
+    pub fn available_recording_days(
+        &self,
+        camera_id: &CameraId,
+    ) -> Result<Vec<NaiveDate>, StorageManagerError> {
+        Ok(self.index()?.available_days(camera_id)?)
+    }
+
+    pub fn recording_by_id(
+        &self,
+        recording_id: &str,
+    ) -> Result<Option<IndexedRecording>, StorageManagerError> {
+        Ok(self.index()?.get_by_relative_path(recording_id)?)
+    }
+
+    pub fn previous_recording(
+        &self,
+        recording: &IndexedRecording,
+    ) -> Result<Option<IndexedRecording>, StorageManagerError> {
+        Ok(self.index()?.previous_recording(recording)?)
+    }
+
+    pub fn next_recording(
+        &self,
+        recording: &IndexedRecording,
+    ) -> Result<Option<IndexedRecording>, StorageManagerError> {
+        Ok(self.index()?.next_recording(recording)?)
+    }
+
+    pub fn write_media_duration(
+        &mut self,
+        recording: &IndexedRecording,
+        media_duration_ms: u64,
+    ) -> Result<bool, StorageManagerError> {
+        Ok(self
+            .index_mut()?
+            .update_duration_if_identity_matches(recording, media_duration_ms)?)
+    }
+
+    pub fn validate_recording_for_playback(
+        &self,
+        recording_id: &str,
+    ) -> Result<ValidatedRecording, RecordingLookupError> {
+        let index = self.index.as_ref().ok_or_else(|| {
+            RecordingLookupError::Index("recording index is unavailable".to_owned())
+        })?;
+        let indexed = index
+            .get_by_relative_path(recording_id)?
+            .ok_or(RecordingLookupError::NotFound)?;
+        if indexed.state != nian_domain::RecordingState::Complete {
+            return Err(RecordingLookupError::NotFinalized);
+        }
+        let path = validate_indexed_playback_path(&self.layout, &indexed)?;
+        Ok(ValidatedRecording { indexed, path })
+    }
+
     pub fn total_indexed_recording_bytes(&self) -> Result<u64, StorageManagerError> {
         Ok(self.index()?.total_recording_bytes()?)
     }
@@ -475,6 +633,11 @@ impl StorageManager {
                 continue;
             }
 
+            if self.playback_pins.is_pinned(&candidate.relative_path) {
+                report.skipped_playback += 1;
+                continue;
+            }
+
             match revalidate_candidate(&self.layout, &candidate) {
                 Ok(()) => {}
                 Err(Revalidation::Missing) => {
@@ -520,6 +683,21 @@ impl StorageManager {
                     revalidate_recovered_commit(&self.layout, &candidate, tombstone, evidence)
             {
                 report.failed.push(failure);
+                continue;
+            }
+
+            #[cfg(test)]
+            if let Ok(gate) = RETENTION_PRE_DELETE_GATE.lock()
+                && let Some(gate) = gate.as_ref()
+            {
+                let _ = gate.reached.send(());
+                let _ = gate.resume.recv();
+            }
+
+            // Close the plan-to-delete race: playback may have validated and
+            // pinned this immutable final after retention selected it.
+            if self.playback_pins.is_pinned(&candidate.relative_path) {
+                report.skipped_playback += 1;
                 continue;
             }
 
@@ -653,6 +831,124 @@ impl StorageManager {
         }
         Ok(report)
     }
+}
+
+pub(crate) fn validate_indexed_playback_path(
+    layout: &RecordingsLayout,
+    indexed: &IndexedRecording,
+) -> Result<PathBuf, RecordingLookupError> {
+    let relative = Path::new(&indexed.relative_path);
+    if relative.is_absolute() {
+        return Err(RecordingLookupError::Stale(
+            "indexed recording identity is absolute".to_owned(),
+        ));
+    }
+
+    let parts: Vec<_> = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(part) => part.to_str().map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    if parts.len() != 5 || parts.iter().any(Option::is_none) {
+        return Err(RecordingLookupError::Stale(
+            "indexed recording identity has invalid path grammar".to_owned(),
+        ));
+    }
+    let parts: Vec<String> = parts.into_iter().flatten().collect();
+    let camera = CameraId::parse(&parts[0]).map_err(|_| {
+        RecordingLookupError::Stale("indexed recording camera component is invalid".to_owned())
+    })?;
+    if camera != indexed.camera_id {
+        return Err(RecordingLookupError::Stale(
+            "indexed recording camera identity changed".to_owned(),
+        ));
+    }
+    let year = parts[1].parse::<i32>().ok();
+    let month = parts[2].parse::<u32>().ok();
+    let day = parts[3].parse::<u32>().ok();
+    let date = match (year, month, day) {
+        (Some(year), Some(month), Some(day)) => NaiveDate::from_ymd_opt(year, month, day),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        RecordingLookupError::Stale("indexed recording date path is invalid".to_owned())
+    })?;
+    if date != indexed.started_at.date() {
+        return Err(RecordingLookupError::Stale(
+            "indexed recording date does not match timeline identity".to_owned(),
+        ));
+    }
+
+    let filename = &parts[4];
+    let Some(identity) = owned_recording_name(filename) else {
+        return Err(RecordingLookupError::Stale(
+            "indexed recording filename is not canonical".to_owned(),
+        ));
+    };
+    if identity.started_at != indexed.started_at.time() || identity.sequence != indexed.sequence {
+        return Err(RecordingLookupError::Stale(
+            "indexed recording filename identity changed".to_owned(),
+        ));
+    }
+    let expected_kind = match indexed.kind {
+        RecordingKind::Normal => RecordingFileKind::NormalRecording,
+        RecordingKind::Recovered => RecordingFileKind::RecoveredRecording,
+    };
+    if nian_storage::classify_recording_file_name(filename) != expected_kind {
+        return Err(RecordingLookupError::Stale(
+            "indexed recording kind does not match filename".to_owned(),
+        ));
+    }
+
+    let root_metadata = match std::fs::symlink_metadata(layout.root()) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RecordingLookupError::Missing);
+        }
+        Err(_) => {
+            return Err(RecordingLookupError::Stale(
+                "recording root cannot be inspected".to_owned(),
+            ));
+        }
+    };
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return Err(RecordingLookupError::Stale(
+            "recording root is not a real directory".to_owned(),
+        ));
+    }
+
+    let mut path = layout.root().to_path_buf();
+    for (index, part) in parts.iter().enumerate() {
+        path.push(part);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(RecordingLookupError::Missing);
+            }
+            Err(_) => {
+                return Err(RecordingLookupError::Stale(
+                    "recording path cannot be inspected".to_owned(),
+                ));
+            }
+        };
+        let is_last = index + 1 == parts.len();
+        if metadata.file_type().is_symlink()
+            || (is_last && !metadata.is_file())
+            || (!is_last && !metadata.is_dir())
+        {
+            return Err(RecordingLookupError::Stale(
+                "recording path contains a symlink or wrong object type".to_owned(),
+            ));
+        }
+        if is_last && metadata.len() != indexed.size_bytes {
+            return Err(RecordingLookupError::Stale(
+                "recording size changed since indexing".to_owned(),
+            ));
+        }
+    }
+    Ok(path)
 }
 
 fn validate_retention(
@@ -1248,6 +1544,117 @@ mod tests {
         assert_eq!(
             std::fs::read(corrupt_target_path(&shm, 2).unwrap()).unwrap(),
             b"old shm"
+        );
+    }
+
+    #[test]
+    fn playback_pin_skips_retention_until_the_session_releases_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = RecordingsLayout::new(temp.path().join("recordings")).unwrap();
+        let camera = CameraId::parse("cam-a").unwrap();
+        let started_at =
+            NaiveDateTime::parse_from_str("2026-08-20T08:30:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let media = layout
+            .day_dir(&camera, started_at.date())
+            .join("08-30-00.mkv");
+        std::fs::create_dir_all(media.parent().unwrap()).unwrap();
+        std::fs::write(&media, b"pinned footage").unwrap();
+        let relative = "cam-a/2026/08/20/08-30-00.mkv";
+        let pins = PlaybackPins::default();
+        let mut manager = StorageManager::open_with_playback_pins(
+            layout,
+            RetentionPolicy {
+                max_age_days: Some(1),
+                max_storage_bytes: None,
+            },
+            None,
+            pins.clone(),
+        )
+        .unwrap();
+        manager.reconcile().unwrap();
+
+        let pin = pins.pin(relative);
+        let report = manager
+            .run_retention(
+                NaiveDateTime::parse_from_str("2026-08-29T12:00:00", "%Y-%m-%dT%H:%M:%S").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.skipped_playback, 1);
+        assert!(media.is_file());
+        assert!(manager.recording_by_id(relative).unwrap().is_some());
+
+        drop(pin);
+        let report = manager
+            .run_retention(
+                NaiveDateTime::parse_from_str("2026-08-29T12:00:00", "%Y-%m-%dT%H:%M:%S").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(report.deleted, 1);
+        assert!(!media.exists());
+        assert!(manager.recording_by_id(relative).unwrap().is_none());
+    }
+
+    #[test]
+    fn playback_pin_created_after_retention_planning_wins_before_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = RecordingsLayout::new(temp.path().join("recordings")).unwrap();
+        let camera = CameraId::parse("cam-a").unwrap();
+        let started_at =
+            NaiveDateTime::parse_from_str("2026-08-20T08:30:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let media = layout
+            .day_dir(&camera, started_at.date())
+            .join("08-30-00.mkv");
+        std::fs::create_dir_all(media.parent().unwrap()).unwrap();
+        std::fs::write(&media, b"race footage").unwrap();
+        let relative = "cam-a/2026/08/20/08-30-00.mkv";
+        let pins = PlaybackPins::default();
+        let mut manager = StorageManager::open_with_playback_pins(
+            layout,
+            RetentionPolicy {
+                max_age_days: Some(1),
+                max_storage_bytes: None,
+            },
+            None,
+            pins.clone(),
+        )
+        .unwrap();
+        manager.reconcile().unwrap();
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *RETENTION_PRE_DELETE_GATE.lock().unwrap() = Some(RetentionTestGate {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        let worker = std::thread::spawn(move || {
+            let report = manager
+                .run_retention(
+                    NaiveDateTime::parse_from_str("2026-08-29T12:00:00", "%Y-%m-%dT%H:%M:%S")
+                        .unwrap(),
+                )
+                .unwrap();
+            (manager, report)
+        });
+        reached_rx.recv().unwrap();
+        let pin = pins.pin(relative);
+        resume_tx.send(()).unwrap();
+        let (mut manager, report) = worker.join().unwrap();
+        *RETENTION_PRE_DELETE_GATE.lock().unwrap() = None;
+
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.skipped_playback, 1);
+        assert!(media.is_file());
+        drop(pin);
+        assert_eq!(
+            manager
+                .run_retention(
+                    NaiveDateTime::parse_from_str("2026-08-29T12:00:00", "%Y-%m-%dT%H:%M:%S",)
+                        .unwrap(),
+                )
+                .unwrap()
+                .deleted,
+            1
         );
     }
 }

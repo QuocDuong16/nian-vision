@@ -248,3 +248,93 @@ fn ipc_camera_probe_unreachable_source_returns_typed_bounded_failure() {
     let _ = read_message(&mut reader);
     assert!(child.wait().unwrap().success());
 }
+
+#[test]
+fn ipc_playback_prepare_packet_copies_h264_mkv_to_browser_mp4() {
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/nian-media-ffmpeg/tests/fixtures/playback_h264.mkv");
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("playback.mp4");
+
+    let mut child = spawn_run();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut stdin = child.stdin.take().unwrap();
+    let _hello = read_message(&mut reader);
+
+    stdin
+        .write_all(
+            request_with_params(
+                1,
+                "playback.prepare",
+                serde_json::json!({
+                    "source_path": fixture,
+                    "output_path": output,
+                    "timeout_ms": 10_000,
+                }),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let Envelope::Response {
+        id,
+        ok,
+        result,
+        error_code,
+        ..
+    } = read_message(&mut reader)
+    else {
+        panic!("expected playback response");
+    };
+    assert_eq!(id, 1);
+    assert!(ok, "playback prepare failed: {error_code:?}");
+    assert_eq!(result["video_codec"], "h264");
+    assert_eq!(result["width"], 160);
+    assert_eq!(result["height"], 120);
+    assert_eq!(result["audio_available"], true);
+    assert_eq!(result["container_compatibility"], "fragmented_mp4");
+    assert_eq!(result["seekable"], true);
+    assert!(
+        result["duration_ms"]
+            .as_u64()
+            .is_some_and(|ms| (3_500..=4_500).contains(&ms))
+    );
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(bytes.len() > 10_000);
+    assert!(
+        bytes.windows(4).any(|window| window == b"sidx"),
+        "worker output must contain the global fragmented-MP4 seek index"
+    );
+
+    stdin
+        .write_all(request(2, method::SHUTDOWN).as_bytes())
+        .unwrap();
+    let _ = read_message(&mut reader);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn ipc_playback_prepare_rejects_malformed_media_with_typed_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("broken.mkv");
+    let output = temp.path().join("playback.mp4");
+    std::fs::write(&source, b"not media").unwrap();
+
+    let mut child = spawn_run();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut stdin = child.stdin.take().unwrap();
+    let _hello = read_message(&mut reader);
+    stdin.write_all(request_with_params(1, "playback.prepare", serde_json::json!({"source_path": source, "output_path": output, "timeout_ms": 2_000})).as_bytes()).unwrap();
+    let Envelope::Response { ok, error_code, .. } = read_message(&mut reader) else {
+        panic!("expected playback failure")
+    };
+    assert!(!ok);
+    assert_eq!(error_code.as_deref(), Some("media_unreadable"));
+    stdin
+        .write_all(request(2, method::SHUTDOWN).as_bytes())
+        .unwrap();
+    let _ = read_message(&mut reader);
+    assert!(child.wait().unwrap().success());
+}

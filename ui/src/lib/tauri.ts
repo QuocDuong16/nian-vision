@@ -67,6 +67,42 @@ export interface DesktopError {
   message: string;
 }
 
+export type TimelineRecordingKind = "normal" | "recovered";
+
+export interface RecordingDto {
+  recording_id: string;
+  camera_id: string;
+  kind: TimelineRecordingKind;
+  started_at: string;
+  sequence: number;
+  size_bytes: number;
+  media_duration_ms: number | null;
+  end_at: string | null;
+}
+
+export interface AdjacentRecordingsDto {
+  previous: RecordingDto | null;
+  next: RecordingDto | null;
+}
+
+export interface PlaybackInspectDto {
+  duration_ms: number | null;
+  video_codec: string;
+  width: number | null;
+  height: number | null;
+  audio_available: boolean;
+  container_compatibility: string;
+  seekable: boolean;
+}
+
+export interface PlaybackOpenDto {
+  session_id: string;
+  url: string;
+  recording: RecordingDto;
+  inspect: PlaybackInspectDto;
+  adjacent: AdjacentRecordingsDto;
+}
+
 export const STOPPED_STATUS: RecordingStatus = {
   state: "stopped",
   camera_id: null,

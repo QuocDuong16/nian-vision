@@ -20,7 +20,7 @@ describe("App shell", () => {
     render(<App />);
 
     fireEvent.click(screen.getByRole("button", { name: "Timeline" }));
-    expect(screen.getByText("No recordings yet")).toBeTruthy();
+    expect(screen.getByText("Recordings timeline")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     expect(

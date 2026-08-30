@@ -26,11 +26,14 @@ mod job;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use nian_ipc::message::{Envelope, event, method};
 use nian_ipc::{FramedWriter, serve};
 use nian_media::{MediaSource, Probe, RtspUrl};
-use nian_media_ffmpeg::{FfmpegBackend, RuntimeVersions};
+use nian_media_ffmpeg::{
+    FfmpegBackend, InterruptHandle, MatroskaMuxer, MediaInput, RuntimeVersions,
+};
 use serde_json::json;
 
 const USAGE: &str = "usage: nian-media-worker probe <path|credential-free-rtsp-url>
@@ -648,6 +651,10 @@ pub mod camera_method {
     pub const PROBE: &str = "camera.probe";
 }
 
+pub mod playback_method {
+    pub const PREPARE: &str = "playback.prepare";
+}
+
 impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
     fn handle(
         &mut self,
@@ -738,6 +745,10 @@ impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
                     with_reason(job::code::INVALID_PARAMS, reason),
                 ))),
             },
+            playback_method::PREPARE => match playback_prepare(params) {
+                Ok(result) => nian_ipc::Dispatch::Reply(Ok(result)),
+                Err(code) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(code))),
+            },
             method::SHUTDOWN => {
                 // Final remediation §4: process shutdown is its OWN
                 // orchestration — one IDEMPOTENT graceful request here; the
@@ -788,6 +799,112 @@ fn probe_params(
         return Err("'timeout_ms' must be between 100 and 60000");
     }
     Ok((source, std::time::Duration::from_millis(timeout_ms)))
+}
+
+fn playback_prepare(params: &serde_json::Value) -> Result<serde_json::Value, &'static str> {
+    let source_path = params
+        .get("source_path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or("internal")?;
+    let output_path = params
+        .get("output_path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or("internal")?;
+    let timeout_ms = params
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(60_000);
+    if !source_path.is_absolute()
+        || !output_path.is_absolute()
+        || source_path == output_path
+        || !(100..=120_000).contains(&timeout_ms)
+    {
+        return Err("internal");
+    }
+
+    let metadata = std::fs::symlink_metadata(&source_path).map_err(|_| "media_unreadable")?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("media_unreadable");
+    }
+
+    // The host owns a unique per-session directory; create_new makes the
+    // worker's cache-file ownership explicit before FFmpeg opens that claim.
+    let claim = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output_path)
+        .map_err(|_| "internal")?;
+    drop(claim);
+
+    let interrupt = InterruptHandle::new();
+    let _deadline = interrupt.scoped_deadline(Duration::from_millis(timeout_ms));
+    let mut input = match MediaInput::open(&MediaSource::File(source_path), &interrupt) {
+        Ok(input) => input,
+        Err(error) => {
+            let _ = std::fs::remove_file(&output_path);
+            return if error.is_timed_out() || error.is_interrupted() {
+                Err("worker_unavailable")
+            } else {
+                Err("media_unreadable")
+            };
+        }
+    };
+    let streams = input.streams();
+    let Some(video) = streams
+        .iter()
+        .find(|stream| stream.media_type == nian_domain::MediaType::Video)
+        .cloned()
+    else {
+        let _ = std::fs::remove_file(&output_path);
+        return Err("unsupported_codec");
+    };
+    if video.codec_name != "h264" {
+        let _ = std::fs::remove_file(&output_path);
+        return Err("unsupported_codec");
+    }
+    let audio_indices: std::collections::HashSet<u32> = streams
+        .iter()
+        .filter(|stream| {
+            stream.media_type == nian_domain::MediaType::Audio && stream.codec_name == "aac"
+        })
+        .map(|stream| stream.stream_index)
+        .collect();
+    let video_index = video.stream_index;
+    let mut muxer = MatroskaMuxer::create_fragmented_mp4_with_selection(
+        &mut input,
+        &output_path,
+        &interrupt,
+        |stream| stream.stream_index == video_index || audio_indices.contains(&stream.stream_index),
+    )
+    .map_err(|_| "unsupported_container")?;
+
+    while let Some(packet) = input.next_packet().map_err(|error| {
+        if error.is_timed_out() || error.is_interrupted() {
+            "worker_unavailable"
+        } else {
+            "media_unreadable"
+        }
+    })? {
+        muxer
+            .write_packet(&packet)
+            .map_err(|_| "unsupported_container")?;
+    }
+    muxer.finalize().map_err(|_| "unsupported_container")?;
+
+    let duration_ms = input
+        .duration()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+    Ok(json!({
+        "duration_ms": duration_ms,
+        "video_codec": video.codec_name,
+        "width": video.width,
+        "height": video.height,
+        "audio_available": !audio_indices.is_empty(),
+        "container_compatibility": "fragmented_mp4",
+        "seekable": true,
+    }))
 }
 
 /// Combines a stable error code with a short, secret-free reason so hosts

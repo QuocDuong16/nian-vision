@@ -13,6 +13,7 @@
 pub mod camera_service;
 pub mod config;
 pub mod error;
+pub mod playback;
 pub mod probe_controller;
 pub mod recording_controller;
 pub mod storage_manager;
@@ -26,6 +27,11 @@ pub use camera_service::{
 };
 pub use config::{AppConfig, SegmentTargetDuration};
 pub use error::ApplicationError;
+pub use playback::{
+    AdjacentRecordingsDto, PlaybackController, PlaybackError, PlaybackErrorCode,
+    PlaybackInspectDto, PlaybackOpenDto, RecordingDto, TimelineRecordingKind,
+    WorkerPlaybackBackend,
+};
 pub use probe_controller::{
     ProbeController, ProbeError, ProbeResult, ProbeRunner, WorkerProbeRunner,
 };
@@ -35,8 +41,9 @@ pub use recording_controller::{
     SupervisorRecordingRunner,
 };
 pub use storage_manager::{
-    ArtifactCleanupReport, ReconciliationFailure, ReconciliationFailureKind, ReconciliationReport,
-    RetentionFailure, RetentionFailureKind, RetentionReport, StorageManager, StorageManagerError,
+    ArtifactCleanupReport, PlaybackPins, ReconciliationFailure, ReconciliationFailureKind,
+    ReconciliationReport, RecordingLookupError, RetentionFailure, RetentionFailureKind,
+    RetentionReport, StorageManager, StorageManagerError, ValidatedRecording,
 };
 pub use supervisor::{
     BinaryLauncher, DesiredRecording, JobTerminal, SupervisorDeadlines, WorkerEnd, WorkerLauncher,

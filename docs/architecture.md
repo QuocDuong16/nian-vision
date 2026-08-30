@@ -20,6 +20,7 @@ TP-Link Tapo C200 over RTSP). This page is the map; the ADRs record why.
 │  RecordingController (M5) ✓  │
 │  ProbeController     (M5) ✓  │
 │  Storage Manager     (M4) ✓  │
+│  PlaybackController  (M6) ✓  │
 │  Worker Supervisor   (M3) ✓  │
 │    (nian-application)        │
 └──────────────┬───────────────┘
@@ -57,7 +58,7 @@ Key properties:
 | Crate | Role | Notes |
 |---|---|---|
 | `nian-domain` | Camera/Recording/Media vocabulary | path-safe IDs, redacted credentials, backoff schedule |
-| `nian-application` | config validation and orchestration policies | `WorkerSupervisor` (M3), `StorageManager` (M4), M5 `CameraService` + single-active `RecordingController` + serialized `ProbeController` |
+| `nian-application` | config validation and orchestration policies | `WorkerSupervisor` (M3), `StorageManager` (M4), M5 camera/record/probe controllers, M6 `PlaybackController` + playback pins |
 | `nian-index` | rebuildable SQLite recording catalog | bundled SQLite, schema v1 migrations, WAL, timeline queries; no camera settings or credentials (M4) |
 | `nian-settings` | authoritative non-secret desktop configuration | app-data `settings.sqlite3`, schema v1 camera/storage settings; no FFmpeg/Tauri/process logic (M5) |
 | `nian-storage` | recordings layout, claiming, publication, inventory/transaction facts | traversal-proof paths, race-safe `claim_segment`, atomic no-replace publish, lease-aware partial primitives, symlink-safe deterministic inventory (M4) |
@@ -66,8 +67,8 @@ Key properties:
 | `nian-media-ffmpeg` | safe FFmpeg wrapper | input/muxer/packet/interrupt/ABI guard; operation-scoped RAII deadlines + typed abort causes (M3) |
 | `nian-recorder` | segmented recording engine + supervision | keyframe rotation, durable finalize/publish; camera reconnect supervisor, partial recovery (M3) |
 | `nian-ffmpeg-sys` | raw FFI (generated) | committed bindings from vendored 8.0.3 headers |
-| `apps/nian-desktop` | Tauri 2 host | managed M5 state, platform app-data resolution, native credential-store adapter, thin typed commands |
-| `apps/nian-media-worker` | media process | `probe` CLI, `run` IPC with `recording.*` plus bounded `camera.probe`, manual `record` smoke command |
+| `apps/nian-desktop` | Tauri 2 host | managed M6 state, platform app-data resolution, native credential-store adapter, playback HTTP owner, thin typed commands |
+| `apps/nian-media-worker` | media process | `probe` CLI, `run` IPC with `recording.*`, bounded `camera.probe`, M6 `playback.prepare`, manual `record` smoke command |
 
 ## Recording data flow
 
@@ -264,9 +265,93 @@ to test a changed non-secret endpoint without exposing that secret to React.
 
 M5 deliberately chooses **session-only desired recording state**. Camera and
 storage configuration is restored after desktop restart, but recording does not
-auto-start. Native tray/autostart/power lifecycle belongs to M7. Playback, live
-view, thumbnails and timeline behavior have not been started; they remain M6.
+auto-start. Native tray/autostart/power lifecycle belongs to M7. M6 adds finalized
+recording playback/timeline only; live view and thumbnails remain out of scope.
 See ADR-0008.
+
+## Recording timeline and playback (M6)
+
+M6 keeps the M4 authority split intact:
+
+```text
+React recording ID (opaque relative identity)
+  → recording_timeline / playback_open
+  → nian-index row lookup
+  → RecordingsLayout + exact camera/date/filename grammar
+  → symlink_metadata on root and every component
+  → finalized normal/recovered regular file with expected size
+  → PlaybackPin + read handle
+  → media-worker playback.prepare
+  → packet-copy fragmented MP4 in app cache
+  → http://127.0.0.1:<ephemeral>/playback/<uuid-token>
+  → HTML <video> HTTP Range requests
+```
+
+The recording ID is the canonical filesystem-derived relative key already stored
+by `nian-index`. It survives index deletion/rebuild; the frontend treats it as an
+opaque identifier and never turns it into a path. The backend resolves the key
+through the index and revalidates the current filesystem object immediately before
+opening it. Absolute paths, non-normal path components, wrong camera/date/name
+grammar, partial/recovery-control artifacts, symlinks, non-regular files and size
+changes are rejected as typed missing/stale/not-finalized failures. Every later
+HTTP media request revalidates the original recording identity again, so a path
+replacement cannot silently redirect an existing session to foreign content.
+
+Timeline reads are database queries, not per-request tree rescans. `nian-index`
+provides available days, `[start,end)` camera range queries and previous/next
+lookups with stable ordering `started_at → sequence → relative_path`; only complete
+recordings participate. Normal and recovered finals use the same timeline DTO.
+Known duration produces `end_at = started_at + media_duration`; unknown duration
+stays NULL and renders honestly. When a recording is opened, `playback.prepare`
+may discover duration through libav. The application writes it back only while the
+indexed camera/kind/time/sequence/size identity still matches; writeback failure
+does not invalidate playback and a full M4 rebuild intentionally returns duration
+to unknown.
+
+`PlaybackController` is application-owned state rather than state hidden inside
+individual Tauri commands. It bounds active sessions, owns the loopback server and
+temporary playback cache, tracks activity, closes/expunges abandoned sessions
+after a bounded idle timeout, and cleans stale `session-*` cache directories at
+startup. Each session has an unguessable UUID token mapping to exactly one
+validated recording. The server binds `127.0.0.1` on an ephemeral port, serves no
+directory listing or arbitrary path parameter, validates Host/Origin where
+practical, limits request/header/buffer sizes, and supports GET/HEAD plus single
+HTTP byte ranges. It never binds `0.0.0.0` or creates a LAN video server.
+
+Recorded footage remains canonical MKV packet-copy media. For the current Tapo
+C200 target, the worker accepts H.264 video and copies AAC audio when present; an
+unsupported audio stream may be omitted rather than transcoded. The worker uses
+the existing direct libav/FFmpeg FFI facade and never invokes an `ffmpeg` CLI.
+The source MKV is packet-copy remuxed once when the playback session opens into a
+unique cache `media.mp4` with
+`frag_keyframe+empty_moov+default_base_moof+global_sidx`. No decoder or encoder is
+used. The MP4 lives outside the recording tree, is never indexed or retention-
+managed, and is deleted with the session.
+
+Seeking in this M6 implementation is therefore a two-stage contract: libav builds
+the keyframe-fragmented MP4 and global segment index once, then WebView2/browser
+seeks use HTTP Range against that prepared representation. A seek does **not**
+decode or remux from recording start. It is keyframe/GOP-granular rather than
+frame-perfect. M6 does not expose a separate per-seek libav operation because the
+session representation is already random-access indexed; if future playback moves
+to on-demand remux streaming, that transport must use libav keyframe seeking rather
+than replaying packets from zero.
+
+Playback ownership is deliberately different from recording ownership.
+`CameraLease` continues to protect active partials, recovery mutation and canonical
+writer ownership. A finalized historical recording needs no camera-wide lease and
+can be read while the same camera records a new segment. Instead, a successful
+playback open acquires a `PlaybackPin` keyed by canonical relative path and keeps a
+source read handle open. Retention consults those pins before work and, critically,
+rechecks immediately before filesystem deletion; a session opened after retention
+planned a candidate therefore wins the race and the candidate is reported as
+`skipped_playback`. After explicit close/idle expiry/application exit, the pin is
+released and normal filesystem-first retention resumes. This product contract is
+portable to Unix, where an open file descriptor alone would not prevent unlink.
+
+M6 is local-recording playback only. It does not implement live RTSP viewing,
+thumbnail generation, clip export, motion analysis, tray/autostart/power handling,
+simultaneous multi-camera recording, ONVIF, AI or cloud behavior. See ADR-0009.
 
 ## Failure model
 

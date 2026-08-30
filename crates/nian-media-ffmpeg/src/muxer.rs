@@ -102,6 +102,33 @@ impl MatroskaMuxer {
         input: &mut MediaInput,
         output_path: &Path,
         interrupt: &InterruptHandle,
+        selector: F,
+    ) -> Result<Self, MediaError>
+    where
+        F: FnMut(&nian_domain::MediaStreamInfo) -> bool,
+    {
+        Self::create_with_selection_for_format(input, output_path, interrupt, false, selector)
+    }
+
+    /// Creates a fragmented MP4 suitable for HTML `<video>` playback while
+    /// preserving the selected compressed packets. No decoder or encoder is used.
+    pub fn create_fragmented_mp4_with_selection<F>(
+        input: &mut MediaInput,
+        output_path: &Path,
+        interrupt: &InterruptHandle,
+        selector: F,
+    ) -> Result<Self, MediaError>
+    where
+        F: FnMut(&nian_domain::MediaStreamInfo) -> bool,
+    {
+        Self::create_with_selection_for_format(input, output_path, interrupt, true, selector)
+    }
+
+    fn create_with_selection_for_format<F>(
+        input: &mut MediaInput,
+        output_path: &Path,
+        interrupt: &InterruptHandle,
+        fragmented_mp4: bool,
         mut selector: F,
     ) -> Result<Self, MediaError>
     where
@@ -148,19 +175,20 @@ impl MatroskaMuxer {
 
         let mut context: *mut sys::AVFormatContext = std::ptr::null_mut();
         // SAFETY: all pointer arguments are valid; on success `context` holds
-        // a freshly allocated output context for the matroska muxer.
+        // a freshly allocated output context for the selected muxer.
+        let format_name = if fragmented_mp4 { c"mp4" } else { c"matroska" };
         let code = unsafe {
             sys::avformat_alloc_output_context2(
                 &mut context,
                 std::ptr::null(),
-                c"matroska".as_ptr(),
+                format_name.as_ptr(),
                 path_c.as_ptr(),
             )
         };
         if code < 0 || context.is_null() {
             return Err(error_for(
                 code,
-                "create matroska output",
+                "create packet-copy output",
                 ErrorKind::Write,
                 Some(interrupt),
             ));
@@ -233,8 +261,37 @@ impl MatroskaMuxer {
             ));
         }
 
+        let mut header_options: *mut sys::AVDictionary = std::ptr::null_mut();
+        if fragmented_mp4 {
+            // SAFETY: dictionary pointer is ours; key/value are static C strings.
+            let option_code = unsafe {
+                sys::av_dict_set(
+                    &mut header_options,
+                    c"movflags".as_ptr(),
+                    c"frag_keyframe+empty_moov+default_base_moof+global_sidx".as_ptr(),
+                    0,
+                )
+            };
+            if option_code < 0 {
+                // SAFETY: dictionary, I/O context and format context are ours.
+                unsafe {
+                    sys::av_dict_free(&mut header_options);
+                    sys::avio_closep(&mut (*context).pb);
+                    sys::avformat_free_context(context);
+                }
+                return Err(error_for(
+                    option_code,
+                    "configure fragmented mp4 output",
+                    ErrorKind::Write,
+                    Some(interrupt),
+                ));
+            }
+        }
+
         // SAFETY: context is valid with all streams and I/O prepared.
-        let code = unsafe { sys::avformat_write_header(context, std::ptr::null_mut()) };
+        let code = unsafe { sys::avformat_write_header(context, &mut header_options) };
+        // SAFETY: any options FFmpeg did not consume remain owned by us.
+        unsafe { sys::av_dict_free(&mut header_options) };
         if code < 0 {
             // Best-effort close: avio_closep always frees the context's I/O
             // and nulls the pointer even when the final flush fails, so this
@@ -247,7 +304,7 @@ impl MatroskaMuxer {
             }
             return Err(error_for(
                 code,
-                "write matroska header",
+                "write packet-copy header",
                 ErrorKind::Write,
                 Some(interrupt),
             ));

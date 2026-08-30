@@ -331,6 +331,115 @@ button:disabled {
   color: #f87171;
 }
 
+.timeline-filters {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) auto;
+  align-items: end;
+  gap: 14px;
+}
+
+.timeline-filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: #cbd5e1;
+  font-size: 13px;
+}
+
+.timeline-filters select {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  background: #0b1220;
+  color: #e2e8f0;
+}
+
+.recording-timeline {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  min-height: 108px;
+  margin-top: 16px;
+  padding: 12px;
+  overflow-x: auto;
+  border-radius: 10px;
+  background: #0b1220;
+}
+
+.timeline-entry {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  min-width: max-content;
+}
+
+.timeline-recording {
+  display: flex;
+  min-width: 116px;
+  min-height: 80px;
+  flex: 1 0 116px;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 3px;
+  border-color: #0e7490;
+  background: #123044;
+  text-align: left;
+}
+
+.timeline-recording.unknown {
+  border-style: dashed;
+  background: #182235;
+}
+
+.timeline-recording.selected {
+  outline: 2px solid #38bdf8;
+  outline-offset: 1px;
+}
+
+.timeline-recording span,
+.timeline-recording small {
+  color: #94a3b8;
+}
+
+.timeline-gap {
+  display: grid;
+  min-width: 86px;
+  place-items: center;
+  padding: 8px;
+  border: 1px dashed #7c2d12;
+  border-radius: 8px;
+  color: #fdba74;
+  background: #26150d;
+  font-size: 12px;
+}
+
+.playback-panel {
+  overflow: hidden;
+}
+
+.playback-video {
+  width: 100%;
+  max-height: 520px;
+  margin-top: 16px;
+  border-radius: 10px;
+  background: #020617;
+}
+
+.playback-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: 10px 0;
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.playback-navigation {
+  margin-top: 12px;
+}
+
 @media (max-width: 720px) {
   .sidebar {
     width: 150px;
@@ -341,6 +450,10 @@ button:disabled {
   }
 
   .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .timeline-filters {
     grid-template-columns: 1fr;
   }
 

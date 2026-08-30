@@ -4,25 +4,32 @@ Local-first desktop NVR (network video recorder) for IP cameras. The first
 supported camera is the TP-Link Tapo C200 over RTSP, with a camera-agnostic
 domain so other RTSP/ONVIF cameras can follow.
 
-**Status**: milestone **M5 (desktop camera management)** is implemented on top
-of M0–M4. The desktop persists camera definitions and recorder/storage settings
+**Status**: milestone **M6 (recording timeline and local playback)** is implemented
+on top of M0–M5. The desktop persists camera definitions and recorder/storage settings
 in an authoritative platform app-data `settings.sqlite3`, while camera passwords
 remain in the operating system credential store. The M4 recording catalog at
 `<storage_root>/.nian/recordings.sqlite3` remains disposable and rebuildable from
 footage. Users can add/edit/delete saved RTSP cameras, test a connection through
 the media worker, start/stop the single M5 active recording, and observe typed
-recording/reconnect state. Multiple camera definitions may be saved, but M5
-allows at most one active desired recording. Recording desired state is
-session-only in M5: saved configuration survives restart, recording itself does
-not auto-start. Playback/timeline and live video remain M6 scope.
+recording/reconnect state. M6 adds recording-day/range queries, filesystem-
+revalidated normal/recovered playback, lazy duration enrichment, seekable
+packet-copy H.264/AAC fragmented-MP4 playback over tokenized loopback HTTP, and
+retention playback pins. Recording still allows at most one active desired
+camera and remains session-only. M7 tray/autostart/power behavior and live camera
+viewing have not been started.
 
 ## What it does today
 
-* Tauri 2 desktop application (React/TypeScript/Vite UI) with managed M5 state:
+* Tauri 2 desktop application (React/TypeScript/Vite UI) with managed M6 state:
   camera CRUD, pre-save connection testing, Start/Stop controls, typed recording
-  status, delete confirmation and persisted storage/retention settings. The
-  webview has no RTSP/network privilege; privileged work flows through narrow
-  Tauri commands.
+  status, delete confirmation, persisted storage/retention settings, recording-day
+  navigation, a gap-aware timeline, native video playback controls and adjacent
+  recording navigation. The webview never receives an absolute recording path;
+  privileged work flows through narrow Tauri commands.
+* Playback sessions bind only an ephemeral `127.0.0.1` port. An unguessable
+  per-session token maps to one already-validated finalized recording; HTTP Range
+  requests provide browser seeking without a directory listing, arbitrary path
+  parameter or LAN listener.
 * Authoritative application settings (`nian-settings`) live in the platform
   app-data directory, separate from recording storage. Camera credentials live
   in the native OS credential store behind `CredentialStore`; neither SQLite
@@ -33,7 +40,9 @@ not auto-start. Playback/timeline and live video remain M6 scope.
   * `nian-media-worker run` serves a versioned NDJSON IPC protocol on
     stdin/stdout with the `recording.*` namespace (one supervised job per
     worker; start/stop/status plus typed reconnect events) and bounded
-    `camera.probe` source-only connection tests;
+    `camera.probe` source-only connection tests. M6 adds `playback.prepare`, which
+    inspects a host-validated finalized MKV and packet-copy remuxes supported H.264
+    plus AAC into fragmented MP4 under the application playback cache;
   * `nian-media-worker record --storage <DIR> --camera <ID> ...` is the
     manual smoke path with explicit stop modes (`--duration N`,
     `--until-stdin-eof`, or Ctrl+C-only) recording from
@@ -58,6 +67,12 @@ not auto-start. Playback/timeline and live video remain M6 scope.
   sub-second finalization events are normalized to the same whole-second local
   identity encoded by filenames. SQLite failures never roll back a published
   media file.
+* Playback/timeline (M6): timeline queries stay inside `nian-index`, while every
+  open and every new media HTTP request revalidates the filesystem-derived
+  recording identity. Recovered finals are first-class entries; unknown duration
+  stays unknown until worker inspection. Playback holds a read handle plus a
+  `PlaybackPin`; retention skips pinned finals and rechecks the pin immediately
+  before deletion, independently of `CameraLease`.
 * Clean crate boundaries with `unsafe` confined to the FFmpeg layers (plus
   one audited Windows publication primitive), a race-safe storage layout,
   credential redaction, and a full quality-gate setup (fmt/clippy/tests,
@@ -70,7 +85,8 @@ React UI ─ typed Tauri commands ─ nian-desktop host
                  │                  │
                  │                  ├─ platform app-data/settings.sqlite3
                  │                  ├─ native OS credential store
-                 │                  │ NDJSON IPC (stdio)
+                 │                  ├─ loopback HTTP playback (127.0.0.1 only)
+                 │                  │ NDJSON control IPC (stdio)
                  │              nian-media-worker
                                 │ FFmpeg FFI (dynamic, LGPL)
                             RTSP cameras
@@ -78,7 +94,7 @@ React UI ─ typed Tauri commands ─ nian-desktop host
 
 See `docs/architecture.md` and `docs/adr/` for the decisions behind this
 layout (process isolation, FFmpeg strategy, container choice, storage
-model, authoritative-settings/native-secret split).
+model, authoritative-settings/native-secret split, M6 playback transport).
 
 ## Requirements
 

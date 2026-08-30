@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use nian_domain::{CameraId, RecordingId, RecordingState};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 
@@ -296,7 +296,7 @@ impl RecordingIndex {
         end: NaiveDateTime,
     ) -> Result<Vec<IndexedRecording>, IndexError> {
         let mut statement = self.connection.prepare(&format!(
-            "{SELECT_SQL} WHERE camera_id=?1 AND started_at>=?2 AND started_at<?3
+            "{SELECT_SQL} WHERE camera_id=?1 AND state='complete' AND started_at>=?2 AND started_at<?3
              ORDER BY started_at, sequence, relative_path"
         ))?;
         let rows = statement.query_map(
@@ -304,6 +304,111 @@ impl RecordingIndex {
             raw_row,
         )?;
         collect_rows(rows)
+    }
+
+    pub fn available_days(&self, camera: &CameraId) -> Result<Vec<NaiveDate>, IndexError> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT substr(started_at, 1, 10)
+             FROM recordings
+             WHERE camera_id=?1 AND state='complete'
+             ORDER BY 1",
+        )?;
+        let rows = statement.query_map([camera.as_str()], |row| row.get::<_, String>(0))?;
+        let mut days = Vec::new();
+        for raw in rows {
+            let raw = raw?;
+            days.push(
+                NaiveDate::parse_from_str(&raw, "%Y-%m-%d").map_err(|error| {
+                    IndexError::InvalidData(format!(
+                        "invalid indexed recording day {raw:?}: {error}"
+                    ))
+                })?,
+            );
+        }
+        Ok(days)
+    }
+
+    pub fn previous_recording(
+        &self,
+        recording: &IndexedRecording,
+    ) -> Result<Option<IndexedRecording>, IndexError> {
+        let raw = self
+            .connection
+            .query_row(
+                &format!(
+                    "{SELECT_SQL}
+                     WHERE camera_id=?1 AND state='complete' AND (
+                        started_at < ?2 OR
+                        (started_at = ?2 AND sequence < ?3) OR
+                        (started_at = ?2 AND sequence = ?3 AND relative_path < ?4)
+                     )
+                     ORDER BY started_at DESC, sequence DESC, relative_path DESC
+                     LIMIT 1"
+                ),
+                params![
+                    recording.camera_id.as_str(),
+                    encode_time(recording.started_at),
+                    i64::from(recording.sequence),
+                    recording.relative_path.as_str(),
+                ],
+                raw_row,
+            )
+            .optional()?;
+        raw.map(IndexedRecording::try_from).transpose()
+    }
+
+    pub fn next_recording(
+        &self,
+        recording: &IndexedRecording,
+    ) -> Result<Option<IndexedRecording>, IndexError> {
+        let raw = self
+            .connection
+            .query_row(
+                &format!(
+                    "{SELECT_SQL}
+                     WHERE camera_id=?1 AND state='complete' AND (
+                        started_at > ?2 OR
+                        (started_at = ?2 AND sequence > ?3) OR
+                        (started_at = ?2 AND sequence = ?3 AND relative_path > ?4)
+                     )
+                     ORDER BY started_at, sequence, relative_path
+                     LIMIT 1"
+                ),
+                params![
+                    recording.camera_id.as_str(),
+                    encode_time(recording.started_at),
+                    i64::from(recording.sequence),
+                    recording.relative_path.as_str(),
+                ],
+                raw_row,
+            )
+            .optional()?;
+        raw.map(IndexedRecording::try_from).transpose()
+    }
+
+    /// Writes media duration only while the indexed filesystem identity still
+    /// matches the object that was inspected. A replacement at the same path
+    /// therefore cannot inherit stale probe metadata.
+    pub fn update_duration_if_identity_matches(
+        &mut self,
+        recording: &IndexedRecording,
+        media_duration_ms: u64,
+    ) -> Result<bool, IndexError> {
+        let changed = self.connection.execute(
+            "UPDATE recordings SET media_duration_ms=?1
+             WHERE relative_path=?2 AND camera_id=?3 AND kind=?4 AND state='complete'
+               AND started_at=?5 AND sequence=?6 AND size_bytes=?7",
+            params![
+                checked_i64(media_duration_ms, "media_duration_ms")?,
+                recording.relative_path.as_str(),
+                recording.camera_id.as_str(),
+                recording.kind.as_str(),
+                encode_time(recording.started_at),
+                i64::from(recording.sequence),
+                checked_i64(recording.size_bytes, "size_bytes")?,
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn total_recording_bytes(&self) -> Result<u64, IndexError> {
@@ -602,6 +707,25 @@ mod tests {
         }
     }
 
+    fn sample_at(
+        relative_path: &str,
+        kind: RecordingKind,
+        started_at: &str,
+        sequence: u32,
+        duration: Option<u64>,
+    ) -> RecordingUpsert {
+        RecordingUpsert {
+            camera_id: CameraId::parse("cam-a").unwrap(),
+            relative_path: relative_path.to_owned(),
+            kind,
+            state: RecordingState::Complete,
+            started_at: NaiveDateTime::parse_from_str(started_at, TIME_FORMAT).unwrap(),
+            sequence,
+            size_bytes: 100 + u64::from(sequence),
+            media_duration_ms: duration,
+        }
+    }
+
     #[test]
     fn fresh_database_migrates_to_v1_and_current_reopen_is_noop() {
         let temp = tempfile::tempdir().unwrap();
@@ -677,6 +801,167 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].started_at, sample().started_at);
         assert_eq!(index.total_recording_bytes().unwrap(), 123);
+    }
+
+    #[test]
+    fn timeline_queries_order_normal_recovered_and_same_second_sequences_stably() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut index = RecordingIndex::open(temp.path().join("index.sqlite3")).unwrap();
+        let rows = [
+            sample_at(
+                "cam-a/2026/08/29/08-30-00-2.recovered.mkv",
+                RecordingKind::Recovered,
+                "2026-08-29T08:30:00",
+                2,
+                Some(1_000),
+            ),
+            sample_at(
+                "cam-a/2026/08/29/08-30-00.mkv",
+                RecordingKind::Normal,
+                "2026-08-29T08:30:00",
+                1,
+                None,
+            ),
+            sample_at(
+                "cam-a/2026/08/29/09-00-00.mkv",
+                RecordingKind::Normal,
+                "2026-08-29T09:00:00",
+                1,
+                Some(2_000),
+            ),
+        ];
+        for row in &rows {
+            index.upsert(row).unwrap();
+        }
+
+        let queried = index
+            .query_time_range(
+                &CameraId::parse("cam-a").unwrap(),
+                NaiveDateTime::parse_from_str("2026-08-29T08:00:00", TIME_FORMAT).unwrap(),
+                NaiveDateTime::parse_from_str("2026-08-29T10:00:00", TIME_FORMAT).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            queried
+                .iter()
+                .map(|row| row.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "cam-a/2026/08/29/08-30-00.mkv",
+                "cam-a/2026/08/29/08-30-00-2.recovered.mkv",
+                "cam-a/2026/08/29/09-00-00.mkv",
+            ]
+        );
+        assert!(queried[0].media_duration_ms.is_none());
+        assert_eq!(queried[1].kind, RecordingKind::Recovered);
+    }
+
+    #[test]
+    fn range_boundaries_days_and_adjacency_are_database_queries() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut index = RecordingIndex::open(temp.path().join("index.sqlite3")).unwrap();
+        for row in [
+            sample_at(
+                "cam-a/2026/08/28/23-59-59.mkv",
+                RecordingKind::Normal,
+                "2026-08-28T23:59:59",
+                1,
+                None,
+            ),
+            sample_at(
+                "cam-a/2026/08/29/00-00-00.mkv",
+                RecordingKind::Normal,
+                "2026-08-29T00:00:00",
+                1,
+                None,
+            ),
+            sample_at(
+                "cam-a/2026/08/30/00-00-00.mkv",
+                RecordingKind::Normal,
+                "2026-08-30T00:00:00",
+                1,
+                None,
+            ),
+        ] {
+            index.upsert(&row).unwrap();
+        }
+        let camera = CameraId::parse("cam-a").unwrap();
+        let start = NaiveDateTime::parse_from_str("2026-08-29T00:00:00", TIME_FORMAT).unwrap();
+        let end = NaiveDateTime::parse_from_str("2026-08-30T00:00:00", TIME_FORMAT).unwrap();
+        let queried = index.query_time_range(&camera, start, end).unwrap();
+        assert_eq!(queried.len(), 1, "start inclusive, end exclusive");
+        assert_eq!(queried[0].started_at, start);
+
+        assert_eq!(index.available_days(&camera).unwrap().len(), 3);
+        assert!(
+            index
+                .available_days(&CameraId::parse("missing-camera").unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            index
+                .previous_recording(&queried[0])
+                .unwrap()
+                .unwrap()
+                .started_at,
+            NaiveDateTime::parse_from_str("2026-08-28T23:59:59", TIME_FORMAT).unwrap()
+        );
+        assert_eq!(
+            index
+                .next_recording(&queried[0])
+                .unwrap()
+                .unwrap()
+                .started_at,
+            end
+        );
+    }
+
+    #[test]
+    fn duration_writeback_requires_the_same_filesystem_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut index = RecordingIndex::open(temp.path().join("index.sqlite3")).unwrap();
+        let row = sample_at(
+            "cam-a/2026/08/29/08-30-00.mkv",
+            RecordingKind::Normal,
+            "2026-08-29T08:30:00",
+            1,
+            None,
+        );
+        index.upsert(&row).unwrap();
+        let indexed = index
+            .get_by_relative_path(&row.relative_path)
+            .unwrap()
+            .unwrap();
+        assert!(
+            index
+                .update_duration_if_identity_matches(&indexed, 9_876)
+                .unwrap()
+        );
+        assert_eq!(
+            index
+                .get_by_relative_path(&row.relative_path)
+                .unwrap()
+                .unwrap()
+                .media_duration_ms,
+            Some(9_876)
+        );
+
+        let mut stale = indexed;
+        stale.size_bytes += 1;
+        assert!(
+            !index
+                .update_duration_if_identity_matches(&stale, 12_345)
+                .unwrap()
+        );
+        assert_eq!(
+            index
+                .get_by_relative_path(&row.relative_path)
+                .unwrap()
+                .unwrap()
+                .media_duration_ms,
+            Some(9_876)
+        );
     }
 
     #[test]

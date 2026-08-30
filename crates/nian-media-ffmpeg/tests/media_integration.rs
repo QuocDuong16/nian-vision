@@ -38,6 +38,10 @@ fn av_fixture_source() -> MediaSource {
     MediaSource::File(fixture_path("sample_av.mkv"))
 }
 
+fn playback_fixture_source() -> MediaSource {
+    MediaSource::File(fixture_path("playback_h264.mkv"))
+}
+
 /// Copies every packet from `input` into `muxer`, returning how many packets
 /// were fed in total.
 fn copy_all_packets(
@@ -425,4 +429,59 @@ fn deadline_aborts_open() {
         Err(other) => panic!("unexpected error {other:?}"),
         Ok(_) => panic!("open must fail with an expired deadline"),
     }
+}
+
+#[test]
+fn fragmented_mp4_packet_copy_preserves_h264_aac_and_random_access_index() {
+    let interrupt = InterruptHandle::new();
+    let mut input = MediaInput::open(&playback_fixture_source(), &interrupt).unwrap();
+    let streams = input.streams();
+    assert_eq!(streams.len(), 2);
+    assert_eq!(input.format_name(), "matroska,webm");
+    assert_eq!(
+        streams
+            .iter()
+            .find(|stream| stream.media_type == MediaType::Video)
+            .unwrap()
+            .codec_name,
+        "h264"
+    );
+
+    let output_dir = tempfile::tempdir().unwrap();
+    let output_path = output_dir.path().join("playback.mp4");
+    let mut muxer = MatroskaMuxer::create_fragmented_mp4_with_selection(
+        &mut input,
+        &output_path,
+        &interrupt,
+        |stream| {
+            stream.media_type == MediaType::Video
+                || (stream.media_type == MediaType::Audio && stream.codec_name == "aac")
+        },
+    )
+    .unwrap();
+    let fed = copy_all_packets(&mut input, &mut muxer).unwrap();
+    assert!(fed > 40);
+    muxer.finalize().unwrap();
+
+    let bytes = std::fs::read(&output_path).unwrap();
+    assert!(
+        bytes.windows(4).any(|window| window == b"sidx"),
+        "fragmented MP4 must contain a global segment index for byte-range seeking"
+    );
+    let backend = FfmpegBackend::new().unwrap();
+    let report = backend.probe(&MediaSource::file(&output_path)).unwrap();
+    assert!(
+        report.format_name.contains("mp4"),
+        "{:?}",
+        report.format_name
+    );
+    assert_eq!(report.video_stream().unwrap().codec_name, "h264");
+    assert!(
+        report
+            .streams
+            .iter()
+            .any(|stream| { stream.media_type == MediaType::Audio && stream.codec_name == "aac" })
+    );
+    let duration = report.duration.unwrap();
+    assert!(Duration::from_millis(3_500) <= duration && duration <= Duration::from_millis(4_500));
 }

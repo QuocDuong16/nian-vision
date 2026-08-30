@@ -6,15 +6,19 @@
 
 #![forbid(unsafe_code)]
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use chrono::NaiveDateTime;
 use nian_application::{
     ApplicationSettingsDto, CameraDraft, CameraService, CameraServiceError, CameraSummary,
-    CredentialStore, CredentialStoreError, ProbeController, ProbeError, ProbeResult,
-    RecordingController, RecordingControllerError, RecordingStatus, SupervisorRecordingRunner,
-    WorkerProbeRunner,
+    CredentialStore, CredentialStoreError, PlaybackController, PlaybackError, PlaybackOpenDto,
+    ProbeController, ProbeError, ProbeResult, RecordingController, RecordingControllerError,
+    RecordingDto, RecordingStatus, SupervisorRecordingRunner, WorkerProbeRunner,
 };
-use nian_domain::{AudioPolicy, CameraId, CredentialRef, Credentials};
+use nian_domain::{
+    AudioPolicy, CameraId, CredentialRef, Credentials, RetentionPolicy, StorageQuota,
+};
 use nian_settings::SettingsStore;
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -154,6 +158,7 @@ impl CredentialStore for NativeCredentialStore {
 struct DesktopState {
     camera_service: Mutex<CameraService>,
     recording_controller: Mutex<RecordingController>,
+    playback_controller: Mutex<PlaybackController>,
     probe_controller: ProbeController,
     /// Serializes operations whose correctness depends on a stable recording
     /// ownership snapshot: start/stop, critical edit/delete, and settings write.
@@ -275,6 +280,77 @@ fn recording_status(
 }
 
 #[tauri::command]
+fn recording_days(
+    state: tauri::State<'_, DesktopState>,
+    camera_id: String,
+) -> Result<Vec<String>, DesktopErrorDto> {
+    let camera_id = CameraId::parse(&camera_id)
+        .map_err(|error| DesktopErrorDto::new("validation", error.to_string()))?;
+    lock(&state.playback_controller)?
+        .recording_days(&camera_id)
+        .map_err(map_playback_error)
+}
+
+#[tauri::command]
+fn recording_timeline(
+    state: tauri::State<'_, DesktopState>,
+    camera_id: String,
+    start: String,
+    end: String,
+) -> Result<Vec<RecordingDto>, DesktopErrorDto> {
+    let camera_id = CameraId::parse(&camera_id)
+        .map_err(|error| DesktopErrorDto::new("validation", error.to_string()))?;
+    let start = parse_local_wall_time(&start)?;
+    let end = parse_local_wall_time(&end)?;
+    if end <= start {
+        return Err(DesktopErrorDto::new(
+            "validation",
+            "timeline end must be after start",
+        ));
+    }
+    lock(&state.playback_controller)?
+        .timeline(&camera_id, start, end)
+        .map_err(map_playback_error)
+}
+
+#[tauri::command]
+fn playback_open(
+    state: tauri::State<'_, DesktopState>,
+    recording_id: String,
+) -> Result<PlaybackOpenDto, DesktopErrorDto> {
+    lock(&state.playback_controller)?
+        .open(&recording_id)
+        .map_err(map_playback_error)
+}
+
+#[tauri::command]
+fn playback_close(
+    state: tauri::State<'_, DesktopState>,
+    session_id: String,
+) -> Result<(), DesktopErrorDto> {
+    lock(&state.playback_controller)?
+        .close(&session_id)
+        .map_err(map_playback_error)
+}
+
+#[tauri::command]
+fn playback_status(
+    state: tauri::State<'_, DesktopState>,
+    session_id: String,
+) -> Result<bool, DesktopErrorDto> {
+    lock(&state.playback_controller)?
+        .session_active(&session_id)
+        .map_err(map_playback_error)
+}
+
+fn parse_local_wall_time(value: &str) -> Result<NaiveDateTime, DesktopErrorDto> {
+    ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"]
+        .into_iter()
+        .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
+        .ok_or_else(|| DesktopErrorDto::new("validation", "invalid local timeline timestamp"))
+}
+
+#[tauri::command]
 fn settings_get(
     state: tauri::State<'_, DesktopState>,
 ) -> Result<ApplicationSettingsDto, DesktopErrorDto> {
@@ -294,9 +370,41 @@ fn settings_update(
         .map_err(map_recording_error)?
         .state
         .is_active();
-    lock(&state.camera_service)?
+    let saved = lock(&state.camera_service)?
         .save_application_settings(settings, active)
-        .map_err(map_camera_error)
+        .map_err(map_camera_error)?;
+    let (storage_root, retention, quota) = playback_storage_config(&saved)?;
+    lock(&state.playback_controller)?
+        .configure_storage(storage_root, retention, quota)
+        .map_err(map_playback_error)?;
+    Ok(saved)
+}
+
+fn playback_storage_config(
+    settings: &ApplicationSettingsDto,
+) -> Result<(Option<PathBuf>, RetentionPolicy, Option<StorageQuota>), DesktopErrorDto> {
+    let retention = RetentionPolicy {
+        max_age_days: settings.max_age_days,
+        max_storage_bytes: settings.max_storage_bytes,
+    };
+    let quota = match (settings.max_storage_bytes, settings.cleanup_target_bytes) {
+        (Some(max_bytes), Some(cleanup_target_bytes)) => Some(StorageQuota {
+            max_bytes,
+            cleanup_target_bytes,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(DesktopErrorDto::new(
+                "validation",
+                "storage quota settings are incomplete",
+            ));
+        }
+    };
+    Ok((
+        settings.storage_root.as_deref().map(PathBuf::from),
+        retention,
+        quota,
+    ))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, DesktopErrorDto> {
@@ -352,6 +460,48 @@ fn map_recording_error(error: RecordingControllerError) -> DesktopErrorDto {
     }
 }
 
+fn map_playback_error(error: PlaybackError) -> DesktopErrorDto {
+    match error {
+        PlaybackError::RecordingNotFound => {
+            DesktopErrorDto::new("recording_not_found", "recording was not found")
+        }
+        PlaybackError::RecordingMissing => DesktopErrorDto::new(
+            "recording_missing",
+            "recording file is missing; refresh the timeline",
+        ),
+        PlaybackError::RecordingStale => DesktopErrorDto::new(
+            "recording_stale",
+            "recording changed on disk; refresh the timeline",
+        ),
+        PlaybackError::RecordingNotFinalized => DesktopErrorDto::new(
+            "recording_not_finalized",
+            "recording is not finalized and cannot be played",
+        ),
+        PlaybackError::UnsupportedCodec => DesktopErrorDto::new(
+            "unsupported_codec",
+            "recording codec is not supported without transcoding",
+        ),
+        PlaybackError::UnsupportedContainer => DesktopErrorDto::new(
+            "unsupported_container",
+            "recording could not be prepared for browser playback",
+        ),
+        PlaybackError::MediaUnreadable => {
+            DesktopErrorDto::new("media_unreadable", "recording media is unreadable")
+        }
+        PlaybackError::PlaybackSessionExpired => DesktopErrorDto::new(
+            "playback_session_expired",
+            "playback session expired; reopen the recording",
+        ),
+        PlaybackError::PlaybackBusy => {
+            DesktopErrorDto::new("playback_busy", "too many playback sessions are active")
+        }
+        PlaybackError::WorkerUnavailable => {
+            DesktopErrorDto::new("worker_unavailable", "media worker is unavailable")
+        }
+        PlaybackError::Internal => DesktopErrorDto::new("internal", "playback operation failed"),
+    }
+}
+
 fn map_probe_error(error: ProbeError) -> DesktopErrorDto {
     match error {
         ProbeError::Busy => DesktopErrorDto::new(
@@ -395,6 +545,9 @@ pub fn run() {
             let settings = SettingsStore::open(settings_path)?;
             let credentials: Arc<dyn CredentialStore> = Arc::new(NativeCredentialStore);
             let camera_service = CameraService::new(Box::new(settings), credentials);
+            let initial_settings = camera_service
+                .application_settings()
+                .map_err(|_| std::io::Error::other("application settings are unavailable"))?;
 
             let worker_name = if cfg!(windows) {
                 "nian-media-worker.exe"
@@ -407,12 +560,24 @@ pub fn run() {
                 RecordingController::new(Arc::new(SupervisorRecordingRunner {
                     worker_program: worker_program.clone(),
                 }));
-            let probe_controller =
-                ProbeController::new(Arc::new(WorkerProbeRunner { worker_program }));
+            let probe_controller = ProbeController::new(Arc::new(WorkerProbeRunner {
+                worker_program: worker_program.clone(),
+            }));
+            let mut playback_controller =
+                PlaybackController::new(worker_program, app_data.join("playback-cache"))
+                    .map_err(|_| std::io::Error::other("playback service could not start"))?;
+            let (storage_root, retention, quota) = playback_storage_config(&initial_settings)
+                .map_err(|error| std::io::Error::other(error.message))?;
+            if let Err(error) =
+                playback_controller.configure_storage(storage_root, retention, quota)
+            {
+                tracing::warn!(code = ?error.code(), "playback storage is unavailable at startup");
+            }
 
             app.manage(DesktopState {
                 camera_service: Mutex::new(camera_service),
                 recording_controller: Mutex::new(recording_controller),
+                playback_controller: Mutex::new(playback_controller),
                 probe_controller,
                 control_gate: Mutex::new(()),
             });
@@ -428,6 +593,11 @@ pub fn run() {
             recording_start,
             recording_stop,
             recording_status,
+            recording_days,
+            recording_timeline,
+            playback_open,
+            playback_close,
+            playback_status,
             settings_get,
             settings_update,
         ])

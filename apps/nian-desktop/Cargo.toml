@@ -11,6 +11,7 @@ license.workspace = true
 tauri-build = { workspace = true }
 
 [dependencies]
+chrono = { workspace = true }
 nian-application = { workspace = true }
 nian-domain = { workspace = true }
 nian-settings = { workspace = true }
