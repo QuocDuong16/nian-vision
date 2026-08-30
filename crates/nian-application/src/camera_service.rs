@@ -140,6 +140,12 @@ pub trait SettingsRepository: Send {
         &mut self,
         settings: &ApplicationSettings,
     ) -> Result<(), SettingsRepositoryError>;
+    fn recording_enabled_cameras(&self) -> Result<Vec<CameraId>, SettingsRepositoryError>;
+    fn set_recording_enabled(
+        &mut self,
+        camera_id: &CameraId,
+        enabled: bool,
+    ) -> Result<bool, SettingsRepositoryError>;
 }
 
 impl SettingsRepository for SettingsStore {
@@ -175,6 +181,18 @@ impl SettingsRepository for SettingsStore {
         settings: &ApplicationSettings,
     ) -> Result<(), SettingsRepositoryError> {
         SettingsStore::save_application_settings(self, settings).map_err(repository_error)
+    }
+
+    fn recording_enabled_cameras(&self) -> Result<Vec<CameraId>, SettingsRepositoryError> {
+        SettingsStore::recording_enabled_cameras(self).map_err(repository_error)
+    }
+
+    fn set_recording_enabled(
+        &mut self,
+        camera_id: &CameraId,
+        enabled: bool,
+    ) -> Result<bool, SettingsRepositoryError> {
+        SettingsStore::set_recording_enabled(self, camera_id, enabled).map_err(repository_error)
     }
 }
 
@@ -250,6 +268,8 @@ pub enum CameraServiceError {
     CredentialRefCollision,
     #[error("recording storage is not configured")]
     StorageNotConfigured,
+    #[error("persisted recording intent violates the single-camera invariant")]
+    DesiredStateInvariant,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,6 +279,7 @@ pub struct ApplicationSettingsDto {
     pub max_age_days: Option<u32>,
     pub max_storage_bytes: Option<u64>,
     pub cleanup_target_bytes: Option<u64>,
+    pub launch_at_login: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +303,7 @@ impl From<ApplicationSettings> for ApplicationSettingsDto {
             max_age_days: value.retention.max_age_days,
             max_storage_bytes: value.retention.max_storage_bytes,
             cleanup_target_bytes: value.quota.map(|quota| quota.cleanup_target_bytes),
+            launch_at_login: value.launch_at_login,
         }
     }
 }
@@ -598,6 +620,7 @@ impl CameraService {
                 segment_target_secs: dto.segment_target_secs,
                 retention,
                 quota,
+                launch_at_login: dto.launch_at_login,
             },
         })
     }
@@ -611,6 +634,34 @@ impl CameraService {
             .save_application_settings(&settings)
             .map_err(map_repository_service_error)?;
         Ok(settings.into())
+    }
+
+    pub fn desired_recording_camera(&self) -> Result<Option<CameraId>, CameraServiceError> {
+        let desired = self
+            .repository
+            .recording_enabled_cameras()
+            .map_err(map_repository_service_error)?;
+        match desired.as_slice() {
+            [] => Ok(None),
+            [camera_id] => Ok(Some(camera_id.clone())),
+            _ => Err(CameraServiceError::DesiredStateInvariant),
+        }
+    }
+
+    pub fn set_recording_enabled(
+        &mut self,
+        camera_id: &str,
+        enabled: bool,
+    ) -> Result<(), CameraServiceError> {
+        let camera_id = parse_camera_id(camera_id)?;
+        if !self
+            .repository
+            .set_recording_enabled(&camera_id, enabled)
+            .map_err(map_repository_service_error)?
+        {
+            return Err(CameraServiceError::CameraNotFound);
+        }
+        Ok(())
     }
 
     pub fn prepare_recording(

@@ -263,6 +263,70 @@ impl RecordingController {
         Ok(status.clone())
     }
 
+    /// Lifecycle-side cooperative stop signal. Unlike the user Stop command this
+    /// is idempotent: suspend and Quit may race an already-running teardown.
+    pub fn request_lifecycle_stop(&mut self) -> Result<(), RecordingControllerError> {
+        self.reap_finished()?;
+        if self.thread.is_none() {
+            return Ok(());
+        }
+        if let Ok(mut status) = self.shared.status.lock() {
+            if status.state.is_active() {
+                status.state = RecordingState::Stopping;
+            }
+        } else {
+            return Err(RecordingControllerError::Synchronization);
+        }
+        if let Some(stop) = &self.stop {
+            stop.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Explicit desktop Quit owns the JoinHandle through terminal completion.
+    /// WorkerSupervisor already provides the bounded graceful-then-force child
+    /// teardown semantics, so this join does not detach a live recorder.
+    pub fn shutdown(&mut self) -> Result<RecordingStatus, RecordingControllerError> {
+        self.reap_finished()?;
+        self.request_lifecycle_stop()?;
+        if let Some(thread) = self.thread.take() {
+            let join_result = thread.join();
+            self.stop = None;
+            if join_result.is_err() {
+                self.replace_status(RecordingStatus {
+                    state: RecordingState::Failed,
+                    camera_id: None,
+                    failure_category: Some("worker_unavailable".to_owned()),
+                    reconnect_attempt: 0,
+                    finalized_segments: 0,
+                })?;
+            }
+        }
+        self.status_snapshot()
+    }
+
+    /// Publishes a startup restoration failure without manufacturing a worker.
+    /// Desired recording intent remains persisted independently.
+    pub fn mark_failed(
+        &mut self,
+        camera_id: CameraId,
+        failure_category: impl Into<String>,
+    ) -> Result<RecordingStatus, RecordingControllerError> {
+        self.reap_finished()?;
+        if self.thread.is_some() {
+            return Err(RecordingControllerError::AlreadyRecording);
+        }
+        let status = RecordingStatus {
+            state: RecordingState::Failed,
+            camera_id: Some(camera_id.as_str().to_owned()),
+            failure_category: Some(failure_category.into()),
+            reconnect_attempt: 0,
+            finalized_segments: 0,
+        };
+        self.replace_status(status.clone())?;
+        Ok(status)
+    }
+
     /// Returns a status snapshot after reaping a finished runner thread.
     /// This makes runner panics observable to UI polling rather than leaving a
     /// stale Recording state forever.

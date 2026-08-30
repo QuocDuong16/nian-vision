@@ -62,8 +62,9 @@ authoritative arbiter for concurrent processes.
 
 For M5, desired recording state is intentionally **session-only**. Saved camera
 definitions and recorder/storage settings survive desktop restart, but recording
-does not auto-start. Tray/autostart/power lifecycle remains M7 scope. M5 permits
-multiple saved cameras and exactly one active desired recording.
+does not auto-start. Tray/autostart/power lifecycle was deferred to M7. M5 permits
+multiple saved cameras and exactly one active desired recording. ADR-0010 supersedes
+the session-only desired-state portion for M7 while preserving this storage/secret split.
 
 ## Consequences
 

@@ -25,11 +25,11 @@ fn camera(name: &str, credential_ref: &str) -> CameraConfig {
 }
 
 #[test]
-fn fresh_database_creates_schema_v1() {
+fn fresh_database_creates_schema_v2() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.sqlite3");
     let store = SettingsStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 1);
+    assert_eq!(store.schema_version().unwrap(), 2);
     assert!(path.exists());
 }
 
@@ -91,7 +91,7 @@ fn future_schema_fails_without_replacing_database() {
         error,
         SettingsError::FutureSchema {
             found: 99,
-            supported: 1
+            supported: 2
         }
     ));
     let after = fs::read(&path).unwrap();
@@ -191,6 +191,7 @@ fn application_quota_round_trips_with_matching_high_and_low_watermarks() {
             max_bytes: 10 * 1024 * 1024,
             cleanup_target_bytes: 8 * 1024 * 1024,
         }),
+        launch_at_login: true,
     };
 
     store.save_application_settings(&settings).unwrap();
@@ -213,6 +214,7 @@ fn mismatched_retention_and_quota_high_watermarks_are_rejected() {
             max_bytes: 11 * 1024 * 1024,
             cleanup_target_bytes: 8 * 1024 * 1024,
         }),
+        launch_at_login: false,
     };
 
     assert!(matches!(
@@ -271,4 +273,93 @@ fn corrupt_database_bytes_survive_failed_open_unchanged() {
 
     assert!(SettingsStore::open(&path).is_err());
     assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn schema_v1_migrates_to_v2_with_safe_lifecycle_defaults() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.sqlite3");
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE cameras (
+                camera_id TEXT PRIMARY KEY NOT NULL,
+                display_name TEXT NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+                rtsp_path TEXT NOT NULL,
+                audio_policy TEXT NOT NULL CHECK(audio_policy IN ('copy_all','exclude')),
+                credential_ref TEXT NOT NULL UNIQUE
+             );
+             CREATE TABLE application_settings (
+                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+                storage_root TEXT NULL,
+                segment_target_secs INTEGER NOT NULL,
+                max_age_days INTEGER NULL,
+                max_storage_bytes INTEGER NULL,
+                cleanup_target_bytes INTEGER NULL
+             );
+             INSERT INTO application_settings VALUES (1, NULL, 300, NULL, NULL, NULL);
+             INSERT INTO cameras VALUES ('front-door','Front door','192.168.1.50',554,'/stream1','copy_all','cred-v1');
+             PRAGMA user_version=1;",
+        )
+        .unwrap();
+    }
+
+    let store = SettingsStore::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 2);
+    assert!(!store.application_settings().unwrap().launch_at_login);
+    assert!(store.recording_enabled_cameras().unwrap().is_empty());
+    drop(store);
+
+    let reopened = SettingsStore::open(&path).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 2);
+}
+
+#[test]
+fn recording_intent_is_single_camera_and_persists_across_reopen() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.sqlite3");
+    let mut store = SettingsStore::open(&path).unwrap();
+    let front = camera("Front door", "cred-v1");
+    store.insert_camera(&front).unwrap();
+    let back = CameraConfig::new(
+        CameraId::parse("back-door").unwrap(),
+        "Back door",
+        CameraSource::Rtsp(
+            CameraEndpoint::new(Host::parse("192.168.1.51").unwrap(), 554, "/stream1").unwrap(),
+        ),
+        AudioPolicy::CopyAll,
+        CredentialRef::parse("cred-v2").unwrap(),
+    )
+    .unwrap();
+    store.insert_camera(&back).unwrap();
+
+    assert!(
+        store
+            .set_recording_enabled(front.camera_id(), true)
+            .unwrap()
+    );
+    assert_eq!(
+        store.recording_enabled_cameras().unwrap(),
+        vec![front.camera_id().clone()]
+    );
+    assert!(store.set_recording_enabled(back.camera_id(), true).unwrap());
+    assert_eq!(
+        store.recording_enabled_cameras().unwrap(),
+        vec![back.camera_id().clone()]
+    );
+    drop(store);
+
+    let mut reopened = SettingsStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.recording_enabled_cameras().unwrap(),
+        vec![back.camera_id().clone()]
+    );
+    assert!(
+        reopened
+            .set_recording_enabled(back.camera_id(), false)
+            .unwrap()
+    );
+    assert!(reopened.recording_enabled_cameras().unwrap().is_empty());
 }

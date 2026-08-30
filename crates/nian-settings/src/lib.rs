@@ -17,7 +17,7 @@ use nian_domain::{
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
@@ -38,6 +38,7 @@ pub struct ApplicationSettings {
     pub segment_target_secs: u64,
     pub retention: RetentionPolicy,
     pub quota: Option<StorageQuota>,
+    pub launch_at_login: bool,
 }
 
 impl Default for ApplicationSettings {
@@ -47,6 +48,7 @@ impl Default for ApplicationSettings {
             segment_target_secs: 300,
             retention: RetentionPolicy::default(),
             quota: None,
+            launch_at_login: false,
         }
     }
 }
@@ -184,10 +186,55 @@ impl SettingsStore {
         )? > 0)
     }
 
+    /// Returns the persisted recording intent. More than one row is returned
+    /// deliberately if the database was externally corrupted so the
+    /// application layer can fail closed instead of silently picking a camera.
+    pub fn recording_enabled_cameras(&self) -> Result<Vec<CameraId>, SettingsError> {
+        let mut statement = self.connection.prepare(
+            "SELECT camera_id FROM cameras WHERE recording_enabled=1 ORDER BY camera_id",
+        )?;
+        let raw_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        raw_ids
+            .into_iter()
+            .map(|raw| CameraId::parse(raw).map_err(invalid_domain))
+            .collect()
+    }
+
+    /// Persists M7's single-camera desired recording state transactionally.
+    pub fn set_recording_enabled(
+        &mut self,
+        camera_id: &CameraId,
+        enabled: bool,
+    ) -> Result<bool, SettingsError> {
+        let transaction = self.connection.transaction()?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cameras WHERE camera_id=?1)",
+            [camera_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(false);
+        }
+        if enabled {
+            transaction.execute(
+                "UPDATE cameras SET recording_enabled=0 WHERE recording_enabled<>0",
+                [],
+            )?;
+        }
+        let affected = transaction.execute(
+            "UPDATE cameras SET recording_enabled=?2 WHERE camera_id=?1",
+            params![camera_id.as_str(), if enabled { 1_i64 } else { 0_i64 }],
+        )?;
+        transaction.commit()?;
+        Ok(affected == 1)
+    }
+
     pub fn application_settings(&self) -> Result<ApplicationSettings, SettingsError> {
         self.connection
             .query_row(
-                "SELECT storage_root, segment_target_secs, max_age_days, max_storage_bytes, cleanup_target_bytes \
+                "SELECT storage_root, segment_target_secs, max_age_days, max_storage_bytes, cleanup_target_bytes, launch_at_login \
              FROM application_settings WHERE singleton_id=1",
                 [],
                 |row| {
@@ -196,11 +243,13 @@ impl SettingsStore {
                     let max_age: Option<i64> = row.get(2)?;
                     let max_bytes: Option<i64> = row.get(3)?;
                     let cleanup_target: Option<i64> = row.get(4)?;
-                    Ok((storage_root, segment, max_age, max_bytes, cleanup_target))
+                    let launch_at_login: i64 = row.get(5)?;
+                    Ok((storage_root, segment, max_age, max_bytes, cleanup_target, launch_at_login))
                 },
             )
             .map_err(SettingsError::from)
-            .and_then(|(root, segment, max_age, max_bytes, cleanup_target)| {
+            .and_then(|(root, segment, max_age, max_bytes, cleanup_target, launch_at_login)| {
+                let launch_at_login = parse_bool(launch_at_login, "launch_at_login")?;
                 let settings = ApplicationSettings {
                     storage_root: root.map(PathBuf::from),
                     segment_target_secs: u64::try_from(segment).map_err(|_| {
@@ -236,6 +285,7 @@ impl SettingsStore {
                         (None, None) => None,
                         _ => return Err(SettingsError::InvalidData("incomplete storage quota".to_owned())),
                     },
+                    launch_at_login,
                 };
                 validate_application_settings(&settings)?;
                 Ok(settings)
@@ -268,7 +318,7 @@ impl SettingsStore {
             .transpose()?;
         let affected = self.connection.execute(
             "UPDATE application_settings SET storage_root=?1, segment_target_secs=?2, \
-             max_age_days=?3, max_storage_bytes=?4, cleanup_target_bytes=?5 WHERE singleton_id=1",
+             max_age_days=?3, max_storage_bytes=?4, cleanup_target_bytes=?5, launch_at_login=?6 WHERE singleton_id=1",
             params![
                 settings
                     .storage_root
@@ -277,7 +327,8 @@ impl SettingsStore {
                 segment,
                 max_age,
                 max_bytes,
-                cleanup_target
+                cleanup_target,
+                if settings.launch_at_login { 1_i64 } else { 0_i64 }
             ],
         )?;
         if affected != 1 {
@@ -310,8 +361,18 @@ fn validate_application_settings(settings: &ApplicationSettings) -> Result<(), S
     Ok(())
 }
 
+fn parse_bool(value: i64, field: &str) -> Result<bool, SettingsError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(SettingsError::InvalidData(format!(
+            "invalid boolean value for {field}"
+        ))),
+    }
+}
+
 fn migrate(connection: &mut Connection) -> Result<(), SettingsError> {
-    let version: i32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let mut version: i32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version == 0 {
         let transaction = connection.transaction()?;
         transaction.execute_batch(
@@ -336,6 +397,18 @@ fn migrate(connection: &mut Connection) -> Result<(), SettingsError> {
                 (singleton_id, storage_root, segment_target_secs, max_age_days, max_storage_bytes, cleanup_target_bytes) \
                 VALUES (1, NULL, 300, NULL, NULL, NULL);\
              PRAGMA user_version=1;",
+        )?;
+        transaction.commit()?;
+        version = 1;
+    }
+    if version == 1 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN recording_enabled INTEGER NOT NULL DEFAULT 0 CHECK(recording_enabled IN (0,1));\
+             ALTER TABLE application_settings ADD COLUMN launch_at_login INTEGER NOT NULL DEFAULT 0 CHECK(launch_at_login IN (0,1));\
+             CREATE UNIQUE INDEX cameras_single_recording_enabled \
+                ON cameras(recording_enabled) WHERE recording_enabled=1;\
+             PRAGMA user_version=2;",
         )?;
         transaction.commit()?;
     }

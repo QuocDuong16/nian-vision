@@ -60,6 +60,11 @@ export interface ApplicationSettings {
   max_age_days: number | null;
   max_storage_bytes: number | null;
   cleanup_target_bytes: number | null;
+  launch_at_login: boolean;
+}
+
+export interface RecordingIntent {
+  camera_id: string | null;
 }
 
 export interface DesktopError {

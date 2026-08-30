@@ -2,6 +2,7 @@
 
 use std::io::BufReader;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -43,7 +44,11 @@ pub enum ProbeError {
 }
 
 pub trait ProbeRunner: Send + Sync {
-    fn run(&self, request: PreparedProbe) -> Result<ProbeResult, ProbeError>;
+    fn run(
+        &self,
+        request: PreparedProbe,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<ProbeResult, ProbeError>;
 }
 
 #[derive(Debug, Clone)]
@@ -52,14 +57,20 @@ pub struct WorkerProbeRunner {
 }
 
 impl ProbeRunner for WorkerProbeRunner {
-    fn run(&self, request: PreparedProbe) -> Result<ProbeResult, ProbeError> {
-        run_worker_probe(&self.worker_program, request)
+    fn run(
+        &self,
+        request: PreparedProbe,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<ProbeResult, ProbeError> {
+        run_worker_probe(&self.worker_program, request, cancel)
     }
 }
 
 pub struct ProbeController {
     runner: Arc<dyn ProbeRunner>,
     gate: Mutex<()>,
+    accepting: AtomicBool,
+    active_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl std::fmt::Debug for ProbeController {
@@ -73,12 +84,51 @@ impl ProbeController {
         Self {
             runner,
             gate: Mutex::new(()),
+            accepting: AtomicBool::new(true),
+            active_cancel: Mutex::new(None),
         }
     }
 
     pub fn probe(&self, request: PreparedProbe) -> Result<ProbeResult, ProbeError> {
         let _guard = self.gate.try_lock().map_err(|_| ProbeError::Busy)?;
-        self.runner.run(request)
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(ProbeError::Cancelled);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        *self
+            .active_cancel
+            .lock()
+            .map_err(|_| ProbeError::WorkerUnavailable)? = Some(cancel.clone());
+        let result = self.runner.run(request, cancel);
+        if let Ok(mut active) = self.active_cancel.lock() {
+            *active = None;
+        }
+        result
+    }
+
+    /// Fast lifecycle edge: reject new probes and ask an in-flight one to end.
+    /// Worker cleanup remains owned by the existing bounded ProbeChildGuard.
+    pub fn stop_accepting_and_cancel(&self) {
+        self.accepting.store(false, Ordering::Release);
+        if let Ok(active) = self.active_cancel.lock()
+            && let Some(cancel) = active.as_ref()
+        {
+            cancel.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn resume_accepting(&self) {
+        self.accepting.store(true, Ordering::Release);
+    }
+
+    /// Explicit Quit waits only for the cancellation-aware bounded probe path.
+    pub fn shutdown(&self) -> Result<(), ProbeError> {
+        self.stop_accepting_and_cancel();
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| ProbeError::WorkerUnavailable)?;
+        Ok(())
     }
 }
 
@@ -219,13 +269,18 @@ impl<S: ProbeSetup> Drop for ProbeChildGuard<'_, S> {
     }
 }
 
-fn run_worker_probe(program: &str, request: PreparedProbe) -> Result<ProbeResult, ProbeError> {
-    run_worker_probe_with(program, request, &DefaultProbeSetup)
+fn run_worker_probe(
+    program: &str,
+    request: PreparedProbe,
+    cancel: Arc<AtomicBool>,
+) -> Result<ProbeResult, ProbeError> {
+    run_worker_probe_with(program, request, cancel, &DefaultProbeSetup)
 }
 
 fn run_worker_probe_with<S: ProbeSetup>(
     program: &str,
     request: PreparedProbe,
+    cancel: Arc<AtomicBool>,
     setup: &S,
 ) -> Result<ProbeResult, ProbeError> {
     let child = Command::new(program)
@@ -234,6 +289,8 @@ fn run_worker_probe_with<S: ProbeSetup>(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
+        .map_err(|_| ProbeError::WorkerUnavailable)?;
+    let child = crate::worker_process::contain_spawned_worker(child)
         .map_err(|_| ProbeError::WorkerUnavailable)?;
     // From this point onward the guard is authoritative for bounded child
     // cleanup/reap on every return path, including setup/send failures.
@@ -247,16 +304,15 @@ fn run_worker_probe_with<S: ProbeSetup>(
 
     let hello_deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let remaining = hello_deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(remaining) {
-            Ok(ReaderMessage::Frame(Envelope::Event { v, name, .. })) if name == event::HELLO => {
+        match recv_with_cancel(&rx, hello_deadline, &cancel, ProbeError::WorkerUnavailable)? {
+            ReaderMessage::Frame(Envelope::Event { v, name, .. }) if name == event::HELLO => {
                 if v != PROTOCOL_VERSION {
                     return Err(ProbeError::Protocol);
                 }
                 break;
             }
-            Ok(ReaderMessage::Frame(_)) => {}
-            Ok(ReaderMessage::Eof | ReaderMessage::Error) | Err(_) => {
+            ReaderMessage::Frame(_) => {}
+            ReaderMessage::Eof | ReaderMessage::Error => {
                 return Err(ProbeError::WorkerUnavailable);
             }
         }
@@ -276,8 +332,7 @@ fn run_worker_probe_with<S: ProbeSetup>(
     let response_deadline =
         Instant::now() + Duration::from_millis(request.timeout_ms) + Duration::from_secs(2);
     let outcome = loop {
-        let remaining = response_deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(remaining) {
+        match recv_with_cancel(&rx, response_deadline, &cancel, ProbeError::SourceTimeout) {
             Ok(ReaderMessage::Frame(Envelope::Response {
                 v,
                 id: 1,
@@ -308,13 +363,37 @@ fn run_worker_probe_with<S: ProbeSetup>(
             Ok(ReaderMessage::Eof | ReaderMessage::Error) => {
                 break Err(ProbeError::WorkerUnavailable);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => break Err(ProbeError::SourceTimeout),
-            Err(mpsc::RecvTimeoutError::Disconnected) => break Err(ProbeError::WorkerUnavailable),
+            Err(error) => break Err(error),
         }
     };
 
     worker.cleanup();
     outcome
+}
+
+fn recv_with_cancel(
+    rx: &mpsc::Receiver<ReaderMessage>,
+    deadline: Instant,
+    cancel: &AtomicBool,
+    timeout_error: ProbeError,
+) -> Result<ReaderMessage, ProbeError> {
+    const POLL: Duration = Duration::from_millis(50);
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err(ProbeError::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(timeout_error);
+        }
+        match rx.recv_timeout(remaining.min(POLL)) {
+            Ok(message) => return Ok(message),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ProbeError::WorkerUnavailable);
+            }
+        }
+    }
 }
 
 fn decode_probe_result(value: &serde_json::Value) -> Result<ProbeResult, ProbeError> {
@@ -374,7 +453,11 @@ mod tests {
     }
 
     impl ProbeRunner for BlockingRunner {
-        fn run(&self, _request: PreparedProbe) -> Result<ProbeResult, ProbeError> {
+        fn run(
+            &self,
+            _request: PreparedProbe,
+            _cancel: Arc<AtomicBool>,
+        ) -> Result<ProbeResult, ProbeError> {
             self.entered.wait();
             let (lock, condvar) = &*self.release;
             let mut released = lock.lock().unwrap();
@@ -484,7 +567,12 @@ mod tests {
         };
 
         assert_eq!(
-            run_worker_probe_with(&program, request(), &setup),
+            run_worker_probe_with(
+                &program,
+                request(),
+                Arc::new(AtomicBool::new(false)),
+                &setup
+            ),
             Err(ProbeError::WorkerUnavailable)
         );
         assert_eq!(reaped.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -503,7 +591,12 @@ mod tests {
         };
 
         assert_eq!(
-            run_worker_probe_with(&program, request(), &setup),
+            run_worker_probe_with(
+                &program,
+                request(),
+                Arc::new(AtomicBool::new(false)),
+                &setup
+            ),
             Err(ProbeError::WorkerUnavailable)
         );
         assert_eq!(reaped.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -532,7 +625,12 @@ mod tests {
         };
 
         assert_eq!(
-            run_worker_probe_with(&program, request(), &setup),
+            run_worker_probe_with(
+                &program,
+                request(),
+                Arc::new(AtomicBool::new(false)),
+                &setup
+            ),
             Err(ProbeError::Protocol)
         );
         assert_eq!(reaped.load(std::sync::atomic::Ordering::SeqCst), 1);

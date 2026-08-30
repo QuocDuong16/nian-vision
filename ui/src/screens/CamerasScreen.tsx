@@ -9,6 +9,7 @@ import type {
   DesktopError,
   ProbeResult,
   RecordingState,
+  RecordingIntent,
   RecordingStatus,
 } from "../lib/tauri";
 
@@ -80,6 +81,7 @@ function ProbeSummary({ result }: { result: ProbeResult }) {
 export function CamerasScreen() {
   const [cameras, setCameras] = useState<CameraSummary[]>([]);
   const [recording, setRecording] = useState<RecordingStatus>(STOPPED_STATUS);
+  const [intent, setIntent] = useState<RecordingIntent>({ camera_id: null });
   const [loading, setLoading] = useState(isTauri());
   const [error, setError] = useState<DesktopError | null>(null);
   const [form, setForm] = useState<CameraFormState | null>(null);
@@ -108,7 +110,12 @@ export function CamerasScreen() {
   const refreshStatus = useCallback(async () => {
     if (!isTauri()) return;
     try {
-      setRecording(await invokeDesktop<RecordingStatus>("recording_status"));
+      const [runtime, desired] = await Promise.all([
+        invokeDesktop<RecordingStatus>("recording_status"),
+        invokeDesktop<RecordingIntent>("recording_intent"),
+      ]);
+      setRecording(runtime);
+      setIntent(desired);
     } catch (cause) {
       setError(desktopError(cause));
     }
@@ -210,11 +217,12 @@ export function CamerasScreen() {
     setBusyCamera(camera.camera_id);
     setError(null);
     try {
-      const ownState = cameraState(camera.camera_id, recording);
-      const next = ACTIVE_STATES.has(ownState)
+      const desiredOn = intent.camera_id === camera.camera_id;
+      const next = desiredOn
         ? await invokeDesktop<RecordingStatus>("recording_stop")
         : await invokeDesktop<RecordingStatus>("recording_start", { cameraId: camera.camera_id });
       setRecording(next);
+      setIntent(await invokeDesktop<RecordingIntent>("recording_intent"));
     } catch (cause) {
       setError(desktopError(cause));
       await refreshStatus();
@@ -265,7 +273,8 @@ export function CamerasScreen() {
           {sortedCameras.map((camera) => {
             const state = cameraState(camera.camera_id, recording);
             const ownActive = recording.camera_id === camera.camera_id && ACTIVE_STATES.has(recording.state);
-            const startDisabled = busyCamera !== null || (!ownActive && globalActive);
+            const desiredOn = intent.camera_id === camera.camera_id;
+            const startDisabled = busyCamera !== null || (!ownActive && !desiredOn && globalActive);
             return (
               <article className="camera-card" key={camera.camera_id}>
                 <div className="camera-card-head">
@@ -278,6 +287,7 @@ export function CamerasScreen() {
                 <div className="camera-placeholder" aria-label="Live view unavailable">
                   <span>No live view in M5</span>
                 </div>
+                <p className="camera-metrics muted">Desired: {desiredOn ? "On" : "Off"} · Runtime: {statusLabel(state)}</p>
                 {recording.camera_id === camera.camera_id && (
                   <p className="camera-metrics muted">
                     Segments: {recording.finalized_segments} · Reconnect attempt: {recording.reconnect_attempt}
@@ -286,17 +296,17 @@ export function CamerasScreen() {
                 )}
                 <div className="button-row">
                   <button
-                    className={ownActive ? "danger-button" : "primary-button"}
+                    className={desiredOn ? "danger-button" : "primary-button"}
                     disabled={startDisabled || state === "stopping"}
                     onClick={() => void toggleRecording(camera)}
                   >
-                    {ownActive ? (state === "stopping" ? "Stopping…" : "Stop") : "Start"}
+                    {desiredOn ? (state === "stopping" ? "Stopping…" : "Stop") : "Start"}
                   </button>
                   <button onClick={() => openEdit(camera)} disabled={busyCamera !== null}>Edit</button>
                   <button
                     onClick={() => setDeleteTarget(camera)}
-                    disabled={busyCamera !== null || ownActive}
-                    title={ownActive ? "Stop recording before deleting this camera" : undefined}
+                    disabled={busyCamera !== null || ownActive || desiredOn}
+                    title={ownActive || desiredOn ? "Turn off recording intent before deleting this camera" : undefined}
                   >Delete</button>
                 </div>
               </article>

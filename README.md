@@ -4,27 +4,34 @@ Local-first desktop NVR (network video recorder) for IP cameras. The first
 supported camera is the TP-Link Tapo C200 over RTSP, with a camera-agnostic
 domain so other RTSP/ONVIF cameras can follow.
 
-**Status**: milestone **M6 (recording timeline and local playback)** is implemented
-on top of M0–M5. The desktop persists camera definitions and recorder/storage settings
-in an authoritative platform app-data `settings.sqlite3`, while camera passwords
-remain in the operating system credential store. The M4 recording catalog at
+**Status**: milestone **M7 (desktop production lifecycle)** is implemented on top
+of M0–M6. The desktop persists camera definitions, recorder/storage settings,
+launch-at-login preference and the single-camera desired recording intent in an
+authoritative platform app-data `settings.sqlite3`, while camera passwords remain
+in the operating system credential store. The M4 recording catalog at
 `<storage_root>/.nian/recordings.sqlite3` remains disposable and rebuildable from
 footage. Users can add/edit/delete saved RTSP cameras, test a connection through
-the media worker, start/stop the single M5 active recording, and observe typed
-recording/reconnect state. M6 adds recording-day/range queries, filesystem-
-revalidated normal/recovered playback, lazy duration enrichment, seekable
-packet-copy H.264/AAC fragmented-MP4 playback over tokenized loopback HTTP, and
-retention playback pins. Recording still allows at most one active desired
-camera and remains session-only. M7 tray/autostart/power behavior and live camera
-viewing have not been started.
+the media worker, start/stop the single active recording, and observe Desired and
+Runtime recording state separately. M6 provides recording-day/range queries,
+filesystem-revalidated normal/recovered playback, lazy duration enrichment,
+seekable packet-copy H.264/AAC fragmented-MP4 playback over tokenized loopback
+HTTP, and retention playback pins. M7 adds single-instance activation,
+close-to-tray, explicit coordinated Quit, launch-at-login with hidden startup,
+persisted recording restoration, Windows suspend/resume handling, and Windows
+Job Object containment so hard desktop termination cannot orphan media workers.
+Live camera viewing, packaging/distribution, simultaneous multi-camera recording
+and ONVIF remain outside M7.
 
 ## What it does today
 
-* Tauri 2 desktop application (React/TypeScript/Vite UI) with managed M6 state:
+* Tauri 2 desktop application (React/TypeScript/Vite UI) with managed M7 state:
   camera CRUD, pre-save connection testing, Start/Stop controls, typed recording
   status, delete confirmation, persisted storage/retention settings, recording-day
   navigation, a gap-aware timeline, native video playback controls and adjacent
-  recording navigation. The webview never receives an absolute recording path;
+  recording navigation, tray controls and launch-at-login preference. Recording
+  cards show persisted Desired state independently from transient Runtime state.
+  Closing the main window hides it; explicit Quit owns backend teardown. The
+  webview never receives an absolute recording path;
   privileged work flows through narrow Tauri commands.
 * Playback sessions bind only an ephemeral `127.0.0.1` port. An unguessable
   per-session token maps to one already-validated finalized recording; HTTP Range
@@ -73,9 +80,11 @@ viewing have not been started.
   stays unknown until worker inspection. Playback holds a read handle plus a
   `PlaybackPin`; retention skips pinned finals and rechecks the pin immediately
   before deletion, independently of `CameraLease`.
-* Clean crate boundaries with `unsafe` confined to the FFmpeg layers (plus
-  one audited Windows publication primitive), a race-safe storage layout,
-  credential redaction, and a full quality-gate setup (fmt/clippy/tests,
+* Clean crate boundaries with `unsafe` confined to the FFmpeg layers plus audited
+  Windows-only platform boundaries: storage no-replace publication and the M7
+  `nian-platform-windows` power-notification/Job-Object wrapper. Application and
+  desktop orchestration remain safe Rust. The workspace keeps a race-safe storage
+  layout, credential redaction, and a full quality-gate setup (fmt/clippy/tests,
   ESLint/tsc/vitest/vite build).
 
 ## Architecture
@@ -85,6 +94,7 @@ React UI ─ typed Tauri commands ─ nian-desktop host
                  │                  │
                  │                  ├─ platform app-data/settings.sqlite3
                  │                  ├─ native OS credential store
+                 │                  ├─ tray/autostart/power + worker containment
                  │                  ├─ loopback HTTP playback (127.0.0.1 only)
                  │                  │ NDJSON control IPC (stdio)
                  │              nian-media-worker
@@ -94,7 +104,8 @@ React UI ─ typed Tauri commands ─ nian-desktop host
 
 See `docs/architecture.md` and `docs/adr/` for the decisions behind this
 layout (process isolation, FFmpeg strategy, container choice, storage
-model, authoritative-settings/native-secret split, M6 playback transport).
+model, authoritative-settings/native-secret split, M6 playback transport and M7
+desktop lifecycle/worker containment).
 
 ## Requirements
 

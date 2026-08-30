@@ -80,12 +80,13 @@ impl WorkerLauncher for BinaryLauncher {
     fn spawn(&mut self) -> std::io::Result<Child> {
         // SECRET BOUNDARY: argv carries the program and the literal
         // subcommand ONLY.
-        Command::new(&self.program)
+        let child = Command::new(&self.program)
             .arg("run")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null()) // worker stderr stays diagnostic-only
-            .spawn()
+            .spawn()?;
+        crate::worker_process::contain_spawned_worker(child)
     }
 }
 

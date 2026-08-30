@@ -17,6 +17,7 @@ Testing is part of the definition of done for every milestone (master spec
 | `nian-index` (M4) | schema v1 migration/reopen, future-version refusal, migration rollback, verified WAL + `foreign_keys=ON`, timeline index, idempotent upsert/query, atomic snapshot replacement, random-byte/runtime corruption classification |
 | `nian-index` (M6) | complete-only camera range queries, start-inclusive/end-exclusive boundaries, normal + recovered ordering, same-second sequence ordering, available days, previous/next, duration writeback fenced by stable filesystem identity |
 | `nian-application` (M6) | playback path revalidation, explicit filesystem→index refresh, normal/recovered freshness with active-partial exclusion, session expiry/token handling, full/middle/suffix HTTP Range, 416/403/410 transport failures, rebuild-stable recording identity, lazy duration enrichment, symlink rejection, cross-process playback-cache instance locking, playback-pin retention skip and deterministic plan→pin→delete race closure |
+| `nian-application` / desktop (M7) | lifecycle admission (`Running`/`Suspending`/`Quitting`), persisted desired-recording restoration, lifecycle-owned recorder shutdown/join, probe cancellation/admission, playback suspend/resume/shutdown, single-instance activation policy, close-to-tray, autostart reconciliation/rollback, suspend/resume convergence and deterministic Quit ordering |
 | `nian-storage` | recordings layout, partial/final naming round-trip, traversal rejection, exclusive claims (incl. sub-second clock regression), no-replace publication (success, collision refusal, recoverable abandoned partials) |
 | `nian-storage` (M3/M4) | partial-file classification plus deterministic exact-grammar filesystem inventory; normal + recovered first-class recordings; foreign/control artifacts excluded; recording-looking symlinks never followed; shared strict recovery-tombstone v2 validation; typed path-presence semantics where only `NotFound` proves absence; shared whole-second filesystem identity normalization |
 | `nian-ipc` | envelope round-trips, framing limits (1 MiB cap, CRLF, truncation), dispatch loop (ping/describe/shutdown/unknown), protocol version guard, handler event emission through the writer before replies (M3) |
@@ -454,11 +455,21 @@ then swaps the already-prepared playback storage to B. The success case also
 prepares a real camera recording request after the commit and asserts its
 `storage_root` is B, proving recording and timeline/playback configuration converge.
 
+### Desktop production lifecycle (M7)
+
+`apps/nian-desktop` regression tests cover window activation order,
+close-to-tray vs real Quit, exact `--startup-hidden` handling, autostart OS
+drift/reconciliation plus rollback failure, persisted desired-state
+restoration/failure visibility, duplicate-free suspend/resume, resume partial-failure
+convergence, and deterministic teardown ordering with process exit last. The Windows
+platform crate is cross-compiled independently to cover native power registration and
+kill-on-close Job Object worker containment.
+
 ## Planned per milestone
 
-* **M7+**: tray/autostart/power lifecycle, M8 distribution, M9 simultaneous
-  multi-camera orchestration and M10 ONVIF. Live camera viewing, clip export,
-  thumbnails/motion analysis and AI/cloud behavior are not part of M6.
+* **M8+**: distribution, M9 simultaneous multi-camera orchestration and M10 ONVIF.
+  Live camera viewing, clip export, thumbnails/motion analysis and AI/cloud
+  behavior are not part of M7.
 * **Hardware/manual** (never in CI): real Tapo C200 via
   `NIAN_VISION_RTSP_URL` with
   `nian-media-worker record --rtsp-from-env ...` and/or an IPC-driven

@@ -12,12 +12,14 @@
 
 pub mod camera_service;
 pub mod config;
+pub mod desktop_lifecycle;
 pub mod error;
 pub mod playback;
 pub mod probe_controller;
 pub mod recording_controller;
 pub mod storage_manager;
 pub mod supervisor;
+mod worker_process;
 
 pub use camera_service::{
     ApplicationSettingsDto, CameraDraft, CameraMutation, CameraService, CameraServiceError,
@@ -26,6 +28,7 @@ pub use camera_service::{
     PreparedProbe, RandomCredentialRefGenerator, SettingsRepository, SettingsRepositoryError,
 };
 pub use config::{AppConfig, SegmentTargetDuration};
+pub use desktop_lifecycle::{DesktopLifecycle, DesktopLifecycleError, DesktopLifecycleState};
 pub use error::ApplicationError;
 pub use playback::{
     AdjacentRecordingsDto, PlaybackController, PlaybackError, PlaybackErrorCode,

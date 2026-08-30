@@ -10,6 +10,7 @@ members = [
     "crates/nian-index",
     "crates/nian-media",
     "crates/nian-media-ffmpeg",
+    "crates/nian-platform-windows",
     "crates/nian-recorder",
     "crates/nian-settings",
     "crates/nian-storage",
@@ -27,6 +28,7 @@ default-members = [
     "crates/nian-index",
     "crates/nian-media",
     "crates/nian-media-ffmpeg",
+    "crates/nian-platform-windows",
     "crates/nian-recorder",
     "crates/nian-settings",
     "crates/nian-storage",
@@ -56,6 +58,7 @@ nian-ipc = { path = "crates/nian-ipc" }
 nian-index = { path = "crates/nian-index" }
 nian-media = { path = "crates/nian-media" }
 nian-media-ffmpeg = { path = "crates/nian-media-ffmpeg" }
+nian-platform-windows = { path = "crates/nian-platform-windows" }
 nian-recorder = { path = "crates/nian-recorder" }
 nian-settings = { path = "crates/nian-settings" }
 nian-storage = { path = "crates/nian-storage" }
@@ -73,9 +76,19 @@ tokio = { version = "=1.53.1", features = ["full"] }
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 uuid = { version = "=1.25.0", features = ["v4"] }
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Power",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
-tauri = "=2.11.5"
+tauri = { version = "=2.11.5", features = ["tray-icon"] }
 tauri-build = { version = "=2.6.3", features = [] }
+tauri-plugin-autostart = "=2.5.1"
+tauri-plugin-single-instance = "=2.4.3"
 
 [profile.release]
 lto = "thin"

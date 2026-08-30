@@ -12,6 +12,7 @@ const initial: ApplicationSettings = {
   max_age_days: null,
   max_storage_bytes: null,
   cleanup_target_bytes: null,
+  launch_at_login: false,
 };
 
 function installDesktop() {

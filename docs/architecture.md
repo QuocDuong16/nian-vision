@@ -21,6 +21,7 @@ TP-Link Tapo C200 over RTSP). This page is the map; the ADRs record why.
 │  ProbeController     (M5) ✓  │
 │  Storage Manager     (M4) ✓  │
 │  PlaybackController  (M6) ✓  │
+│  DesktopLifecycle    (M7) ✓  │
 │  Worker Supervisor   (M3) ✓  │
 │    (nian-application)        │
 └──────────────┬───────────────┘
@@ -48,26 +49,28 @@ Key properties:
 * Application code never sees FFmpeg types; `nian-media` is the seam
   (ADR-0001).
 * `unsafe` exists inside `nian-media-ffmpeg` (safe public API) and
-  `nian-ffmpeg-sys` (raw declarations), plus one audited exception:
-  `nian-storage`'s Windows no-replace publication primitive (`MoveFileExW`,
-  compiled only on Windows targets). Every other crate has
-  `#![forbid(unsafe_code)]`.
+  `nian-ffmpeg-sys` (raw declarations), plus audited Windows-only platform
+  boundaries: `nian-storage`'s no-replace publication primitive and M7's
+  `nian-platform-windows` suspend/resume + Job Object wrapper. Application and
+  desktop orchestration remain safe Rust; Win32 raw handles/callback pointers do
+  not leak across those boundaries.
 
 ## Crate map
 
 | Crate | Role | Notes |
 |---|---|---|
 | `nian-domain` | Camera/Recording/Media vocabulary | path-safe IDs, redacted credentials, backoff schedule |
-| `nian-application` | config validation and orchestration policies | `WorkerSupervisor` (M3), `StorageManager` (M4), M5 camera/record/probe controllers, M6 `PlaybackController` + playback pins |
+| `nian-application` | config validation and orchestration policies | `WorkerSupervisor` (M3), `StorageManager` (M4), M5 camera/record/probe controllers, M6 `PlaybackController` + playback pins, M7 lifecycle admission |
 | `nian-index` | rebuildable SQLite recording catalog | bundled SQLite, schema v1 migrations, WAL, timeline queries; no camera settings or credentials (M4) |
-| `nian-settings` | authoritative non-secret desktop configuration | app-data `settings.sqlite3`, schema v1 camera/storage settings; no FFmpeg/Tauri/process logic (M5) |
+| `nian-settings` | authoritative non-secret desktop configuration | app-data `settings.sqlite3`, schema v2 camera/storage + desired-recording/autostart settings; no FFmpeg/Tauri/process logic |
 | `nian-storage` | recordings layout, claiming, publication, inventory/transaction facts | traversal-proof paths, race-safe `claim_segment`, atomic no-replace publish, lease-aware partial primitives, symlink-safe deterministic inventory (M4) |
 | `nian-ipc` | NDJSON protocol + serve loop | versioned envelopes, size-capped framing; handlers may emit events mid-request (M3) |
 | `nian-media` | backend-agnostic facade | `Probe`, `MediaSource`; errors distinguish cancellation vs timeout (M3); packets travel as backend-owned types |
 | `nian-media-ffmpeg` | safe FFmpeg wrapper | input/muxer/packet/interrupt/ABI guard; operation-scoped RAII deadlines + typed abort causes (M3) |
 | `nian-recorder` | segmented recording engine + supervision | keyframe rotation, durable finalize/publish; camera reconnect supervisor, partial recovery (M3) |
 | `nian-ffmpeg-sys` | raw FFI (generated) | committed bindings from vendored 8.0.3 headers |
-| `apps/nian-desktop` | Tauri 2 host | managed M6 state, platform app-data resolution, native credential-store adapter, playback HTTP owner, thin typed commands |
+| `nian-platform-windows` | isolated Win32 desktop boundary | M7 suspend/resume notifications and kill-on-close Job Object worker containment |
+| `apps/nian-desktop` | Tauri 2 host | managed M7 state, single-instance/tray/autostart/lifecycle owner, platform app-data + native credentials, playback HTTP owner, thin typed commands |
 | `apps/nian-media-worker` | media process | `probe` CLI, `run` IPC with `recording.*`, bounded `camera.probe`, M6 `playback.prepare`, manual `record` smoke command |
 
 ## Recording data flow
@@ -263,11 +266,12 @@ it never acquires a camera recording lease or touches storage. The desktop can
 probe an unsaved form. An edit with blank password can reuse the committed secret
 to test a changed non-secret endpoint without exposing that secret to React.
 
-M5 deliberately chooses **session-only desired recording state**. Camera and
-storage configuration is restored after desktop restart, but recording does not
-auto-start. Native tray/autostart/power lifecycle belongs to M7. M6 adds finalized
-recording playback/timeline only; live view and thumbnails remain out of scope.
-See ADR-0008.
+M5 originally chose session-only desired recording state. M7 supersedes only that
+lifetime rule: the single allowed desired camera is now persisted in authoritative
+settings and restored through the normal `RecordingController` path after desktop
+restart or resume. Runtime state remains separate and may legitimately be `Failed`
+while Desired stays On. M6 playback/timeline semantics are unchanged; live view
+and thumbnails remain out of scope. See ADR-0008 and ADR-0010.
 
 ## Recording timeline and playback (M6)
 
@@ -390,8 +394,47 @@ is released and normal filesystem-first retention resumes. This product contract
 is portable to Unix, where an open file descriptor alone would not prevent unlink.
 
 M6 is local-recording playback only. It does not implement live RTSP viewing,
-thumbnail generation, clip export, motion analysis, tray/autostart/power handling,
-simultaneous multi-camera recording, ONVIF, AI or cloud behavior. See ADR-0009.
+thumbnail generation, clip export, motion analysis, simultaneous multi-camera
+recording, ONVIF, AI or cloud behavior. Tray/autostart/power lifecycle is layered
+above M6 by M7 without changing the playback transport. See ADR-0009.
+
+## Desktop production lifecycle (M7)
+
+M7 adds a Rust-authoritative desktop lifecycle with `Running`, `Suspending` and
+terminal `Quitting` states. A desktop `control_gate` serializes transitions with
+operations whose correctness depends on admission or recording ownership. Camera
+mutation, Start, Probe, playback open and settings mutation prove `Running` before
+they commit work. Suspend and Quit close subsystem admission before any blocking
+teardown begins.
+
+The desktop is single-instance. The single-instance Tauri plugin is registered
+first, so a secondary process exits before initializing media/storage resources.
+A manual second launch activates the existing window; the exact autostart marker
+`--startup-hidden` does not. The main window is created hidden, normal interactive
+startup explicitly shows/unminimizes/focuses it, and Close hides it to the tray.
+Only explicit coordinated Quit tears down the backend.
+
+Authoritative settings schema v2 stores `launch_at_login` and one
+`recording_enabled` camera. A partial unique index enforces the existing
+single-camera desired-recording constraint. Start persists Desired=On before
+starting the runtime controller; user Stop persists Desired=Off before signalling
+runtime teardown. Suspend and Quit never rewrite desired intent. Startup and
+resume therefore restore Desired=On through the same `RecordingController` path,
+while runtime `Failed` remains independently visible to the UI.
+
+Windows suspend/resume events come from the isolated `nian-platform-windows`
+boundary. Resume is convergent per subsystem rather than all-or-nothing: playback
+expiry/index resync, recording ownership completion/restoration and probe admission
+are attempted independently. A playback refresh failure is reported but cannot
+leave recording/probe/playback admission permanently wedged. Duplicate Resume
+while already Running is a no-op.
+
+Explicit Quit follows deterministic ownership order: recording shutdown/join,
+playback shutdown, probe shutdown, power notification unregister/join, then process
+exit. Hard Windows desktop termination uses a process-owned Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; the desktop joins it before any worker spawn,
+workers inherit membership atomically, and every production spawn verifies
+containment or kills/reaps the uncontained child. See ADR-0010.
 
 ## Failure model
 
@@ -404,10 +447,13 @@ fixed 2s→5s→10s→30s→60s schedule (`nian_domain::ReconnectBackoff`). The
 filesystem remains the source of survival; SQLite is a rebuildable index
 (ADR-0005).
 
-Sleep/wake note (M3 §17): no native Windows power-event integration yet —
-the supervised state machines tolerate long wall-clock interruptions by
-construction (timeouts fire, dead connections fail, supervisors
-reconnect), but native suspend/resume event handling remains M7 scope.
+Sleep/wake is now explicit M7 lifecycle input on Windows. Native power
+notifications move the desktop to `Suspending`, close new work admission and
+request bounded recorder/probe/playback interruption. Resume returns admission to
+`Running`, independently resynchronizes playback storage, rejoins any stopping
+recording controller, restores persisted desired recording through the normal
+start path and reopens probe admission. One subsystem's resume failure is surfaced
+without preventing the remaining subsystems from converging.
 
 ## Documentation index
 

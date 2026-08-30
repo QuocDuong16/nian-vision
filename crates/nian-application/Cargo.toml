@@ -12,6 +12,7 @@ chrono = { workspace = true }
 nian-domain = { workspace = true }
 nian-index = { workspace = true }
 nian-ipc = { workspace = true }
+nian-platform-windows = { workspace = true }
 nian-settings = { workspace = true }
 nian-storage = { workspace = true }
 serde = { workspace = true }

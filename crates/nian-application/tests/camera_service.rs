@@ -27,6 +27,7 @@ struct RepoState {
     fail_update: bool,
     fail_delete: bool,
     hide_get_camera_once: bool,
+    desired_camera: Option<String>,
 }
 
 #[derive(Clone)]
@@ -93,6 +94,7 @@ impl SettingsRepository for FakeRepo {
             segment_target_secs: 300,
             retention: RetentionPolicy::default(),
             quota: None,
+            launch_at_login: false,
         })
     }
     fn save_application_settings(
@@ -100,6 +102,33 @@ impl SettingsRepository for FakeRepo {
         _settings: &ApplicationSettings,
     ) -> Result<(), SettingsRepositoryError> {
         Ok(())
+    }
+    fn recording_enabled_cameras(&self) -> Result<Vec<CameraId>, SettingsRepositoryError> {
+        self.0
+            .lock()
+            .unwrap()
+            .desired_camera
+            .as_deref()
+            .map(CameraId::parse)
+            .transpose()
+            .map(|camera| camera.into_iter().collect())
+            .map_err(|_| SettingsRepositoryError::Persistence)
+    }
+    fn set_recording_enabled(
+        &mut self,
+        camera_id: &CameraId,
+        enabled: bool,
+    ) -> Result<bool, SettingsRepositoryError> {
+        let mut state = self.0.lock().unwrap();
+        if !state.cameras.contains_key(camera_id.as_str()) {
+            return Ok(false);
+        }
+        if enabled {
+            state.desired_camera = Some(camera_id.as_str().to_owned());
+        } else if state.desired_camera.as_deref() == Some(camera_id.as_str()) {
+            state.desired_camera = None;
+        }
+        Ok(true)
     }
 }
 
@@ -408,6 +437,7 @@ fn settings_validation_reuses_application_policy() {
         max_age_days: None,
         max_storage_bytes: None,
         cleanup_target_bytes: None,
+        launch_at_login: false,
     };
     assert!(matches!(
         service.save_application_settings(bad, false),

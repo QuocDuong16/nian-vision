@@ -9,6 +9,7 @@ interface SettingsForm {
   max_age_days: string;
   max_storage_bytes: string;
   cleanup_target_bytes: string;
+  launch_at_login: boolean;
 }
 
 const EMPTY: SettingsForm = {
@@ -17,6 +18,7 @@ const EMPTY: SettingsForm = {
   max_age_days: "",
   max_storage_bytes: "",
   cleanup_target_bytes: "",
+  launch_at_login: false,
 };
 
 function toForm(settings: ApplicationSettings): SettingsForm {
@@ -26,6 +28,7 @@ function toForm(settings: ApplicationSettings): SettingsForm {
     max_age_days: settings.max_age_days === null ? "" : String(settings.max_age_days),
     max_storage_bytes: settings.max_storage_bytes === null ? "" : String(settings.max_storage_bytes),
     cleanup_target_bytes: settings.cleanup_target_bytes === null ? "" : String(settings.cleanup_target_bytes),
+    launch_at_login: settings.launch_at_login,
   };
 }
 
@@ -81,6 +84,7 @@ export function StorageScreen() {
         max_age_days: positiveInteger(form.max_age_days, "Max age days"),
         max_storage_bytes: maxStorageBytes,
         cleanup_target_bytes: cleanupTargetBytes,
+        launch_at_login: form.launch_at_login,
       };
     } catch (cause) {
       setError({ code: "validation", message: cause instanceof Error ? cause.message : "Invalid settings." });

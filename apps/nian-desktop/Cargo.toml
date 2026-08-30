@@ -14,11 +14,14 @@ tauri-build = { workspace = true }
 chrono = { workspace = true }
 nian-application = { workspace = true }
 nian-domain = { workspace = true }
+nian-platform-windows = { workspace = true }
 nian-settings = { workspace = true }
 keyring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { workspace = true }
+tauri-plugin-autostart = { workspace = true }
+tauri-plugin-single-instance = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

@@ -1,0 +1,17 @@
+[package]
+name = "nian-platform-windows"
+description = "Isolated Windows desktop lifecycle/process boundary for Nian Vision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[lints]
+workspace = true

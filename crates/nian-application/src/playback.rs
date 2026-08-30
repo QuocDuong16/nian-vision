@@ -51,6 +51,7 @@ pub enum PlaybackErrorCode {
     PlaybackSessionExpired,
     PlaybackBusy,
     WorkerUnavailable,
+    LifecycleBlocked,
     Internal,
 }
 
@@ -76,6 +77,8 @@ pub enum PlaybackError {
     PlaybackBusy,
     #[error("media worker is unavailable")]
     WorkerUnavailable,
+    #[error("playback admission is blocked by desktop lifecycle")]
+    LifecycleBlocked,
     #[error("playback service is unavailable")]
     Internal,
 }
@@ -93,6 +96,7 @@ impl PlaybackError {
             Self::PlaybackSessionExpired => PlaybackErrorCode::PlaybackSessionExpired,
             Self::PlaybackBusy => PlaybackErrorCode::PlaybackBusy,
             Self::WorkerUnavailable => PlaybackErrorCode::WorkerUnavailable,
+            Self::LifecycleBlocked => PlaybackErrorCode::LifecycleBlocked,
             Self::Internal => PlaybackErrorCode::Internal,
         }
     }
@@ -342,6 +346,7 @@ pub struct PlaybackController {
     runtime: Arc<Mutex<PlaybackRuntime>>,
     server: PlaybackHttpServer,
     cache_instance: PlaybackCacheInstance,
+    accepting: bool,
 }
 
 impl std::fmt::Debug for PlaybackController {
@@ -375,6 +380,7 @@ impl PlaybackController {
             runtime,
             server,
             cache_instance,
+            accepting: true,
         })
     }
 
@@ -475,6 +481,9 @@ impl PlaybackController {
     }
 
     pub fn open(&mut self, recording_id: &str) -> Result<PlaybackOpenDto, PlaybackError> {
+        if !self.accepting {
+            return Err(PlaybackError::LifecycleBlocked);
+        }
         self.expire_sessions();
         if self.active_session_count() >= MAX_PLAYBACK_SESSIONS {
             return Err(PlaybackError::PlaybackBusy);
@@ -612,6 +621,27 @@ impl PlaybackController {
             .sessions
             .get(session_id)
             .is_some_and(|session| !session.close_requested))
+    }
+
+    pub fn stop_accepting(&mut self) {
+        self.accepting = false;
+    }
+
+    pub fn resume_accepting(&mut self) {
+        self.accepting = true;
+    }
+
+    /// Resume resync keeps normal M6 expiry semantics: sleeping does not grant
+    /// an immortal PlaybackPin, and the filesystem index is reconciled again.
+    pub fn resume_resync(&mut self) -> Result<(), PlaybackError> {
+        self.expire_sessions();
+        self.refresh_index()
+    }
+
+    pub fn shutdown(&mut self) {
+        self.accepting = false;
+        self.close_all();
+        self.server.shutdown();
     }
 
     fn active_session_count(&self) -> usize {
@@ -761,12 +791,18 @@ impl PlaybackHttpServer {
     }
 }
 
-impl Drop for PlaybackHttpServer {
-    fn drop(&mut self) {
+impl PlaybackHttpServer {
+    fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+impl Drop for PlaybackHttpServer {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -1096,6 +1132,8 @@ fn run_worker_prepare(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
+        .map_err(|_| PlaybackError::WorkerUnavailable)?;
+    let child = crate::worker_process::contain_spawned_worker(child)
         .map_err(|_| PlaybackError::WorkerUnavailable)?;
     let mut worker = WorkerGuard {
         child,
