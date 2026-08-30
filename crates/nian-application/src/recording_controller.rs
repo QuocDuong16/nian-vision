@@ -303,7 +303,20 @@ impl RecordingController {
     }
 
     fn reap_finished(&mut self) -> Result<(), RecordingControllerError> {
-        if !self.thread.as_ref().is_some_and(JoinHandle::is_finished) {
+        let thread_finished = self.thread.as_ref().is_some_and(JoinHandle::is_finished);
+        // The finalizer publishes Stopped/Failed only after the runner returns.
+        // A tiny scheduler window still exists before the thread function itself
+        // returns, so terminal status also proves that joining is now bounded.
+        // This keeps terminal ownership cleanup independent of scheduler timing.
+        let terminal_published = if self.thread.is_some() {
+            matches!(
+                self.status_snapshot()?.state,
+                RecordingState::Stopped | RecordingState::Failed
+            )
+        } else {
+            false
+        };
+        if !thread_finished && !terminal_published {
             return Ok(());
         }
 
