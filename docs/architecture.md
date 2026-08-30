@@ -379,9 +379,15 @@ playback open acquires a `PlaybackPin` keyed by canonical relative path and keep
 source read handle open. Retention consults those pins before work and, critically,
 rechecks immediately before filesystem deletion; a session opened after retention
 planned a candidate therefore wins the race and the candidate is reported as
-`skipped_playback`. After explicit close/idle expiry/application exit, the pin is
-released and normal filesystem-first retention resumes. This product contract is
-portable to Unix, where an open file descriptor alone would not prevent unlink.
+`skipped_playback`. HTTP requests refresh activity and cannot expire mid-response,
+but buffered browser playback is also represented explicitly: while the mounted
+video/session exists, Timeline sends `playback_keepalive` every 45 seconds. Keepalive
+expires stale sessions before lookup and never reactivates an expired or closing
+session. Explicit close, navigation, media failure and unmount stop heartbeats;
+renderer disappearance therefore falls back to the ten-minute idle TTL. Once the
+last active request/session ownership signal is gone and the TTL expires, the pin
+is released and normal filesystem-first retention resumes. This product contract
+is portable to Unix, where an open file descriptor alone would not prevent unlink.
 
 M6 is local-recording playback only. It does not implement live RTSP viewing,
 thumbnail generation, clip export, motion analysis, tray/autostart/power handling,

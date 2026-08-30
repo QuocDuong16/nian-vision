@@ -590,6 +590,19 @@ impl PlaybackController {
         Ok(())
     }
 
+    pub fn keep_alive(&mut self, session_id: &str) -> Result<(), PlaybackError> {
+        self.expire_sessions();
+        let mut runtime = self.runtime.lock().map_err(|_| PlaybackError::Internal)?;
+        let Some(session) = runtime.sessions.get_mut(session_id) else {
+            return Err(PlaybackError::PlaybackSessionExpired);
+        };
+        if session.close_requested {
+            return Err(PlaybackError::PlaybackSessionExpired);
+        }
+        session.last_activity = Instant::now();
+        Ok(())
+    }
+
     pub fn session_active(&mut self, session_id: &str) -> Result<bool, PlaybackError> {
         self.expire_sessions();
         Ok(self
@@ -1377,6 +1390,173 @@ mod tests {
                 .unwrap()
                 .flatten()
                 .all(|entry| !entry.file_name().to_string_lossy().starts_with("session-"))
+        );
+    }
+
+    #[test]
+    fn keepalive_refreshes_a_live_session_near_expiry() {
+        let relative = "cam-a/2026/08/29/08-30-00.mkv";
+        let (_temp, mut controller) = controller_with_files(&[(relative, b"recording")]);
+        let opened = controller.open(relative).unwrap();
+        let stale_activity = Instant::now() - SESSION_IDLE_TIMEOUT + Duration::from_secs(1);
+        controller
+            .runtime
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&opened.session_id)
+            .unwrap()
+            .last_activity = stale_activity;
+
+        controller.keep_alive(&opened.session_id).unwrap();
+
+        let runtime = controller.runtime.lock().unwrap();
+        let session = runtime.sessions.get(&opened.session_id).unwrap();
+        assert!(session.last_activity > stale_activity);
+        assert!(controller.pins.is_pinned(relative));
+    }
+
+    #[test]
+    fn keepalive_cannot_revive_an_already_expired_session() {
+        let relative = "cam-a/2026/08/29/08-30-00.mkv";
+        let (_temp, mut controller) = controller_with_files(&[(relative, b"recording")]);
+        let opened = controller.open(relative).unwrap();
+        controller
+            .runtime
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&opened.session_id)
+            .unwrap()
+            .last_activity = Instant::now() - SESSION_IDLE_TIMEOUT - Duration::from_secs(1);
+
+        assert!(matches!(
+            controller.keep_alive(&opened.session_id),
+            Err(PlaybackError::PlaybackSessionExpired)
+        ));
+        assert!(
+            !controller
+                .runtime
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key(&opened.session_id)
+        );
+        assert!(!controller.pins.is_pinned(relative));
+    }
+
+    #[test]
+    fn keepalive_preserves_retention_pin_until_heartbeats_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let relative = "cam-a/2026/08/29/08-30-00.mkv";
+        let source = root.join(relative);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"recording").unwrap();
+        let backend: Arc<dyn PlaybackBackend> = Arc::new(FakeBackend {
+            bytes: b"prepared-media".to_vec(),
+            duration_ms: Some(5_000),
+        });
+        let mut controller =
+            PlaybackController::with_backend(backend, temp.path().join("playback-cache")).unwrap();
+        controller
+            .configure_storage(
+                Some(root),
+                RetentionPolicy {
+                    max_age_days: Some(1),
+                    max_storage_bytes: None,
+                },
+                None,
+            )
+            .unwrap();
+        let opened = controller.open(relative).unwrap();
+        controller
+            .runtime
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&opened.session_id)
+            .unwrap()
+            .last_activity = Instant::now() - SESSION_IDLE_TIMEOUT + Duration::from_secs(1);
+        controller.keep_alive(&opened.session_id).unwrap();
+
+        let now =
+            NaiveDateTime::parse_from_str("2026-09-01T08:30:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let report = controller
+            .storage
+            .as_mut()
+            .unwrap()
+            .run_retention(now)
+            .unwrap();
+        assert_eq!(report.skipped_playback, 1);
+        assert!(source.exists());
+        assert!(
+            controller
+                .storage
+                .as_ref()
+                .unwrap()
+                .recording_by_id(relative)
+                .unwrap()
+                .is_some()
+        );
+
+        controller
+            .runtime
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&opened.session_id)
+            .unwrap()
+            .last_activity = Instant::now() - SESSION_IDLE_TIMEOUT - Duration::from_secs(1);
+        controller.expire_sessions();
+        assert!(!controller.pins.is_pinned(relative));
+
+        controller
+            .storage
+            .as_mut()
+            .unwrap()
+            .run_retention(now)
+            .unwrap();
+        assert!(!source.exists());
+        assert!(
+            controller
+                .storage
+                .as_ref()
+                .unwrap()
+                .recording_by_id(relative)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn keepalive_rejects_a_close_requested_session() {
+        let relative = "cam-a/2026/08/29/08-30-00.mkv";
+        let (_temp, mut controller) = controller_with_files(&[(relative, b"recording")]);
+        let opened = controller.open(relative).unwrap();
+        controller
+            .runtime
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&opened.session_id)
+            .unwrap()
+            .active_requests = 1;
+        controller.close(&opened.session_id).unwrap();
+
+        assert!(matches!(
+            controller.keep_alive(&opened.session_id),
+            Err(PlaybackError::PlaybackSessionExpired)
+        ));
+        assert!(
+            controller
+                .runtime
+                .lock()
+                .unwrap()
+                .sessions
+                .get(&opened.session_id)
+                .unwrap()
+                .close_requested
         );
     }
 

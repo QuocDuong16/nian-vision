@@ -374,8 +374,11 @@ assets.
 filesystem safety remain deterministic and fast. They cover full/middle/suffix
 Range responses, invalid Range → 416, non-loopback Host → 403, unknown/expired
 token → 410, session timeout releasing its pin, active-request deferral so idle
-expiry/explicit close cannot release a pin mid-response, recovered/normal
-ordering, duration enrichment, rebuild-stable recording IDs, missing files and
+expiry/explicit close cannot release a pin mid-response, and explicit keepalive
+ownership. Keepalive tests mutate `last_activity` directly to prove near-expiry
+refresh, no resurrection after TTL, rejection of `close_requested`, and retention
+skipping a heartbeat-kept pin until heartbeats stop and the same session expires.
+Recovered/normal ordering, duration enrichment, rebuild-stable recording IDs, missing files and
 symlink replacement. Freshness coverage starts with only A indexed, publishes
 canonical normal B plus a recovered final and an actively leased `.partial.mkv`,
 then proves `refresh_index()` discovers only the two finalized additions without
@@ -429,8 +432,13 @@ also proves Timeline invokes the explicit `recordings_refresh` boundary, Next
 from a 23:59 recording into the next day and Previous from 00:01 into the prior
 day both keep the newly opened session/video URL alive, the day selector follows
 the adjacent recording, and an HTML media-element error becomes a visible
-user-safe state that releases the failed session and allows Reopen. Lint
-(`eslint`), `tsc --noEmit`, Vitest and Vite build gate the frontend.
+user-safe state that releases the failed session and allows Reopen. Fake-timer
+heartbeat coverage proves a mounted playback session sends `playback_keepalive`
+at the 45-second cadence; opening another recording transfers heartbeat ownership;
+media error and unmount stop the old timer and request close; backend expiry clears
+the dead video/session and offers Reopen; isolated internal keepalive failures retry
+silently while three consecutive failures surface one safe warning that clears
+after recovery. Lint (`eslint`), `tsc --noEmit`, Vitest and Vite build gate the frontend.
 
 Desktop configuration tests parse the committed `tauri.conf.json` and assert the
 CSP contains the narrow playback allowance

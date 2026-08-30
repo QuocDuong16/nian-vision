@@ -51,6 +51,11 @@ type TimelineLoadOptions = {
   keepSessionForRecordingId?: string | null;
 };
 
+const PLAYBACK_KEEPALIVE_INTERVAL_MS = 45_000;
+const PLAYBACK_KEEPALIVE_FAILURE_THRESHOLD = 3;
+const PLAYBACK_EXPIRED_MESSAGE = "Playback session expired. Reopen the recording.";
+const PLAYBACK_KEEPALIVE_WARNING = "Playback session keepalive is unavailable. Reopen the recording if playback stops.";
+
 export function TimelineScreen() {
   const [cameras, setCameras] = useState<CameraSummary[]>([]);
   const [cameraId, setCameraId] = useState("");
@@ -67,7 +72,19 @@ export function TimelineScreen() {
   const sessionRef = useRef<string | null>(null);
   const sessionRecordingRef = useRef<string | null>(null);
 
+  const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const heartbeatFailuresRef = useRef(0);
+
+  const stopPlaybackHeartbeat = useCallback(() => {
+    if (heartbeatTimerRef.current !== null) {
+      clearInterval(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = null;
+    }
+    heartbeatFailuresRef.current = 0;
+  }, []);
+
   const closePlayback = useCallback(async (clearPlaybackError = true) => {
+    stopPlaybackHeartbeat();
     const sessionId = sessionRef.current;
     sessionRef.current = null;
     sessionRecordingRef.current = null;
@@ -80,7 +97,7 @@ export function TimelineScreen() {
     } catch {
       // Expired/closed sessions need no UI escalation during cleanup.
     }
-  }, []);
+  }, [stopPlaybackHeartbeat]);
 
   const loadTimeline = useCallback(async (
     nextCameraId: string,
@@ -169,6 +186,55 @@ export function TimelineScreen() {
     };
   }, [cameraId, closePlayback, loadTimeline]);
 
+  useEffect(() => {
+    const sessionId = playback?.session_id;
+    if (!sessionId || !isTauri()) {
+      stopPlaybackHeartbeat();
+      return;
+    }
+
+    stopPlaybackHeartbeat();
+    let cancelled = false;
+    let inFlight = false;
+    const heartbeat = async () => {
+      if (cancelled || inFlight || sessionRef.current !== sessionId) return;
+      inFlight = true;
+      try {
+        await invokeDesktop<void>("playback_keepalive", { sessionId });
+        if (cancelled || sessionRef.current !== sessionId) return;
+        heartbeatFailuresRef.current = 0;
+        setPlaybackError((current) => current === PLAYBACK_KEEPALIVE_WARNING ? null : current);
+      } catch (cause) {
+        if (cancelled || sessionRef.current !== sessionId) return;
+        const failure = desktopError(cause);
+        if (failure.code === "playback_session_expired") {
+          stopPlaybackHeartbeat();
+          sessionRef.current = null;
+          sessionRecordingRef.current = null;
+          setPlayback(null);
+          setEnded(false);
+          setPlaybackError(PLAYBACK_EXPIRED_MESSAGE);
+          return;
+        }
+        heartbeatFailuresRef.current += 1;
+        if (heartbeatFailuresRef.current === PLAYBACK_KEEPALIVE_FAILURE_THRESHOLD) {
+          setPlaybackError(PLAYBACK_KEEPALIVE_WARNING);
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    heartbeatTimerRef.current = setInterval(() => {
+      void heartbeat();
+    }, PLAYBACK_KEEPALIVE_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      stopPlaybackHeartbeat();
+    };
+  }, [playback?.session_id, stopPlaybackHeartbeat]);
+
   useEffect(() => () => {
     const sessionId = sessionRef.current;
     if (sessionId && isTauri()) {
@@ -246,6 +312,7 @@ export function TimelineScreen() {
   }, [cameraId, closePlayback, day, loadTimeline]);
 
   const handlePlaybackMediaError = useCallback(() => {
+    stopPlaybackHeartbeat();
     const sessionId = sessionRef.current;
     sessionRef.current = null;
     sessionRecordingRef.current = null;
@@ -255,7 +322,7 @@ export function TimelineScreen() {
     if (sessionId && isTauri()) {
       void invokeDesktop<void>("playback_close", { sessionId }).catch(() => undefined);
     }
-  }, []);
+  }, [stopPlaybackHeartbeat]);
 
   const dayIndex = days.indexOf(day);
   const previousDay = dayIndex > 0 ? days[dayIndex - 1] : null;

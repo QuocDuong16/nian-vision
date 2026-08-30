@@ -341,6 +341,16 @@ fn playback_close(
 }
 
 #[tauri::command]
+fn playback_keepalive(
+    state: tauri::State<'_, DesktopState>,
+    session_id: String,
+) -> Result<(), DesktopErrorDto> {
+    lock(&state.playback_controller)?
+        .keep_alive(&session_id)
+        .map_err(map_playback_error)
+}
+
+#[tauri::command]
 fn playback_status(
     state: tauri::State<'_, DesktopState>,
     session_id: String,
@@ -621,6 +631,7 @@ pub fn run() {
             recording_timeline,
             playback_open,
             playback_close,
+            playback_keepalive,
             playback_status,
             settings_get,
             settings_update,

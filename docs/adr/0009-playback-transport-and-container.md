@@ -174,6 +174,18 @@ change becomes a deferred close until the last active request finishes. New
 requests are rejected once close is requested. The final request guard releases
 the session and pin deterministically.
 
+HTTP traffic is not the sole ownership signal because the WebView may buffer the
+prepared MP4 and play from memory without another Range request. While a playback
+video/session remains mounted, Timeline sends `playback_keepalive` every 45 seconds.
+The controller first expires sessions against the current clock, then refreshes
+`last_activity` only for a still-live, non-closing session; an already-expired or
+`close_requested` session returns `playback_session_expired` and cannot be revived.
+HTTP admission/completion continues to refresh activity independently. Closing,
+media failure, session replacement, intentional camera/day navigation and unmount
+stop the heartbeat. If the renderer disappears without cleanup, heartbeat stops
+and the existing ten-minute idle timeout remains the bounded abandonment path that
+removes the cache and drops `PlaybackPin`.
+
 ### Preparation responsiveness
 
 `playback_open` remains synchronous in M6. The desktop command therefore holds
