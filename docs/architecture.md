@@ -451,9 +451,10 @@ containment or kills/reaps the uncontained child. See ADR-0010.
 
 ## Linux distribution and signed updates (M8)
 
-M8 currently defines one production distribution target:
-`x86_64-unknown-linux-gnu`, shipped as an AppImage. Windows and macOS packaging
-are explicitly deferred rather than partially maintained.
+M8 currently defines one CI-validated production distribution target:
+`x86_64-unknown-linux-gnu`, shipped as an AppImage. Windows x86_64 remains the
+primary future product target, but release packaging/signing validation is
+deferred until a Forgejo Windows runner exists. macOS packaging is also deferred.
 
 The AppImage contains the desktop host, a sibling `nian-media-worker`, and an
 application-owned FFmpeg 8.0.3 shared runtime. The pre-bundle worker is linked with
@@ -481,13 +482,26 @@ fails after runtime teardown, the current application restarts rather than
 remaining stranded in Quitting; normal M7 startup restoration then re-applies the
 persisted recording intent.
 
-Release-only Tauri configuration is generated from environment values. The
-committed repository contains neither the private updater signing key nor a fake
-production endpoint. Production generation rejects non-HTTPS/local/example
-authorities. The Forgejo release workflow builds on Debian 12, validates version
-and tag equality, runs frontend/Rust/media gates, performs clean staged-runtime
-and extracted-AppImage smoke tests, then emits `latest.json`,
-`release-manifest.json`, `BUILD_METADATA.json` and `SHA256SUMS.txt`.
+Release-only Tauri configuration is public-only: updater public key, HTTPS endpoint
+and bundle/resource mapping. Private updater signing material exists only in the
+signed AppImage build step. Frontend assets are built earlier and the release
+config disables Tauri's `beforeBuildCommand`, so Vite never inherits signing
+secrets. After Tauri signs the AppImage, a release verifier using the same
+Minisign-compatible representation as `tauri-plugin-updater` verifies the exact
+AppImage/signature against the configured public key before the generated config
+is removed.
+
+Production authority validation rejects non-HTTPS, local/loopback and reserved
+placeholder hosts. The Forgejo release workflow builds on Debian 12, validates
+version/tag equality, runs frontend/Rust/media gates, performs clean staged and
+extracted-AppImage worker smoke, launches the actual AppImage under isolated
+Xvfb/D-Bus until the backend emits its startup-ready marker, and scans staging,
+extracted application files, frontend assets and finalized artifacts for a
+configured secret canary. Finalization emits `latest.json`, `release-manifest.json`,
+`BUILD_METADATA.json` and `SHA256SUMS.txt`; a separate validator proves those
+metadata fields and hashes describe the exact finalized AppImage/signature.
+Forgejo artifact upload remains generation/transport only, not production updater
+publication.
 
 See ADR-0011 and `docs/releasing.md` for the release contract.
 

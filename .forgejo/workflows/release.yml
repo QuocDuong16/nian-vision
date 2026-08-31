@@ -19,13 +19,6 @@ jobs:
     timeout-minutes: 120
     container:
       image: rust:1.98.0-bookworm
-    env:
-      NIAN_UPDATER_ENDPOINT: ${{ secrets.NIAN_UPDATER_ENDPOINT }}
-      NIAN_UPDATER_PUBLIC_KEY: ${{ secrets.NIAN_UPDATER_PUBLIC_KEY }}
-      NIAN_RELEASE_DOWNLOAD_BASE_URL: ${{ secrets.NIAN_RELEASE_DOWNLOAD_BASE_URL }}
-      NIAN_RELEASE_SECRET_SENTINEL: ${{ secrets.NIAN_RELEASE_SECRET_SENTINEL }}
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
     steps:
       - name: Install pinned Node.js runtime for actions
@@ -54,16 +47,6 @@ jobs:
           esac
           node scripts/release/version-check.mjs --tag "$tag" --require-clean
 
-      - name: Require release signing and updater secrets
-        run: |
-          set -Eeuo pipefail
-          for name in NIAN_UPDATER_ENDPOINT NIAN_UPDATER_PUBLIC_KEY NIAN_RELEASE_DOWNLOAD_BASE_URL TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
-            if [[ -z "${!name:-}" ]]; then
-              echo "Production release secret is missing: $name" >&2
-              exit 1
-            fi
-          done
-
       - name: Install Linux release prerequisites
         run: |
           set -Eeuo pipefail
@@ -72,7 +55,9 @@ jobs:
             build-essential \
             binutils \
             curl \
+            dbus-x11 \
             file \
+            fuse3 \
             git \
             libayatana-appindicator3-dev \
             libfuse2 \
@@ -81,6 +66,8 @@ jobs:
             libwebkit2gtk-4.1-dev \
             patchelf \
             pkg-config \
+            xauth \
+            xvfb \
             xz-utils
 
       - name: Install pinned pnpm
@@ -98,10 +85,14 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Release script tests
-        run: pnpm release:test
+      - name: Release script and updater-verifier tests
+        run: |
+          set -Eeuo pipefail
+          pnpm release:test
+          cargo clippy -p nian-release-verifier --all-targets -- -D warnings
+          cargo test -p nian-release-verifier
 
-      - name: Frontend quality
+      - name: Frontend quality and release asset build
         run: |
           set -Eeuo pipefail
           pnpm lint
@@ -136,27 +127,58 @@ jobs:
           cargo build -p nian-media-worker --release
 
       - name: Stage and clean-smoke Linux runtime
+        env:
+          NIAN_RELEASE_SECRET_SENTINEL: ${{ secrets.NIAN_RELEASE_SECRET_SENTINEL }}
         run: scripts/release/stage-linux.sh
 
       - name: Generate release-only Tauri configuration
+        env:
+          NIAN_UPDATER_ENDPOINT: ${{ secrets.NIAN_UPDATER_ENDPOINT }}
+          NIAN_UPDATER_PUBLIC_KEY: ${{ secrets.NIAN_UPDATER_PUBLIC_KEY }}
         run: node scripts/release/write-tauri-release-config.mjs
 
       - name: Build signed updater AppImage
         env:
           NIAN_UPDATER_CONFIGURED: "1"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -Eeuo pipefail
+          test -n "${TAURI_SIGNING_PRIVATE_KEY:-}" || { echo "TAURI_SIGNING_PRIVATE_KEY is required" >&2; exit 1; }
+          test -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" || { echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD is required" >&2; exit 1; }
           cd apps/nian-desktop
           ../../ui/node_modules/.bin/tauri build \
             --config tauri.release.generated.conf.json \
             --bundles appimage \
             --ci
 
-      - name: Smoke actual AppImage installed layout
+      - name: Verify updater signature against configured public key
+        env:
+          NIAN_UPDATER_PUBLIC_KEY: ${{ secrets.NIAN_UPDATER_PUBLIC_KEY }}
+        run: |
+          set -Eeuo pipefail
+          configured_public_key="$(node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync("apps/nian-desktop/tauri.release.generated.conf.json","utf8")); process.stdout.write(c.plugins.updater.pubkey)')"
+          [[ "$configured_public_key" == "$NIAN_UPDATER_PUBLIC_KEY" ]] || { echo "generated updater public key differs from release configuration input" >&2; exit 1; }
+          mapfile -t images < <(find target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print | sort)
+          [[ "${#images[@]}" -eq 1 ]] || { echo "expected exactly one generated AppImage" >&2; exit 1; }
+          test -f "${images[0]}.sig" || { echo "generated AppImage signature is missing" >&2; exit 1; }
+          NIAN_UPDATER_PUBLIC_KEY="$configured_public_key" cargo run --quiet -p nian-release-verifier -- "${images[0]}" "${images[0]}.sig"
+
+      - name: Dispose generated Tauri release configuration
+        run: rm -f apps/nian-desktop/tauri.release.generated.conf.json
+
+      - name: Smoke actual AppImage runtime and desktop startup
+        env:
+          NIAN_RELEASE_SECRET_SENTINEL: ${{ secrets.NIAN_RELEASE_SECRET_SENTINEL }}
         run: scripts/release/smoke-appimage.sh
 
       - name: Finalize manifest, updater metadata and SHA-256 checksums
+        env:
+          NIAN_RELEASE_DOWNLOAD_BASE_URL: ${{ secrets.NIAN_RELEASE_DOWNLOAD_BASE_URL }}
         run: node scripts/release/finalize-linux-release.mjs
+
+      - name: Validate finalized updater metadata relationships
+        run: node scripts/release/validate-release-output.mjs
 
       - name: Verify checksum manifest
         run: |
@@ -164,8 +186,13 @@ jobs:
           cd dist/release
           sha256sum --check --strict SHA256SUMS.txt
 
+      - name: Final secret sentinel scan
+        env:
+          NIAN_RELEASE_SECRET_SENTINEL: ${{ secrets.NIAN_RELEASE_SECRET_SENTINEL }}
+        run: node scripts/release/scan-release-secrets.mjs ui/dist dist/release
+
       - name: Upload Linux release artifacts
-        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        uses: https://code.forgejo.org/forgejo/upload-artifact@16871d9e8cfcf27ff31822cac382bbb5450f1e1e # v4
         with:
           name: nian-vision-linux-x86_64-${{ github.ref_name }}
           path: dist/release/

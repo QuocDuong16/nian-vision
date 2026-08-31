@@ -1852,6 +1852,7 @@ pub fn run() {
                     *startup_error = Some(error);
                 }
             }
+            tracing::info!(event = "desktop_startup_ready", "desktop startup ready");
 
             Ok(())
         })

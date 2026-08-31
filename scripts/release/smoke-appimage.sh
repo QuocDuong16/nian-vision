@@ -10,7 +10,34 @@ if [[ "${#images[@]}" -ne 1 ]]; then
 fi
 
 work_dir="$(mktemp -d)"
-trap 'rm -rf "$work_dir"' EXIT
+desktop_session_pid=""
+cleanup() {
+  if [[ -n "$desktop_session_pid" ]] && kill -0 "$desktop_session_pid" 2>/dev/null; then
+    kill -TERM -- "-$desktop_session_pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      kill -0 "$desktop_session_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$desktop_session_pid" 2>/dev/null; then
+      kill -KILL -- "-$desktop_session_pid" 2>/dev/null || true
+    fi
+    wait "$desktop_session_pid" 2>/dev/null || true
+  fi
+  runtime_root="$work_dir/desktop-home/runtime"
+  if [[ -d "$runtime_root" ]]; then
+    shopt -s nullglob dotglob
+    for candidate in "$runtime_root"/*; do
+      # D-Bus services may leave detached GVFS/document-portal FUSE mountpoints.
+      # Trying every top-level runtime entry is harmless for ordinary directories
+      # and avoids depending on a mount namespace visible to findmnt/mountpoint.
+      fusermount3 -uz "$candidate" 2>/dev/null || umount -l "$candidate" 2>/dev/null || true
+    done
+    shopt -u nullglob dotglob
+  fi
+  rm -rf "$work_dir"
+}
+trap cleanup EXIT
+
 appimage="${images[0]}"
 (
   cd "$work_dir"
@@ -42,8 +69,88 @@ if ! readelf -d "$appdir/usr/bin/nian-media-worker" | grep -Fq '$ORIGIN/../lib';
   exit 1
 fi
 
+# Scan the actual extracted application tree after Tauri bundling. The scanner is
+# binary-safe and never prints the configured sentinel value.
+node "$repo_root/scripts/release/scan-release-secrets.mjs" "$appdir"
+
 env -u LD_LIBRARY_PATH -u NIAN_FFMPEG_LIB_DIR \
   node "$repo_root/scripts/release/stage-runtime-smoke.mjs" \
   "$appdir/usr/bin/nian-media-worker" "$work_dir/runtime-smoke"
 
-printf 'AppImage extracted-layout smoke passed: %s\n' "$appimage"
+# Launch the real AppImage under an isolated X11 + D-Bus session. Readiness is a
+# backend marker emitted only after Tauri setup has completed. Polling is bounded;
+# there is no arbitrary long sleep pretending to be a readiness check.
+desktop_home="$work_dir/desktop-home"
+mkdir -p \
+  "$desktop_home/.config" \
+  "$desktop_home/.cache" \
+  "$desktop_home/.local/share" \
+  "$desktop_home/runtime"
+chmod 0700 "$desktop_home/runtime"
+desktop_log="$work_dir/desktop.log"
+
+setsid env \
+  -u LD_LIBRARY_PATH \
+  -u NIAN_FFMPEG_LIB_DIR \
+  APPIMAGE_EXTRACT_AND_RUN=1 \
+  HOME="$desktop_home" \
+  XDG_CONFIG_HOME="$desktop_home/.config" \
+  XDG_CACHE_HOME="$desktop_home/.cache" \
+  XDG_DATA_HOME="$desktop_home/.local/share" \
+  XDG_RUNTIME_DIR="$desktop_home/runtime" \
+  GSETTINGS_BACKEND=memory \
+  NO_AT_BRIDGE=1 \
+  dbus-run-session -- \
+  xvfb-run -a \
+  "$appimage" --startup-hidden \
+  >"$desktop_log" 2>&1 &
+desktop_session_pid=$!
+
+ready=0
+deadline=$((SECONDS + 20))
+while (( SECONDS < deadline )); do
+  if grep -Fq 'desktop startup ready' "$desktop_log"; then
+    ready=1
+    break
+  fi
+  if ! kill -0 "$desktop_session_pid" 2>/dev/null; then
+    echo "desktop AppImage exited before startup readiness" >&2
+    sed -n '1,160p' "$desktop_log" >&2
+    wait "$desktop_session_pid" 2>/dev/null || true
+    desktop_session_pid=""
+    exit 1
+  fi
+  sleep 0.1
+done
+if [[ "$ready" -ne 1 ]]; then
+  echo "desktop AppImage did not reach startup readiness before the bounded deadline" >&2
+  sed -n '1,160p' "$desktop_log" >&2
+  exit 1
+fi
+
+# Prove it remains alive after readiness rather than emitting the marker on its
+# way to an immediate crash.
+for _ in $(seq 1 10); do
+  if ! kill -0 "$desktop_session_pid" 2>/dev/null; then
+    echo "desktop AppImage exited during the post-readiness stability interval" >&2
+    sed -n '1,160p' "$desktop_log" >&2
+    wait "$desktop_session_pid" 2>/dev/null || true
+    desktop_session_pid=""
+    exit 1
+  fi
+  sleep 0.1
+done
+
+kill -TERM -- "-$desktop_session_pid" 2>/dev/null || true
+for _ in $(seq 1 50); do
+  kill -0 "$desktop_session_pid" 2>/dev/null || break
+  sleep 0.1
+done
+if kill -0 "$desktop_session_pid" 2>/dev/null; then
+  echo "desktop AppImage did not terminate after controlled smoke shutdown" >&2
+  exit 1
+fi
+wait "$desktop_session_pid" 2>/dev/null || true
+desktop_session_pid=""
+
+printf 'AppImage worker and desktop startup smoke passed: %s\n' "$appimage"

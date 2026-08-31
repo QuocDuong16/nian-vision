@@ -87,10 +87,7 @@ if grep -RIE '/home/[^/]+/|[A-Za-z]:\\Users\\|BEGIN (RSA |OPENSSH )?PRIVATE KEY|
   echo "release staging contains an absolute build path or secret-like material" >&2
   exit 1
 fi
-if [[ -n "${NIAN_RELEASE_SECRET_SENTINEL:-}" ]] && grep -RIFq "$NIAN_RELEASE_SECRET_SENTINEL" "$stage"; then
-  echo "release staging contains the configured secret sentinel" >&2
-  exit 1
-fi
+node "$repo_root/scripts/release/scan-release-secrets.mjs" "$stage"
 
 node "$repo_root/scripts/release/stage-runtime-smoke.mjs"
 printf 'Linux x86_64 release runtime staged at %s\n' "$stage"

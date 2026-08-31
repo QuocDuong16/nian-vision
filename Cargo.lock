@@ -2594,6 +2594,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nian-release-verifier"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "minisign-verify",
+]
+
+[[package]]
 name = "nian-settings"
 version = "0.1.0"
 dependencies = [

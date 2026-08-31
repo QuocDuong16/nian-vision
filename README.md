@@ -4,8 +4,8 @@ Local-first desktop NVR (network video recorder) for IP cameras. The first
 supported camera is the TP-Link Tapo C200 over RTSP, with a camera-agnostic
 domain so other RTSP/ONVIF cameras can follow.
 
-**Status**: milestone **M8 (Linux distribution)** is implemented on top
-of M0–M6. The desktop persists camera definitions, recorder/storage settings,
+**Status**: milestone **M8 (Linux distribution)** is implemented and security-hardened on top
+of M0–M7. The desktop persists camera definitions, recorder/storage settings,
 launch-at-login preference and the single-camera desired recording intent in an
 authoritative platform app-data `settings.sqlite3`, while camera passwords remain
 in the operating system credential store. The M4 recording catalog at
@@ -22,9 +22,13 @@ Job Object containment so hard desktop termination cannot orphan media workers.
 M8 adds a Linux x86_64 AppImage release path with a pinned LGPL FFmpeg 8.0.3
 runtime, desktop/worker release-version compatibility, signed Tauri updater
 artifacts, explicit update confirmation, deterministic lifecycle handoff and
-release provenance/checksums. Windows and macOS distribution are deliberately
-deferred. Live camera viewing, simultaneous multi-camera recording and ONVIF
-remain outside M8.
+release provenance/checksums, release-time updater key-pair verification, final
+secret-canary scans, metadata consistency validation and an actual headless
+AppImage desktop startup smoke. Linux x86_64 is the current M8 validated release
+target. Windows x86_64 remains the primary future product target, with release
+packaging/signing validation deferred until a Forgejo Windows runner exists; macOS
+distribution is also deferred. Live camera viewing, simultaneous multi-camera
+recording and ONVIF remain outside M8.
 
 ## What it does today
 
@@ -144,7 +148,7 @@ and emits updater metadata plus SHA-256/provenance manifests.
 
 Production release configuration and private updater signing material are injected
 only through Forgejo secrets; they are not stored in the repository. See
-`docs/releasing.md` and ADR-0011. Windows and macOS release packaging are deferred.
+`docs/releasing.md` and ADR-0011. Windows x86_64 release packaging/signing validation is deferred pending a Forgejo Windows runner; macOS packaging is deferred.
 
 ## Supported camera protocols
 

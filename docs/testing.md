@@ -478,11 +478,18 @@ containment.
 
 ### Linux distribution and updater (M8)
 
-Release-script unit tests cover strict SemVer/tag convergence and mechanically
-reject FFmpeg GPL, nonfree and static-link configuration drift. The release
-workflow builds the exact SHA-256-pinned FFmpeg 8.0.3 source candidate and runs the
-full `nian-media-ffmpeg` fixture integration suite against those libraries before
-they are eligible for packaging.
+Release-script/tool tests cover strict SemVer/tag convergence, mechanically reject
+FFmpeg GPL/nonfree/static-link drift, verify immutable release-action pins and
+prove workflow secret scoping. Generated Tauri config tests require a public-only
+shape with an empty release `beforeBuildCommand`, and authority tests reject
+non-HTTPS/local/reserved-placeholder endpoints. Fixed offline updater signature
+vectors prove matching-key success plus mismatched-key, mutated-artifact and
+mutated-signature failure using `minisign-verify`, the same verifier family used by
+Tauri updater runtime.
+
+The release workflow builds the exact SHA-256-pinned FFmpeg 8.0.3 source candidate
+and runs the full `nian-media-ffmpeg` fixture integration suite against those
+libraries before they are eligible for packaging.
 
 `scripts/release/stage-linux.sh` then exercises the release worker with development
 library overrides removed. It verifies the installation-relative worker RUNPATH,
@@ -496,14 +503,26 @@ discovery, explicit installation confirmation and the update command boundary.
 Desktop Rust tests prove update admission blocks new lifecycle work before teardown
 and that updater teardown reaches Quitting/Stopped while preserving persisted
 Desired recording intent. The production AppImage path additionally extracts the
-actual built image and repeats installed-layout worker/media smoke checks before
-release metadata and checksums are finalized.
+actual built image and repeats installed-layout worker/media smoke checks. It then
+launches the actual AppImage under isolated Xvfb/D-Bus, waits on the backend
+`desktop_startup_ready` marker, proves a bounded post-readiness stability interval
+and terminates the smoke session. No camera, internet or stored keyring credential
+is required.
+
+Release security gates scan the staged runtime, extracted AppImage tree, frontend
+assets and finalized release directory for a configured binary-safe secret
+sentinel. Post-build cryptographic verification proves the generated AppImage and
+`.sig` match the configured updater public key. Final metadata tests and production
+validation prove `latest.json`, `release-manifest.json` and `SHA256SUMS.txt` all
+reference/hash the exact finalized AppImage and signature.
 
 ## Planned per milestone
 
-* **M9+**: simultaneous multi-camera orchestration and M10 ONVIF. Windows/macOS
-  distribution, live camera viewing, clip export, thumbnails/motion analysis and
-  AI/cloud behavior are not part of the Linux-only M8 release milestone.
+* **M9+**: simultaneous multi-camera orchestration and M10 ONVIF. Windows x86_64
+  remains the primary future product target, but M8 release packaging/signing
+  validation is deferred until a Forgejo Windows runner exists. macOS distribution,
+  live camera viewing, clip export, thumbnails/motion analysis and AI/cloud behavior
+  are outside the current Linux M8 release scope.
 * **Hardware/manual** (never in CI): real Tapo C200 via
   `NIAN_VISION_RTSP_URL` with
   `nian-media-worker record --rtsp-from-env ...` and/or an IPC-driven

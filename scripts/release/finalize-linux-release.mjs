@@ -12,6 +12,7 @@ import {
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { validateHttpsAuthority } from "./release-authority.mjs";
 import { collectVersions, validateVersions } from "./version-check.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -25,12 +26,7 @@ function sha256(path) {
 }
 
 function requireHttpsBase(raw) {
-  const url = new URL(raw);
-  if (url.protocol !== "https:") throw new Error("NIAN_RELEASE_DOWNLOAD_BASE_URL must use HTTPS");
-  if (["localhost", "127.0.0.1", "example.com"].includes(url.hostname.toLowerCase())) {
-    throw new Error("NIAN_RELEASE_DOWNLOAD_BASE_URL is not a production release authority");
-  }
-  return url.toString().replace(/\/$/, "");
+  return validateHttpsAuthority(raw, "NIAN_RELEASE_DOWNLOAD_BASE_URL").toString().replace(/\/$/, "");
 }
 
 function oneFile(suffix) {

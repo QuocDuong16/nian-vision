@@ -8,7 +8,7 @@ fi
 
 required=(
   cargo rustc node pnpm gcc make pkg-config curl sha256sum tar xz
-  readelf ldd file git
+  readelf ldd file git dbus-run-session xvfb-run xauth setsid fusermount3
 )
 for command in "${required[@]}"; do
   command -v "$command" >/dev/null 2>&1 || {

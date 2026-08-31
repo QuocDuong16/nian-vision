@@ -1,0 +1,11 @@
+[package]
+name = "nian-release-verifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+minisign-verify.workspace = true
+

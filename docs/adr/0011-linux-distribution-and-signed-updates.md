@@ -18,9 +18,10 @@ the release surface before one platform has been proven end to end.
 
 ### Linux x86_64 AppImage is the only M8 production target
 
-M8 ships `x86_64-unknown-linux-gnu` as an AppImage. Windows and macOS release
-packaging are deferred. Release CI builds on Debian 12 to keep a deliberate glibc
-baseline.
+M8 ships `x86_64-unknown-linux-gnu` as an AppImage. Windows x86_64 remains the
+primary future product target, but packaging/signing validation is deferred until
+a Forgejo Windows runner exists. macOS packaging is deferred. Release CI builds on
+Debian 12 to keep a deliberate glibc baseline.
 
 AppImage is also the updater artifact on Linux, avoiding two competing ownership
 models such as a distro package manager plus an in-app binary replacer.
@@ -60,12 +61,39 @@ M7's graceful shutdown ownership. Desired recording intent is preserved. If the
 installer handoff fails or returns after teardown, the current application
 restarts so it cannot remain stranded in Quitting.
 
-### Release configuration and private signing material stay out of Git
+### Release configuration and private signing material stay out of Git and ordinary steps
 
-Release-only Tauri configuration is generated from CI environment/secrets.
+Release-only Tauri configuration contains only the updater public key/endpoint and
+bundle/resource mapping. The updater private key and password are injected only
+into the signed AppImage build step, never job-wide. Frontend assets are built
+before that step and the release config disables `beforeBuildCommand`, preventing
+Vite/package lifecycle code from inheriting `TAURI_SIGNING_*`. The generated config
+is removed after post-build verification in successful CI.
+
 Production generation requires HTTPS updater/download authorities and rejects
-local/example endpoints. Finalized artifacts include checksums and non-secret
-provenance metadata; private keys and secret values are never embedded.
+local, loopback and reserved placeholder endpoints. Finalized artifacts include
+checksums and non-secret provenance metadata; private keys and secret values are
+never embedded.
+
+### Release-time verification defends against signing-secret misconfiguration
+
+Tauri runtime signature verification remains authoritative for downloaded updates.
+In addition, release CI verifies the exact generated AppImage and `.sig` against
+the exact public key configured into the release build before finalization. The
+release verifier uses `minisign-verify`, matching the verifier family used by
+`tauri-plugin-updater`; no custom signature algorithm is introduced.
+
+Fixed offline regression vectors cover matching key, mismatched key, mutated
+artifact and mutated signature. Secret-canary scans run at staging, extracted
+AppImage and finalized release boundaries. The actual AppImage is also launched
+under isolated Xvfb/D-Bus and must reach a backend readiness marker and remain
+stable for a bounded interval.
+
+Final metadata is mechanically revalidated so `latest.json`, the release manifest
+and `SHA256SUMS.txt` all identify/hash the exact finalized AppImage/signature.
+Forgejo artifact upload is not treated as production updater publication; a
+separate deployment must make immutable payloads available before exposing
+`latest.json`.
 
 ## Consequences
 
@@ -77,9 +105,9 @@ provenance metadata; private keys and secret values are never embedded.
   teardown invariants as explicit Quit.
 * Release CI is intentionally more expensive because it builds and tests the exact
   FFmpeg runtime that will ship.
-* Windows/macOS users do not yet receive a supported release artifact; those
-  platforms require separate future distribution decisions rather than copied
-  Linux assumptions.
+* Windows x86_64 release validation remains deferred for lack of an appropriate
+  Forgejo Windows runner; existing Windows-first runtime architecture remains in
+  scope and must not be removed. macOS distribution remains deferred.
 
 ## Rejected alternatives
 

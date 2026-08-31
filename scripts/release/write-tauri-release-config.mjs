@@ -1,6 +1,8 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+import { validateHttpsAuthority } from "./release-authority.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const appDir = resolve(root, "apps/nian-desktop");
@@ -13,20 +15,8 @@ function requireEnv(name) {
   return value;
 }
 
-function validateEndpoint(raw) {
-  const url = new URL(raw);
-  if (url.protocol !== "https:") throw new Error("NIAN_UPDATER_ENDPOINT must use HTTPS");
-  const host = url.hostname.toLowerCase();
-  if (
-    host === "localhost" ||
-    host === "127.0.0.1" ||
-    host.endsWith(".localhost") ||
-    host === "example.com" ||
-    host.endsWith(".example.com")
-  ) {
-    throw new Error("NIAN_UPDATER_ENDPOINT is not a production update authority");
-  }
-  return url.toString();
+export function validateEndpoint(raw) {
+  return validateHttpsAuthority(raw, "NIAN_UPDATER_ENDPOINT").toString();
 }
 
 function fromApp(path) {
@@ -37,14 +27,36 @@ function requireFile(path, label) {
   if (!existsSync(path)) throw new Error(`${label} is missing: ${path}`);
 }
 
-try {
+export function createReleaseConfig({ endpoint, pubkey, workerBase, appimageFiles }) {
+  return {
+    // Frontend assets are built before the signing step. Keeping this hook
+    // empty prevents Vite from inheriting TAURI_SIGNING_* at bundle time.
+    build: {
+      beforeBuildCommand: "",
+    },
+    bundle: {
+      targets: ["appimage"],
+      createUpdaterArtifacts: true,
+      externalBin: [fromApp(workerBase)],
+      linux: {
+        appimage: {
+          bundleMediaFramework: false,
+          files: appimageFiles,
+        },
+      },
+    },
+    plugins: {
+      updater: {
+        pubkey,
+        endpoints: [endpoint],
+      },
+    },
+  };
+}
+
+export function generateReleaseConfig() {
   const endpoint = validateEndpoint(requireEnv("NIAN_UPDATER_ENDPOINT"));
   const pubkey = requireEnv("NIAN_UPDATER_PUBLIC_KEY");
-  if (process.env.PRODUCTION_RELEASE === "true") {
-    requireEnv("TAURI_SIGNING_PRIVATE_KEY");
-    requireEnv("TAURI_SIGNING_PRIVATE_KEY_PASSWORD");
-  }
-
   const workerBase = resolve(stage, "tauri/nian-media-worker");
   requireFile(`${workerBase}-${target}`, "Tauri worker sidecar staging binary");
 
@@ -69,32 +81,20 @@ try {
     appimageFiles[destination] = fromApp(source);
   }
 
-  const config = {
-    bundle: {
-      targets: ["appimage"],
-      createUpdaterArtifacts: true,
-      externalBin: [fromApp(workerBase)],
-      linux: {
-        appimage: {
-          bundleMediaFramework: false,
-          files: appimageFiles,
-        },
-      },
-    },
-    plugins: {
-      updater: {
-        pubkey,
-        endpoints: [endpoint],
-      },
-    },
-  };
-
+  const config = createReleaseConfig({ endpoint, pubkey, workerBase, appimageFiles });
   const output = resolve(appDir, "tauri.release.generated.conf.json");
   writeFileSync(output, `${JSON.stringify(config, null, 2)}
 `);
-  process.stdout.write(`${output}
+  return output;
+}
+
+if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+  try {
+    const output = generateReleaseConfig();
+    process.stdout.write(`${output}
 `);
-} catch (error) {
-  console.error(`Tauri release configuration generation failed: ${error.message}`);
-  process.exitCode = 1;
+  } catch (error) {
+    console.error(`Tauri release configuration generation failed: ${error.message}`);
+    process.exitCode = 1;
+  }
 }
