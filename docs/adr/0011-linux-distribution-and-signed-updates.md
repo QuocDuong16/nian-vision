@@ -18,10 +18,11 @@ the release surface before one platform has been proven end to end.
 
 ### Linux x86_64 AppImage is the only M8 production target
 
-M8 ships `x86_64-unknown-linux-gnu` as an AppImage. Windows x86_64 remains the
-primary future product target, but packaging/signing validation is deferred until
-a Forgejo Windows runner exists. macOS packaging is deferred. Release CI builds on
-Debian 12 to keep a deliberate glibc baseline.
+M8 currently ships `x86_64-unknown-linux-gnu` as an AppImage. Windows x86_64 remains
+the next M8 release target and will use an explicit GitHub-hosted Windows runner
+such as `windows-2022`; packaging/signing is not yet implemented or marked
+validated. macOS packaging is deferred. Linux release CI builds inside Debian 12
+to keep a deliberate glibc baseline.
 
 AppImage is also the updater artifact on Linux, avoiding two competing ownership
 models such as a distro package manager plus an in-app binary replacer.
@@ -61,19 +62,38 @@ M7's graceful shutdown ownership. Desired recording intent is preserved. If the
 installer handoff fails or returns after teardown, the current application
 restarts so it cannot remain stranded in Quitting.
 
+### Forgejo remains source/quality authority; GitHub is release-only
+
+Forgejo remains the authoritative source repository and normal push/PR/quality CI
+platform. GitHub is a one-way mirror used only for release CI on GitHub-hosted
+platform runners and for public GitHub Releases. Release tags originate on Forgejo
+and must mirror to the same Git object on GitHub. Release preflight proves the tag
+ref, `GITHUB_SHA`, mirror actor and default-branch reachability before building.
+GitHub release automation never pushes source, changes versions or creates tags.
+
+The production workflow defaults to `contents: read`; only the final publication
+job receives `contents: write`. Platform builds transfer candidates through
+temporary GitHub Actions artifacts. The final job creates a draft GitHub Release,
+uploads all verified assets, downloads them back for filename/byte/checksum
+verification and only then publishes it. An already-published release is never
+overwritten.
+
 ### Release configuration and private signing material stay out of Git and ordinary steps
 
 Release-only Tauri configuration contains only the updater public key/endpoint and
 bundle/resource mapping. The updater private key and password are injected only
-into the signed AppImage build step, never job-wide. Frontend assets are built
-before that step and the release config disables `beforeBuildCommand`, preventing
+into the signed AppImage build step through the protected GitHub
+`production-release` Environment, never job-wide. Frontend assets are built before
+that step and the release config disables `beforeBuildCommand`, preventing
 Vite/package lifecycle code from inheriting `TAURI_SIGNING_*`. The generated config
 is removed after post-build verification in successful CI.
 
 Production generation requires HTTPS updater/download authorities and rejects
-local, loopback and reserved placeholder endpoints. Finalized artifacts include
-checksums and non-secret provenance metadata; private keys and secret values are
-never embedded.
+local, loopback and reserved placeholder endpoints. The current stable metadata
+endpoint is GitHub `releases/latest/download/latest.json`; finalized AppImage URLs
+use the exact tagged GitHub Release. Draft releases are therefore invisible to the
+updater. Finalized artifacts include checksums and non-secret provenance metadata;
+private keys and secret values are never embedded.
 
 ### Release-time verification defends against signing-secret misconfiguration
 
@@ -90,10 +110,9 @@ under isolated Xvfb/D-Bus and must reach a backend readiness marker and remain
 stable for a bounded interval.
 
 Final metadata is mechanically revalidated so `latest.json`, the release manifest
-and `SHA256SUMS.txt` all identify/hash the exact finalized AppImage/signature.
-Forgejo artifact upload is not treated as production updater publication; a
-separate deployment must make immutable payloads available before exposing
-`latest.json`.
+and `SHA256SUMS.txt` all identify/hash the exact finalized AppImage/signature and
+mirrored tag commit. A separate GitHub verification job repeats those checks before
+publication; GitHub Actions artifacts are transfer-only and are not public releases.
 
 ## Consequences
 
@@ -105,9 +124,10 @@ separate deployment must make immutable payloads available before exposing
   teardown invariants as explicit Quit.
 * Release CI is intentionally more expensive because it builds and tests the exact
   FFmpeg runtime that will ship.
-* Windows x86_64 release validation remains deferred for lack of an appropriate
-  Forgejo Windows runner; existing Windows-first runtime architecture remains in
-  scope and must not be removed. macOS distribution remains deferred.
+* Windows x86_64 remains the next M8 release slice and can use an explicit
+  GitHub-hosted Windows runner such as `windows-2022`; it is not yet implemented or
+  marked validated. Existing Windows-first runtime architecture remains in scope
+  and must not be removed. macOS distribution remains deferred.
 
 ## Rejected alternatives
 

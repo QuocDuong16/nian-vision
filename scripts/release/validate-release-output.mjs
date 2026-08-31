@@ -29,6 +29,8 @@ export function validateReleaseOutput({
   outputDir,
   expectedVersion,
   expectedPlatform = "linux-x86_64",
+  expectedArtifactBaseUrl,
+  expectedCommit,
 }) {
   const output = resolve(outputDir);
   const appImageName = `Nian-Vision_${expectedVersion}_linux-x86_64.AppImage`;
@@ -49,6 +51,17 @@ export function validateReleaseOutput({
   if (decodeURIComponent(basename(url.pathname)) !== appImageName) {
     throw new Error("latest.json artifact URL filename does not match the finalized AppImage");
   }
+  if (expectedArtifactBaseUrl) {
+    const expectedBase = validateHttpsAuthority(expectedArtifactBaseUrl, "expected release base URL").toString().replace(/\/$/, "");
+    if (url.toString() !== `${expectedBase}/${appImageName}`) {
+      throw new Error("latest.json artifact URL does not match the expected tagged GitHub Release asset URL");
+    }
+  }
+  const releaseNotes = readFileSync(resolve(output, "RELEASE_NOTES.md"), "utf8").trim();
+  if (!releaseNotes.startsWith(`# Nian Vision ${expectedVersion}\n`) && releaseNotes !== `# Nian Vision ${expectedVersion}`) {
+    throw new Error("RELEASE_NOTES.md heading does not match the application version");
+  }
+  if (latest.notes !== releaseNotes) throw new Error("latest.json notes differ from RELEASE_NOTES.md");
   const signatureText = readFileSync(signature, "utf8").trim();
   if (platform.signature !== signatureText) {
     throw new Error("latest.json signature does not match the finalized signature file");
@@ -56,6 +69,7 @@ export function validateReleaseOutput({
 
   const appImageHash = sha256(appImage);
   if (manifest.version !== expectedVersion) throw new Error("release manifest version does not match application version");
+  if (expectedCommit && manifest.commit !== expectedCommit) throw new Error("release manifest commit does not match the release tag commit");
   if (manifest.platform !== expectedPlatform || manifest.updater?.platform_key !== expectedPlatform) {
     throw new Error("release manifest platform does not match the Linux updater target");
   }
@@ -100,6 +114,8 @@ function main() {
     outputDir: resolve(root, "dist/release"),
     expectedVersion,
     expectedPlatform: releaseConfig.platform,
+    expectedArtifactBaseUrl: process.env.NIAN_EXPECTED_RELEASE_BASE_URL?.trim() || undefined,
+    expectedCommit: process.env.NIAN_EXPECTED_RELEASE_COMMIT?.trim() || undefined,
   });
   process.stdout.write("finalized Linux updater metadata validation passed\n");
 }

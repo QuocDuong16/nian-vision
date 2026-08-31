@@ -11,6 +11,9 @@ const version = "0.1.0";
 const platform = "linux-x86_64";
 const appImageName = `Nian-Vision_${version}_linux-x86_64.AppImage`;
 const signatureName = `${appImageName}.sig`;
+const releaseBase = "https://github.com/niand/nian-vision/releases/download/v0.1.0";
+const commit = "0b468e5520cf89ee4a10c31de92e48a975c3ffe2";
+const notes = "# Nian Vision 0.1.0\n\nFixture release notes.";
 
 function sha256(data) {
   return createHash("sha256").update(data).digest("hex");
@@ -22,19 +25,21 @@ function fixture() {
   const sig = Buffer.from("tauri-signature-base64\n");
   writeFileSync(join(dir, appImageName), app);
   writeFileSync(join(dir, signatureName), sig);
+  writeFileSync(join(dir, "RELEASE_NOTES.md"), `${notes}\n`);
   const latest = {
     version,
-    notes: "fixture",
+    notes,
     pub_date: "2026-08-31T00:00:00Z",
     platforms: {
       [platform]: {
         signature: sig.toString("utf8").trim(),
-        url: `https://downloads.niand.io.vn/releases/${appImageName}`,
+        url: `${releaseBase}/${appImageName}`,
       },
     },
   };
   const manifest = {
     version,
+    commit,
     platform,
     appimage: { filename: appImageName, sha256: sha256(app), bytes: app.length },
     updater: {
@@ -52,6 +57,7 @@ function fixture() {
     [signatureName, sig],
     ["latest.json", readFileSync(join(dir, "latest.json"))],
     ["release-manifest.json", readFileSync(join(dir, "release-manifest.json"))],
+    ["RELEASE_NOTES.md", readFileSync(join(dir, "RELEASE_NOTES.md"))],
   ];
   writeFileSync(
     join(dir, "SHA256SUMS.txt"),
@@ -65,7 +71,13 @@ function rewriteJson(dir, name, value) {
 }
 
 function validate(dir) {
-  return validateReleaseOutput({ outputDir: dir, expectedVersion: version, expectedPlatform: platform });
+  return validateReleaseOutput({
+    outputDir: dir,
+    expectedVersion: version,
+    expectedPlatform: platform,
+    expectedArtifactBaseUrl: releaseBase,
+    expectedCommit: commit,
+  });
 }
 
 test("finalized updater metadata is internally consistent", () => {
@@ -109,4 +121,33 @@ test("SHA256SUMS stale AppImage entry fails", () => {
   );
   writeFileSync(join(dir, "SHA256SUMS.txt"), sums);
   assert.throws(() => validate(dir), /SHA256SUMS AppImage/);
+});
+
+
+test("latest.json wrong tagged GitHub Release base fails", () => {
+  const { dir, latest } = fixture();
+  latest.platforms[platform].url = `https://github.com/niand/nian-vision/releases/download/v9.9.9/${appImageName}`;
+  rewriteJson(dir, "latest.json", latest);
+  assert.throws(() => validate(dir), /expected tagged GitHub Release asset URL/);
+});
+
+test("release manifest commit drift fails", () => {
+  const { dir, manifest } = fixture();
+  manifest.commit = "f".repeat(40);
+  rewriteJson(dir, "release-manifest.json", manifest);
+  assert.throws(() => validate(dir), /manifest commit/);
+});
+
+test("latest notes must match RELEASE_NOTES.md", () => {
+  const { dir, latest } = fixture();
+  latest.notes = "drift";
+  rewriteJson(dir, "latest.json", latest);
+  assert.throws(() => validate(dir), /notes differ/);
+});
+
+
+test("release notes heading version drift fails", () => {
+  const { dir } = fixture();
+  writeFileSync(join(dir, "RELEASE_NOTES.md"), "# Nian Vision 9.9.9\n");
+  assert.throws(() => validate(dir), /heading does not match/);
 });

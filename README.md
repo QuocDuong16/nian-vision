@@ -25,9 +25,10 @@ artifacts, explicit update confirmation, deterministic lifecycle handoff and
 release provenance/checksums, release-time updater key-pair verification, final
 secret-canary scans, metadata consistency validation and an actual headless
 AppImage desktop startup smoke. Linux x86_64 is the current M8 validated release
-target. Windows x86_64 remains the primary future product target, with release
-packaging/signing validation deferred until a Forgejo Windows runner exists; macOS
-distribution is also deferred. Live camera viewing, simultaneous multi-camera
+target. Windows x86_64 remains the next M8 release target and will use an explicit
+GitHub-hosted Windows runner such as `windows-2022`; its packaging/signing path is
+not yet implemented or marked validated. macOS distribution is also deferred.
+Live camera viewing, simultaneous multi-camera
 recording and ONVIF remain outside M8.
 
 ## What it does today
@@ -146,9 +147,14 @@ stages the worker plus app-owned shared libraries, runs clean-runtime media smok
 tests, builds the AppImage, re-opens the AppImage for installed-layout smoke tests,
 and emits updater metadata plus SHA-256/provenance manifests.
 
-Production release configuration and private updater signing material are injected
-only through Forgejo secrets; they are not stored in the repository. See
-`docs/releasing.md` and ADR-0011. Windows x86_64 release packaging/signing validation is deferred pending a Forgejo Windows runner; macOS packaging is deferred.
+Forgejo remains the authoritative source repository and normal push/PR/quality CI
+platform. GitHub is a one-way mirror used only for hosted release CI and public
+GitHub Releases. Release tags originate on Forgejo and the mirror must synchronize
+tags as well as branches. Private updater signing material is scoped to the protected
+GitHub `production-release` environment and only the signing step receives it. See
+`docs/releasing.md` and ADR-0011. Windows x86_64 packaging is the next M8 release
+slice and will use an explicit GitHub-hosted Windows runner; it is not yet marked
+validated. macOS packaging remains deferred.
 
 ## Supported camera protocols
 

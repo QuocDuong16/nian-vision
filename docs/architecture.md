@@ -452,9 +452,10 @@ containment or kills/reaps the uncontained child. See ADR-0010.
 ## Linux distribution and signed updates (M8)
 
 M8 currently defines one CI-validated production distribution target:
-`x86_64-unknown-linux-gnu`, shipped as an AppImage. Windows x86_64 remains the
-primary future product target, but release packaging/signing validation is
-deferred until a Forgejo Windows runner exists. macOS packaging is also deferred.
+`x86_64-unknown-linux-gnu`, shipped as an AppImage. Windows x86_64 remains the next
+M8 release target and will use an explicit GitHub-hosted Windows runner such as
+`windows-2022`; packaging/signing is not yet implemented or marked validated.
+macOS packaging is also deferred.
 
 The AppImage contains the desktop host, a sibling `nian-media-worker`, and an
 application-owned FFmpeg 8.0.3 shared runtime. The pre-bundle worker is linked with
@@ -492,16 +493,25 @@ AppImage/signature against the configured public key before the generated config
 is removed.
 
 Production authority validation rejects non-HTTPS, local/loopback and reserved
-placeholder hosts. The Forgejo release workflow builds on Debian 12, validates
-version/tag equality, runs frontend/Rust/media gates, performs clean staged and
-extracted-AppImage worker smoke, launches the actual AppImage under isolated
-Xvfb/D-Bus until the backend emits its startup-ready marker, and scans staging,
-extracted application files, frontend assets and finalized artifacts for a
-configured secret canary. Finalization emits `latest.json`, `release-manifest.json`,
-`BUILD_METADATA.json` and `SHA256SUMS.txt`; a separate validator proves those
-metadata fields and hashes describe the exact finalized AppImage/signature.
-Forgejo artifact upload remains generation/transport only, not production updater
-publication.
+placeholder hosts. Forgejo remains the authoritative source repository and normal
+CI authority; GitHub is a one-way mirror used only for hosted release CI and public
+GitHub Releases. Release tags originate on Forgejo, mirror to the same Git object,
+and are checked against `GITHUB_SHA`, the configured mirror actor and the mirrored
+default branch before any release build starts.
+
+The Linux release build runs on a GitHub-hosted Ubuntu runner with the actual build
+inside `rust:1.98.0-bookworm`, preserving the accepted Debian 12/glibc baseline. It
+runs frontend/Rust/media gates, clean staged and extracted-AppImage worker smoke,
+launches the actual AppImage under isolated Xvfb/D-Bus until the backend emits its
+startup-ready marker, and scans staging, extracted application files, frontend
+assets and finalized artifacts for a configured secret canary. Finalization emits
+`latest.json`, `release-manifest.json`, `BUILD_METADATA.json` and `SHA256SUMS.txt`;
+a separate verification job proves those metadata fields, commit identity, hashes
+and updater signature describe the exact finalized candidate. Publication is a
+separate `contents: write` job: it creates a draft GitHub Release, uploads every
+verified asset, downloads them back for filename/byte/checksum validation, and only
+then publishes the release. Draft releases are never advertised by the stable
+`releases/latest/download/latest.json` updater endpoint.
 
 See ADR-0011 and `docs/releasing.md` for the release contract.
 

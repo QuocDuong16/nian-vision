@@ -1,128 +1,235 @@
-# Releasing Nian Vision on Linux
+# Releasing Nian Vision
 
-M8 currently has one CI-validated production release target: **Linux x86_64
-AppImage**. Windows x86_64 remains the primary future desktop product target, but
-its packaging/signing validation is explicitly deferred until a Forgejo Windows
-runner is available. macOS distribution is also deferred.
+## Authority model
 
-## Release contract
+Nian Vision uses an explicit hybrid CI model:
 
-Production releases are tag-driven. The Forgejo `Release Linux` workflow requires
-a `v<SemVer>` tag whose version exactly matches all committed version surfaces:
+```text
+Forgejo
+  -> authoritative source repository
+  -> normal push/PR/quality CI
+  -> self-hosted DIND resources
 
-* `[workspace.package].version` in `Cargo.toml`;
-* `apps/nian-desktop/tauri.conf.json`;
-* root `package.json`; and
-* `ui/package.json`.
+GitHub
+  -> one-way mirror of Forgejo
+  -> release CI only
+  -> GitHub-hosted platform runners
+  -> GitHub Releases for public binaries
+```
+
+GitHub is not a second development source of truth. Ordinary commits, pull-request
+quality gates, version changes and release tags originate on Forgejo. No GitHub
+release workflow pushes source changes back to Forgejo, edits source, bumps a
+version or creates a tag.
+
+The mirror must synchronize **tags as well as branches**. A release therefore flows:
+
+```text
+Forgejo commit
+-> Forgejo vX.Y.Z tag
+-> mirror pushes the same tag/object to GitHub
+-> GitHub Actions validates the mirrored identity
+-> release candidate builds
+-> draft GitHub Release
+-> asset verification
+-> publish
+```
+
+## GitHub mirror and tag protection
+
+Configure the GitHub mirror repository with repository variable
+`RELEASE_MIRROR_ACTOR` set to the GitHub identity used by the Forgejo mirror. The
+release preflight rejects tag events delivered by another actor.
+
+Also configure a GitHub tag ruleset for `v*` outside the repository:
+
+- only the release/mirror identity may create or update release tags;
+- normal developers and automation must not create `v*` tags directly on GitHub;
+- release tags should not be force-updated or deleted as part of normal operation.
+
+The workflow additionally proves that `GITHUB_REF` is an actual `refs/tags/v*`,
+checked-out `HEAD == GITHUB_SHA`, the dereferenced tag commit equals `GITHUB_SHA`,
+and the release commit is reachable from the mirrored default branch. These checks
+are defense in depth and do not replace the tag ruleset.
+
+## Version and release-note contract
+
+The `vX.Y.Z` tag must exactly match all committed version surfaces:
+
+- `[workspace.package].version` in `Cargo.toml`;
+- `apps/nian-desktop/tauri.conf.json`;
+- root `package.json`; and
+- `ui/package.json`.
 
 `scripts/release/version-check.mjs` rejects malformed SemVer, version drift, tag
-mismatch and a dirty source tree in production mode. Release CI never creates or
-modifies tags.
+mismatch and dirty production source. Release CI never modifies tags or versions.
 
-The release runner is Debian 12 with Rust 1.98.0, Node 26.7.0 and pnpm 11.22.0.
-This deliberately constrains the Linux glibc baseline rather than silently
-inheriting requirements from a newer developer workstation.
+`RELEASE_NOTES.md` is the single release-notes source. The finalized copy is used
+for both Tauri `latest.json` notes and the GitHub Release body, preventing separate
+Forgejo/GitHub release-note histories. Update it in the authoritative Forgejo
+release commit before creating the tag.
 
-## Release secrets and scope
+## GitHub production-release environment
 
-The release job has **no release secrets at job scope**. Each value is injected
-only into the step that consumes it:
+The Linux signing job, verification job and final publication job use the GitHub
+Environment `production-release`. Configure these Environment secrets:
 
-| Forgejo secret | Scope | Purpose |
+| Secret | Scope | Purpose |
 |---|---|---|
-| `TAURI_SIGNING_PRIVATE_KEY` | signed AppImage build step only | long-lived Tauri updater signing key |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | signed AppImage build step only | required passphrase for that key |
-| `NIAN_UPDATER_PUBLIC_KEY` | release-config generation and post-build signature verification | public key embedded in the application and used to verify the generated AppImage |
-| `NIAN_UPDATER_ENDPOINT` | release-config generation only | HTTPS URL returning updater metadata |
-| `NIAN_RELEASE_DOWNLOAD_BASE_URL` | finalization only | HTTPS base URL written into finalized `latest.json` |
-| `NIAN_RELEASE_SECRET_SENTINEL` | staging, extracted-AppImage smoke and final artifact scan | optional canary used to detect secret leakage |
+| `TAURI_SIGNING_PRIVATE_KEY` | Linux AppImage signing step only | long-lived Tauri updater signing key |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Linux AppImage signing step only | required key passphrase |
+| `NIAN_UPDATER_PUBLIC_KEY` | release-config generation and signature-verification steps | public updater verification key |
+| `NIAN_RELEASE_SECRET_SENTINEL` | staging/extracted/final scan steps | optional secret-leak canary |
 
-The frontend is fully built **before** private updater signing material enters the
-environment. The generated Tauri release config explicitly sets
-`beforeBuildCommand` to an empty command, so the signed Tauri bundle step does not
-spawn Vite while `TAURI_SIGNING_*` exists. Vite keeps its default `VITE_*` exposure
-model; no broad `TAURI_*` `envPrefix` is configured.
+The private updater key/password never exist at workflow/job scope and are not
+available to checkout, dependency installation, frontend builds, tests, FFmpeg,
+ordinary Cargo commands, staging, metadata generation, artifact transfer or
+publication. Vite is built before signing secrets enter the environment, and the
+release Tauri config disables `beforeBuildCommand` so signing cannot spawn Vite.
 
-`apps/nian-desktop/tauri.release.generated.conf.json` contains only public updater
-configuration plus bundle/resource mapping. It never receives or serializes the
-private signing key/password, is gitignored, and is removed after cryptographic
-post-build verification in successful CI. A failed job still runs in an ephemeral
-CI workspace, so the non-secret generated config is not a persistence boundary.
+The current GitHub-hosted updater endpoint is deterministic and needs no secret:
 
-Production updater/download authorities must use HTTPS and must not be localhost,
-loopback, RFC example/invalid/test placeholder hosts, or equivalent subdomains.
-The metadata endpoint and artifact/CDN host may intentionally be different.
+```text
+https://github.com/<owner>/<repo>/releases/latest/download/latest.json
+```
 
-## Release security gates
+`latest` resolves only published GitHub Releases, so a draft release is never
+advertised to clients. If updater metadata later moves to a separate HTTPS static
+host, add `NIAN_UPDATER_ENDPOINT` to the Environment and preserve the same
+non-placeholder HTTPS validation. Artifact URLs in `latest.json` always use the
+exact tagged GitHub Release URL.
 
-All production `uses:` actions in `.forgejo/workflows/release.yml` are pinned to
-immutable commit SHAs. Mutable action tags are not accepted by the release workflow.
+Future Windows Authenticode material belongs in the same protected Environment,
+but only once Windows packaging enters M8. Apple signing/notarization material is
+out of current scope.
 
-Tauri signs the generated AppImage, then `nian-release-verifier` independently
-verifies the **exact AppImage bytes** against the generated `.AppImage.sig` and the
-public key stored in the generated Tauri config. The verifier uses the same
-`base64` + `minisign-verify` representation used by `tauri-plugin-updater`; it is a
-misconfiguration defense, not a replacement for Tauri runtime verification.
-Release tests include fixed offline vectors proving:
+## GitHub Actions permissions and dependency pins
 
-* key A signature + public key A succeeds;
-* key A signature + public key B fails;
-* a mutated artifact fails; and
-* a mutated signature fails.
+`.github/workflows/release.yml` defaults to:
 
-The configured secret sentinel is scanned at three boundaries: staged runtime,
-actual extracted AppImage tree, and finalized release output. The final scan also
-covers built frontend assets. The scanner is binary-safe and reports only the file
-path on failure, never the sentinel value.
+```yaml
+permissions:
+  contents: read
+```
 
-## Pipeline
+Build and verification jobs receive no repository write permission. Only
+`publish-release` overrides this with `contents: write`. The workflow does not
+grant actions/packages/issues/pull-request write authority. Signing secrets are
+not repository write authority.
 
-`.forgejo/workflows/release.yml` executes the following sequence:
+Every third-party `uses:` action is pinned to an exact 40-character commit SHA
+with a human-readable version comment. Structural release tests reject floating
+action tags. GitHub Release publication uses the GitHub-hosted `gh` CLI rather
+than another third-party release action.
 
-1. validate release tag/version/source cleanliness;
-2. install pinned toolchain/runtime prerequisites;
-3. run release-script, workflow-structure and updater-verifier tests;
-4. run frontend lint/typecheck/tests and build final frontend assets without signing secrets;
-5. download and SHA-256 verify FFmpeg 8.0.3;
-6. build the minimal LGPL, shared-only FFmpeg runtime;
-7. mechanically validate FFmpeg GPL/nonfree/shared configuration;
-8. run the real `nian-media-ffmpeg` fixture integration suite against that build;
-9. run Rust fmt/clippy/workspace tests against the candidate FFmpeg ABI;
-10. build the release media worker;
-11. stage worker, app-owned FFmpeg libraries, notices and build metadata;
-12. run clean staged worker/media smoke and the staging secret scan;
-13. generate public-only release Tauri configuration;
-14. inject the private updater key/password only for the signed AppImage build;
-15. cryptographically verify the generated AppImage/signature against the configured public key;
-16. dispose the generated Tauri release config;
-17. extract the actual AppImage and repeat installed worker/media checks;
-18. launch the **actual AppImage** under isolated Xvfb + D-Bus, wait for the backend startup-ready marker, prove a bounded post-ready stability interval, then terminate the smoke session;
-19. scan the extracted application tree for the configured secret sentinel;
-20. finalize `latest.json`, release manifest and SHA-256 manifest;
-21. validate finalized version/platform/URL/signature/hash relationships;
-22. verify `SHA256SUMS.txt` against actual finalized bytes;
-23. scan frontend assets and the complete finalized release directory for the secret sentinel; and
-24. upload the finalized directory as a Forgejo CI artifact.
+## Build topology
 
-The worker checks remain unchanged: application/protocol HELLO, exact application
-version, FFmpeg ABI 62/62/60, fixture `camera.probe`, fixture `playback.prepare`,
-application-local RUNPATH and no dependency on `NIAN_FFMPEG_LIB_DIR` or
-`LD_LIBRARY_PATH`.
+Current topology:
+
+```text
+release-preflight
+      |
+      v
+build-linux
+      |
+      v
+verify-release
+      |
+      v
+publish-release
+```
+
+When Windows packaging is implemented, `build-windows` becomes an independent
+peer of `build-linux`, both feeding `verify-release`. Independent platform builds
+should not be serialized without a reason.
+
+### Linux build
+
+`build-linux` runs on an explicit GitHub-hosted `ubuntu-24.04` runner with the
+actual build inside `rust:1.98.0-bookworm`. The container preserves the accepted
+Debian 12/glibc 2.36 release baseline rather than inheriting the host runner's
+glibc. The job also pins Node 26.7.0 and pnpm 11.22.0.
+
+It preserves all accepted Linux M8 gates:
+
+1. exact source/tag/version validation;
+2. SHA-256-pinned FFmpeg 8.0.3 source;
+3. shared LGPL runtime with GPL/nonfree rejection;
+4. media fixture integration against the release FFmpeg candidate;
+5. Rust fmt/clippy/workspace tests;
+6. release worker build and application-local FFmpeg closure;
+7. clean worker HELLO/version/ABI 62/62/60 probe/playback smoke;
+8. public-only Tauri release config;
+9. private signing key/password injected only for AppImage signing;
+10. post-build minisign-compatible public/private key verification;
+11. extracted AppImage worker smoke and real desktop Xvfb/D-Bus startup smoke;
+12. staged/extracted/final secret-canary scans;
+13. finalized `latest.json`, release-manifest and SHA-256 consistency; and
+14. upload of `linux-release-candidate` as a temporary GitHub Actions artifact.
+
+Temporary Actions artifacts are build-transfer objects, not the public release.
+
+### Verification job
+
+`verify-release` downloads the Linux candidate and independently revalidates:
+
+- exact tag/HEAD identity;
+- application version;
+- exact GitHub tagged asset URL;
+- release-manifest commit/hash relationships;
+- `latest.json` signature and release-notes consistency;
+- every `SHA256SUMS.txt` entry;
+- finalized AppImage signature using `NIAN_UPDATER_PUBLIC_KEY`; and
+- final secret sentinel boundary.
+
+Only this validated directory is uploaded as `verified-release` for publication.
+Any required platform build or verification failure means there is no public
+release.
+
+## Draft-first GitHub publication
+
+`publish-release` alone receives `contents: write`. It consumes only
+`verified-release` and never source-build artifacts directly.
+
+Publication ordering is:
+
+```text
+create draft release for existing mirrored tag
+-> upload every finalized asset
+-> download the draft assets back from GitHub
+-> compare filenames and bytes to verified-release
+-> verify SHA256SUMS again
+-> publish the draft as the latest release
+```
+
+An already-published release is never overwritten. A failed attempt may leave a
+draft, which a retry can delete and recreate. This remains compatible with GitHub
+immutable releases because mutability is required only while the release is a
+draft; verified publication is the terminal transition.
+
+The expected public assets currently include:
+
+- `Nian-Vision_X.Y.Z_linux-x86_64.AppImage`;
+- matching `.AppImage.sig`;
+- `latest.json`;
+- `release-manifest.json`;
+- `SHA256SUMS.txt`;
+- `RELEASE_NOTES.md`;
+- `THIRD_PARTY_NOTICES.txt`; and
+- FFmpeg build/license/provenance files.
+
+No generic `app.AppImage` or `setup.exe` filename is a public release contract.
 
 ## Updater behavior
 
-The Settings screen exposes a manual Check for updates action. Checking does not
-stop recording. Installation requires explicit confirmation and re-checks the
-expected version.
-
-Runtime ordering remains:
+Runtime verification remains Tauri-owned:
 
 ```text
 check/update selection
 -> download AppImage
--> Tauri verifies updater signature with the embedded public key
+-> Tauri verifies updater signature with embedded public key
 -> verified bytes exist
--> enter terminal update lifecycle / close new admission
+-> enter terminal M7 update lifecycle / close new admission
 -> gracefully stop RecordingController
 -> close playback sessions and pins
 -> cancel/reap probe
@@ -132,59 +239,23 @@ check/update selection
 -> persisted desired recording restores
 ```
 
-Release-time signature verification only catches a misconfigured public/private
-key pair before publication. It does **not** replace Tauri's built-in runtime
-verification, and updater installation never begins while M7 teardown is incomplete.
-`recording_enabled` is never cleared merely because an update is installed.
+Release-time signature verification only catches signing-secret/public-key
+misconfiguration before publication. It does not replace Tauri runtime
+verification. `recording_enabled` is never cleared because an update installs.
 
-## Release outputs and metadata consistency
+## Platform status
 
-The finalized release directory contains:
+- **Linux x86_64 AppImage**: current M8 CI-validated release target.
+- **Windows x86_64**: next primary product release target. Packaging/signing
+  validation is not implemented or marked tested yet. It will use an explicitly
+  selected GitHub-hosted Windows runner such as `windows-2022`, not Forgejo DIND.
+- **macOS**: distribution remains out of current scope.
 
-* `Nian-Vision_<version>_linux-x86_64.AppImage`;
-* the matching `.AppImage.sig` Tauri v2 updater signature;
-* `latest.json`;
-* `release-manifest.json`;
-* `BUILD_METADATA.json`;
-* `SHA256SUMS.txt`; and
-* FFmpeg license/build-notice evidence.
-
-`validate-release-output.mjs` proves that `latest.json` version/platform/URL/signature,
-release-manifest filenames/hashes and `SHA256SUMS.txt` all describe the exact
-finalized AppImage and signature. No updater metadata may point back to Tauri's
-pre-finalization filename.
-
-## Publication is a separate deployment step
-
-The Forgejo workflow **generates, validates and uploads a CI artifact**. That
-artifact upload does not update the production updater endpoint and must not be
-described as publication.
-
-A deployment process must publish only a release directory that passed every gate
-above. Publish immutable payloads first (AppImage, `.sig`, checksums/manifests),
-then make `latest.json` visible **last** so the production updater endpoint never
-advertises an artifact before its bytes/signature are available. A metadata/CDN
-split is valid as long as both authorities remain HTTPS.
-
-Rollback normally means publishing a newer fixed release; the updater does not
-silently downgrade clients.
-
-## Windows status
-
-* **Linux x86_64 AppImage**: current M8 CI-validated release target.
-* **Windows x86_64**: primary future product target; application/runtime source
-  contracts remain intact, but installer/build/signing validation is deferred
-  until an appropriate Forgejo Windows runner exists. Do not mark Windows release
-  packaging or signing as tested yet.
-* **macOS**: distribution remains out of current scope.
-
-The lack of a Windows runner is an infrastructure constraint, not a Linux M8
-implementation failure, and no Windows-first runtime architecture should be
-removed because release CI is Linux-only today.
+The hybrid migration intentionally happens before Windows packaging so the next
+M8 slice can use a real hosted Windows runner without weakening the already
+validated Linux path.
 
 ## Local validation
-
-Release-independent checks can be run without production signing secrets:
 
 ```bash
 pnpm release:test
@@ -198,6 +269,6 @@ pnpm test
 pnpm build
 ```
 
-A full local AppImage proof additionally needs Linux desktop packaging prerequisites
-(Xvfb, D-Bus, FUSE helper) and a disposable Tauri signing key. Never substitute a
-local disposable key for the production updater trust root.
+A full local AppImage proof additionally needs Linux desktop packaging
+prerequisites (Xvfb, D-Bus, FUSE helper) and a disposable Tauri signing key. Never
+substitute a local disposable key for the production updater trust root.

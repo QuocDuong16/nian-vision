@@ -1,87 +1,144 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 
-const workflow = readFileSync(new URL("../../.forgejo/workflows/release.yml", import.meta.url), "utf8");
+const githubWorkflowPath = new URL("../../.github/workflows/release.yml", import.meta.url);
+const forgejoReleasePath = new URL("../../.forgejo/workflows/release.yml", import.meta.url);
+const forgejoQualityPath = new URL("../../.forgejo/workflows/quality.yml", import.meta.url);
+const workflow = readFileSync(githubWorkflowPath, "utf8");
 const viteConfig = readFileSync(new URL("../../ui/vite.config.ts", import.meta.url), "utf8");
 
-function stepsByName() {
-  const parts = workflow.split(/^      - name: /m).slice(1);
-  return new Map(parts.map((part) => {
-    const newline = part.indexOf("\n");
-    return [part.slice(0, newline).trim(), part.slice(newline + 1)];
-  }));
+function jobBody(name) {
+  const marker = `  ${name}:\n`;
+  const start = workflow.indexOf(marker);
+  assert.ok(start >= 0, `missing job ${name}`);
+  const rest = workflow.slice(start + marker.length);
+  const next = rest.search(/^  [a-zA-Z0-9_-]+:\n/m);
+  return next >= 0 ? rest.slice(0, next) : rest;
 }
 
-const steps = stepsByName();
+function stepBody(job, name) {
+  const body = jobBody(job);
+  const marker = `      - name: ${name}\n`;
+  const start = body.indexOf(marker);
+  assert.ok(start >= 0, `missing step ${job}/${name}`);
+  const rest = body.slice(start + marker.length);
+  const next = rest.search(/^      - name: /m);
+  return next >= 0 ? rest.slice(0, next) : rest;
+}
 
-test("release job-level environment contains no release secrets", () => {
-  const beforeSteps = workflow.slice(0, workflow.indexOf("    steps:"));
-  assert.equal(beforeSteps.includes("${{ secrets."), false);
-  assert.equal(beforeSteps.includes("TAURI_SIGNING_PRIVATE_KEY"), false);
-  assert.equal(beforeSteps.includes("TAURI_SIGNING_PRIVATE_KEY_PASSWORD"), false);
+test("Forgejo production release workflow is removed while normal quality CI remains", () => {
+  assert.equal(existsSync(forgejoReleasePath), false);
+  assert.equal(existsSync(githubWorkflowPath), true);
+  assert.equal(existsSync(forgejoQualityPath), true);
+  const quality = readFileSync(forgejoQualityPath, "utf8");
+  assert.match(quality, /pull_request:/);
+  assert.match(quality, /cargo clippy/);
+  assert.match(quality, /cargo test/);
 });
 
-test("updater private signing material is scoped only to the signed AppImage step", () => {
-  const build = steps.get("Build signed updater AppImage");
-  assert.ok(build);
-  assert.match(build, /TAURI_SIGNING_PRIVATE_KEY: \${{ secrets\.TAURI_SIGNING_PRIVATE_KEY }}/);
-  assert.match(build, /TAURI_SIGNING_PRIVATE_KEY_PASSWORD: \${{ secrets\.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}/);
-  for (const [name, body] of steps) {
-    if (name === "Build signed updater AppImage") continue;
-    assert.equal(body.includes("secrets.TAURI_SIGNING_PRIVATE_KEY"), false, `${name} receives updater private key material`);
-    assert.equal(body.includes("TAURI_SIGNING_PRIVATE_KEY_PASSWORD"), false, `${name} receives updater private key password`);
-  }
-  assert.equal(build.includes("pnpm"), false);
-  assert.equal(build.includes("vite"), false);
+test("GitHub release workflow auto-triggers only from v* tag pushes", () => {
+  const trigger = workflow.slice(0, workflow.indexOf("permissions:"));
+  assert.match(trigger, /push:\n    tags:\n      - "v\*"/);
+  assert.equal(trigger.includes("pull_request:"), false);
+  assert.equal(trigger.includes("branches:"), false);
+  assert.equal(trigger.includes("workflow_dispatch:"), false);
 });
 
-test("frontend build cannot inherit updater signing variables", () => {
-  const frontend = steps.get("Frontend quality and release asset build");
-  assert.ok(frontend);
-  assert.equal(frontend.includes("TAURI_SIGNING_"), false);
-  assert.equal(viteConfig.includes("envPrefix"), false);
-  const generate = steps.get("Generate release-only Tauri configuration");
-  assert.ok(generate);
-  assert.equal(generate.includes("TAURI_SIGNING_"), false);
-});
-
-test("all production release actions are pinned to immutable revisions", () => {
+test("all GitHub release actions are pinned to immutable commit SHAs", () => {
   const uses = [...workflow.matchAll(/^\s+uses:\s+(\S+)@([^\s]+)(?:\s+#.*)?$/gm)];
-  assert.ok(uses.length > 0);
+  assert.ok(uses.length >= 3);
   for (const [, action, revision] of uses) {
     assert.match(revision, /^[0-9a-f]{40}$/, `${action} is not pinned to a 40-character commit SHA`);
   }
-  assert.match(
-    workflow,
-    /forgejo\/upload-artifact@16871d9e8cfcf27ff31822cac382bbb5450f1e1e # v4/,
-  );
+  assert.match(workflow, /actions\/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4\.2\.2/);
+  assert.match(workflow, /actions\/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\.6\.2/);
+  assert.match(workflow, /actions\/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4\.3\.0/);
+  assert.equal(workflow.includes("softprops/action-gh-release"), false);
 });
 
-test("public updater and authority values are scoped only to the steps that need them", () => {
-  assert.match(steps.get("Generate release-only Tauri configuration"), /secrets\.NIAN_UPDATER_ENDPOINT/);
-  assert.match(steps.get("Generate release-only Tauri configuration"), /secrets\.NIAN_UPDATER_PUBLIC_KEY/);
-  assert.match(steps.get("Verify updater signature against configured public key"), /secrets\.NIAN_UPDATER_PUBLIC_KEY/);
-  assert.match(steps.get("Finalize manifest, updater metadata and SHA-256 checksums"), /secrets\.NIAN_RELEASE_DOWNLOAD_BASE_URL/);
-  assert.equal(steps.get("Upload Linux release artifacts").includes("secrets."), false);
+test("default GitHub permissions are read-only and only publish-release gets contents write", () => {
+  assert.match(workflow, /permissions:\n  contents: read/);
+  const writes = [...workflow.matchAll(/contents: write/g)];
+  assert.equal(writes.length, 1);
+  assert.match(jobBody("publish-release"), /permissions:\n      contents: write/);
+  for (const job of ["release-preflight", "build-linux", "verify-release"]) {
+    assert.equal(jobBody(job).includes("contents: write"), false, `${job} has repository write permission`);
+  }
+  assert.equal(/(?:actions|packages|issues|pull-requests): write/.test(workflow), false);
 });
 
-test("secret sentinel reaches stage, extracted AppImage smoke, and final artifact scan only", () => {
-  const expected = new Set([
-    "Stage and clean-smoke Linux runtime",
-    "Smoke actual AppImage runtime and desktop startup",
-    "Final secret sentinel scan",
-  ]);
-  for (const [name, body] of steps) {
-    assert.equal(body.includes("NIAN_RELEASE_SECRET_SENTINEL"), expected.has(name), `${name} has unexpected sentinel scope`);
+test("private signing secrets are scoped only to the Linux signing step", () => {
+  const signing = stepBody("build-linux", "Build signed updater AppImage");
+  assert.match(signing, /secrets\.TAURI_SIGNING_PRIVATE_KEY/);
+  assert.match(signing, /secrets\.TAURI_SIGNING_PRIVATE_KEY_PASSWORD/);
+  const withoutSigning = workflow.replace(signing, "");
+  assert.equal(withoutSigning.includes("secrets.TAURI_SIGNING_PRIVATE_KEY"), false);
+  assert.equal(withoutSigning.includes("secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD"), false);
+  assert.equal(signing.includes("pnpm"), false);
+  assert.equal(signing.includes("vite"), false);
+  assert.equal(viteConfig.includes("envPrefix"), false);
+});
+
+test("release trust contract proves tag version SHA mirror actor and default-branch reachability", () => {
+  const preflight = jobBody("release-preflight");
+  assert.match(preflight, /refs\/tags\/v\*/);
+  assert.match(preflight, /GITHUB_SHA/);
+  assert.match(preflight, /refs\/tags\/\$\{tag\}\^\{commit\}/);
+  assert.match(preflight, /merge-base --is-ancestor/);
+  assert.match(preflight, /RELEASE_MIRROR_ACTOR/);
+  assert.match(preflight, /version-check\.mjs --tag "\$tag" --require-clean/);
+});
+
+test("release topology is preflight to Linux build to verification to publication", () => {
+  assert.match(jobBody("build-linux"), /needs: release-preflight/);
+  assert.match(jobBody("verify-release"), /needs: \[release-preflight, build-linux\]/);
+  assert.match(jobBody("publish-release"), /needs: \[release-preflight, verify-release\]/);
+  assert.match(stepBody("build-linux", "Upload Linux release candidate"), /name: linux-release-candidate/);
+  assert.match(stepBody("verify-release", "Upload verified release payload"), /name: verified-release/);
+});
+
+test("publication is draft-first and byte-verifies uploaded assets before publish", () => {
+  const publish = jobBody("publish-release");
+  const createAt = publish.indexOf("gh release create");
+  const uploadAt = publish.indexOf("gh release upload");
+  const downloadAt = publish.indexOf("gh release download");
+  const compareAt = publish.indexOf("cmp --silent");
+  const publishAt = publish.indexOf("--draft=false");
+  assert.ok(createAt >= 0 && createAt < uploadAt && uploadAt < downloadAt && downloadAt < compareAt && compareAt < publishAt);
+  assert.match(publish, /--draft/);
+  assert.match(publish, /refusing to overwrite an already-published release/);
+});
+
+test("GitHub release uses stable latest metadata and exact tagged asset URLs", () => {
+  const generate = stepBody("build-linux", "Generate release-only Tauri configuration");
+  assert.match(generate, /releases\/latest\/download\/latest\.json/);
+  const finalize = stepBody("build-linux", "Finalize GitHub Release candidate");
+  assert.match(finalize, /releases\/download\/\$\{\{ github\.ref_name \}\}/);
+  assert.equal(workflow.includes("NIAN_RELEASE_DOWNLOAD_BASE_URL: ${{ secrets."), false);
+});
+
+test("release workflow never pushes source changes or creates release tags", () => {
+  assert.equal(/git push/.test(workflow), false);
+  assert.equal(/git tag(?:\s|$)/.test(workflow), false);
+  assert.equal(/version bump|npm version|cargo set-version/.test(workflow), false);
+});
+
+
+test("protected production-release environment is limited to signing verification and publication jobs", () => {
+  assert.equal(jobBody("release-preflight").includes("environment: production-release"), false);
+  for (const job of ["build-linux", "verify-release", "publish-release"]) {
+    assert.match(jobBody(job), /environment: production-release/);
   }
 });
 
-test("signature verification precedes config disposal, smoke, finalization, and upload", () => {
-  const verifyAt = workflow.indexOf("- name: Verify updater signature against configured public key");
-  const disposeAt = workflow.indexOf("- name: Dispose generated Tauri release configuration");
-  const smokeAt = workflow.indexOf("- name: Smoke actual AppImage runtime and desktop startup");
-  const finalizeAt = workflow.indexOf("- name: Finalize manifest, updater metadata and SHA-256 checksums");
-  const uploadAt = workflow.indexOf("- name: Upload Linux release artifacts");
-  assert.ok(verifyAt > 0 && verifyAt < disposeAt && disposeAt < smokeAt && smokeAt < finalizeAt && finalizeAt < uploadAt);
+test("updater public key is exposed only to configuration and cryptographic verification steps", () => {
+  const allowed = [
+    stepBody("build-linux", "Generate release-only Tauri configuration"),
+    stepBody("build-linux", "Verify updater signature against configured public key"),
+    stepBody("verify-release", "Reverify finalized updater signature"),
+  ];
+  const count = [...workflow.matchAll(/secrets\.NIAN_UPDATER_PUBLIC_KEY/g)].length;
+  assert.equal(count, allowed.length);
+  for (const body of allowed) assert.match(body, /secrets\.NIAN_UPDATER_PUBLIC_KEY/);
 });

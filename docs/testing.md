@@ -479,9 +479,14 @@ containment.
 ### Linux distribution and updater (M8)
 
 Release-script/tool tests cover strict SemVer/tag convergence, mechanically reject
-FFmpeg GPL/nonfree/static-link drift, verify immutable release-action pins and
-prove workflow secret scoping. Generated Tauri config tests require a public-only
-shape with an empty release `beforeBuildCommand`, and authority tests reject
+FFmpeg GPL/nonfree/static-link drift, and validate the hybrid release topology:
+Forgejo has no active tag-release workflow, GitHub release automation is tag-only,
+every `uses:` action is immutable-SHA pinned, default GitHub permissions are
+read-only, only publication receives `contents: write`, signing secrets remain
+step-scoped, and Forgejo quality CI remains present. Mirror trust checks require
+`GITHUB_SHA`/tag identity, the configured mirror actor and default-branch
+reachability. Generated Tauri config tests require a public-only shape with an
+empty release `beforeBuildCommand`, and authority tests reject
 non-HTTPS/local/reserved-placeholder endpoints. Fixed offline updater signature
 vectors prove matching-key success plus mismatched-key, mutated-artifact and
 mutated-signature failure using `minisign-verify`, the same verifier family used by
@@ -512,15 +517,19 @@ is required.
 Release security gates scan the staged runtime, extracted AppImage tree, frontend
 assets and finalized release directory for a configured binary-safe secret
 sentinel. Post-build cryptographic verification proves the generated AppImage and
-`.sig` match the configured updater public key. Final metadata tests and production
-validation prove `latest.json`, `release-manifest.json` and `SHA256SUMS.txt` all
-reference/hash the exact finalized AppImage and signature.
+`.sig` match the configured updater public key. The separate GitHub `verify-release`
+job re-downloads the temporary Linux candidate and rechecks version, tag commit,
+exact tagged asset URL, signature and every checksum before producing the only
+payload accepted by `publish-release`. Publication itself is draft-first: GitHub
+Release assets are uploaded, downloaded back, byte-compared and checksum-verified
+before the draft can become public.
 
 ## Planned per milestone
 
 * **M9+**: simultaneous multi-camera orchestration and M10 ONVIF. Windows x86_64
-  remains the primary future product target, but M8 release packaging/signing
-  validation is deferred until a Forgejo Windows runner exists. macOS distribution,
+  remains the next M8 release slice and will use an explicit GitHub-hosted Windows
+  runner (for example `windows-2022`); packaging/signing is not yet implemented or
+  marked validated. macOS distribution,
   live camera viewing, clip export, thumbnails/motion analysis and AI/cloud behavior
   are outside the current Linux M8 release scope.
 * **Hardware/manual** (never in CI): real Tapo C200 via

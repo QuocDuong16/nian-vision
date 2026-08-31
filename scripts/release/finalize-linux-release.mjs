@@ -20,6 +20,7 @@ const stage = resolve(root, "dist/linux-x86_64");
 const bundle = resolve(root, "target/release/bundle/appimage");
 const output = resolve(root, "dist/release");
 const releaseConfig = JSON.parse(readFileSync(resolve(root, "scripts/release/release-config.json"), "utf8"));
+const releaseNotes = readFileSync(resolve(root, "RELEASE_NOTES.md"), "utf8").trim();
 
 function sha256(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
@@ -61,8 +62,9 @@ try {
     "FFMPEG_BUILD_FLAGS.txt",
     "FFMPEG_CONFIG.h",
     "BUILD_METADATA.json",
+    "RELEASE_NOTES.md",
   ]) {
-    copyArtifact(resolve(stage, name), name);
+    copyArtifact(name === "RELEASE_NOTES.md" ? resolve(root, name) : resolve(stage, name), name);
   }
 
   const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
@@ -72,7 +74,7 @@ try {
 
   const latest = {
     version,
-    notes: process.env.NIAN_RELEASE_NOTES?.trim() || `Nian Vision ${version}`,
+    notes: releaseNotes,
     pub_date: pubDate,
     platforms: {
       "linux-x86_64": {
