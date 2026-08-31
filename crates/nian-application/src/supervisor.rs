@@ -952,15 +952,7 @@ fn verify_hello(envelope: &Envelope) -> Result<&serde_json::Value, String> {
     if name != "hello" {
         return Err("first event was not hello".to_owned());
     }
-    let protocol = data
-        .get("protocol")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    if protocol != u64::from(PROTOCOL_VERSION) {
-        return Err(format!(
-            "protocol mismatch: worker speaks {protocol}, we speak {PROTOCOL_VERSION}"
-        ));
-    }
+    nian_ipc::validate_worker_hello(data).map_err(|error| error.to_string())?;
     if data.get("ffmpeg").is_none() {
         return Err("hello missing ffmpeg capability report".to_owned());
     }

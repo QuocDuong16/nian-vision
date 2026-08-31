@@ -1,0 +1,24 @@
+NIAN VISION - THIRD-PARTY NOTICES
+=================================
+
+FFmpeg 8.0.3
+------------
+
+Nian Vision dynamically links an application-owned build of FFmpeg 8.0.3.
+The source archive used by the release process is:
+
+  https://ffmpeg.org/releases/ffmpeg-8.0.3.tar.xz
+
+Expected SHA-256:
+
+  6136812ea6d4e68bdba27e33c2a94382711cdf4f8602ffef056ff792bd6f9818
+
+The release build is configured for shared libraries and explicitly disables
+GPL and nonfree components. Exact release configure flags are shipped as
+FFMPEG_BUILD_FLAGS.txt. The FFmpeg LGPL 2.1 license text copied from the exact
+source archive is shipped as FFMPEG-LGPL-2.1.txt.
+
+Corresponding FFmpeg source may be obtained from the URL above. These notices
+describe the selected third-party build and its license facts. They do not make
+the proprietary Nian Vision application code an LGPL work, and they are not a
+legal guarantee or legal advice.

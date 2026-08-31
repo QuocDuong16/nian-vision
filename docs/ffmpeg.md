@@ -28,6 +28,31 @@ is the practical reference.
 3. `pkg-config` (`libavformat`, `libavcodec`, `libavutil`) for standard
    dev-package installs.
 
+## Linux release runtime
+
+Production Linux releases do not use the developer machine's FFmpeg installation.
+`scripts/release/build-ffmpeg-linux.sh` downloads the exact FFmpeg 8.0.3 tarball,
+verifies the pinned SHA-256, builds shared libraries with GPL/nonfree disabled and
+stores the exact configure flags plus generated `config.h` as release evidence.
+
+Before packaging, `validate-ffmpeg-config.mjs` mechanically checks the license and
+shared/static mode, then `nian-media-ffmpeg`'s real integration suite runs against
+that candidate runtime. Staging copies only the ABI libraries used by the worker:
+
+* `libavformat.so.62`
+* `libavcodec.so.62`
+* `libavutil.so.60`
+
+The pre-bundle release worker contains `$ORIGIN/../lib/nian-vision` RUNPATH, so
+staging resolves those libraries from its application-owned runtime rather than
+through `LD_LIBRARY_PATH` or a developer package manager. Tauri normalizes the
+worker RUNPATH to `$ORIGIN/../lib` while assembling the AppImage; release resources
+therefore place the same three SONAME libraries in the AppImage-private `/usr/lib`.
+Staging verifies the dynamic dependency closure with development overrides removed
+and exercises HELLO, fixture probe and `playback.prepare` through the staged worker.
+The AppImage is extracted and smoke-tested again after packaging. Exact flags, LGPL text and third-party
+notices are shipped with the release.
+
 ## Regenerating bindings
 
 Only needed when bumping the FFmpeg pin or extending the whitelist:

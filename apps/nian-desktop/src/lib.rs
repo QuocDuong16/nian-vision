@@ -27,6 +27,7 @@ use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
+use tauri_plugin_updater::UpdaterExt;
 use tracing_subscriber::EnvFilter;
 
 const CREDENTIAL_SERVICE: &str = "Nian Vision";
@@ -38,6 +39,20 @@ static PENDING_MANUAL_ACTIVATION: std::sync::atomic::AtomicBool =
 pub struct AppInfo {
     pub name: String,
     pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AvailableUpdateDto {
+    pub version: String,
+    pub notes: Option<String>,
+    pub date: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UpdateCheckDto {
+    pub configured: bool,
+    pub current_version: String,
+    pub available: Option<AvailableUpdateDto>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -186,6 +201,7 @@ struct DesktopState {
     tray_watch_tx: Mutex<Option<mpsc::Sender<TrayWatchMessage>>>,
     tray_thread: Mutex<Option<JoinHandle<()>>>,
     startup_error: Mutex<Option<DesktopErrorDto>>,
+    update_installing: std::sync::atomic::AtomicBool,
     startup_complete: std::sync::atomic::AtomicBool,
     /// Serializes operations whose correctness depends on lifecycle admission
     /// and a stable recording ownership snapshot.
@@ -344,6 +360,15 @@ fn activate_main_window(app: &AppHandle) -> Result<(), DesktopErrorDto> {
 }
 
 fn require_running(state: &DesktopState) -> Result<(), DesktopErrorDto> {
+    if state
+        .update_installing
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(DesktopErrorDto::new(
+            "update_in_progress",
+            "application update is in progress",
+        ));
+    }
     state
         .lifecycle
         .require_running()
@@ -353,6 +378,17 @@ fn require_running(state: &DesktopState) -> Result<(), DesktopErrorDto> {
 fn admit_running(state: &DesktopState) -> Result<(), DesktopErrorDto> {
     let _gate = lock(&state.control_gate)?;
     require_running(state)
+}
+
+fn updater_configured() -> bool {
+    matches!(option_env!("NIAN_UPDATER_CONFIGURED"), Some("1"))
+}
+
+fn map_update_error(_error: tauri_plugin_updater::Error) -> DesktopErrorDto {
+    DesktopErrorDto::new(
+        "update_failed",
+        "cryptographically verified update operation failed",
+    )
 }
 
 fn map_lifecycle_error(error: DesktopLifecycleError) -> DesktopErrorDto {
@@ -375,6 +411,129 @@ fn app_info() -> AppInfo {
         name: "Nian Vision".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
     }
+}
+
+#[tauri::command]
+async fn update_check(app: AppHandle) -> Result<UpdateCheckDto, DesktopErrorDto> {
+    let current_version = env!("CARGO_PKG_VERSION").to_owned();
+    if !updater_configured() {
+        return Ok(UpdateCheckDto {
+            configured: false,
+            current_version,
+            available: None,
+        });
+    }
+
+    let update = app
+        .updater()
+        .map_err(map_update_error)?
+        .check()
+        .await
+        .map_err(map_update_error)?;
+    Ok(UpdateCheckDto {
+        configured: true,
+        current_version,
+        available: update.map(|update| AvailableUpdateDto {
+            version: update.version.to_string(),
+            notes: update.body,
+            date: update.date.map(|date| date.to_string()),
+        }),
+    })
+}
+
+#[tauri::command]
+async fn update_install(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<DesktopState>>,
+    expected_version: String,
+) -> Result<(), DesktopErrorDto> {
+    if !cfg!(target_os = "linux") {
+        return Err(DesktopErrorDto::new(
+            "update_unsupported",
+            "application updates are only packaged for Linux",
+        ));
+    }
+    if std::env::var_os("APPIMAGE").is_none() {
+        return Err(DesktopErrorDto::new(
+            "update_unsupported",
+            "in-app updates require the packaged Nian Vision AppImage",
+        ));
+    }
+    if !updater_configured() {
+        return Err(DesktopErrorDto::new(
+            "update_unconfigured",
+            "no production update channel is configured for this build",
+        ));
+    }
+    state
+        .update_installing
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .map_err(|_| {
+            DesktopErrorDto::new(
+                "update_in_progress",
+                "application update is already in progress",
+            )
+        })?;
+
+    let package = async {
+        let update = app
+            .updater()
+            .map_err(map_update_error)?
+            .check()
+            .await
+            .map_err(map_update_error)?
+            .ok_or_else(|| {
+                DesktopErrorDto::new("update_unavailable", "no application update is available")
+            })?;
+        if update.version != expected_version {
+            return Err(DesktopErrorDto::new(
+                "update_changed",
+                "available update changed; check for updates again",
+            ));
+        }
+        let bytes = update
+            .download(|_, _| {}, || {})
+            .await
+            .map_err(map_update_error)?;
+        Ok::<_, DesktopErrorDto>((update, bytes))
+    }
+    .await;
+
+    let (update, bytes) = match package {
+        Ok(package) => package,
+        Err(error) => {
+            state
+                .update_installing
+                .store(false, std::sync::atomic::Ordering::Release);
+            return Err(error);
+        }
+    };
+
+    // Only after the updater package has passed signature verification do we
+    // enter M7's terminal handoff. Desired recording intent is deliberately
+    // untouched, so startup restoration resumes it after the new binary starts.
+    if let Err(error) = begin_update_shutdown(&state) {
+        tracing::error!(
+            code = error.code,
+            "update lifecycle teardown failed; restarting current build"
+        );
+        app.restart();
+    }
+
+    if let Err(_error) = update.install(bytes) {
+        tracing::error!("signed updater handoff failed; restarting current build");
+        app.restart();
+    }
+
+    // Linux AppImage installation replaces the packaged image. Restart exactly
+    // once after the signed updater handoff so M7 restores desired recording
+    // intent through normal startup instead of inventing updater-only behavior.
+    app.restart();
 }
 
 #[tauri::command]
@@ -1161,6 +1320,7 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn run_shutdown_sequence<R, P, Q, T, W, E>(
     recording: R,
     playback: P,
@@ -1184,42 +1344,99 @@ fn run_shutdown_sequence<R, P, Q, T, W, E>(
     exit();
 }
 
+fn shutdown_power_runtime(state: &DesktopState) {
+    // Dispatcher shutdown is explicit and independent of callback ownership.
+    if let Ok(mut control) = state.power_dispatch_tx.lock()
+        && let Some(control) = control.take()
+    {
+        let _ = control.send(PowerDispatchMessage::Shutdown);
+    }
+    if let Ok(mut subscription) = state.power_subscription.lock() {
+        subscription.take();
+    }
+    if let Ok(mut thread) = state.power_thread.lock()
+        && let Some(thread) = thread.take()
+    {
+        let _ = thread.join();
+    }
+}
+
+fn shutdown_runtime_resources(state: &DesktopState) -> Result<(), DesktopErrorDto> {
+    let mut first_error = None;
+    match state.recording_controller.lock() {
+        Ok(mut controller) => {
+            if let Err(error) = controller.shutdown() {
+                capture_first_error(&mut first_error, map_recording_error(error));
+            }
+        }
+        Err(_) => capture_first_error(
+            &mut first_error,
+            DesktopErrorDto::new("lifecycle_failed", "recording shutdown failed"),
+        ),
+    }
+    match state.playback_controller.lock() {
+        Ok(mut playback) => playback.shutdown(),
+        Err(_) => capture_first_error(
+            &mut first_error,
+            DesktopErrorDto::new("lifecycle_failed", "playback shutdown failed"),
+        ),
+    }
+    if let Err(error) = state.probe_controller.shutdown() {
+        capture_first_error(&mut first_error, map_probe_error(error));
+    }
+    shutdown_tray_watcher(state);
+    shutdown_power_runtime(state);
+    first_error.map_or(Ok(()), Err)
+}
+
+fn begin_update_shutdown(state: &DesktopState) -> Result<(), DesktopErrorDto> {
+    let mut admission_error = None;
+    {
+        let _gate = lock(&state.control_gate)?;
+        if !state
+            .update_installing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(DesktopErrorDto::new(
+                "update_failed",
+                "update handoff was not admitted",
+            ));
+        }
+        if !state.lifecycle.begin_quit().map_err(map_lifecycle_error)? {
+            return Err(DesktopErrorDto::new(
+                "quitting",
+                "application is already quitting",
+            ));
+        }
+        state.probe_controller.stop_accepting_and_cancel();
+        match state.playback_controller.lock() {
+            Ok(mut playback) => playback.stop_accepting(),
+            Err(_) => capture_first_error(
+                &mut admission_error,
+                DesktopErrorDto::new("lifecycle_failed", "playback update admission failed"),
+            ),
+        }
+        match state.recording_controller.lock() {
+            Ok(mut controller) => {
+                if let Err(error) = controller.request_lifecycle_stop() {
+                    capture_first_error(&mut admission_error, map_recording_error(error));
+                }
+            }
+            Err(_) => capture_first_error(
+                &mut admission_error,
+                DesktopErrorDto::new("lifecycle_failed", "recording update admission failed"),
+            ),
+        }
+    }
+    if let Some(error) = admission_error {
+        return Err(error);
+    }
+    shutdown_runtime_resources(state)
+}
+
 fn finish_quit(state: &DesktopState, app: &AppHandle) {
-    run_shutdown_sequence(
-        || {
-            if let Ok(mut controller) = state.recording_controller.lock() {
-                let _ = controller.shutdown();
-            }
-        },
-        || {
-            if let Ok(mut playback) = state.playback_controller.lock() {
-                playback.shutdown();
-            }
-        },
-        || {
-            let _ = state.probe_controller.shutdown();
-        },
-        || shutdown_tray_watcher(state),
-        || {
-            // Dispatcher shutdown is explicit and independent of callback
-            // ownership. If Win32 unregistration fails, the leak-safe callback
-            // may retain its Sender forever, but Shutdown still makes recv exit.
-            if let Ok(mut control) = state.power_dispatch_tx.lock()
-                && let Some(control) = control.take()
-            {
-                let _ = control.send(PowerDispatchMessage::Shutdown);
-            }
-            if let Ok(mut subscription) = state.power_subscription.lock() {
-                subscription.take();
-            }
-            if let Ok(mut thread) = state.power_thread.lock()
-                && let Some(thread) = thread.take()
-            {
-                let _ = thread.join();
-            }
-        },
-        || app.exit(0),
-    );
+    let _ = shutdown_runtime_resources(state);
+    app.exit(0);
 }
 
 fn request_quit(app: &AppHandle) -> Result<(), DesktopErrorDto> {
@@ -1484,9 +1701,11 @@ pub fn run() {
         }))
         .plugin(
             tauri_plugin_autostart::Builder::new()
+                .app_name("Nian Vision")
                 .arg(STARTUP_HIDDEN_ARG)
                 .build(),
         )
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
             if window.label() != "main" {
                 return;
@@ -1568,6 +1787,7 @@ pub fn run() {
                 tray_watch_tx: Mutex::new(Some(tray_watch_tx)),
                 tray_thread: Mutex::new(None),
                 startup_error: Mutex::new(startup_error),
+                update_installing: std::sync::atomic::AtomicBool::new(false),
                 startup_complete: std::sync::atomic::AtomicBool::new(false),
                 control_gate: Mutex::new(()),
             });
@@ -1637,6 +1857,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_info,
+            update_check,
+            update_install,
             camera_list,
             camera_create,
             camera_update,
@@ -2154,6 +2376,7 @@ mod tests {
                 tray_watch_tx: Mutex::new(None),
                 tray_thread: Mutex::new(None),
                 startup_error: Mutex::new(None),
+                update_installing: std::sync::atomic::AtomicBool::new(false),
                 startup_complete: std::sync::atomic::AtomicBool::new(false),
                 control_gate: Mutex::new(()),
             },
@@ -2247,6 +2470,52 @@ mod tests {
         let quitting = DesktopLifecycle::new();
         quitting.begin_quit().unwrap();
         assert_eq!(close_action(&quitting).unwrap(), CloseAction::Allow);
+    }
+
+    #[test]
+    fn update_admission_blocks_new_operations_before_teardown() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, _repository, _runner, _probe) = lifecycle_state(&root, false);
+
+        state.update_installing.store(true, Ordering::Release);
+        let error = require_running(&state).unwrap_err();
+
+        assert_eq!(error.code, "update_in_progress");
+        assert_eq!(
+            state.lifecycle.state().unwrap(),
+            DesktopLifecycleState::Running
+        );
+    }
+
+    #[test]
+    fn update_shutdown_preserves_desired_recording_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, _runner, _probe) = lifecycle_state(&root, false);
+        restore_desired_recording_locked(&state).unwrap();
+
+        state.update_installing.store(true, Ordering::Release);
+        begin_update_shutdown(&state).unwrap();
+
+        assert_eq!(
+            state.lifecycle.state().unwrap(),
+            DesktopLifecycleState::Quitting
+        );
+        assert_eq!(
+            repository.lock().unwrap().desired_camera.as_deref(),
+            Some("front-door")
+        );
+        assert_eq!(
+            state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .status()
+                .unwrap()
+                .state,
+            RecordingState::Stopped,
+        );
     }
 
     #[test]

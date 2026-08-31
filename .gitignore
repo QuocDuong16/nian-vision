@@ -15,6 +15,8 @@ apps/nian-desktop/gen/schemas/
 # builds (scripts/ci-install-ffmpeg.sh)
 /.ffmpeg-lib/
 /ffmpeg-dist/
+/dist/
+apps/nian-desktop/tauri.release.generated.conf.json
 
 # Environment / secrets — never commit credentials
 .env

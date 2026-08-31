@@ -476,11 +476,34 @@ callback state remains reclaimable. The Windows platform crate is cross-compiled
 independently to cover native power registration and kill-on-close Job Object worker
 containment.
 
+### Linux distribution and updater (M8)
+
+Release-script unit tests cover strict SemVer/tag convergence and mechanically
+reject FFmpeg GPL, nonfree and static-link configuration drift. The release
+workflow builds the exact SHA-256-pinned FFmpeg 8.0.3 source candidate and runs the
+full `nian-media-ffmpeg` fixture integration suite against those libraries before
+they are eligible for packaging.
+
+`scripts/release/stage-linux.sh` then exercises the release worker with development
+library overrides removed. It verifies the installation-relative worker RUNPATH,
+FFmpeg ABI 62/62/60, complete dynamic dependency closure, HELLO application-version
+compatibility, fixture `camera.probe`, and fixture `playback.prepare`. The worker
+must resolve all three FFmpeg libraries from the staged application-owned runtime,
+not system FFmpeg.
+
+Frontend Settings tests cover configured/unconfigured update state, update
+discovery, explicit installation confirmation and the update command boundary.
+Desktop Rust tests prove update admission blocks new lifecycle work before teardown
+and that updater teardown reaches Quitting/Stopped while preserving persisted
+Desired recording intent. The production AppImage path additionally extracts the
+actual built image and repeats installed-layout worker/media smoke checks before
+release metadata and checksums are finalized.
+
 ## Planned per milestone
 
-* **M8+**: distribution, M9 simultaneous multi-camera orchestration and M10 ONVIF.
-  Live camera viewing, clip export, thumbnails/motion analysis and AI/cloud
-  behavior are not part of M7.
+* **M9+**: simultaneous multi-camera orchestration and M10 ONVIF. Windows/macOS
+  distribution, live camera viewing, clip export, thumbnails/motion analysis and
+  AI/cloud behavior are not part of the Linux-only M8 release milestone.
 * **Hardware/manual** (never in CI): real Tapo C200 via
   `NIAN_VISION_RTSP_URL` with
   `nian-media-worker record --rtsp-from-env ...` and/or an IPC-driven

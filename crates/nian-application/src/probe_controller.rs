@@ -305,8 +305,8 @@ fn run_worker_probe_with<S: ProbeSetup>(
     let hello_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match recv_with_cancel(&rx, hello_deadline, &cancel, ProbeError::WorkerUnavailable)? {
-            ReaderMessage::Frame(Envelope::Event { v, name, .. }) if name == event::HELLO => {
-                if v != PROTOCOL_VERSION {
+            ReaderMessage::Frame(Envelope::Event { v, name, data }) if name == event::HELLO => {
+                if v != PROTOCOL_VERSION || nian_ipc::validate_worker_hello(&data).is_err() {
                     return Err(ProbeError::Protocol);
                 }
                 break;

@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "io.niand.nian-vision",
   "build": {
-    "beforeDevCommand": "pnpm --dir ../../ui dev",
+    "beforeDevCommand": "pnpm --dir ../ui dev",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "pnpm --dir ../../ui build",
+    "beforeBuildCommand": "pnpm --dir ../ui build",
     "frontendDist": "../../ui/dist"
   },
   "app": {
@@ -26,7 +26,14 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["appimage"],
+    "createUpdaterArtifacts": false,
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": false,
+        "files": {}
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

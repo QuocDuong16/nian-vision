@@ -4,7 +4,7 @@ Local-first desktop NVR (network video recorder) for IP cameras. The first
 supported camera is the TP-Link Tapo C200 over RTSP, with a camera-agnostic
 domain so other RTSP/ONVIF cameras can follow.
 
-**Status**: milestone **M7 (desktop production lifecycle)** is implemented on top
+**Status**: milestone **M8 (Linux distribution)** is implemented on top
 of M0–M6. The desktop persists camera definitions, recorder/storage settings,
 launch-at-login preference and the single-camera desired recording intent in an
 authoritative platform app-data `settings.sqlite3`, while camera passwords remain
@@ -19,8 +19,12 @@ HTTP, and retention playback pins. M7 adds single-instance activation,
 close-to-tray, explicit coordinated Quit, launch-at-login with hidden startup,
 persisted recording restoration, Windows suspend/resume handling, and Windows
 Job Object containment so hard desktop termination cannot orphan media workers.
-Live camera viewing, packaging/distribution, simultaneous multi-camera recording
-and ONVIF remain outside M7.
+M8 adds a Linux x86_64 AppImage release path with a pinned LGPL FFmpeg 8.0.3
+runtime, desktop/worker release-version compatibility, signed Tauri updater
+artifacts, explicit update confirmation, deterministic lifecycle handoff and
+release provenance/checksums. Windows and macOS distribution are deliberately
+deferred. Live camera viewing, simultaneous multi-camera recording and ONVIF
+remain outside M8.
 
 ## What it does today
 
@@ -104,8 +108,8 @@ React UI ─ typed Tauri commands ─ nian-desktop host
 
 See `docs/architecture.md` and `docs/adr/` for the decisions behind this
 layout (process isolation, FFmpeg strategy, container choice, storage
-model, authoritative-settings/native-secret split, M6 playback transport and M7
-desktop lifecycle/worker containment).
+model, authoritative-settings/native-secret split, M6 playback transport, M7
+desktop lifecycle/worker containment and M8 Linux distribution/updater design).
 
 ## Requirements
 
@@ -129,6 +133,19 @@ pnpm --filter nian-ui test
 
 Full commands and conventions: `docs/development.md`.
 
+## Linux release
+
+The currently supported production distribution target is **Linux x86_64 only**,
+shipped as a signed-update-capable AppImage. The release workflow builds against a
+Debian 12 baseline, builds FFmpeg 8.0.3 from its SHA-256-pinned source archive,
+stages the worker plus app-owned shared libraries, runs clean-runtime media smoke
+tests, builds the AppImage, re-opens the AppImage for installed-layout smoke tests,
+and emits updater metadata plus SHA-256/provenance manifests.
+
+Production release configuration and private updater signing material are injected
+only through Forgejo secrets; they are not stored in the repository. See
+`docs/releasing.md` and ADR-0011. Windows and macOS release packaging are deferred.
+
 ## Supported camera protocols
 
 * RTSP (H.264) — implemented at the media layer, manual smoke test via
@@ -138,6 +155,8 @@ Full commands and conventions: `docs/development.md`.
 ## License notes
 
 * Nian Vision's own code is proprietary (private repository).
-* FFmpeg is used dynamically and, for distribution, will be built in LGPL
-  mode (no `--enable-gpl`, no `--enable-nonfree`); see `docs/ffmpeg.md` and
-  `thirdparty/README.md` for vendored-header provenance.
+* FFmpeg is dynamically linked. The Linux release pipeline builds the exact
+  FFmpeg 8.0.3 source pin in LGPL mode with shared libraries and mechanically
+  rejects GPL/nonfree/static drift before packaging. Release artifacts include
+  the exact configure flags, FFmpeg LGPL text and `THIRD_PARTY_NOTICES.txt`; see
+  `docs/ffmpeg.md` and `thirdparty/README.md` for provenance.

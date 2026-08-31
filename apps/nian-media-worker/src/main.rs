@@ -188,6 +188,7 @@ fn cmd_run() -> Result<(), String> {
     let hello = json!({
         "worker": "nian-media-worker",
         "protocol": nian_ipc::PROTOCOL_VERSION,
+        "application_version": nian_ipc::APPLICATION_VERSION,
         "ffmpeg": versions_json(versions),
     });
 

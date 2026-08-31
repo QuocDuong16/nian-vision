@@ -17,10 +17,12 @@
 
 pub mod error;
 pub mod framing;
+pub mod handshake;
 pub mod message;
 pub mod server;
 
 pub use error::IpcError;
 pub use framing::{FramedReader, FramedWriter, MAX_MESSAGE_BYTES};
+pub use handshake::{APPLICATION_VERSION, WorkerHelloError, validate_worker_hello};
 pub use message::{Envelope, PROTOCOL_VERSION, RequestId};
 pub use server::{Dispatch, Handler, RpcFailure, serve};

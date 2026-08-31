@@ -11,6 +11,8 @@
     "build": "pnpm --filter nian-ui build",
     "lint": "pnpm --filter nian-ui lint",
     "typecheck": "pnpm --filter nian-ui typecheck",
-    "test": "pnpm --filter nian-ui test"
+    "test": "pnpm --filter nian-ui test",
+    "release:test": "node --test scripts/release/*.test.mjs",
+    "release:version": "node scripts/release/version-check.mjs"
   }
 }

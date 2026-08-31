@@ -1181,8 +1181,10 @@ fn run_worker_prepare(
     loop {
         let remaining = hello_deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(remaining) {
-            Ok(WorkerMessage::Frame(Envelope::Event { v, name, .. }))
-                if v == PROTOCOL_VERSION && name == event::HELLO =>
+            Ok(WorkerMessage::Frame(Envelope::Event { v, name, data }))
+                if v == PROTOCOL_VERSION
+                    && name == event::HELLO
+                    && nian_ipc::validate_worker_hello(&data).is_ok() =>
             {
                 break;
             }

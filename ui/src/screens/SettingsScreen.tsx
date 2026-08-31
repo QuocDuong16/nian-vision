@@ -1,17 +1,22 @@
 import { useEffect, useState } from "react";
 import { desktopError, invokeDesktop, isTauri } from "../lib/tauri";
-import type { ApplicationSettings, DesktopError } from "../lib/tauri";
+import type { AppInfo, ApplicationSettings, DesktopError, UpdateCheck } from "../lib/tauri";
 
 export function SettingsScreen() {
   const [settings, setSettings] = useState<ApplicationSettings | null>(null);
+  const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
+  const [update, setUpdate] = useState<UpdateCheck | null>(null);
   const [saving, setSaving] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [installing, setInstalling] = useState(false);
   const [error, setError] = useState<DesktopError | null>(null);
 
   useEffect(() => {
     if (!isTauri()) return;
-    void invokeDesktop<ApplicationSettings>("settings_get")
-      .then(setSettings)
-      .catch((cause) => setError(desktopError(cause)));
+    void Promise.all([
+      invokeDesktop<ApplicationSettings>("settings_get").then(setSettings),
+      invokeDesktop<AppInfo>("app_info").then(setAppInfo),
+    ]).catch((cause) => setError(desktopError(cause)));
   }, []);
 
   async function setLaunchAtLogin(enabled: boolean) {
@@ -27,6 +32,36 @@ export function SettingsScreen() {
       setError(desktopError(cause));
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function checkForUpdates() {
+    if (checking || installing || !isTauri()) return;
+    setChecking(true);
+    setError(null);
+    try {
+      setUpdate(await invokeDesktop<UpdateCheck>("update_check"));
+    } catch (cause) {
+      setError(desktopError(cause));
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  async function installUpdate() {
+    if (!update?.available || installing || !isTauri()) return;
+    const approved = window.confirm(
+      `Install Nian Vision ${update.available.version}? Active recording will stop cleanly and resume after the application restarts.`,
+    );
+    if (!approved) return;
+
+    setInstalling(true);
+    setError(null);
+    try {
+      await invokeDesktop<void>("update_install", { expectedVersion: update.available.version });
+    } catch (cause) {
+      setError(desktopError(cause));
+      setInstalling(false);
     }
   }
 
@@ -52,6 +87,34 @@ export function SettingsScreen() {
           <span>Launch at login</span>
         </label>
         <p className="muted">Login launch starts hidden in the system tray. Manual launch opens the main window.</p>
+      </div>
+      <div className="panel">
+        <h3>Updates</h3>
+        <p>Current version: <strong>{appInfo?.version ?? "unknown"}</strong></p>
+        <div className="button-row">
+          <button type="button" disabled={checking || installing || !isTauri()} onClick={() => void checkForUpdates()}>
+            {checking ? "Checking…" : "Check for updates"}
+          </button>
+          {update?.available && (
+            <button type="button" disabled={installing} onClick={() => void installUpdate()}>
+              {installing ? "Installing…" : `Download and install ${update.available.version}`}
+            </button>
+          )}
+        </div>
+        {update && !update.configured && (
+          <p className="muted">This build has no production update channel configured.</p>
+        )}
+        {update?.configured && !update.available && (
+          <p className="muted">Nian Vision is up to date.</p>
+        )}
+        {update?.available && (
+          <div className="update-summary">
+            <p><strong>Version {update.available.version} is available.</strong></p>
+            {update.available.notes && <p>{update.available.notes}</p>}
+            {update.available.date && <p className="muted">Published {update.available.date}</p>}
+            <p className="muted">Installing requires an explicit restart. Recording intent is preserved and restored after startup.</p>
+          </div>
+        )}
       </div>
       <div className="panel">
         <h3>Window behavior</h3>

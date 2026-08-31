@@ -6,6 +6,18 @@ export interface AppInfo {
   version: string;
 }
 
+export interface AvailableUpdate {
+  version: string;
+  notes: string | null;
+  date: string | null;
+}
+
+export interface UpdateCheck {
+  configured: boolean;
+  current_version: string;
+  available: AvailableUpdate | null;
+}
+
 export type AudioPolicy = "copy_all" | "exclude";
 
 export interface CameraSummary {

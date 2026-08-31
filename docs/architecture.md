@@ -449,6 +449,48 @@ desktop termination uses a process-owned Job Object with
 workers inherit membership atomically, and every production spawn verifies
 containment or kills/reaps the uncontained child. See ADR-0010.
 
+## Linux distribution and signed updates (M8)
+
+M8 currently defines one production distribution target:
+`x86_64-unknown-linux-gnu`, shipped as an AppImage. Windows and macOS packaging
+are explicitly deferred rather than partially maintained.
+
+The AppImage contains the desktop host, a sibling `nian-media-worker`, and an
+application-owned FFmpeg 8.0.3 shared runtime. The pre-bundle worker is linked with
+relative RUNPATH `$ORIGIN/../lib/nian-vision`, which makes release staging
+self-contained. Tauri normalizes the worker RUNPATH to `$ORIGIN/../lib` inside the
+AppImage, where the three FFmpeg SONAME libraries are installed in the image's
+private `/usr/lib`. Both staging and extracted-AppImage smoke verify that
+`libavformat.so.62`, `libavcodec.so.62` and `libavutil.so.60` resolve from the
+application-owned runtime with development overrides removed. The candidate FFmpeg build is SHA-256 pinned, explicitly LGPL/shared,
+and validated by the real media integration suite before packaging.
+
+Desktop and worker also share an application-version handshake. The IPC protocol
+version remains independently authoritative, while packaged builds require the
+worker HELLO `application_version` to equal the desktop release version. A copied
+worker from another release therefore fails closed instead of silently executing
+against a merely wire-compatible host.
+
+The updater is Rust-owned through `tauri-plugin-updater`; React receives only the
+narrow `update_check` and `update_install` commands. Checking does not disturb
+recording. Installation requires an explicit UI confirmation and first downloads
+and verifies the signed updater artifact. Only after cryptographic verification
+does the host set the update admission gate and reuse M7 teardown ordering.
+Persisted Desired recording intent is not cleared. If updater handoff returns or
+fails after runtime teardown, the current application restarts rather than
+remaining stranded in Quitting; normal M7 startup restoration then re-applies the
+persisted recording intent.
+
+Release-only Tauri configuration is generated from environment values. The
+committed repository contains neither the private updater signing key nor a fake
+production endpoint. Production generation rejects non-HTTPS/local/example
+authorities. The Forgejo release workflow builds on Debian 12, validates version
+and tag equality, runs frontend/Rust/media gates, performs clean staged-runtime
+and extracted-AppImage smoke tests, then emits `latest.json`,
+`release-manifest.json`, `BUILD_METADATA.json` and `SHA256SUMS.txt`.
+
+See ADR-0011 and `docs/releasing.md` for the release contract.
+
 ## Failure model
 
 Camera and network failures are normal operation (master spec §11):
@@ -473,4 +515,5 @@ without preventing the remaining subsystems from converging.
 * ADRs: `docs/adr/` (resilience model: ADR-0007)
 * FFmpeg specifics: `docs/ffmpeg.md`
 * Development setup: `docs/development.md`
+* Linux releases/updater: `docs/releasing.md`
 * Testing: `docs/testing.md`
