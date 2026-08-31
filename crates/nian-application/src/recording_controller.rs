@@ -131,8 +131,11 @@ impl RecordingRunner for SupervisorRecordingRunner {
     }
 }
 
+type StatusObserver = Arc<dyn Fn(RecordingStatus) + Send + Sync>;
+
 struct SharedStatus {
     status: Mutex<RecordingStatus>,
+    observer: Mutex<Option<StatusObserver>>,
 }
 
 pub struct RecordingController {
@@ -167,6 +170,7 @@ impl RecordingController {
             spawner,
             shared: Arc::new(SharedStatus {
                 status: Mutex::new(RecordingStatus::default()),
+                observer: Mutex::new(None),
             }),
             stop: None,
             thread: None,
@@ -178,13 +182,7 @@ impl RecordingController {
         camera_id: CameraId,
         desired: DesiredRecording,
     ) -> Result<RecordingStatus, RecordingControllerError> {
-        self.reap_finished()?;
-        // JoinHandle ownership is authoritative. A terminal-looking status can
-        // never authorize a second run while the previous supervision thread
-        // still exists and has not been joined.
-        if self.thread.is_some() {
-            return Err(RecordingControllerError::AlreadyRecording);
-        }
+        self.ensure_startable()?;
 
         self.replace_status(RecordingStatus {
             state: RecordingState::Starting,
@@ -223,6 +221,9 @@ impl RecordingController {
                         status.failure_category = failure_category;
                     }
                 }
+                let snapshot = status.clone();
+                drop(status);
+                notify_status(&shared, snapshot);
             }
         });
 
@@ -243,24 +244,57 @@ impl RecordingController {
         self.status()
     }
 
+    /// Non-mutating admission check for a new recording run.
+    ///
+    /// JoinHandle ownership is authoritative. Finished runs are reaped before
+    /// the decision, but an owned live/Stopping runner always rejects a new
+    /// start. Desktop callers use this before mutating persisted desired state.
+    pub fn ensure_startable(&mut self) -> Result<(), RecordingControllerError> {
+        self.reap_finished()?;
+        if self.thread.is_some() {
+            return Err(RecordingControllerError::AlreadyRecording);
+        }
+        Ok(())
+    }
+
+    /// Registers a process-local observer for authoritative status changes.
+    /// The observer is invoked only after the status mutex is released and is
+    /// intended as a wake-up signal for host-owned projections such as tray UI.
+    pub fn set_status_observer(
+        &mut self,
+        observer: Arc<dyn Fn(RecordingStatus) + Send + Sync>,
+    ) -> Result<(), RecordingControllerError> {
+        *self
+            .shared
+            .observer
+            .lock()
+            .map_err(|_| RecordingControllerError::Synchronization)? = Some(observer);
+        notify_status(&self.shared, self.status_snapshot()?);
+        Ok(())
+    }
+
     pub fn stop(&mut self) -> Result<RecordingStatus, RecordingControllerError> {
         self.reap_finished()?;
         if self.thread.is_none() {
             return Err(RecordingControllerError::NotRecording);
         }
-        let mut status = self
-            .shared
-            .status
-            .lock()
-            .map_err(|_| RecordingControllerError::Synchronization)?;
-        if !status.state.is_active() || status.state == RecordingState::Stopping {
-            return Err(RecordingControllerError::NotRecording);
-        }
-        status.state = RecordingState::Stopping;
+        let updated = {
+            let mut status = self
+                .shared
+                .status
+                .lock()
+                .map_err(|_| RecordingControllerError::Synchronization)?;
+            if !status.state.is_active() || status.state == RecordingState::Stopping {
+                return Err(RecordingControllerError::NotRecording);
+            }
+            status.state = RecordingState::Stopping;
+            status.clone()
+        };
         if let Some(stop) = &self.stop {
             stop.store(true, Ordering::Release);
         }
-        Ok(status.clone())
+        notify_status(&self.shared, updated.clone());
+        Ok(updated)
     }
 
     /// Lifecycle-side cooperative stop signal. Unlike the user Stop command this
@@ -271,8 +305,14 @@ impl RecordingController {
             return Ok(());
         }
         if let Ok(mut status) = self.shared.status.lock() {
+            let changed = status.state.is_active() && status.state != RecordingState::Stopping;
             if status.state.is_active() {
                 status.state = RecordingState::Stopping;
+            }
+            let snapshot = changed.then(|| status.clone());
+            drop(status);
+            if let Some(snapshot) = snapshot {
+                notify_status(&self.shared, snapshot);
             }
         } else {
             return Err(RecordingControllerError::Synchronization);
@@ -362,7 +402,8 @@ impl RecordingController {
             .shared
             .status
             .lock()
-            .map_err(|_| RecordingControllerError::Synchronization)? = replacement;
+            .map_err(|_| RecordingControllerError::Synchronization)? = replacement.clone();
+        notify_status(&self.shared, replacement);
         Ok(())
     }
 
@@ -417,6 +458,17 @@ impl Drop for RecordingController {
     }
 }
 
+fn notify_status(shared: &SharedStatus, status: RecordingStatus) {
+    let observer = shared
+        .observer
+        .lock()
+        .ok()
+        .and_then(|observer| observer.clone());
+    if let Some(observer) = observer {
+        observer(status);
+    }
+}
+
 fn apply_worker_progress(shared: &SharedStatus, payload: &serde_json::Value) {
     let Some(worker_state) = payload.get("state").and_then(serde_json::Value::as_str) else {
         return;
@@ -447,6 +499,9 @@ fn apply_worker_progress(shared: &SharedStatus, payload: &serde_json::Value) {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(status.finalized_segments);
         status.failure_category = None;
+        let snapshot = status.clone();
+        drop(status);
+        notify_status(shared, snapshot);
     }
 }
 

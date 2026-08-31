@@ -56,8 +56,12 @@ ownership. Start, camera mutation, Probe, playback open and settings mutation
 must prove Running while holding that gate before they can commit new work.
 
 Suspend and Quit close subsystem admission before potentially blocking teardown.
-Power callbacks themselves only enqueue a typed event; the application power
-dispatcher performs the bounded orchestration off the Win32 callback thread.
+Power callbacks themselves only enqueue a typed event. Registration happens before
+startup restoration so early notifications are not lost, while dispatch starts only
+after authoritative startup initialization has completed. The power dispatcher then
+performs bounded orchestration off the Win32 callback thread. Dispatcher shutdown is
+an explicit control message and does not depend on callback-Sender destruction, so a
+leak-safe Win32 unregister failure cannot strand Quit waiting for channel disconnect.
 
 ### Persisted desired recording is separate from runtime status
 
@@ -70,9 +74,15 @@ Start ordering is:
 
 ```text
 validate/prepare recording
+-> prove RecordingController admission while ownership is stable
 -> persist Desired=On
 -> start RecordingController
 ```
+
+Rejected second-camera starts therefore cannot replace persisted intent for the
+already-owned run, including while that prior run is still Stopping. Once admission
+has succeeded, a genuine thread/worker startup failure intentionally leaves Desired
+On so restart/restoration can retry the user's intent.
 
 If runtime startup fails, Desired remains On. The failure is visible as runtime
 `Failed`, and the next startup/resume may retry restoration through the same
@@ -92,13 +102,22 @@ persisted desired flag.
 The UI presents Desired and Runtime separately. `Desired: On / Runtime: Failed`
 is a valid, observable state rather than being collapsed into "recording off".
 
+The tray is also Rust-authoritative. `RecordingController` publishes status-change
+notifications from Starting through terminal Stopped/Failed, and a host-owned tray
+watcher projects those notifications together with persisted intent. It does not
+depend on the React polling loop. The watcher has its own explicit Shutdown + join
+path during process Quit.
+
 ### Launch-at-login preference and OS registration converge transactionally
 
-Autostart uses the exact `--startup-hidden` argument. On settings change, the host
-prepares all ordinary settings/playback changes first, changes the OS autostart
-registration, and only then commits authoritative settings. If settings
-persistence fails, the OS registration is rolled back. A rollback failure is a
-typed `autostart_failed` error and is never reported as convergence.
+Autostart uses the exact `--startup-hidden` argument. Launch-at-login-only changes
+are allowed while recording because they do not alter recording-critical storage
+configuration. Such a change does not prepare or swap playback storage, so active
+playback sessions and retention pins remain owned. For settings that do change
+storage/recording policy, the existing recording busy rule still applies. The host
+changes OS autostart registration before committing authoritative settings; if
+settings persistence fails, the OS registration is rolled back. A rollback failure
+is a typed `autostart_failed` error and is never reported as convergence.
 
 At startup, persisted `launch_at_login` remains authoritative. The OS registration
 is inspected and reconciled to that preference; OS drift does not rewrite the
@@ -127,6 +146,7 @@ fixed:
 recording shutdown/join
 -> playback shutdown
 -> probe shutdown
+-> tray watcher shutdown/join
 -> unregister/join power event infrastructure
 -> process exit
 ```
@@ -167,9 +187,13 @@ All raw handles, callback pointers and Job Object FFI remain inside
 ## Verification
 
 Automated tests cover activation ordering, close-to-tray policy, exact hidden-start
-argument detection, autostart drift/rollback failures, desired restoration and
-failure visibility, suspend/resume single-restoration behavior, resume error
-convergence, deterministic Quit ordering, settings schema migration/invariants and
-UI separation of Desired versus Runtime. The Windows platform crate is
+argument detection, truthful Suspending/Quitting activation errors, autostart
+drift/rollback failures, launch-only updates during recording and active playback,
+desired restoration/failure visibility, rejected second-camera Start without intent
+replacement, queued startup Suspend/Resume ordering, suspend/resume
+single-restoration behavior, resume error convergence, tray status/intent projection,
+explicit tray and power-dispatcher shutdown, leak-safe callback-Sender retention,
+deterministic Quit ordering, settings schema migration/invariants and UI separation
+of Desired versus Runtime. The Windows platform crate is
 cross-compiled for `x86_64-pc-windows-msvc` to compile-check the Job Object and
 power-notification FFI surface.

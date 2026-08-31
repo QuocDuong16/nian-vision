@@ -416,22 +416,35 @@ Only explicit coordinated Quit tears down the backend.
 
 Authoritative settings schema v2 stores `launch_at_login` and one
 `recording_enabled` camera. A partial unique index enforces the existing
-single-camera desired-recording constraint. Start persists Desired=On before
-starting the runtime controller; user Stop persists Desired=Off before signalling
-runtime teardown. Suspend and Quit never rewrite desired intent. Startup and
-resume therefore restore Desired=On through the same `RecordingController` path,
-while runtime `Failed` remains independently visible to the UI.
+single-camera desired-recording constraint. Start first proves runtime-controller
+admission while the desktop control gate and controller ownership are stable, then
+persists Desired=On, then starts the runtime controller. A rejected second-camera
+Start therefore cannot replace the previous desired intent, including while the
+previous controller is Stopping. User Stop persists Desired=Off before signalling
+runtime teardown. Suspend and Quit never rewrite desired intent. Startup and resume
+therefore restore Desired=On through the same `RecordingController` path, while
+runtime `Failed` remains independently visible to the UI.
+
+Recording status changes are projected to the native tray from Rust through a
+controller observer and host-owned tray watcher; React polling is not authoritative
+for tray correctness. Persisted-intent changes separately wake the same watcher.
+Both the tray watcher and the power dispatcher use explicit Shutdown messages and
+are joined during Quit.
 
 Windows suspend/resume events come from the isolated `nian-platform-windows`
-boundary. Resume is convergent per subsystem rather than all-or-nothing: playback
-expiry/index resync, recording ownership completion/restoration and probe admission
-are attempted independently. A playback refresh failure is reported but cannot
-leave recording/probe/playback admission permanently wedged. Duplicate Resume
-while already Running is a no-op.
+boundary. Notifications are subscribed before desired-recording restoration so an
+early event is queued rather than lost, but dispatch begins only after startup
+initialization is complete. Resume is convergent per subsystem rather than
+all-or-nothing: playback expiry/index resync, recording ownership
+completion/restoration and probe admission are attempted independently. A playback
+refresh failure is reported but cannot leave recording/probe/playback admission
+permanently wedged. Duplicate Resume while already Running is a no-op.
 
 Explicit Quit follows deterministic ownership order: recording shutdown/join,
-playback shutdown, probe shutdown, power notification unregister/join, then process
-exit. Hard Windows desktop termination uses a process-owned Job Object with
+playback shutdown, probe shutdown, tray watcher shutdown/join, power notification
+unregister/dispatcher join, then process exit. Dispatcher termination is controlled
+explicitly and does not depend on Win32 callback context reclamation. Hard Windows
+desktop termination uses a process-owned Job Object with
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; the desktop joins it before any worker spawn,
 workers inherit membership atomically, and every production spawn verifies
 containment or kills/reaps the uncontained child. See ADR-0010.

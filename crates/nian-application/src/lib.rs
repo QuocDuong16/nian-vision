@@ -31,7 +31,7 @@ pub use config::{AppConfig, SegmentTargetDuration};
 pub use desktop_lifecycle::{DesktopLifecycle, DesktopLifecycleError, DesktopLifecycleState};
 pub use error::ApplicationError;
 pub use playback::{
-    AdjacentRecordingsDto, PlaybackController, PlaybackError, PlaybackErrorCode,
+    AdjacentRecordingsDto, PlaybackBackend, PlaybackController, PlaybackError, PlaybackErrorCode,
     PlaybackInspectDto, PlaybackOpenDto, PreparedPlaybackStorage, RecordingDto,
     TimelineRecordingKind, WorkerPlaybackBackend,
 };

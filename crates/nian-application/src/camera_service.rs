@@ -574,9 +574,6 @@ impl CameraService {
         dto: ApplicationSettingsDto,
         recording_active: bool,
     ) -> Result<PreparedApplicationSettings, CameraServiceError> {
-        if recording_active {
-            return Err(CameraServiceError::CameraBusy);
-        }
         let storage_root = dto.storage_root.as_ref().map(PathBuf::from);
         let retention = RetentionPolicy {
             max_age_days: dto.max_age_days,
@@ -614,15 +611,27 @@ impl CameraService {
                 "segment target duration must be between 5 and 3600 seconds".to_owned(),
             ));
         }
-        Ok(PreparedApplicationSettings {
-            settings: ApplicationSettings {
-                storage_root,
-                segment_target_secs: dto.segment_target_secs,
-                retention,
-                quota,
-                launch_at_login: dto.launch_at_login,
-            },
-        })
+        let settings = ApplicationSettings {
+            storage_root,
+            segment_target_secs: dto.segment_target_secs,
+            retention,
+            quota,
+            launch_at_login: dto.launch_at_login,
+        };
+        if recording_active {
+            let current = self
+                .repository
+                .application_settings()
+                .map_err(map_repository_service_error)?;
+            if settings.storage_root != current.storage_root
+                || settings.segment_target_secs != current.segment_target_secs
+                || settings.retention != current.retention
+                || settings.quota != current.quota
+            {
+                return Err(CameraServiceError::CameraBusy);
+            }
+        }
+        Ok(PreparedApplicationSettings { settings })
     }
 
     pub fn commit_application_settings(

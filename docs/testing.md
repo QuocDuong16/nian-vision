@@ -458,12 +458,23 @@ prepares a real camera recording request after the commit and asserts its
 ### Desktop production lifecycle (M7)
 
 `apps/nian-desktop` regression tests cover window activation order,
-close-to-tray vs real Quit, exact `--startup-hidden` handling, autostart OS
-drift/reconciliation plus rollback failure, persisted desired-state
-restoration/failure visibility, duplicate-free suspend/resume, resume partial-failure
-convergence, and deterministic teardown ordering with process exit last. The Windows
-platform crate is cross-compiled independently to cover native power registration and
-kill-on-close Job Object worker containment.
+close-to-tray vs real Quit, exact `--startup-hidden` handling, truthful lifecycle
+activation errors, autostart OS drift/reconciliation plus rollback failure,
+launch-at-login-only changes while a recorder or playback session is active,
+persisted desired-state restoration/failure visibility, active/Stopping
+second-camera Start rejection without desired-intent replacement, queued
+Suspend/Resume delivery during startup initialization, duplicate-free
+suspend/resume, resume partial-failure convergence, Rust-authoritative tray
+Starting/Connecting/Recording/Backoff/Failed projection, Stop-button intent
+semantics, tray watcher Shutdown/join, and deterministic teardown ordering with
+process exit last.
+
+Power lifecycle seam tests additionally retain/leak the callback-owned Sender to
+model Win32 unregistration failure and prove the dispatcher still terminates from
+its explicit Shutdown control message. A successful-unregistration model proves
+callback state remains reclaimable. The Windows platform crate is cross-compiled
+independently to cover native power registration and kill-on-close Job Object worker
+containment.
 
 ## Planned per milestone
 

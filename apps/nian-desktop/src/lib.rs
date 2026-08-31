@@ -7,9 +7,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
-#[cfg(any(windows, test))]
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use chrono::NaiveDateTime;
@@ -183,7 +181,10 @@ struct DesktopState {
     probe_controller: ProbeController,
     lifecycle: DesktopLifecycle,
     power_subscription: Mutex<Option<Box<dyn PowerEventSubscription>>>,
+    power_dispatch_tx: Mutex<Option<mpsc::Sender<PowerDispatchMessage>>>,
     power_thread: Mutex<Option<JoinHandle<()>>>,
+    tray_watch_tx: Mutex<Option<mpsc::Sender<TrayWatchMessage>>>,
+    tray_thread: Mutex<Option<JoinHandle<()>>>,
     startup_error: Mutex<Option<DesktopErrorDto>>,
     startup_complete: std::sync::atomic::AtomicBool,
     /// Serializes operations whose correctness depends on lifecycle admission
@@ -224,6 +225,20 @@ impl AutostartService for NativeAutostartService<'_> {
             self.app.autolaunch().disable().map_err(|_| ())
         }
     }
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerDispatchMessage {
+    Event(nian_platform_windows::PowerEvent),
+    Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrayWatchMessage {
+    Status(RecordingStatus),
+    RefreshIntent,
+    Shutdown,
 }
 
 #[cfg(any(windows, test))]
@@ -312,12 +327,7 @@ fn activate_window(
     lifecycle: &DesktopLifecycle,
     window: &impl WindowActions,
 ) -> Result<(), DesktopErrorDto> {
-    if !lifecycle.activation_allowed() {
-        return Err(DesktopErrorDto::new(
-            "quitting",
-            "application activation is unavailable while quitting",
-        ));
-    }
+    lifecycle.require_running().map_err(map_lifecycle_error)?;
     window
         .show()
         .and_then(|_| window.unminimize())
@@ -447,21 +457,21 @@ fn start_recording(
     require_running(state)?;
     let id = CameraId::parse(camera_id)
         .map_err(|error| DesktopErrorDto::new("validation", error.to_string()))?;
-    let desired = {
-        let mut service = lock(&state.camera_service)?;
-        let desired = service
-            .prepare_recording(camera_id)
-            .map_err(map_camera_error)?;
-        // Desired state is durable before runtime startup. If the controller
-        // launch fails, this remains true so restart can retry restoration.
-        service
-            .set_recording_enabled(camera_id, true)
-            .map_err(map_desired_state_error)?;
-        desired
-    };
-    lock(&state.recording_controller)?
-        .start(id, desired)
-        .map_err(map_recording_error)
+    let desired = lock(&state.camera_service)?
+        .prepare_recording(camera_id)
+        .map_err(map_camera_error)?;
+    let mut controller = lock(&state.recording_controller)?;
+    // Admission is proven before desired-state mutation. The control gate and
+    // controller guard remain owned until runtime start, so a rejected second
+    // camera can never replace the authoritative persisted intent.
+    controller.ensure_startable().map_err(map_recording_error)?;
+    lock(&state.camera_service)?
+        .set_recording_enabled(camera_id, true)
+        .map_err(map_desired_state_error)?;
+    wake_tray_intent(state);
+    // From here on desired=true is intentionally durable. Genuine thread/worker
+    // startup failures leave it On so restart/restoration can retry user intent.
+    controller.start(id, desired).map_err(map_recording_error)
 }
 
 #[tauri::command]
@@ -484,6 +494,7 @@ fn stop_recording(state: &DesktopState) -> Result<RecordingStatus, DesktopErrorD
         lock(&state.camera_service)?
             .set_recording_enabled(desired_camera.as_str(), false)
             .map_err(map_desired_state_error)?;
+        wake_tray_intent(state);
     }
     let mut controller = lock(&state.recording_controller)?;
     let status = controller.status().map_err(map_recording_error)?;
@@ -679,10 +690,17 @@ fn update_settings_transaction(
         .prepare_application_settings(settings, recording_active)
         .map_err(map_camera_error)?;
     let prepared_dto = prepared_settings.dto();
-    let (storage_root, retention, quota) = playback_storage_config(&prepared_dto)?;
-    let prepared_playback = playback
-        .prepare_storage(storage_root, retention, quota)
-        .map_err(map_playback_error)?;
+    let critical_settings_changed = recording_storage_settings_changed(&previous, &prepared_dto);
+    let prepared_playback = if critical_settings_changed {
+        let (storage_root, retention, quota) = playback_storage_config(&prepared_dto)?;
+        Some(
+            playback
+                .prepare_storage(storage_root, retention, quota)
+                .map_err(map_playback_error)?,
+        )
+    } else {
+        None
+    };
 
     let autostart_changed = previous.launch_at_login != prepared_dto.launch_at_login;
     if autostart_changed {
@@ -714,8 +732,21 @@ fn update_settings_transaction(
             return Err(map_camera_error(error));
         }
     };
-    playback.commit_prepared_storage(prepared_playback);
+    if let Some(prepared_playback) = prepared_playback {
+        playback.commit_prepared_storage(prepared_playback);
+    }
     Ok(saved)
+}
+
+fn recording_storage_settings_changed(
+    previous: &ApplicationSettingsDto,
+    next: &ApplicationSettingsDto,
+) -> bool {
+    previous.storage_root != next.storage_root
+        || previous.segment_target_secs != next.segment_target_secs
+        || previous.max_age_days != next.max_age_days
+        || previous.max_storage_bytes != next.max_storage_bytes
+        || previous.cleanup_target_bytes != next.cleanup_target_bytes
 }
 
 fn playback_storage_config(
@@ -933,6 +964,7 @@ fn restoration_failure_category(error: &CameraServiceError) -> &'static str {
 fn restore_desired_recording_locked(
     state: &DesktopState,
 ) -> Result<Option<RecordingStatus>, DesktopErrorDto> {
+    require_running(state)?;
     let desired_camera = lock(&state.camera_service)?
         .desired_recording_camera()
         .map_err(map_desired_state_error)?;
@@ -957,19 +989,13 @@ fn restore_desired_recording_locked(
         .map_err(map_recording_error)
 }
 
-fn refresh_tray(app: &AppHandle) {
-    let Some(state) = app.try_state::<Arc<DesktopState>>() else {
-        return;
-    };
-    let Some(tray) = app.try_state::<TrayUi>() else {
-        return;
-    };
-    let status = match lock(&state.recording_controller)
-        .and_then(|mut c| c.status().map_err(map_recording_error))
-    {
-        Ok(status) => status,
-        Err(_) => return,
-    };
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrayProjection {
+    status_text: String,
+    stop_enabled: bool,
+}
+
+fn tray_projection(status: &RecordingStatus, desired_on: bool) -> TrayProjection {
     let label = match status.state {
         RecordingState::Stopped => "Stopped",
         RecordingState::Starting => "Starting",
@@ -980,7 +1006,20 @@ fn refresh_tray(app: &AppHandle) {
         RecordingState::Stopping => "Stopping",
         RecordingState::Failed => "Failed",
     };
-    let _ = tray.status.set_text(format!("Recording status: {label}"));
+    TrayProjection {
+        status_text: format!("Recording status: {label}"),
+        stop_enabled: desired_on
+            || (status.state.is_active() && status.state != RecordingState::Stopping),
+    }
+}
+
+fn render_tray_status(app: &AppHandle, status: &RecordingStatus) {
+    let Some(state) = app.try_state::<Arc<DesktopState>>() else {
+        return;
+    };
+    let Some(tray) = app.try_state::<TrayUi>() else {
+        return;
+    };
     let desired_on = lock(&state.camera_service)
         .and_then(|service| {
             service
@@ -990,9 +1029,76 @@ fn refresh_tray(app: &AppHandle) {
         .ok()
         .flatten()
         .is_some();
-    let _ = tray.stop.set_enabled(
-        desired_on || (status.state.is_active() && status.state != RecordingState::Stopping),
-    );
+    let projection = tray_projection(status, desired_on);
+    let _ = tray.status.set_text(projection.status_text);
+    let _ = tray.stop.set_enabled(projection.stop_enabled);
+}
+
+fn refresh_tray(app: &AppHandle) {
+    let Some(state) = app.try_state::<Arc<DesktopState>>() else {
+        return;
+    };
+    let status = match lock(&state.recording_controller)
+        .and_then(|mut c| c.status().map_err(map_recording_error))
+    {
+        Ok(status) => status,
+        Err(_) => return,
+    };
+    render_tray_status(app, &status);
+}
+
+fn run_tray_watch_loop<F>(rx: mpsc::Receiver<TrayWatchMessage>, mut refresh: F)
+where
+    F: FnMut(&RecordingStatus),
+{
+    let mut status = RecordingStatus::default();
+    loop {
+        match rx.recv() {
+            Ok(TrayWatchMessage::Status(next)) => status = next,
+            Ok(TrayWatchMessage::RefreshIntent) => {}
+            Ok(TrayWatchMessage::Shutdown) | Err(_) => break,
+        }
+        refresh(&status);
+    }
+}
+
+fn start_tray_watcher(
+    app: &tauri::App,
+    state: &Arc<DesktopState>,
+    rx: mpsc::Receiver<TrayWatchMessage>,
+) -> Result<(), DesktopErrorDto> {
+    let app_handle = app.handle().clone();
+    let thread = std::thread::Builder::new()
+        .name("desktop-tray-status".to_owned())
+        .spawn(move || {
+            run_tray_watch_loop(rx, |status| render_tray_status(&app_handle, status));
+        })
+        .map_err(|_| {
+            DesktopErrorDto::new("lifecycle_failed", "tray status worker could not start")
+        })?;
+    *lock(&state.tray_thread)? = Some(thread);
+    Ok(())
+}
+
+fn wake_tray_intent(state: &DesktopState) {
+    if let Ok(sender) = state.tray_watch_tx.lock()
+        && let Some(sender) = sender.as_ref()
+    {
+        let _ = sender.send(TrayWatchMessage::RefreshIntent);
+    }
+}
+
+fn shutdown_tray_watcher(state: &DesktopState) {
+    if let Ok(mut sender) = state.tray_watch_tx.lock()
+        && let Some(sender) = sender.take()
+    {
+        let _ = sender.send(TrayWatchMessage::Shutdown);
+    }
+    if let Ok(mut thread) = state.tray_thread.lock()
+        && let Some(thread) = thread.take()
+    {
+        let _ = thread.join();
+    }
 }
 
 fn install_tray(app: &tauri::App) -> tauri::Result<()> {
@@ -1055,17 +1161,25 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-fn run_shutdown_sequence<R, P, Q, W, E>(recording: R, playback: P, probe: Q, power: W, exit: E)
-where
+fn run_shutdown_sequence<R, P, Q, T, W, E>(
+    recording: R,
+    playback: P,
+    probe: Q,
+    tray: T,
+    power: W,
+    exit: E,
+) where
     R: FnOnce(),
     P: FnOnce(),
     Q: FnOnce(),
+    T: FnOnce(),
     W: FnOnce(),
     E: FnOnce(),
 {
     recording();
     playback();
     probe();
+    tray();
     power();
     exit();
 }
@@ -1085,9 +1199,16 @@ fn finish_quit(state: &DesktopState, app: &AppHandle) {
         || {
             let _ = state.probe_controller.shutdown();
         },
+        || shutdown_tray_watcher(state),
         || {
-            // Stop the power source after media resources, then join its tiny
-            // dispatcher so no lifecycle work can race final process exit.
+            // Dispatcher shutdown is explicit and independent of callback
+            // ownership. If Win32 unregistration fails, the leak-safe callback
+            // may retain its Sender forever, but Shutdown still makes recv exit.
+            if let Ok(mut control) = state.power_dispatch_tx.lock()
+                && let Some(control) = control.take()
+            {
+                let _ = control.send(PowerDispatchMessage::Shutdown);
+            }
             if let Ok(mut subscription) = state.power_subscription.lock() {
                 subscription.take();
             }
@@ -1265,11 +1386,11 @@ fn handle_power_event(
 #[cfg(any(windows, test))]
 fn subscribe_power_source(
     source: &dyn PowerEventSource,
-    tx: mpsc::Sender<nian_platform_windows::PowerEvent>,
+    tx: mpsc::Sender<PowerDispatchMessage>,
 ) -> Result<Box<dyn PowerEventSubscription>, DesktopErrorDto> {
     source
         .subscribe(Arc::new(move |event| {
-            let _ = tx.send(event);
+            let _ = tx.send(PowerDispatchMessage::Event(event));
         }))
         .map_err(|_| {
             DesktopErrorDto::new(
@@ -1280,38 +1401,57 @@ fn subscribe_power_source(
 }
 
 #[cfg(windows)]
-fn install_power_events(
-    app: &tauri::App,
+fn prepare_power_events(
     state: &Arc<DesktopState>,
-) -> Result<(), DesktopErrorDto> {
+) -> Result<Option<mpsc::Receiver<PowerDispatchMessage>>, DesktopErrorDto> {
     let (tx, rx) = mpsc::channel();
     let source = NativePowerEventSource;
-    let subscription = subscribe_power_source(&source, tx)?;
+    let subscription = subscribe_power_source(&source, tx.clone())?;
+    *lock(&state.power_subscription)? = Some(subscription);
+    *lock(&state.power_dispatch_tx)? = Some(tx);
+    Ok(Some(rx))
+}
+
+#[cfg(not(windows))]
+fn prepare_power_events(
+    _state: &Arc<DesktopState>,
+) -> Result<Option<mpsc::Receiver<PowerDispatchMessage>>, DesktopErrorDto> {
+    Ok(None)
+}
+
+fn run_power_dispatch_loop<F>(rx: mpsc::Receiver<PowerDispatchMessage>, mut handle_event: F)
+where
+    F: FnMut(nian_platform_windows::PowerEvent),
+{
+    while let Ok(PowerDispatchMessage::Event(event)) = rx.recv() {
+        handle_event(event);
+    }
+}
+
+fn start_power_dispatcher(
+    app: &tauri::App,
+    state: &Arc<DesktopState>,
+    rx: Option<mpsc::Receiver<PowerDispatchMessage>>,
+) -> Result<(), DesktopErrorDto> {
+    let Some(rx) = rx else {
+        return Ok(());
+    };
     let state_for_thread = state.clone();
     let app_handle = app.handle().clone();
     let thread = std::thread::Builder::new()
         .name("desktop-power-events".to_owned())
         .spawn(move || {
-            while let Ok(event) = rx.recv() {
+            run_power_dispatch_loop(rx, |event| {
                 if let Err(error) = handle_power_event(&state_for_thread, event) {
                     tracing::warn!(code = error.code, "power lifecycle handling failed");
                 }
                 refresh_tray(&app_handle);
-            }
+            });
         })
         .map_err(|_| {
             DesktopErrorDto::new("lifecycle_failed", "power event worker could not start")
         })?;
-    *lock(&state.power_subscription)? = Some(subscription);
     *lock(&state.power_thread)? = Some(thread);
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn install_power_events(
-    _app: &tauri::App,
-    _state: &Arc<DesktopState>,
-) -> Result<(), DesktopErrorDto> {
     Ok(())
 }
 
@@ -1382,10 +1522,19 @@ pub fn run() {
             };
             let worker_path = std::env::current_exe()?.with_file_name(worker_name);
             let worker_program = worker_path.to_string_lossy().into_owned();
-            let recording_controller =
+            let (tray_watch_tx, tray_watch_rx) = mpsc::channel();
+            let mut recording_controller =
                 RecordingController::new(Arc::new(SupervisorRecordingRunner {
                     worker_program: worker_program.clone(),
                 }));
+            let tray_status_tx = tray_watch_tx.clone();
+            recording_controller
+                .set_status_observer(Arc::new(move |status| {
+                    let _ = tray_status_tx.send(TrayWatchMessage::Status(status));
+                }))
+                .map_err(|_| {
+                    std::io::Error::other("tray status observer could not be installed")
+                })?;
             let probe_controller = ProbeController::new(Arc::new(WorkerProbeRunner {
                 worker_program: worker_program.clone(),
             }));
@@ -1414,26 +1563,43 @@ pub fn run() {
                 probe_controller,
                 lifecycle: DesktopLifecycle::new(),
                 power_subscription: Mutex::new(None),
+                power_dispatch_tx: Mutex::new(None),
                 power_thread: Mutex::new(None),
+                tray_watch_tx: Mutex::new(Some(tray_watch_tx)),
+                tray_thread: Mutex::new(None),
                 startup_error: Mutex::new(startup_error),
                 startup_complete: std::sync::atomic::AtomicBool::new(false),
                 control_gate: Mutex::new(()),
             });
             app.manage(state.clone());
 
-            if let Err(error) = install_power_events(app, &state) {
-                tracing::warn!(code = error.code, "power event source is unavailable");
-                *lock(&state.startup_error)
-                    .map_err(|error| std::io::Error::other(error.message))? = Some(error);
-            }
+            // Subscribe before restoration so Windows cannot lose early power
+            // events, but do not dispatch them concurrently with startup. The
+            // receiver queues them until authoritative initialization finishes.
+            let power_rx = match prepare_power_events(&state) {
+                Ok(rx) => rx,
+                Err(error) => {
+                    tracing::warn!(code = error.code, "power event source is unavailable");
+                    *lock(&state.startup_error)
+                        .map_err(|error| std::io::Error::other(error.message))? = Some(error);
+                    None
+                }
+            };
             install_tray(app)?;
 
-            if let Err(error) = restore_desired_recording_locked(&state) {
-                tracing::warn!(code = error.code, "desired recording restoration failed");
-                if let Ok(mut startup_error) = state.startup_error.lock()
-                    && startup_error.is_none()
-                {
-                    *startup_error = Some(error);
+            {
+                start_tray_watcher(app, &state, tray_watch_rx)
+                    .map_err(|error| std::io::Error::other(error.message))?;
+
+                let _gate = lock(&state.control_gate)
+                    .map_err(|error| std::io::Error::other(error.message))?;
+                if let Err(error) = restore_desired_recording_locked(&state) {
+                    tracing::warn!(code = error.code, "desired recording restoration failed");
+                    if let Ok(mut startup_error) = state.startup_error.lock()
+                        && startup_error.is_none()
+                    {
+                        *startup_error = Some(error);
+                    }
                 }
             }
             refresh_tray(app.handle());
@@ -1458,6 +1624,15 @@ pub fn run() {
             {
                 tracing::warn!(code = error.code, "deferred main window activation failed");
             }
+            if let Err(error) = start_power_dispatcher(app, &state, power_rx) {
+                tracing::warn!(code = error.code, "power event dispatcher could not start");
+                if let Ok(mut startup_error) = state.startup_error.lock()
+                    && startup_error.is_none()
+                {
+                    *startup_error = Some(error);
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1524,7 +1699,7 @@ mod tests {
         settings: nian_settings::ApplicationSettings,
         fail_save: bool,
         fail_desired_write: bool,
-        camera: Option<nian_domain::CameraConfig>,
+        cameras: Vec<nian_domain::CameraConfig>,
         desired_camera: Option<String>,
         extra_desired_camera: Option<String>,
     }
@@ -1539,7 +1714,7 @@ mod tests {
             &self,
         ) -> Result<Vec<nian_domain::CameraConfig>, nian_application::SettingsRepositoryError>
         {
-            Ok(self.state.lock().unwrap().camera.iter().cloned().collect())
+            Ok(self.state.lock().unwrap().cameras.clone())
         }
 
         fn get_camera(
@@ -1551,9 +1726,9 @@ mod tests {
                 .state
                 .lock()
                 .unwrap()
-                .camera
-                .as_ref()
-                .filter(|camera| camera.camera_id() == camera_id)
+                .cameras
+                .iter()
+                .find(|camera| camera.camera_id() == camera_id)
                 .cloned())
         }
 
@@ -1619,7 +1794,11 @@ mod tests {
             if state.fail_desired_write {
                 return Err(nian_application::SettingsRepositoryError::Persistence);
             }
-            if state.camera.as_ref().map(|camera| camera.camera_id()) != Some(camera_id) {
+            if !state
+                .cameras
+                .iter()
+                .any(|camera| camera.camera_id() == camera_id)
+            {
                 return Ok(false);
             }
             state.desired_camera = enabled.then(|| camera_id.as_str().to_owned());
@@ -1644,7 +1823,7 @@ mod tests {
             },
             fail_save: false,
             fail_desired_write: false,
-            camera: None,
+            cameras: Vec::new(),
             desired_camera: None,
             extra_desired_camera: None,
         }));
@@ -1728,6 +1907,50 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ParkedStoppingRunner {
+        starts: AtomicUsize,
+        stop_seen: AtomicBool,
+        release: AtomicBool,
+    }
+
+    impl nian_application::RecordingRunner for ParkedStoppingRunner {
+        fn run(
+            &self,
+            _desired: nian_application::DesiredRecording,
+            stop: Arc<AtomicBool>,
+            _observer: Arc<dyn Fn(&serde_json::Value) + Send + Sync>,
+        ) -> Result<nian_application::WorkerEnd, nian_application::RecordingRunFailure> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            while !stop.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            self.stop_seen.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            Ok(nian_application::WorkerEnd::RequestedShutdown)
+        }
+    }
+
+    struct ScriptedTransitionRunner;
+
+    impl nian_application::RecordingRunner for ScriptedTransitionRunner {
+        fn run(
+            &self,
+            _desired: nian_application::DesiredRecording,
+            _stop: Arc<AtomicBool>,
+            observer: Arc<dyn Fn(&serde_json::Value) + Send + Sync>,
+        ) -> Result<nian_application::WorkerEnd, nian_application::RecordingRunFailure> {
+            for state in ["recovering", "connecting", "recording", "backoff"] {
+                observer(&serde_json::json!({"state": state}));
+            }
+            Err(nian_application::RecordingRunFailure::Permanent {
+                failure_category: Some("source_open_failed".to_owned()),
+            })
+        }
+    }
+
     struct FailingRecordingThreadSpawner;
 
     impl nian_application::RecordingThreadSpawner for FailingRecordingThreadSpawner {
@@ -1737,6 +1960,32 @@ mod tests {
             _task: Box<dyn FnOnce() + Send + 'static>,
         ) -> std::io::Result<JoinHandle<()>> {
             Err(std::io::Error::other("injected recording thread failure"))
+        }
+    }
+
+    struct FakePlaybackBackend;
+
+    impl nian_application::PlaybackBackend for FakePlaybackBackend {
+        fn prepare(
+            &self,
+            source_path: &std::path::Path,
+            output_path: &std::path::Path,
+        ) -> Result<nian_application::PlaybackInspectDto, PlaybackError> {
+            let metadata = std::fs::symlink_metadata(source_path)
+                .map_err(|_| PlaybackError::MediaUnreadable)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(PlaybackError::MediaUnreadable);
+            }
+            std::fs::write(output_path, b"prepared-media").map_err(|_| PlaybackError::Internal)?;
+            Ok(nian_application::PlaybackInspectDto {
+                duration_ms: Some(5_000),
+                video_codec: "h264".to_owned(),
+                width: Some(1920),
+                height: Some(1080),
+                audio_available: false,
+                container_compatibility: "fragmented_mp4".to_owned(),
+                seekable: true,
+            })
         }
     }
 
@@ -1782,6 +2031,44 @@ mod tests {
         }
     }
 
+    struct RetainedCallbackSubscription {
+        callback: Option<PowerEventCallback>,
+        leak_on_drop: bool,
+        reclaimed: Arc<AtomicBool>,
+    }
+
+    impl Drop for RetainedCallbackSubscription {
+        fn drop(&mut self) {
+            let Some(callback) = self.callback.take() else {
+                return;
+            };
+            if self.leak_on_drop {
+                std::mem::forget(callback);
+            } else {
+                drop(callback);
+                self.reclaimed.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    struct RetainingPowerEventSource {
+        leak_on_drop: bool,
+        reclaimed: Arc<AtomicBool>,
+    }
+
+    impl PowerEventSource for RetainingPowerEventSource {
+        fn subscribe(
+            &self,
+            callback: PowerEventCallback,
+        ) -> Result<Box<dyn PowerEventSubscription>, ()> {
+            Ok(Box::new(RetainedCallbackSubscription {
+                callback: Some(callback),
+                leak_on_drop: self.leak_on_drop,
+                reclaimed: self.reclaimed.clone(),
+            }))
+        }
+    }
+
     fn seed_recording_camera(
         repository: &Arc<Mutex<TestRepositoryState>>,
         credentials: &Arc<nian_application::MemoryCredentialStore>,
@@ -1791,7 +2078,7 @@ mod tests {
         credentials
             .put(&credential_ref, &Credentials::new("admin", "secret"))
             .unwrap();
-        repository.lock().unwrap().camera = Some(
+        repository.lock().unwrap().cameras.push(
             nian_domain::CameraConfig::new(
                 CameraId::parse("front-door").unwrap(),
                 "Front door",
@@ -1809,6 +2096,27 @@ mod tests {
             .unwrap(),
         );
         repository.lock().unwrap().desired_camera = desired.then(|| "front-door".to_owned());
+    }
+
+    fn seed_second_recording_camera(repository: &Arc<Mutex<TestRepositoryState>>) {
+        let credential_ref = CredentialRef::parse("desktop-lifecycle-test-ref").unwrap();
+        repository.lock().unwrap().cameras.push(
+            nian_domain::CameraConfig::new(
+                CameraId::parse("back-door").unwrap(),
+                "Back door",
+                nian_domain::CameraSource::Rtsp(
+                    nian_domain::CameraEndpoint::new(
+                        nian_domain::Host::parse("192.168.1.51").unwrap(),
+                        554,
+                        "/stream1",
+                    )
+                    .unwrap(),
+                ),
+                AudioPolicy::CopyAll,
+                credential_ref,
+            )
+            .unwrap(),
+        );
     }
 
     fn lifecycle_state(
@@ -1841,7 +2149,10 @@ mod tests {
                 probe_controller,
                 lifecycle: DesktopLifecycle::new(),
                 power_subscription: Mutex::new(None),
+                power_dispatch_tx: Mutex::new(None),
                 power_thread: Mutex::new(None),
+                tray_watch_tx: Mutex::new(None),
+                tray_thread: Mutex::new(None),
                 startup_error: Mutex::new(None),
                 startup_complete: std::sync::atomic::AtomicBool::new(false),
                 control_gate: Mutex::new(()),
@@ -1903,7 +2214,7 @@ mod tests {
     }
 
     #[test]
-    fn activation_runs_show_unminimize_focus_and_quit_blocks_it() {
+    fn activation_reports_suspending_and_quitting_truthfully() {
         let lifecycle = DesktopLifecycle::new();
         let window = FakeWindow::default();
 
@@ -1912,6 +2223,10 @@ mod tests {
             *window.calls.lock().unwrap(),
             vec!["show", "unminimize", "focus"]
         );
+
+        lifecycle.begin_suspend().unwrap();
+        let error = activate_window(&lifecycle, &window).unwrap_err();
+        assert_eq!(error.code, "suspending");
 
         lifecycle.begin_quit().unwrap();
         let error = activate_window(&lifecycle, &window).unwrap_err();
@@ -1966,9 +2281,62 @@ mod tests {
 
         assert_eq!(
             rx.recv_timeout(Duration::from_millis(50)).unwrap(),
-            nian_platform_windows::PowerEvent::Resume
+            PowerDispatchMessage::Event(nian_platform_windows::PowerEvent::Resume)
         );
         assert_eq!(source.subscriptions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn successful_power_unregistration_model_reclaims_callback_state() {
+        let reclaimed = Arc::new(AtomicBool::new(false));
+        let source = RetainingPowerEventSource {
+            leak_on_drop: false,
+            reclaimed: reclaimed.clone(),
+        };
+        let (tx, rx) = mpsc::channel();
+        let subscription = subscribe_power_source(&source, tx).unwrap();
+
+        drop(subscription);
+
+        assert!(reclaimed.load(Ordering::Acquire));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn leaked_callback_sender_cannot_block_dispatcher_shutdown_or_final_exit() {
+        let (control_tx, rx) = mpsc::channel();
+        let reclaimed = Arc::new(AtomicBool::new(false));
+        let source = RetainingPowerEventSource {
+            leak_on_drop: true,
+            reclaimed: reclaimed.clone(),
+        };
+        let subscription = subscribe_power_source(&source, control_tx.clone()).unwrap();
+        drop(subscription);
+        assert!(!reclaimed.load(Ordering::Acquire));
+        let dispatcher = std::thread::spawn(move || {
+            run_power_dispatch_loop(rx, |_| {});
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let power_events = events.clone();
+        let exit_events = events.clone();
+
+        run_shutdown_sequence(
+            || {},
+            || {},
+            || {},
+            || {},
+            move || {
+                control_tx.send(PowerDispatchMessage::Shutdown).unwrap();
+                dispatcher.join().unwrap();
+                power_events.lock().unwrap().push("power-joined");
+            },
+            move || exit_events.lock().unwrap().push("exit"),
+        );
+
+        assert_eq!(*events.lock().unwrap(), vec!["power-joined", "exit"]);
     }
 
     #[test]
@@ -1977,6 +2345,7 @@ mod tests {
         let recording = events.clone();
         let playback = events.clone();
         let probe = events.clone();
+        let tray = events.clone();
         let power = events.clone();
         let exit = events.clone();
 
@@ -1984,14 +2353,164 @@ mod tests {
             move || recording.lock().unwrap().push("recording"),
             move || playback.lock().unwrap().push("playback"),
             move || probe.lock().unwrap().push("probe"),
+            move || tray.lock().unwrap().push("tray"),
             move || power.lock().unwrap().push("power"),
             move || exit.lock().unwrap().push("exit"),
         );
 
         assert_eq!(
             *events.lock().unwrap(),
-            vec!["recording", "playback", "probe", "power", "exit"]
+            vec!["recording", "playback", "probe", "tray", "power", "exit"]
         );
+    }
+
+    #[test]
+    fn recording_status_observer_drives_tray_projection_without_frontend_polling() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, _repository, _runner, _probe) = lifecycle_state(&root, true);
+        let (tx, rx) = mpsc::channel();
+        let projections = Arc::new(Mutex::new(Vec::new()));
+        let captured = projections.clone();
+        let watcher = std::thread::spawn(move || {
+            run_tray_watch_loop(rx, |status| {
+                captured.lock().unwrap().push(tray_projection(status, true));
+            });
+        });
+
+        let mut controller = RecordingController::new(Arc::new(ScriptedTransitionRunner));
+        let observer_tx = tx.clone();
+        controller
+            .set_status_observer(Arc::new(move |status| {
+                let _ = observer_tx.send(TrayWatchMessage::Status(status));
+            }))
+            .unwrap();
+        *state.recording_controller.lock().unwrap() = controller;
+
+        start_recording(&state, "front-door").unwrap();
+        for _ in 0..200 {
+            let status = state.recording_controller.lock().unwrap().status().unwrap();
+            if status.state == RecordingState::Failed {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        tx.send(TrayWatchMessage::Shutdown).unwrap();
+        watcher.join().unwrap();
+
+        let projections = projections.lock().unwrap();
+        let labels = projections
+            .iter()
+            .map(|projection| projection.status_text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "Recording status: Stopped",
+                "Recording status: Starting",
+                "Recording status: Recovering",
+                "Recording status: Connecting",
+                "Recording status: Recording",
+                "Recording status: Backoff",
+                "Recording status: Failed",
+            ]
+        );
+        assert!(projections.last().unwrap().stop_enabled);
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown()
+            .unwrap();
+    }
+
+    #[test]
+    fn tray_stop_clears_intent_before_publishing_stopping_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, _default_runner, _probe) = lifecycle_state(&root, true);
+        repository.lock().unwrap().desired_camera = None;
+        let runner = Arc::new(ParkedStoppingRunner::default());
+        *state.recording_controller.lock().unwrap() = RecordingController::new(runner.clone());
+        let (tx, rx) = mpsc::channel();
+        *state.tray_watch_tx.lock().unwrap() = Some(tx.clone());
+        let observer_tx = tx.clone();
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .set_status_observer(Arc::new(move |status| {
+                let _ = observer_tx.send(TrayWatchMessage::Status(status));
+            }))
+            .unwrap();
+
+        start_recording(&state, "front-door").unwrap();
+        for _ in 0..200 {
+            if runner.starts.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        while rx.try_recv().is_ok() {}
+
+        let stopped = stop_recording(&state).unwrap();
+        assert_eq!(stopped.state, RecordingState::Stopping);
+        assert!(repository.lock().unwrap().desired_camera.is_none());
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(50)).unwrap(),
+            TrayWatchMessage::RefreshIntent
+        );
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(50)).unwrap(),
+            TrayWatchMessage::Status(RecordingStatus {
+                state: RecordingState::Stopping,
+                ..
+            })
+        ));
+
+        runner.release.store(true, Ordering::Release);
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown()
+            .unwrap();
+    }
+
+    #[test]
+    fn tray_stop_enablement_includes_persisted_intent_but_not_off_stopping() {
+        assert!(!tray_projection(&RecordingStatus::default(), false).stop_enabled);
+        let failed = RecordingStatus {
+            state: RecordingState::Failed,
+            ..RecordingStatus::default()
+        };
+        assert!(tray_projection(&failed, true).stop_enabled);
+        let stopping = RecordingStatus {
+            state: RecordingState::Stopping,
+            ..RecordingStatus::default()
+        };
+        assert!(!tray_projection(&stopping, false).stop_enabled);
+    }
+
+    #[test]
+    fn tray_watcher_shutdown_is_explicit_and_joined() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, _repository, _runner, _probe) = lifecycle_state(&root, true);
+        let (tx, rx) = mpsc::channel();
+        let exited = Arc::new(AtomicBool::new(false));
+        let thread_exited = exited.clone();
+        let thread = std::thread::spawn(move || {
+            run_tray_watch_loop(rx, |_| {});
+            thread_exited.store(true, Ordering::Release);
+        });
+        *state.tray_watch_tx.lock().unwrap() = Some(tx);
+        *state.tray_thread.lock().unwrap() = Some(thread);
+
+        shutdown_tray_watcher(&state);
+
+        assert!(exited.load(Ordering::Acquire));
+        assert!(state.tray_thread.lock().unwrap().is_none());
     }
 
     #[test]
@@ -2048,6 +2567,87 @@ mod tests {
         assert_eq!(runner.starts.load(Ordering::SeqCst), 0);
         let status = state.recording_controller.lock().unwrap().status().unwrap();
         assert_eq!(status.state, RecordingState::Failed);
+    }
+
+    #[test]
+    fn rejected_second_camera_start_preserves_intent_until_prior_runner_is_reaped() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, _default_runner, _probe) = lifecycle_state(&root, true);
+        seed_second_recording_camera(&repository);
+        repository.lock().unwrap().desired_camera = None;
+        let runner = Arc::new(ParkedStoppingRunner::default());
+        *state.recording_controller.lock().unwrap() = RecordingController::new(runner.clone());
+
+        start_recording(&state, "front-door").unwrap();
+        for _ in 0..200 {
+            if runner.starts.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(runner.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repository.lock().unwrap().desired_camera.as_deref(),
+            Some("front-door")
+        );
+
+        let error = start_recording(&state, "back-door").unwrap_err();
+        assert_eq!(error.code, "already_recording");
+        assert_eq!(
+            repository.lock().unwrap().desired_camera.as_deref(),
+            Some("front-door")
+        );
+        assert_eq!(runner.starts.load(Ordering::SeqCst), 1);
+
+        let stopped = stop_recording(&state).unwrap();
+        assert_eq!(stopped.state, RecordingState::Stopping);
+        assert!(repository.lock().unwrap().desired_camera.is_none());
+        for _ in 0..200 {
+            if runner.stop_seen.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(runner.stop_seen.load(Ordering::Acquire));
+
+        let error = start_recording(&state, "back-door").unwrap_err();
+        assert_eq!(error.code, "already_recording");
+        assert!(repository.lock().unwrap().desired_camera.is_none());
+        assert_eq!(runner.starts.load(Ordering::SeqCst), 1);
+
+        runner.release.store(true, Ordering::Release);
+        for _ in 0..200 {
+            if state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .ensure_startable()
+                .is_ok()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        start_recording(&state, "back-door").unwrap();
+        for _ in 0..200 {
+            if runner.starts.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(runner.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            repository.lock().unwrap().desired_camera.as_deref(),
+            Some("back-door")
+        );
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown()
+            .unwrap();
     }
 
     #[test]
@@ -2187,6 +2787,105 @@ mod tests {
     }
 
     #[test]
+    fn startup_restore_refuses_to_start_after_lifecycle_is_suspending() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, _repository, runner, _probe) = lifecycle_state(&root, true);
+        state.lifecycle.begin_suspend().unwrap();
+
+        let error = restore_desired_recording_locked(&state).unwrap_err();
+
+        assert_eq!(error.code, "suspending");
+        assert_eq!(runner.starts.load(Ordering::SeqCst), 0);
+        state.lifecycle.begin_quit().unwrap();
+        let error = restore_desired_recording_locked(&state).unwrap_err();
+        assert_eq!(error.code, "quitting");
+        assert_eq!(runner.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn queued_suspend_during_startup_is_processed_only_after_initial_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, _repository, runner, _probe) = lifecycle_state(&root, true);
+        let (tx, rx) = mpsc::channel();
+        tx.send(PowerDispatchMessage::Event(
+            nian_platform_windows::PowerEvent::Suspend,
+        ))
+        .unwrap();
+        tx.send(PowerDispatchMessage::Shutdown).unwrap();
+
+        {
+            let _gate = state.control_gate.lock().unwrap();
+            restore_desired_recording_locked(&state).unwrap();
+            wait_for_starts(&runner, 1);
+            assert_eq!(
+                state.lifecycle.state().unwrap(),
+                DesktopLifecycleState::Running
+            );
+        }
+
+        run_power_dispatch_loop(rx, |event| handle_power_event(&state, event).unwrap());
+        assert_eq!(
+            state.lifecycle.state().unwrap(),
+            DesktopLifecycleState::Suspending
+        );
+        assert_eq!(runner.starts.load(Ordering::SeqCst), 1);
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown()
+            .unwrap();
+    }
+
+    #[test]
+    fn queued_suspend_resume_during_startup_converges_to_one_active_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, _repository, runner, _probe) = lifecycle_state(&root, true);
+        let (tx, rx) = mpsc::channel();
+        tx.send(PowerDispatchMessage::Event(
+            nian_platform_windows::PowerEvent::Suspend,
+        ))
+        .unwrap();
+        tx.send(PowerDispatchMessage::Event(
+            nian_platform_windows::PowerEvent::Resume,
+        ))
+        .unwrap();
+        tx.send(PowerDispatchMessage::Shutdown).unwrap();
+
+        {
+            let _gate = state.control_gate.lock().unwrap();
+            restore_desired_recording_locked(&state).unwrap();
+            wait_for_starts(&runner, 1);
+        }
+        run_power_dispatch_loop(rx, |event| handle_power_event(&state, event).unwrap());
+        wait_for_starts(&runner, 2);
+
+        assert_eq!(
+            state.lifecycle.state().unwrap(),
+            DesktopLifecycleState::Running
+        );
+        assert_eq!(runner.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .active_camera()
+                .unwrap(),
+            Some(CameraId::parse("front-door").unwrap())
+        );
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown()
+            .unwrap();
+    }
+
+    #[test]
     fn resume_error_does_not_wedge_recording_playback_or_probe_admission() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("recordings");
@@ -2244,6 +2943,108 @@ mod tests {
         assert!(!media.split_whitespace().any(|source| source == "*"));
         assert!(!csp.contains("192.168."));
         assert!(!csp.contains("default-src http:"));
+    }
+
+    #[test]
+    fn launch_only_update_succeeds_while_recording_and_leaves_runner_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, _repository, runner, _probe) = lifecycle_state(&root, true);
+        restore_desired_recording_locked(&state).unwrap();
+        wait_for_starts(&runner, 1);
+        let autostart = FakeAutostart::default();
+
+        {
+            let mut service = state.camera_service.lock().unwrap();
+            let mut playback = state.playback_controller.lock().unwrap();
+            let mut next = service.application_settings().unwrap();
+            next.launch_at_login = true;
+            let saved =
+                update_settings_transaction(&mut service, &mut playback, &autostart, next, true)
+                    .unwrap();
+            assert!(saved.launch_at_login);
+        }
+
+        assert_eq!(runner.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .active_camera()
+                .unwrap(),
+            Some(CameraId::parse("front-door").unwrap())
+        );
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown()
+            .unwrap();
+    }
+
+    #[test]
+    fn launch_only_update_keeps_active_playback_session_open_and_pinned() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let relative = "front-door/2026/08/29/08-30-00.mkv";
+        let source = root.join(relative);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"source-media").unwrap();
+        let (mut service, _state, _credentials) = test_service(&root);
+        let mut playback = PlaybackController::with_backend(
+            Arc::new(FakePlaybackBackend),
+            temp.path().join("cache"),
+        )
+        .unwrap();
+        playback
+            .configure_storage(Some(root.clone()), RetentionPolicy::default(), None)
+            .unwrap();
+        let opened = playback.open(relative).unwrap();
+        assert!(playback.session_active(&opened.session_id).unwrap());
+
+        let previous = service.application_settings().unwrap();
+        let mut next = previous.clone();
+        next.launch_at_login = true;
+        assert!(!recording_storage_settings_changed(&previous, &next));
+        let autostart = FakeAutostart::default();
+
+        let saved =
+            update_settings_transaction(&mut service, &mut playback, &autostart, next, true)
+                .unwrap();
+
+        assert!(saved.launch_at_login);
+        assert_eq!(playback.configured_storage_root(), Some(root.as_path()));
+        assert!(playback.session_active(&opened.session_id).unwrap());
+        playback.close(&opened.session_id).unwrap();
+    }
+
+    #[test]
+    fn recording_critical_settings_change_remains_blocked_while_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("recordings-a");
+        let root_b = temp.path().join("recordings-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let (mut service, _state, _credentials) = test_service(&root_a);
+        let mut playback = configured_playback(&root_a, temp.path().join("cache"));
+        let next = settings_for(&root_b);
+        assert!(recording_storage_settings_changed(
+            &service.application_settings().unwrap(),
+            &next
+        ));
+
+        let error = update_settings_transaction(
+            &mut service,
+            &mut playback,
+            &FakeAutostart::default(),
+            next,
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "camera_busy");
+        assert_eq!(playback.configured_storage_root(), Some(root_a.as_path()));
     }
 
     #[test]
@@ -2414,7 +3215,7 @@ mod tests {
         credentials
             .put(&credential_ref, &Credentials::new("admin", "secret"))
             .unwrap();
-        state.lock().unwrap().camera = Some(
+        state.lock().unwrap().cameras.push(
             nian_domain::CameraConfig::new(
                 CameraId::parse("front-door").unwrap(),
                 "Front door",
