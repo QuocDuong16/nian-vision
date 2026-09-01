@@ -476,60 +476,78 @@ callback state remains reclaimable. The Windows platform crate is cross-compiled
 independently to cover native power registration and kill-on-close Job Object worker
 containment.
 
-### Linux distribution and updater (M8)
+### Linux and Windows distribution/updater (M8)
 
 Release-script/tool tests cover strict SemVer/tag convergence, mechanically reject
 FFmpeg GPL/nonfree/static-link drift, and validate the hybrid release topology:
 Forgejo has no active tag-release workflow, GitHub release automation is tag-only,
 every `uses:` action is immutable-SHA pinned, default GitHub permissions are
-read-only, only publication receives `contents: write`, signing secrets remain
-step-scoped, and Forgejo quality CI remains present. Mirror trust checks require
-`GITHUB_SHA`/tag identity, the configured mirror actor and default-branch
-reachability. Generated Tauri config tests require a public-only shape with an
-empty release `beforeBuildCommand`, and authority tests reject
-non-HTTPS/local/reserved-placeholder endpoints. Fixed offline updater signature
-vectors prove matching-key success plus mismatched-key, mutated-artifact and
-mutated-signature failure using `minisign-verify`, the same verifier family used by
-Tauri updater runtime.
+read-only, only publication receives `contents: write`, and Forgejo quality CI
+remains present. Mirror trust checks require `GITHUB_SHA`/tag identity, the configured
+mirror actor and default-branch reachability.
 
-The release workflow builds the exact SHA-256-pinned FFmpeg 8.0.3 source candidate
-and runs the full `nian-media-ffmpeg` fixture integration suite against those
-libraries before they are eligible for packaging.
+Structural tests require `build-linux` and `build-windows` to be independent peers,
+with explicit `windows-2022` for Windows. Protected signing jobs are separate from
+pnpm/Vite, FFmpeg compilation and ordinary tests. Updater private key material is
+confined to the updater-signing steps; Windows PFX/password material is confined to
+Windows Authenticode steps. Generated Linux and Windows Tauri configs contain only
+public updater configuration and bundle/resource mappings with
+`beforeBuildCommand` disabled.
 
-`scripts/release/stage-linux.sh` then exercises the release worker with development
-library overrides removed. It verifies the installation-relative worker RUNPATH,
-FFmpeg ABI 62/62/60, complete dynamic dependency closure, HELLO application-version
-compatibility, fixture `camera.probe`, and fixture `playback.prepare`. The worker
-must resolve all three FFmpeg libraries from the staged application-owned runtime,
-not system FFmpeg.
+Both platform jobs build the exact SHA-256-pinned FFmpeg 8.0.3 source authority.
+Linux keeps its accepted LGPL/shared candidate and media fixture integration suite.
+Windows uses the MSVC FFmpeg toolchain, requires shared DLLs plus the MSVC import
+libraries, and runs the same media integration surface before packaging. Static and
+runtime contracts reject GPL/nonfree/static drift, missing required DLLs, MSYS2 or
+vcpkg runtime authority, repository build paths and `NIAN_FFMPEG_LIB_DIR` runtime
+dependence.
 
-Frontend Settings tests cover configured/unconfigured update state, update
-discovery, explicit installation confirmation and the update command boundary.
-Desktop Rust tests prove update admission blocks new lifecycle work before teardown
-and that updater teardown reaches Quitting/Stopped while preserving persisted
-Desired recording intent. The production AppImage path additionally extracts the
-actual built image and repeats installed-layout worker/media smoke checks. It then
-launches the actual AppImage under isolated Xvfb/D-Bus, waits on the backend
-`desktop_startup_ready` marker, proves a bounded post-readiness stability interval
-and terminates the smoke session. No camera, internet or stored keyring credential
-is required.
+`scripts/release/stage-linux.sh` preserves the accepted Linux worker RUNPATH/ABI and
+fixture smoke. `scripts/release/stage-windows.ps1` recursively inspects the worker and
+FFmpeg DLL closure with `dumpbin /dependents`, copies required VC runtime DLLs
+application-locally, accepts only API-set/System32 dependencies outside that stage,
+and invokes the cross-platform worker smoke with a clean Windows environment. Worker
+HELLO still proves IPC protocol, application version and FFmpeg ABI 62/62/60 before
+fixture `camera.probe`, fixture `playback.prepare` and clean shutdown.
 
-Release security gates scan the staged runtime, extracted AppImage tree, frontend
-assets and finalized release directory for a configured binary-safe secret
-sentinel. Post-build cryptographic verification proves the generated AppImage and
-`.sig` match the configured updater public key. The separate GitHub `verify-release`
-job re-downloads the temporary Linux candidate and rechecks version, tag commit,
-exact tagged asset URL, signature and every checksum before producing the only
-payload accepted by `publish-release`. Publication itself is draft-first: GitHub
-Release assets are uploaded, downloaded back, byte-compared and checksum-verified
-before the draft can become public.
+The actual Linux AppImage is still extracted and smoke-tested, then launched under
+isolated Xvfb/D-Bus until backend readiness. The actual Windows NSIS installer is
+silently installed into a disposable runner-local directory. The installed desktop,
+worker and full application-local DLL closure must be byte-identical to the exact
+bundle inputs. Installed worker media smoke runs without development FFmpeg
+overrides. The installed desktop must reach backend readiness, prove successful real
+Windows power-notification subscription, and prove the accepted kill-on-close Job
+Object reaps the exact installed worker after hard desktop death.
+
+Windows upgrade/data smoke creates settings through the real `nian-settings` API. It
+proves camera configuration, credential reference, persisted `recording_enabled`,
+`launch_at_login`, selected footage root and footage bytes survive reinstall. A stale
+Windows Run entry is deliberately seeded and startup reconciliation must repair it.
+Fresh install must keep launch-at-login off. Silent uninstall must remove application
+binaries and stale autostart registration while preserving authoritative settings and
+footage.
+
+Updater cryptographic regression vectors continue to prove matching-key success plus
+mismatched-key, mutated-artifact and mutated-signature failure through
+`nian-release-verifier`. Windows updater signing uses the same verifier/trust root as
+Linux. When Authenticode is enabled, `signtool` mechanically verifies the desktop,
+worker and installer after signing; when it is disabled the Windows platform manifest
+records `authenticode_signed: false`, and the required-policy mode rejects that state.
+
+Platform jobs emit candidate fragments rather than competing public metadata.
+Assembly tests prove Linux/Windows version/commit/FFmpeg authority convergence, one
+Tauri `latest.json` with `linux-x86_64` and `windows-x86_64`, one multi-platform
+manifest and one global `SHA256SUMS.txt`. Mutation tests reject stale Windows artifact
+bytes and checksum drift. `verify-release` requires both signed candidates, re-verifies
+both updater signatures, scans the combined release boundary, and only then emits
+`verified-release`. Draft publication still uploads every asset, downloads them back,
+compares the exact filename set and bytes, verifies the global checksums and publishes.
 
 ## Planned per milestone
 
 * **M9+**: simultaneous multi-camera orchestration and M10 ONVIF. Windows x86_64
-  remains the next M8 release slice and will use an explicit GitHub-hosted Windows
-  runner (for example `windows-2022`); packaging/signing is not yet implemented or
-  marked validated. macOS distribution,
+  release automation is implemented in M8 but remains unmarked as validated until
+  the required `windows-2022` tag-release path completes successfully. macOS distribution,
   live camera viewing, clip export, thumbnails/motion analysis and AI/cloud behavior
   are outside the current Linux M8 release scope.
 * **Hardware/manual** (never in CI): real Tapo C200 via

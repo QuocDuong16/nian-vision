@@ -79,6 +79,14 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        #[cfg(windows)]
+        Some("__containment-smoke") if args.len() == 1 => match cmd_containment_smoke() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("containment smoke failed: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Some("record") if args.len() > 1 => match cmd_record(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -94,6 +102,21 @@ fn main() -> ExitCode {
             eprintln!("{USAGE}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(windows)]
+fn cmd_containment_smoke() -> Result<(), String> {
+    if std::env::var("NIAN_WORKER_CONTAINMENT_SMOKE").as_deref() != Ok("1") {
+        return Err(
+            "diagnostic containment mode requires NIAN_WORKER_CONTAINMENT_SMOKE=1".to_owned(),
+        );
+    }
+
+    // Deliberately independent of stdin and IPC. Parent death must not create
+    // an EOF path that could make this probe exit without Job Object cleanup.
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
     }
 }
 

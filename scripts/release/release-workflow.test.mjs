@@ -57,30 +57,53 @@ test("all GitHub release actions are pinned to immutable commit SHAs", () => {
   assert.equal(workflow.includes("softprops/action-gh-release"), false);
 });
 
-test("default GitHub permissions are read-only and only publish-release gets contents write", () => {
+test("default permissions are read-only and only publication can write repository contents", () => {
   assert.match(workflow, /permissions:\n  contents: read/);
-  const writes = [...workflow.matchAll(/contents: write/g)];
-  assert.equal(writes.length, 1);
+  assert.equal([...workflow.matchAll(/contents: write/g)].length, 1);
   assert.match(jobBody("publish-release"), /permissions:\n      contents: write/);
-  for (const job of ["release-preflight", "build-linux", "verify-release"]) {
+  for (const job of ["release-preflight", "build-linux", "build-windows", "sign-linux", "sign-windows", "verify-release"]) {
     assert.equal(jobBody(job).includes("contents: write"), false, `${job} has repository write permission`);
   }
   assert.equal(/(?:actions|packages|issues|pull-requests): write/.test(workflow), false);
 });
 
-test("private signing secrets are scoped only to the Linux signing step", () => {
-  const signing = stepBody("build-linux", "Build signed updater AppImage");
-  assert.match(signing, /secrets\.TAURI_SIGNING_PRIVATE_KEY/);
-  assert.match(signing, /secrets\.TAURI_SIGNING_PRIVATE_KEY_PASSWORD/);
-  const withoutSigning = workflow.replace(signing, "");
-  assert.equal(withoutSigning.includes("secrets.TAURI_SIGNING_PRIVATE_KEY"), false);
-  assert.equal(withoutSigning.includes("secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD"), false);
-  assert.equal(signing.includes("pnpm"), false);
-  assert.equal(signing.includes("vite"), false);
+test("ordinary compiler jobs are outside the protected release environment", () => {
+  for (const job of ["release-preflight", "build-linux", "build-windows"]) {
+    assert.equal(jobBody(job).includes("environment: production-release"), false, `${job} unexpectedly requires protected approval`);
+  }
+  for (const job of ["sign-linux", "sign-windows", "verify-release", "publish-release"]) {
+    assert.match(jobBody(job), /environment: production-release/, `${job} must use the protected release environment`);
+  }
+});
+
+test("updater private key is scoped only to updater-signing steps", () => {
+  const linux = stepBody("sign-linux", "Sign Linux updater artifact");
+  const windows = stepBody("sign-windows", "Sign final Windows updater artifact");
+  assert.match(linux, /secrets\.TAURI_SIGNING_PRIVATE_KEY/);
+  assert.match(linux, /secrets\.TAURI_SIGNING_PRIVATE_KEY_PASSWORD/);
+  assert.match(windows, /secrets\.TAURI_SIGNING_PRIVATE_KEY/);
+  assert.match(windows, /secrets\.TAURI_SIGNING_PRIVATE_KEY_PASSWORD/);
+  let outside = workflow.replace(linux, "").replace(windows, "");
+  assert.equal(outside.includes("secrets.TAURI_SIGNING_PRIVATE_KEY"), false);
+  assert.equal(outside.includes("secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD"), false);
+  assert.equal(linux.includes("pnpm install"), false);
+  assert.equal(windows.includes("pnpm install"), false);
   assert.equal(viteConfig.includes("envPrefix"), false);
 });
 
-test("release trust contract proves tag version SHA mirror actor and default-branch reachability", () => {
+test("Windows Authenticode private material is confined to Windows signing steps", () => {
+  const binaries = stepBody("sign-windows", "Authenticode-sign Windows application binaries when configured");
+  const installer = stepBody("sign-windows", "Authenticode-sign and verify final NSIS installer when configured");
+  for (const body of [binaries, installer]) {
+    assert.match(body, /secrets\.WINDOWS_SIGNING_PFX_BASE64/);
+    assert.match(body, /secrets\.WINDOWS_SIGNING_PFX_PASSWORD/);
+  }
+  const outside = workflow.replace(binaries, "").replace(installer, "");
+  assert.equal(outside.includes("WINDOWS_SIGNING_PFX_BASE64"), false);
+  assert.equal(outside.includes("WINDOWS_SIGNING_PFX_PASSWORD"), false);
+});
+
+test("release trust contract proves mirrored tag version SHA actor and default-branch reachability", () => {
   const preflight = jobBody("release-preflight");
   assert.match(preflight, /refs\/tags\/v\*/);
   assert.match(preflight, /GITHUB_SHA/);
@@ -90,12 +113,46 @@ test("release trust contract proves tag version SHA mirror actor and default-bra
   assert.match(preflight, /version-check\.mjs --tag "\$tag" --require-clean/);
 });
 
-test("release topology is preflight to Linux build to verification to publication", () => {
+test("Linux and Windows build jobs are peers and both signed candidates gate verification", () => {
   assert.match(jobBody("build-linux"), /needs: release-preflight/);
-  assert.match(jobBody("verify-release"), /needs: \[release-preflight, build-linux\]/);
+  assert.match(jobBody("build-windows"), /needs: release-preflight/);
+  assert.equal(jobBody("build-windows").includes("needs: build-linux"), false);
+  assert.match(jobBody("sign-linux"), /needs: \[release-preflight, build-linux\]/);
+  assert.match(jobBody("sign-windows"), /needs: \[release-preflight, build-windows\]/);
+  assert.match(jobBody("verify-release"), /needs: \[release-preflight, sign-linux, sign-windows\]/);
   assert.match(jobBody("publish-release"), /needs: \[release-preflight, verify-release\]/);
-  assert.match(stepBody("build-linux", "Upload Linux release candidate"), /name: linux-release-candidate/);
-  assert.match(stepBody("verify-release", "Upload verified release payload"), /name: verified-release/);
+});
+
+test("Linux signing is isolated from its compiler and dependency build", () => {
+  assert.equal(jobBody("build-linux").includes("TAURI_SIGNING_PRIVATE_KEY"), false);
+  assert.equal(jobBody("build-linux").includes("secrets."), false);
+  assert.equal(jobBody("sign-linux").includes("pnpm install"), false);
+  assert.equal(jobBody("sign-linux").includes("vite"), false);
+  assert.equal(jobBody("sign-windows").includes("pnpm install"), false);
+  assert.equal(jobBody("sign-windows").includes("vite"), false);
+  assert.match(stepBody("build-linux", "Upload unsigned Linux build"), /name: linux-unsigned-build/);
+  assert.match(stepBody("sign-linux", "Upload Linux release candidate"), /name: linux-release-candidate/);
+});
+
+test("GitHub release uses stable latest metadata and exact tagged asset assembly", () => {
+  for (const job of ["build-linux", "build-windows"]) {
+    const name = job === "build-linux" ? "Generate release-only Tauri configuration" : "Generate public-only Windows Tauri configuration";
+    assert.match(stepBody(job, name), /releases\/latest\/download\/latest\.json/);
+  }
+  assert.match(stepBody("verify-release", "Assemble one public multi-platform release"), /releases\/download\/\$\{\{ github\.ref_name \}\}/);
+  assert.equal(workflow.includes("NIAN_RELEASE_DOWNLOAD_BASE_URL: ${{ secrets."), false);
+});
+
+test("updater public key is a non-secret variable used only for config and verification", () => {
+  assert.equal(workflow.includes("secrets.NIAN_UPDATER_PUBLIC_KEY"), false);
+  const occurrences = [...workflow.matchAll(/vars\.NIAN_UPDATER_PUBLIC_KEY/g)].length;
+  assert.equal(occurrences, 6);
+  assert.match(stepBody("build-linux", "Generate release-only Tauri configuration"), /vars\.NIAN_UPDATER_PUBLIC_KEY/);
+  assert.match(stepBody("build-windows", "Generate public-only Windows Tauri configuration"), /vars\.NIAN_UPDATER_PUBLIC_KEY/);
+  assert.match(stepBody("sign-linux", "Verify Linux updater signature"), /vars\.NIAN_UPDATER_PUBLIC_KEY/);
+  assert.match(stepBody("sign-windows", "Generate Windows bundle configuration"), /vars\.NIAN_UPDATER_PUBLIC_KEY/);
+  assert.match(stepBody("sign-windows", "Verify Windows updater signature"), /vars\.NIAN_UPDATER_PUBLIC_KEY/);
+  assert.match(stepBody("verify-release", "Reverify both updater signatures"), /vars\.NIAN_UPDATER_PUBLIC_KEY/);
 });
 
 test("publication is draft-first and byte-verifies uploaded assets before publish", () => {
@@ -110,35 +167,8 @@ test("publication is draft-first and byte-verifies uploaded assets before publis
   assert.match(publish, /refusing to overwrite an already-published release/);
 });
 
-test("GitHub release uses stable latest metadata and exact tagged asset URLs", () => {
-  const generate = stepBody("build-linux", "Generate release-only Tauri configuration");
-  assert.match(generate, /releases\/latest\/download\/latest\.json/);
-  const finalize = stepBody("build-linux", "Finalize GitHub Release candidate");
-  assert.match(finalize, /releases\/download\/\$\{\{ github\.ref_name \}\}/);
-  assert.equal(workflow.includes("NIAN_RELEASE_DOWNLOAD_BASE_URL: ${{ secrets."), false);
-});
-
 test("release workflow never pushes source changes or creates release tags", () => {
   assert.equal(/git push/.test(workflow), false);
   assert.equal(/git tag(?:\s|$)/.test(workflow), false);
   assert.equal(/version bump|npm version|cargo set-version/.test(workflow), false);
-});
-
-
-test("protected production-release environment is limited to signing verification and publication jobs", () => {
-  assert.equal(jobBody("release-preflight").includes("environment: production-release"), false);
-  for (const job of ["build-linux", "verify-release", "publish-release"]) {
-    assert.match(jobBody(job), /environment: production-release/);
-  }
-});
-
-test("updater public key is exposed only to configuration and cryptographic verification steps", () => {
-  const allowed = [
-    stepBody("build-linux", "Generate release-only Tauri configuration"),
-    stepBody("build-linux", "Verify updater signature against configured public key"),
-    stepBody("verify-release", "Reverify finalized updater signature"),
-  ];
-  const count = [...workflow.matchAll(/secrets\.NIAN_UPDATER_PUBLIC_KEY/g)].length;
-  assert.equal(count, allowed.length);
-  for (const body of allowed) assert.match(body, /secrets\.NIAN_UPDATER_PUBLIC_KEY/);
 });

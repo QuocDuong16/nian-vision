@@ -27,7 +27,7 @@ function requireFile(path, label) {
   if (!existsSync(path)) throw new Error(`${label} is missing: ${path}`);
 }
 
-export function createReleaseConfig({ endpoint, pubkey, workerBase, appimageFiles }) {
+export function createReleaseConfig({ endpoint, pubkey, workerBase, appimageFiles, createUpdaterArtifacts = false }) {
   return {
     // Frontend assets are built before the signing step. Keeping this hook
     // empty prevents Vite from inheriting TAURI_SIGNING_* at bundle time.
@@ -36,7 +36,7 @@ export function createReleaseConfig({ endpoint, pubkey, workerBase, appimageFile
     },
     bundle: {
       targets: ["appimage"],
-      createUpdaterArtifacts: true,
+      createUpdaterArtifacts,
       externalBin: [fromApp(workerBase)],
       linux: {
         appimage: {
@@ -81,7 +81,13 @@ export function generateReleaseConfig() {
     appimageFiles[destination] = fromApp(source);
   }
 
-  const config = createReleaseConfig({ endpoint, pubkey, workerBase, appimageFiles });
+  const config = createReleaseConfig({
+    endpoint,
+    pubkey,
+    workerBase,
+    appimageFiles,
+    createUpdaterArtifacts: process.env.NIAN_CREATE_UPDATER_ARTIFACTS === "true",
+  });
   const output = resolve(appDir, "tauri.release.generated.conf.json");
   writeFileSync(output, `${JSON.stringify(config, null, 2)}
 `);

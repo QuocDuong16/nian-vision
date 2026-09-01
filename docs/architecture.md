@@ -449,69 +449,97 @@ desktop termination uses a process-owned Job Object with
 workers inherit membership atomically, and every production spawn verifies
 containment or kills/reaps the uncontained child. See ADR-0010.
 
-## Linux distribution and signed updates (M8)
+## Linux and Windows distribution with signed updates (M8)
 
-M8 currently defines one CI-validated production distribution target:
-`x86_64-unknown-linux-gnu`, shipped as an AppImage. Windows x86_64 remains the next
-M8 release target and will use an explicit GitHub-hosted Windows runner such as
-`windows-2022`; packaging/signing is not yet implemented or marked validated.
-macOS packaging is also deferred.
+M8 now defines two required production release candidates from the same mirrored
+Forgejo tag and application revision. Linux uses `x86_64-unknown-linux-gnu` as an
+AppImage. Windows uses `x86_64-pc-windows-msvc` as an NSIS installer on the explicit
+GitHub-hosted `windows-2022` runner. Linux remains the already validated release
+target; Windows is implemented in the release graph but is not marked validated
+until the hosted Windows tag path completes successfully. macOS remains deferred.
 
-The AppImage contains the desktop host, a sibling `nian-media-worker`, and an
+The Linux AppImage contains the desktop host, a sibling `nian-media-worker`, and an
 application-owned FFmpeg 8.0.3 shared runtime. The pre-bundle worker is linked with
-relative RUNPATH `$ORIGIN/../lib/nian-vision`, which makes release staging
-self-contained. Tauri normalizes the worker RUNPATH to `$ORIGIN/../lib` inside the
-AppImage, where the three FFmpeg SONAME libraries are installed in the image's
-private `/usr/lib`. Both staging and extracted-AppImage smoke verify that
-`libavformat.so.62`, `libavcodec.so.62` and `libavutil.so.60` resolve from the
-application-owned runtime with development overrides removed. The candidate FFmpeg build is SHA-256 pinned, explicitly LGPL/shared,
-and validated by the real media integration suite before packaging.
+relative RUNPATH `$ORIGIN/../lib/nian-vision`; Tauri normalizes it to
+`$ORIGIN/../lib` inside the image, where the required FFmpeg SONAMEs are installed
+in private `/usr/lib`. Staging and extracted-AppImage smoke prove ABI 62/62/60 and
+media fixture behavior with development overrides removed.
 
-Desktop and worker also share an application-version handshake. The IPC protocol
-version remains independently authoritative, while packaged builds require the
-worker HELLO `application_version` to equal the desktop release version. A copied
-worker from another release therefore fails closed instead of silently executing
-against a merely wire-compatible host.
+The Windows runtime is built from the same SHA-256-pinned FFmpeg 8.0.3 archive with
+`--toolchain=msvc`, shared libraries enabled and GPL/nonfree/static output disabled.
+The MSVC FFmpeg build emits `avformat.lib`, `avcodec.lib` and `avutil.lib` import
+libraries for the Rust `x86_64-pc-windows-msvc` link while the installed runtime uses
+`avformat-62.dll`, `avcodec-62.dll`, `avutil-60.dll` plus any mechanically discovered
+application-local VC runtime closure. `dumpbin /dependents` recursively validates
+the worker and FFmpeg DLLs; dependencies must resolve from the staged application,
+a copied Visual C++ redistributable DLL, an API-set, or Windows System32. MSYS2,
+vcpkg, repository target directories and developer PATHs are never runtime
+authorities. Tauri's Windows resource directory is the executable directory, so the
+DLLs and sidecar follow the normal application-local Windows loader model without
+global PATH or System32 mutation.
 
-The updater is Rust-owned through `tauri-plugin-updater`; React receives only the
-narrow `update_check` and `update_install` commands. Checking does not disturb
-recording. Installation requires an explicit UI confirmation and first downloads
-and verifies the signed updater artifact. Only after cryptographic verification
-does the host set the update admission gate and reuse M7 teardown ordering.
-Persisted Desired recording intent is not cleared. If updater handoff returns or
-fails after runtime teardown, the current application restarts rather than
-remaining stranded in Quitting; normal M7 startup restoration then re-applies the
-persisted recording intent.
+Desktop and worker share the accepted application-version HELLO contract in both
+packages. IPC protocol version and FFmpeg ABI remain independently authoritative.
+Clean staged runtime smoke on each platform verifies HELLO, application version, ABI
+62/62/60, fixture `camera.probe`, fixture `playback.prepare` and clean shutdown.
 
-Release-only Tauri configuration is public-only: updater public key, HTTPS endpoint
-and bundle/resource mapping. Private updater signing material exists only in the
-signed AppImage build step. Frontend assets are built earlier and the release
-config disables Tauri's `beforeBuildCommand`, so Vite never inherits signing
-secrets. After Tauri signs the AppImage, a release verifier using the same
-Minisign-compatible representation as `tauri-plugin-updater` verifies the exact
-AppImage/signature against the configured public key before the generated config
-is removed.
+Windows packaging uses NSIS current-user installation and Tauri's normal WebView2
+`downloadBootstrapper` policy. The actual installer is smoke-tested in an isolated
+test root: installed desktop/worker/DLL bytes must match the exact bundle inputs,
+the worker media fixture smoke runs without FFmpeg development overrides, and the
+desktop must reach backend readiness. A CI-only diagnostic seam additionally proves
+the installed desktop successfully registered the real `nian-platform-windows`
+power subscription and that the accepted kill-on-close Job Object reaps the exact
+installed sibling worker after hard desktop death.
 
-Production authority validation rejects non-HTTPS, local/loopback and reserved
-placeholder hosts. Forgejo remains the authoritative source repository and normal
-CI authority; GitHub is a one-way mirror used only for hosted release CI and public
-GitHub Releases. Release tags originate on Forgejo, mirror to the same Git object,
-and are checked against `GITHUB_SHA`, the configured mirror actor and the mirrored
-default branch before any release build starts.
+The Windows install smoke also creates authoritative M7 settings through the real
+`nian-settings` API, deliberately seeds a stale launch-at-login executable path,
+reinstalls the candidate, and proves camera configuration, credential reference,
+`recording_enabled`, user-selected footage root and footage bytes survive. Startup
+reconciliation must repair the Windows Run entry. Silent uninstall removes packaged
+binaries and stale autostart registration while leaving settings and footage intact.
+No downgrade migration is introduced.
 
-The Linux release build runs on a GitHub-hosted Ubuntu runner with the actual build
-inside `rust:1.98.0-bookworm`, preserving the accepted Debian 12/glibc baseline. It
-runs frontend/Rust/media gates, clean staged and extracted-AppImage worker smoke,
-launches the actual AppImage under isolated Xvfb/D-Bus until the backend emits its
-startup-ready marker, and scans staging, extracted application files, frontend
-assets and finalized artifacts for a configured secret canary. Finalization emits
-`latest.json`, `release-manifest.json`, `BUILD_METADATA.json` and `SHA256SUMS.txt`;
-a separate verification job proves those metadata fields, commit identity, hashes
-and updater signature describe the exact finalized candidate. Publication is a
-separate `contents: write` job: it creates a draft GitHub Release, uploads every
-verified asset, downloads them back for filename/byte/checksum validation, and only
-then publishes the release. Draft releases are never advertised by the stable
-`releases/latest/download/latest.json` updater endpoint.
+Updater ownership stays Rust/Tauri-owned. React receives only the narrow update
+commands. Update download/signature verification happens before M7 terminal teardown;
+persisted desired recording intent remains authoritative and normal startup restore
+continues after update. The public updater trust root is shared across Linux and
+Windows.
+
+Release signing is isolated from compilation. `build-linux` and `build-windows` are
+peer jobs with no protected release environment. They run frontend lifecycle code,
+FFmpeg compilation and ordinary Rust/media tests, then emit unsigned build inputs.
+`sign-linux` and `sign-windows` run separately in the protected
+`production-release` environment and do not run pnpm/Vite lifecycle commands. They
+apply the Tauri updater signature to the exact final platform artifact and verify it
+with `nian-release-verifier`.
+
+Windows has a separate Authenticode trust boundary from the Tauri updater signature.
+When PFX credentials are configured, Windows SDK `signtool` signs and then verifies
+`nian-desktop.exe`, `nian-media-worker.exe` and the final NSIS installer before the
+Tauri updater signature is generated. When credentials are absent, the platform
+manifest explicitly records `authenticode_signed: false`; the repository variable
+`REQUIRE_WINDOWS_AUTHENTICODE=true` makes verification fail closed. Authenticode
+private material and updater private keys are step-scoped and never serialized into
+Tauri config or build metadata.
+
+Platform signing jobs emit `linux-release-candidate` and
+`windows-release-candidate`, each with a platform manifest fragment. Neither job is
+authoritative for public updater metadata. `verify-release` requires both candidates,
+revalidates tag/version/commit identity and both updater signatures, then assembles
+one `latest.json` using the Tauri `linux-x86_64` and `windows-x86_64` keys, one
+multi-platform `release-manifest.json`, one `RELEASE_NOTES.md` and one global
+`SHA256SUMS.txt`. Every updater URL names the exact tagged GitHub Release asset.
+
+Forgejo remains the authoritative source and normal push/PR/quality CI platform.
+GitHub remains a one-way release mirror. Mirrored release tags are checked against
+`GITHUB_SHA`, the configured mirror actor and default-branch reachability before any
+build starts. Workflow permissions default to `contents: read`; only
+`publish-release` receives `contents: write`. Publication keeps the accepted
+draft-first boundary: upload all Linux, Windows and shared assets, download them
+back, compare the exact filename set and bytes, verify global SHA-256 sums, then
+publish. Drafts are not advertised by the stable
+`releases/latest/download/latest.json` endpoint.
 
 See ADR-0011 and `docs/releasing.md` for the release contract.
 

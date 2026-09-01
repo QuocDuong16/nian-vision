@@ -53,6 +53,31 @@ and exercises HELLO, fixture probe and `playback.prepare` through the staged wor
 The AppImage is extracted and smoke-tested again after packaging. Exact flags, LGPL text and third-party
 notices are shipped with the release.
 
+## Windows release runtime
+
+The Windows x86_64 release path builds the same FFmpeg 8.0.3 source pin on the
+explicit `windows-2022` runner using FFmpeg's MSVC toolchain. The production build
+remains shared/LGPL-only and emits the MSVC import libraries consumed by Rust plus
+the application-local runtime DLLs:
+
+* `avformat-62.dll`
+* `avcodec-62.dll`
+* `avutil-60.dll`
+
+`scripts/release/stage-windows.ps1` recursively inspects `dumpbin /dependents` for
+the worker, the three FFmpeg DLLs and, after it is compiled, the desktop executable.
+Dependencies must resolve from the staged application directory, Windows API-set /
+System32, or an explicitly copied Visual C++ redistributable DLL from the selected
+MSVC toolchain. MSYS2, vcpkg and developer build paths are never runtime authority.
+
+The clean staged worker smoke removes `NIAN_FFMPEG_LIB_DIR` and does not add a
+developer FFmpeg directory to `PATH`. NSIS installs the same DLL closure beside the
+desktop/worker; the installed-runtime smoke hashes those files against the exact
+staged inputs and repeats the worker media fixture checks. FFmpeg configuration,
+license text, source checksum and build flags are carried into the platform manifest
+and then the combined GitHub Release metadata. Windows remains unmarked as validated
+until the hosted Windows tag-release path completes successfully.
+
 ## Regenerating bindings
 
 Only needed when bumping the FFmpeg pin or extending the whitelist:

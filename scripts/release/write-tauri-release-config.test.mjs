@@ -20,11 +20,22 @@ test("release config contains only public updater data and bundle configuration"
   assert.equal(config.build.beforeBuildCommand, "");
   assert.equal(config.plugins.updater.pubkey, pubkey);
   assert.deepEqual(config.plugins.updater.endpoints, [endpoint]);
-  assert.equal(config.bundle.createUpdaterArtifacts, true);
+  assert.equal(config.bundle.createUpdaterArtifacts, false);
   assert.equal(serialized.includes(privateKey), false);
   assert.equal(serialized.includes(privatePassword), false);
   assert.equal(serialized.includes("TAURI_SIGNING_PRIVATE_KEY"), false);
   assert.equal(serialized.includes("TAURI_SIGNING_PRIVATE_KEY_PASSWORD"), false);
+});
+
+test("Linux updater artifacts can be deliberately enabled for compatibility-only builds", () => {
+  const config = createReleaseConfig({
+    endpoint: "https://updates.niand.io.vn/latest.json",
+    pubkey: "PUBLIC-UPDATER-KEY",
+    workerBase: "/workspace/dist/linux-x86_64/tauri/nian-media-worker",
+    appimageFiles: {},
+    createUpdaterArtifacts: true,
+  });
+  assert.equal(config.bundle.createUpdaterArtifacts, true);
 });
 
 test("production updater authority must be HTTPS and non-placeholder", () => {

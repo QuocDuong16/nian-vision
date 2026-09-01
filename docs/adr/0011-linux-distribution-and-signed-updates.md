@@ -1,142 +1,199 @@
-# ADR-0011: Linux AppImage distribution and signed updater handoff
+# ADR-0011: Cross-platform desktop distribution and signed updater handoff
 
 * Status: Accepted
 * Milestone: M8
 
 ## Context
 
-M0-M7 created a local-first NVR whose correctness depends on process isolation,
-an exact FFmpeg ABI, durable recording publication and an explicit desktop
-lifecycle. Distribution cannot simply copy the desktop executable: the media
-worker and its FFmpeg runtime are part of the application compatibility boundary,
-and replacing binaries while recording must not bypass M7 teardown.
+M0-M7 created a local-first NVR whose correctness depends on process isolation, an
+exact FFmpeg ABI, durable recording publication and an explicit desktop lifecycle.
+Distribution therefore cannot mean copying only the desktop executable: the media
+worker and its FFmpeg runtime are part of the compatibility boundary, and replacing
+binaries while recording must not bypass M7 teardown.
 
-Maintaining Windows, macOS and Linux packaging simultaneously would also expand
-the release surface before one platform has been proven end to end.
+M8 first proved this release model end to end on Linux. After that Linux slice and
+the Forgejo/GitHub hybrid release topology passed review, Windows x86_64 became the
+second required M8 platform. macOS remains deliberately deferred.
 
 ## Decision
 
-### Linux x86_64 AppImage is the only M8 production target
+### Linux AppImage and Windows NSIS are the M8 release formats
 
-M8 currently ships `x86_64-unknown-linux-gnu` as an AppImage. Windows x86_64 remains
-the next M8 release target and will use an explicit GitHub-hosted Windows runner
-such as `windows-2022`; packaging/signing is not yet implemented or marked
-validated. macOS packaging is deferred. Linux release CI builds inside Debian 12
-to keep a deliberate glibc baseline.
+Linux targets `x86_64-unknown-linux-gnu` and ships an AppImage built against the
+accepted Debian 12/glibc baseline. Windows targets `x86_64-pc-windows-msvc` and ships
+a canonical NSIS `.exe` built on the explicit GitHub-hosted `windows-2022` runner.
+`windows-latest` is not the release toolchain identity. MSI may be added later; macOS
+is not part of this decision.
 
-AppImage is also the updater artifact on Linux, avoiding two competing ownership
-models such as a distro package manager plus an in-app binary replacer.
+AppImage is the Linux updater artifact. The NSIS installer is the Windows updater
+artifact. Both use the same Tauri updater trust root and the accepted M7 terminal
+update lifecycle.
 
-### The application owns its FFmpeg runtime
+### The application owns FFmpeg on both platforms
 
-Release CI builds FFmpeg 8.0.3 from a SHA-256-pinned upstream source archive with
-shared libraries enabled and GPL/nonfree disabled. The candidate configuration is
-mechanically validated and exercised by the real media integration suite.
+Both platform jobs build FFmpeg 8.0.3 from the exact same SHA-256-pinned upstream
+source archive. Shared libraries are enabled; static, GPL and nonfree builds are
+rejected mechanically. The enabled protocol/demux/mux/parser surface remains the
+existing recording/recovery/probe/playback contract rather than expanding into
+transcoding merely for packaging. No FFmpeg CLI runtime is shipped.
 
-The packaged worker resolves `libavformat.so.62`, `libavcodec.so.62` and
-`libavutil.so.60` from application-owned files. Pre-bundle release staging uses
-`$ORIGIN/../lib/nian-vision`; Tauri's AppImage bundler normalizes the packaged
-worker RUNPATH to `$ORIGIN/../lib`, so the final AppImage stores the three SONAME
-libraries in its private `/usr/lib`. Release staging and extracted-AppImage smoke remove
-development overrides and proves those libraries come from the application-owned
-runtime. License text, build flags and third-party notices are shipped with the
-application.
+On Linux, the worker resolves `libavformat.so.62`, `libavcodec.so.62` and
+`libavutil.so.60` from application-owned files. Pre-bundle staging uses
+`$ORIGIN/../lib/nian-vision`; Tauri normalizes the packaged worker RUNPATH to
+`$ORIGIN/../lib` inside the AppImage, where the required SONAMEs live in private
+`/usr/lib`.
 
-### Desktop/worker application versions must match in packaged builds
+On Windows, FFmpeg is configured with `--toolchain=msvc`. The build must emit the
+MSVC import libraries `avformat.lib`, `avcodec.lib` and `avutil.lib` for the Rust
+`x86_64-pc-windows-msvc` link, while runtime DLLs are application-local. Staging
+recursively inspects `nian-media-worker.exe` and the FFmpeg DLLs with
+`dumpbin /dependents`. Dependencies must resolve from the staged runtime, copied VC
+redistributable DLLs, Windows API-sets or actual System32 files. MSYS2, vcpkg,
+developer PATH, repository target directories and `NIAN_FFMPEG_LIB_DIR` are never
+installed runtime authorities. Global PATH, System32 copies and COM registration are
+not used.
 
-IPC protocol compatibility alone is insufficient for a release pair. Worker
-HELLO therefore carries `application_version`; packaged hosts reject a worker with
-a missing or different application version even if the NDJSON protocol version is
-otherwise compatible. Debug builds retain limited tolerance for legacy test stubs
-that omit the field, but an explicit mismatch is always rejected.
+### Desktop/worker application versions remain a release pair
+
+IPC protocol compatibility alone is insufficient. Worker HELLO carries
+`application_version`; packaged hosts reject a missing or mismatched application
+version even when the NDJSON protocol version is otherwise compatible. Both clean
+platform staging smokes also require FFmpeg ABI 62/62/60 before fixture probe and
+playback preparation.
+
+### Windows uses NSIS current-user installation and normal WebView2 bootstrap
+
+The Windows Tauri release config is public-only and targets NSIS. The installer uses
+current-user mode and Tauri's normal WebView2 `downloadBootstrapper` strategy rather
+than skipping WebView2 or bundling a fixed runtime without need. The worker and
+application-owned DLL closure are deliberately bundled beside the installed desktop
+layout expected by the Windows loader. React never launches the worker.
+
+The actual NSIS installer is smoke-tested in a disposable install root. Installed
+desktop, worker and application-local DLL bytes must match the exact bundle inputs.
+The installed worker repeats the clean HELLO/ABI/probe/playback/shutdown smoke. The
+installed desktop must reach backend readiness, successfully register the real
+`nian-platform-windows` suspend/resume notification source, and preserve the accepted
+Windows Job Object containment: after hard desktop death the exact installed sibling
+worker must be reaped. Window focus/minimize events are not substitutes for power
+events.
+
+### Upgrade and uninstall preserve authoritative user state
+
+Windows installer smoke creates an M7 settings fixture through the actual
+`nian-settings` API and proves camera configuration, credential reference, persisted
+`recording_enabled`, launch-at-login preference, user-selected recording root and
+footage bytes survive reinstall/upgrade. A deliberately stale Run entry must be
+repaired by M7 startup reconciliation to the installed executable path. Fresh install
+keeps launch-at-login disabled.
+
+Silent uninstall removes application binaries and stale OS autostart registration but
+does not delete settings SQLite, native credentials or recordings. No downgrade
+migration is introduced. The recording index remains rebuildable under the existing
+M4 rules.
 
 ### Signed update verification precedes lifecycle teardown
 
-`tauri-plugin-updater` owns transport/signature verification in Rust. The frontend
-has only narrow check/install commands. Update installation is explicit user
-action.
+`tauri-plugin-updater` owns runtime transport/signature verification in Rust. The
+frontend has only narrow check/install commands. The host downloads and verifies the
+platform updater artifact before changing lifecycle state. Only after verification
+does it close new admission and reuse M7's graceful shutdown ownership. Persisted
+desired recording intent is preserved; a failed installer handoff cannot leave the
+application stranded indefinitely in Quitting.
 
-The host downloads and verifies the updater artifact before changing lifecycle
-state. After verification it marks update admission, closes new work and reuses
-M7's graceful shutdown ownership. Desired recording intent is preserved. If the
-installer handoff fails or returns after teardown, the current application
-restarts so it cannot remain stranded in Quitting.
+### Compilation and signing are separate trust domains
+
+`build-linux` and `build-windows` are independent peers after release preflight.
+They run dependency installation, frontend lifecycle code, FFmpeg compilation and
+ordinary test suites without protected signing secrets. They emit unsigned candidate
+inputs through temporary GitHub Actions artifacts.
+
+`sign-linux` and `sign-windows` run in the protected `production-release` GitHub
+Environment. They do not run pnpm/Vite lifecycle commands. The updater private key
+and password appear only in the exact Tauri updater-signing steps. Release-only Tauri
+configuration contains only public updater data and resource mappings.
+
+Windows Authenticode is a separate trust layer from the Tauri updater signature. If a
+PFX/password is configured, Windows SDK `signtool` signs and then mechanically
+verifies `nian-desktop.exe`, `nian-media-worker.exe` and the final NSIS installer.
+The installer is Authenticode-signed before its mandatory Tauri updater signature so
+the updater signature covers the exact published bytes. If Authenticode credentials
+are absent, the Windows manifest explicitly records `authenticode_signed: false`; a
+release policy variable can require Authenticode and fail closed. No certificate,
+password or private key is committed or written into build metadata.
 
 ### Forgejo remains source/quality authority; GitHub is release-only
 
 Forgejo remains the authoritative source repository and normal push/PR/quality CI
-platform. GitHub is a one-way mirror used only for release CI on GitHub-hosted
-platform runners and for public GitHub Releases. Release tags originate on Forgejo
-and must mirror to the same Git object on GitHub. Release preflight proves the tag
-ref, `GITHUB_SHA`, mirror actor and default-branch reachability before building.
-GitHub release automation never pushes source, changes versions or creates tags.
+platform. GitHub is a one-way mirror used for release CI on hosted platform runners
+and for public GitHub Releases. Release tags originate on Forgejo and must mirror to
+the same Git object. Preflight proves the tag ref, `GITHUB_SHA`, mirror actor,
+default-branch reachability and tag/version convergence. GitHub release automation
+never creates tags, changes versions or pushes source back to Forgejo.
 
-The production workflow defaults to `contents: read`; only the final publication
-job receives `contents: write`. Platform builds transfer candidates through
-temporary GitHub Actions artifacts. The final job creates a draft GitHub Release,
-uploads all verified assets, downloads them back for filename/byte/checksum
-verification and only then publishes it. An already-published release is never
-overwritten.
+Workflow permissions default to `contents: read`. Build, signing and verification
+jobs have no repository write authority. Only `publish-release` receives
+`contents: write`. Signing authority and publication authority are distinct trust
+domains.
 
-### Release configuration and private signing material stay out of Git and ordinary steps
+### Public updater metadata is assembled only after both platforms pass
 
-Release-only Tauri configuration contains only the updater public key/endpoint and
-bundle/resource mapping. The updater private key and password are injected only
-into the signed AppImage build step through the protected GitHub
-`production-release` Environment, never job-wide. Frontend assets are built before
-that step and the release config disables `beforeBuildCommand`, preventing
-Vite/package lifecycle code from inheriting `TAURI_SIGNING_*`. The generated config
-is removed after post-build verification in successful CI.
+Each signing job emits one platform release candidate and a platform manifest
+fragment. Neither platform job produces an authoritative public `latest.json` or
+checksum manifest.
 
-Production generation requires HTTPS updater/download authorities and rejects
-local, loopback and reserved placeholder endpoints. The current stable metadata
-endpoint is GitHub `releases/latest/download/latest.json`; finalized AppImage URLs
-use the exact tagged GitHub Release. Draft releases are therefore invisible to the
-updater. Finalized artifacts include checksums and non-secret provenance metadata;
-private keys and secret values are never embedded.
+`verify-release` requires both Linux and Windows candidates. It re-verifies the exact
+AppImage and NSIS updater signatures, platform manifests, shared release notes,
+version/commit identity, FFmpeg source authority, Authenticode classification/policy,
+required assets and secret-canary boundaries. It then generates exactly one public
+`latest.json` containing the Tauri keys `linux-x86_64` and `windows-x86_64`, one
+multi-platform `release-manifest.json`, and one global `SHA256SUMS.txt` covering all
+public assets except itself. Artifact URLs point to the exact tagged GitHub Release.
 
-### Release-time verification defends against signing-secret misconfiguration
+### Publication remains draft-first and fail-closed
 
-Tauri runtime signature verification remains authoritative for downloaded updates.
-In addition, release CI verifies the exact generated AppImage and `.sig` against
-the exact public key configured into the release build before finalization. The
-release verifier uses `minisign-verify`, matching the verifier family used by
-`tauri-plugin-updater`; no custom signature algorithm is introduced.
-
-Fixed offline regression vectors cover matching key, mismatched key, mutated
-artifact and mutated signature. Secret-canary scans run at staging, extracted
-AppImage and finalized release boundaries. The actual AppImage is also launched
-under isolated Xvfb/D-Bus and must reach a backend readiness marker and remain
-stable for a bounded interval.
-
-Final metadata is mechanically revalidated so `latest.json`, the release manifest
-and `SHA256SUMS.txt` all identify/hash the exact finalized AppImage/signature and
-mirrored tag commit. A separate GitHub verification job repeats those checks before
-publication; GitHub Actions artifacts are transfer-only and are not public releases.
+The final publication job creates a draft GitHub Release for the already-mirrored tag,
+uploads every verified Linux, Windows and shared asset, downloads all assets again,
+compares the exact filename set and bytes, verifies the global checksum manifest and
+only then publishes the draft as Latest. An already-published release is never
+overwritten. Drafts are not visible through the stable
+`releases/latest/download/latest.json` updater endpoint.
 
 ## Consequences
 
-* Linux has one deterministic, updater-compatible release artifact.
-* A release cannot accidentally pair the desktop with a worker from another app
-  version.
-* The worker does not depend on the user's system FFmpeg installation.
-* Update checking does not interrupt recording; installation uses the same
-  teardown invariants as explicit Quit.
-* Release CI is intentionally more expensive because it builds and tests the exact
-  FFmpeg runtime that will ship.
-* Windows x86_64 remains the next M8 release slice and can use an explicit
-  GitHub-hosted Windows runner such as `windows-2022`; it is not yet implemented or
-  marked validated. Existing Windows-first runtime architecture remains in scope
-  and must not be removed. macOS distribution remains deferred.
+* Linux keeps its already accepted AppImage/runtime/security invariants.
+* Windows users do not install FFmpeg separately and the application remains on the
+  MSVC target.
+* A release cannot pair desktop and worker from different application versions.
+* A required failure on either Linux or Windows prevents public production release.
+* Private signing material is isolated from dependency/frontend/media build runners.
+* Authenticode can be introduced or required independently without weakening the
+  mandatory Tauri updater signature.
+* Windows CI is more expensive because it builds FFmpeg from source and exercises the
+  actual NSIS install/upgrade/uninstall boundary.
+* Windows implementation is not called validated until the hosted `windows-2022` tag
+  release path completes successfully.
+* macOS remains deferred; M9 is unaffected by this release decision.
 
 ## Rejected alternatives
 
 * **Ship system FFmpeg dependencies**: rejected because ABI/configuration would be
-  outside the application's control.
-* **Static FFmpeg**: rejected by the existing dynamic/LGPL integration strategy.
-* **Unsigned updater downloads**: rejected because transport TLS alone does not
-  establish artifact authenticity.
-* **Stop recording before download/verification**: rejected because update checks
-  and failed downloads must not cause avoidable recording downtime.
-* **Package all desktop OSes in M8**: rejected to keep the first distribution
-  milestone auditable and actually testable end to end.
+  outside application control.
+* **Download a third-party prebuilt Windows FFmpeg**: rejected because provenance,
+  features and licensing would no longer match the accepted source authority.
+* **Switch Windows Rust to GNU**: rejected because the application target remains
+  `x86_64-pc-windows-msvc`; packaging must solve MSVC compatibility rather than move
+  the product target.
+* **Static FFmpeg**: rejected by the existing dynamic/LGPL strategy.
+* **Global PATH/System32 DLL installation**: rejected in favor of application-local
+  Windows loading.
+* **Skip WebView2 installation**: rejected because the installer must remain usable
+  on systems without a preinstalled runtime.
+* **Treat Authenticode as the updater signature**: rejected; they have different trust
+  purposes and updater signature verification remains mandatory.
+* **Generate competing Linux and Windows `latest.json` files**: rejected because
+  public metadata must describe one release revision across all required platforms.
+* **Unsigned updater downloads**: rejected because TLS alone does not establish
+  artifact authenticity.
+* **Stop recording before download/verification**: rejected because update checks and
+  failed downloads must not cause avoidable recording downtime.

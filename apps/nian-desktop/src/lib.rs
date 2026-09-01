@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
@@ -1672,6 +1674,45 @@ fn start_power_dispatcher(
     Ok(())
 }
 
+fn emit_startup_smoke_marker() -> std::io::Result<()> {
+    if let Some(path) = std::env::var_os("NIAN_DESKTOP_STARTUP_SMOKE_FILE") {
+        std::fs::write(path, b"desktop_startup_ready\n")?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn emit_power_subscription_smoke_marker() -> std::io::Result<()> {
+    if let Some(path) = std::env::var_os("NIAN_DESKTOP_POWER_SMOKE_FILE") {
+        std::fs::write(path, b"windows_power_subscription_ready\n")?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn start_containment_smoke_worker() -> std::io::Result<()> {
+    let Some(marker) = std::env::var_os("NIAN_DESKTOP_CONTAINMENT_SMOKE_FILE") else {
+        return Ok(());
+    };
+    let worker = std::env::current_exe()?.with_file_name("nian-media-worker.exe");
+    let mut child = Command::new(worker)
+        .arg("__containment-smoke")
+        .env("NIAN_WORKER_CONTAINMENT_SMOKE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Err(error) = nian_platform_windows::contain_worker_process(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let pid = child.id();
+    // This child ignores stdin, so hard-death disappearance proves containment.
+    std::fs::write(marker, format!("{pid}\n"))?;
+    Ok(())
+}
+
 /// Initializes logging and starts the Tauri runtime.
 pub fn run() {
     tracing_subscriber::fmt()
@@ -1797,7 +1838,11 @@ pub fn run() {
             // events, but do not dispatch them concurrently with startup. The
             // receiver queues them until authoritative initialization finishes.
             let power_rx = match prepare_power_events(&state) {
-                Ok(rx) => rx,
+                Ok(rx) => {
+                    #[cfg(windows)]
+                    emit_power_subscription_smoke_marker()?;
+                    rx
+                }
                 Err(error) => {
                     tracing::warn!(code = error.code, "power event source is unavailable");
                     *lock(&state.startup_error)
@@ -1852,6 +1897,9 @@ pub fn run() {
                     *startup_error = Some(error);
                 }
             }
+            emit_startup_smoke_marker()?;
+            #[cfg(windows)]
+            start_containment_smoke_worker()?;
             tracing::info!(event = "desktop_startup_ready", "desktop startup ready");
 
             Ok(())

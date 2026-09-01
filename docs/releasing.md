@@ -71,37 +71,50 @@ release commit before creating the tag.
 
 ## GitHub production-release environment
 
-The Linux signing job, verification job and final publication job use the GitHub
-Environment `production-release`. Configure these Environment secrets:
+Only jobs that need protected signing material, release verification canaries or
+publication approval use the GitHub Environment `production-release`:
+
+- `sign-linux`;
+- `sign-windows`;
+- `verify-release`; and
+- `publish-release`.
+
+`build-linux` and `build-windows` are deliberately outside this Environment. They
+run dependency installation, frontend lifecycle scripts, FFmpeg compilation and
+ordinary tests without protected signing material.
+
+Configure these Environment secrets:
 
 | Secret | Scope | Purpose |
 |---|---|---|
-| `TAURI_SIGNING_PRIVATE_KEY` | Linux AppImage signing step only | long-lived Tauri updater signing key |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Linux AppImage signing step only | required key passphrase |
-| `NIAN_UPDATER_PUBLIC_KEY` | release-config generation and signature-verification steps | public updater verification key |
-| `NIAN_RELEASE_SECRET_SENTINEL` | staging/extracted/final scan steps | optional secret-leak canary |
+| `TAURI_SIGNING_PRIVATE_KEY` | updater-signing step in `sign-linux` and `sign-windows` only | shared Tauri updater signing key |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | same updater-signing steps only | updater-key passphrase |
+| `WINDOWS_SIGNING_PFX_BASE64` | Windows Authenticode steps only | optional production code-signing certificate/PFX bytes |
+| `WINDOWS_SIGNING_PFX_PASSWORD` | Windows Authenticode steps only | optional PFX password |
+| `NIAN_RELEASE_SECRET_SENTINEL` | staged/installed/final scan steps | optional binary-safe secret-leak canary |
 
-The private updater key/password never exist at workflow/job scope and are not
-available to checkout, dependency installation, frontend builds, tests, FFmpeg,
-ordinary Cargo commands, staging, metadata generation, artifact transfer or
-publication. Vite is built before signing secrets enter the environment, and the
-release Tauri config disables `beforeBuildCommand` so signing cannot spawn Vite.
+Configure these non-secret repository/environment variables:
 
-The current GitHub-hosted updater endpoint is deterministic and needs no secret:
+| Variable | Purpose |
+|---|---|
+| `NIAN_UPDATER_PUBLIC_KEY` | public verification key embedded in both platform builds and used by release verification |
+| `WINDOWS_SIGNING_TIMESTAMP_URL` | HTTPS Authenticode timestamp authority when Windows signing is configured |
+| `REQUIRE_WINDOWS_AUTHENTICODE` | set to `true` to reject public publication of an explicitly unsigned Windows candidate |
+
+The private updater key/password never exist at workflow/job scope. Authenticode
+material likewise appears only in the exact Windows signing steps. Signing jobs do
+not run pnpm/Vite or frontend lifecycle scripts; they install the exact Tauri CLI
+version through Cargo solely for bundling/signing. Generated Tauri release configs
+contain only public updater configuration and resource/sidecar mapping.
+
+The stable updater endpoint needs no secret:
 
 ```text
 https://github.com/<owner>/<repo>/releases/latest/download/latest.json
 ```
 
-`latest` resolves only published GitHub Releases, so a draft release is never
-advertised to clients. If updater metadata later moves to a separate HTTPS static
-host, add `NIAN_UPDATER_ENDPOINT` to the Environment and preserve the same
-non-placeholder HTTPS validation. Artifact URLs in `latest.json` always use the
-exact tagged GitHub Release URL.
-
-Future Windows Authenticode material belongs in the same protected Environment,
-but only once Windows packaging enters M8. Apple signing/notarization material is
-out of current scope.
+`latest` resolves only published GitHub Releases, so a draft is never advertised.
+Every platform URL inside `latest.json` uses the exact tagged GitHub Release asset.
 
 ## GitHub Actions permissions and dependency pins
 
@@ -124,110 +137,170 @@ than another third-party release action.
 
 ## Build topology
 
-Current topology:
+Current release topology keeps platform compilation independent and signing isolated:
 
 ```text
 release-preflight
       |
-      v
-build-linux
-      |
-      v
-verify-release
-      |
-      v
-publish-release
+      +------------------------+
+      |                        |
+      v                        v
+build-linux                build-windows
+      |                        |
+      v                        v
+sign-linux                 sign-windows
+      |                        |
+      +-----------+------------+
+                  |
+                  v
+           verify-release
+                  |
+                  v
+          publish-release
 ```
 
-When Windows packaging is implemented, `build-windows` becomes an independent
-peer of `build-linux`, both feeding `verify-release`. Independent platform builds
-should not be serialized without a reason.
+A required Linux or Windows failure blocks the release. Windows is not serialized
+after Linux. Temporary GitHub Actions artifacts are transfer objects between these
+jobs, not public release authority.
 
-### Linux build
+### Linux build and signing
 
-`build-linux` runs on an explicit GitHub-hosted `ubuntu-24.04` runner with the
-actual build inside `rust:1.98.0-bookworm`. The container preserves the accepted
-Debian 12/glibc 2.36 release baseline rather than inheriting the host runner's
-glibc. The job also pins Node 26.7.0 and pnpm 11.22.0.
+`build-linux` runs on `ubuntu-24.04` with the actual compilation inside
+`rust:1.98.0-bookworm`, preserving the accepted Debian 12/glibc 2.36 baseline. It
+pins Node 26.7.0 and pnpm 11.22.0 and preserves the existing Linux M8 gates: exact
+source/tag/version, SHA-256-pinned FFmpeg 8.0.3, LGPL/shared checks, media fixtures,
+Rust fmt/clippy/workspace tests, clean staged worker smoke and actual AppImage
+worker/desktop smoke. It produces an unsigned AppImage input and the staged runtime
+without receiving private release secrets.
 
-It preserves all accepted Linux M8 gates:
+`sign-linux` runs separately in `production-release`. It scans the staged runtime
+and built frontend with the configured sentinel, signs the exact AppImage with the
+Tauri updater key, independently verifies the resulting signature with
+`nian-release-verifier`, repeats the signed AppImage boundary smoke, creates the
+Linux platform manifest fragment and scans the finalized Linux candidate. The
+signing runner does not run pnpm or Vite.
 
-1. exact source/tag/version validation;
-2. SHA-256-pinned FFmpeg 8.0.3 source;
-3. shared LGPL runtime with GPL/nonfree rejection;
-4. media fixture integration against the release FFmpeg candidate;
-5. Rust fmt/clippy/workspace tests;
-6. release worker build and application-local FFmpeg closure;
-7. clean worker HELLO/version/ABI 62/62/60 probe/playback smoke;
-8. public-only Tauri release config;
-9. private signing key/password injected only for AppImage signing;
-10. post-build minisign-compatible public/private key verification;
-11. extracted AppImage worker smoke and real desktop Xvfb/D-Bus startup smoke;
-12. staged/extracted/final secret-canary scans;
-13. finalized `latest.json`, release-manifest and SHA-256 consistency; and
-14. upload of `linux-release-candidate` as a temporary GitHub Actions artifact.
+### Windows build and signing
 
-Temporary Actions artifacts are build-transfer objects, not the public release.
+`build-windows` runs on the explicit GitHub-hosted `windows-2022` runner and targets
+`x86_64-pc-windows-msvc`. Node 26.7.0, pnpm 11.22.0 and Rust 1.98.0 are pinned. The
+job builds FFmpeg 8.0.3 from the same source archive/SHA used by Linux with
+`--toolchain=msvc`, `--enable-shared`, `--disable-static`, `--disable-gpl` and
+`--disable-nonfree`. Required MSVC import libraries are emitted by the FFmpeg MSVC
+build and consumed through `NIAN_FFMPEG_LIB_DIR` only while compiling Rust.
 
-### Verification job
+The Windows stage contains `nian-media-worker.exe`, the FFmpeg DLL closure, any
+required application-local Visual C++ redistributable DLLs and release evidence.
+`dumpbin /dependents` recursively validates the worker and FFmpeg DLLs. Anything not
+resolved from the stage must be a Windows API-set/System32 dependency; MSYS2, vcpkg,
+developer PATH and repository build directories are not runtime authorities. The
+clean worker smoke removes the FFmpeg development override and verifies HELLO,
+application version, ABI 62/62/60, fixture probe/playback and shutdown.
 
-`verify-release` downloads the Linux candidate and independently revalidates:
+The unsigned desktop is then built with a public-only Tauri configuration. NSIS is
+the canonical Windows bundle and WebView2 uses `downloadBootstrapper`. Runtime DLLs
+are application-local beside the installed executable/worker, never global PATH or
+System32 copies.
 
-- exact tag/HEAD identity;
-- application version;
-- exact GitHub tagged asset URL;
-- release-manifest commit/hash relationships;
-- `latest.json` signature and release-notes consistency;
-- every `SHA256SUMS.txt` entry;
-- finalized AppImage signature using `NIAN_UPDATER_PUBLIC_KEY`; and
-- final secret sentinel boundary.
+`sign-windows` runs separately in `production-release`. Optional Authenticode is
+applied first to the exact desktop and worker bytes. The NSIS installer is then
+built from those inputs, optionally Authenticode-signed and mechanically verified,
+and finally receives the mandatory Tauri updater signature. This order matters: the
+updater signature covers the exact final installer bytes that will be published.
 
-Only this validated directory is uploaded as `verified-release` for publication.
-Any required platform build or verification failure means there is no public
-release.
+When Authenticode credentials are unavailable the candidate is explicitly classified
+`authenticode_signed: false`. Setting `REQUIRE_WINDOWS_AUTHENTICODE=true` makes final
+verification reject that state. Tauri updater signing remains mandatory regardless
+of Authenticode.
+
+### Windows installed-runtime gates
+
+The actual NSIS installer is silently installed into a disposable runner-local
+directory. CI proves:
+
+- the installed desktop, worker and complete application-local DLL closure match the
+  exact signed/bundled input bytes;
+- third-party notices, FFmpeg build/license evidence and `BUILD_METADATA.json` exist;
+- the installed worker passes the clean media fixture smoke without system FFmpeg;
+- the installed desktop reaches backend readiness and successfully registers the
+  native `nian-platform-windows` power subscription;
+- hard desktop termination causes the accepted Windows Job Object to reap the exact
+  installed sibling media worker;
+- a fresh install leaves `launch_at_login=false`;
+- authoritative camera settings, credential refs, `recording_enabled`, selected
+  recording root and footage bytes survive reinstall/upgrade;
+- M7 startup reconciliation repairs a deliberately stale Windows Run entry to the
+  actual installed executable path; and
+- silent uninstall removes application binaries and stale autostart registration
+  without deleting settings SQLite or recording footage.
+
+No physical camera and no downgrade migration are involved.
+
+### Platform candidates and final verification
+
+`sign-linux` and `sign-windows` each emit one platform candidate with a
+`platform-manifest.json`. Platform jobs do **not** generate independent public
+`latest.json` or checksum authorities.
+
+`verify-release` requires both signed candidates and independently revalidates:
+
+- mirrored tag/version/commit identity;
+- matching FFmpeg 8.0.3 source version/SHA across platforms;
+- Linux AppImage updater signature;
+- Windows NSIS updater signature;
+- Windows Authenticode classification/policy;
+- platform artifact and runtime hashes;
+- the exact tagged GitHub Release URLs;
+- shared `RELEASE_NOTES.md`;
+- the required asset set; and
+- final secret-sentinel boundaries.
+
+Only this stage assembles the public metadata. `latest.json` contains exactly the
+Tauri updater keys `linux-x86_64` and `windows-x86_64`; `release-manifest.json`
+contains both platform fragments plus the shared source/commit authority; and one
+global `SHA256SUMS.txt` covers every public asset except itself. The verified
+directory is then uploaded as `verified-release`.
 
 ## Draft-first GitHub publication
 
 `publish-release` alone receives `contents: write`. It consumes only
-`verified-release` and never source-build artifacts directly.
-
-Publication ordering is:
+`verified-release` and never platform build inputs directly. Publication ordering is:
 
 ```text
 create draft release for existing mirrored tag
--> upload every finalized asset
--> download the draft assets back from GitHub
--> compare filenames and bytes to verified-release
--> verify SHA256SUMS again
+-> upload every Linux + Windows + shared asset
+-> download every draft asset back from GitHub
+-> compare the exact filename set and bytes
+-> verify the global SHA256SUMS.txt again
 -> publish the draft as the latest release
 ```
 
 An already-published release is never overwritten. A failed attempt may leave a
-draft, which a retry can delete and recreate. This remains compatible with GitHub
-immutable releases because mutability is required only while the release is a
-draft; verified publication is the terminal transition.
+draft, which a retry can delete and recreate; publication is the terminal transition.
 
-The expected public assets currently include:
+Canonical public names include:
 
 - `Nian-Vision_X.Y.Z_linux-x86_64.AppImage`;
-- matching `.AppImage.sig`;
+- `Nian-Vision_X.Y.Z_linux-x86_64.AppImage.sig`;
+- `Nian-Vision_X.Y.Z_windows-x86_64-setup.exe`;
+- `Nian-Vision_X.Y.Z_windows-x86_64-setup.exe.sig`;
 - `latest.json`;
 - `release-manifest.json`;
 - `SHA256SUMS.txt`;
 - `RELEASE_NOTES.md`;
 - `THIRD_PARTY_NOTICES.txt`; and
-- FFmpeg build/license/provenance files.
+- platform FFmpeg build/license/provenance evidence.
 
-No generic `app.AppImage` or `setup.exe` filename is a public release contract.
+Generic names such as `setup.exe` are not a public release contract.
 
 ## Updater behavior
 
-Runtime verification remains Tauri-owned:
+Runtime verification remains Tauri-owned on both platforms:
 
 ```text
 check/update selection
--> download AppImage
--> Tauri verifies updater signature with embedded public key
+-> download the platform artifact
+-> Tauri verifies the updater signature with the embedded public key
 -> verified bytes exist
 -> enter terminal M7 update lifecycle / close new admission
 -> gracefully stop RecordingController
@@ -239,21 +312,20 @@ check/update selection
 -> persisted desired recording restores
 ```
 
-Release-time signature verification only catches signing-secret/public-key
-misconfiguration before publication. It does not replace Tauri runtime
-verification. `recording_enabled` is never cleared because an update installs.
+Release-time signature verification catches signing-secret/public-key
+misconfiguration before publication; it does not replace runtime verification.
+Windows Authenticode is an independent publisher-identity layer and does not replace
+the Tauri updater signature. `recording_enabled` is never cleared merely because an
+update installs.
 
 ## Platform status
 
-- **Linux x86_64 AppImage**: current M8 CI-validated release target.
-- **Windows x86_64**: next primary product release target. Packaging/signing
-  validation is not implemented or marked tested yet. It will use an explicitly
-  selected GitHub-hosted Windows runner such as `windows-2022`, not Forgejo DIND.
-- **macOS**: distribution remains out of current scope.
-
-The hybrid migration intentionally happens before Windows packaging so the next
-M8 slice can use a real hosted Windows runner without weakening the already
-validated Linux path.
+- **Linux x86_64 AppImage**: M8 CI-validated release target.
+- **Windows x86_64 NSIS**: M8 release automation is implemented on explicit
+  `windows-2022`, including bundled FFmpeg, install/upgrade/uninstall smoke, updater
+  signing and optional Authenticode. It remains unmarked as validated until the
+  hosted Windows tag-release path completes successfully.
+- **macOS**: distribution remains outside current M8 scope.
 
 ## Local validation
 
@@ -269,6 +341,9 @@ pnpm test
 pnpm build
 ```
 
-A full local AppImage proof additionally needs Linux desktop packaging
-prerequisites (Xvfb, D-Bus, FUSE helper) and a disposable Tauri signing key. Never
-substitute a local disposable key for the production updater trust root.
+A full local Linux AppImage proof additionally needs Xvfb, D-Bus/FUSE helpers and a
+disposable updater signing key. The authoritative Windows packaging proof requires a
+real Windows/MSVC environment equivalent to the explicit `windows-2022` release
+runner; a Linux cross-check cannot prove MSVC linking, NSIS behavior, WebView2
+bootstrap, Authenticode or Windows loader/Job Object/power-event behavior. Never use
+a disposable local key as the production updater trust root.

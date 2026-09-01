@@ -25,13 +25,23 @@ if (!existsSync(fixture)) throw new Error(`media fixture missing: ${fixture}`);
 rmSync(cache, { recursive: true, force: true });
 mkdirSync(cache, { recursive: true });
 
-const cleanEnv = {
-  PATH: "/usr/bin:/bin",
-  HOME: process.env.HOME ?? "/tmp",
-  LANG: process.env.LANG ?? "C.UTF-8",
-};
-for (const name of ["TMPDIR", "XDG_RUNTIME_DIR"]) {
-  if (process.env[name]) cleanEnv[name] = process.env[name];
+const cleanEnv = process.platform === "win32"
+  ? {
+      PATH: dirname(worker),
+      SystemRoot: process.env.SystemRoot ?? "C:\\Windows",
+      WINDIR: process.env.WINDIR ?? process.env.SystemRoot ?? "C:\\Windows",
+      TEMP: process.env.TEMP ?? smokeRoot,
+      TMP: process.env.TMP ?? process.env.TEMP ?? smokeRoot,
+    }
+  : {
+      PATH: "/usr/bin:/bin",
+      HOME: process.env.HOME ?? "/tmp",
+      LANG: process.env.LANG ?? "C.UTF-8",
+    };
+if (process.platform !== "win32") {
+  for (const name of ["TMPDIR", "XDG_RUNTIME_DIR"]) {
+    if (process.env[name]) cleanEnv[name] = process.env[name];
+  }
 }
 
 const child = spawn(worker, ["run"], {

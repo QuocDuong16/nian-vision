@@ -19,15 +19,16 @@ HTTP, and retention playback pins. M7 adds single-instance activation,
 close-to-tray, explicit coordinated Quit, launch-at-login with hidden startup,
 persisted recording restoration, Windows suspend/resume handling, and Windows
 Job Object containment so hard desktop termination cannot orphan media workers.
-M8 adds a Linux x86_64 AppImage release path with a pinned LGPL FFmpeg 8.0.3
-runtime, desktop/worker release-version compatibility, signed Tauri updater
-artifacts, explicit update confirmation, deterministic lifecycle handoff and
-release provenance/checksums, release-time updater key-pair verification, final
-secret-canary scans, metadata consistency validation and an actual headless
-AppImage desktop startup smoke. Linux x86_64 is the current M8 validated release
-target. Windows x86_64 remains the next M8 release target and will use an explicit
-GitHub-hosted Windows runner such as `windows-2022`; its packaging/signing path is
-not yet implemented or marked validated. macOS distribution is also deferred.
+M8 adds Linux x86_64 AppImage and Windows x86_64 NSIS release paths with a pinned
+LGPL FFmpeg 8.0.3 runtime, desktop/worker release-version compatibility, signed
+Tauri updater artifacts, explicit update confirmation, deterministic lifecycle
+handoff, release provenance/checksums, release-time updater key-pair verification,
+secret-canary scans and installed-runtime smoke tests. Linux x86_64 is the current
+validated release target. The Windows implementation uses the explicit GitHub-hosted
+`windows-2022` runner, `x86_64-pc-windows-msvc`, an application-local FFmpeg DLL
+closure, NSIS install/upgrade/uninstall smoke, Job Object/power-subscription checks
+and the same updater trust root. Windows remains unmarked as validated until that
+hosted tag-release path completes successfully. macOS distribution is deferred.
 Live camera viewing, simultaneous multi-camera
 recording and ONVIF remain outside M8.
 
@@ -138,23 +139,31 @@ pnpm --filter nian-ui test
 
 Full commands and conventions: `docs/development.md`.
 
-## Linux release
+## Desktop releases
 
-The currently supported production distribution target is **Linux x86_64 only**,
-shipped as a signed-update-capable AppImage. The release workflow builds against a
-Debian 12 baseline, builds FFmpeg 8.0.3 from its SHA-256-pinned source archive,
-stages the worker plus app-owned shared libraries, runs clean-runtime media smoke
-tests, builds the AppImage, re-opens the AppImage for installed-layout smoke tests,
-and emits updater metadata plus SHA-256/provenance manifests.
+Linux x86_64 ships as an AppImage built against the accepted Debian 12 baseline.
+Windows x86_64 is packaged as an NSIS current-user installer on `windows-2022`
+using `x86_64-pc-windows-msvc`. Both build FFmpeg 8.0.3 from the same SHA-256-pinned
+upstream archive and bundle the media worker plus application-owned FFmpeg runtime.
+Windows uses Tauri's normal WebView2 `downloadBootstrapper` policy; users do not
+need a separate FFmpeg installation and the installer does not modify global PATH.
+
+Platform build jobs produce unsigned candidates without protected signing secrets.
+Separate `sign-linux` and `sign-windows` jobs in the protected
+`production-release` environment apply the shared Tauri updater trust root. The
+Windows signing boundary can additionally apply and mechanically verify
+Authenticode for the desktop executable, media worker and final NSIS installer. If
+credentials are absent the candidate is explicitly classified unsigned, and a
+repository policy switch can require Authenticode and fail closed.
 
 Forgejo remains the authoritative source repository and normal push/PR/quality CI
 platform. GitHub is a one-way mirror used only for hosted release CI and public
 GitHub Releases. Release tags originate on Forgejo and the mirror must synchronize
-tags as well as branches. Private updater signing material is scoped to the protected
-GitHub `production-release` environment and only the signing step receives it. See
-`docs/releasing.md` and ADR-0011. Windows x86_64 packaging is the next M8 release
-slice and will use an explicit GitHub-hosted Windows runner; it is not yet marked
-validated. macOS packaging remains deferred.
+tags as well as branches. One verification stage assembles Linux and Windows into a
+single `latest.json`, multi-platform release manifest and global `SHA256SUMS.txt`.
+The existing draft-first GitHub Release flow then uploads, re-downloads and
+byte-verifies every public asset before publication. See `docs/releasing.md` and
+ADR-0011. macOS packaging remains deferred.
 
 ## Supported camera protocols
 
@@ -165,8 +174,8 @@ validated. macOS packaging remains deferred.
 ## License notes
 
 * Nian Vision's own code is proprietary (private repository).
-* FFmpeg is dynamically linked. The Linux release pipeline builds the exact
-  FFmpeg 8.0.3 source pin in LGPL mode with shared libraries and mechanically
-  rejects GPL/nonfree/static drift before packaging. Release artifacts include
+* FFmpeg is dynamically linked. Linux and Windows release jobs build the exact
+  FFmpeg 8.0.3 source pin in LGPL shared mode and mechanically reject
+  GPL/nonfree/static drift before packaging. Release artifacts include
   the exact configure flags, FFmpeg LGPL text and `THIRD_PARTY_NOTICES.txt`; see
   `docs/ffmpeg.md` and `thirdparty/README.md` for provenance.

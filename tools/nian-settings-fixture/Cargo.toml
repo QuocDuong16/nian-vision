@@ -1,0 +1,11 @@
+[package]
+name = "nian-settings-fixture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nian-domain.workspace = true
+nian-settings.workspace = true
+serde_json.workspace = true

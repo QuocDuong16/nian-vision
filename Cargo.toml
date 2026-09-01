@@ -16,6 +16,7 @@ members = [
     "crates/nian-storage",
     "tools/bindgen-gen",
     "tools/nian-release-verifier",
+    "tools/nian-settings-fixture",
 ]
 # tools/bindgen-gen needs libclang and is only built explicitly:
 #   cargo run -p bindgen-gen

@@ -74,7 +74,6 @@ jobs:
     needs: release-preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-    environment: production-release
     container:
       image: rust:1.98.0-bookworm
     steps:
@@ -170,81 +169,379 @@ jobs:
           cargo build -p nian-media-worker --release
 
       - name: Stage and clean-smoke Linux runtime
-        env:
-          NIAN_RELEASE_SECRET_SENTINEL: ${{ secrets.NIAN_RELEASE_SECRET_SENTINEL }}
         run: scripts/release/stage-linux.sh
 
       - name: Generate release-only Tauri configuration
         env:
-          NIAN_UPDATER_PUBLIC_KEY: ${{ secrets.NIAN_UPDATER_PUBLIC_KEY }}
+          NIAN_UPDATER_PUBLIC_KEY: ${{ vars.NIAN_UPDATER_PUBLIC_KEY }}
           NIAN_UPDATER_ENDPOINT: ${{ github.server_url }}/${{ github.repository }}/releases/latest/download/latest.json
         run: node scripts/release/write-tauri-release-config.mjs
 
-      - name: Build signed updater AppImage
+      - name: Build unsigned AppImage bundle
         env:
           NIAN_UPDATER_CONFIGURED: "1"
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -Eeuo pipefail
-          test -n "${TAURI_SIGNING_PRIVATE_KEY:-}" || { echo "TAURI_SIGNING_PRIVATE_KEY is required" >&2; exit 1; }
-          test -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" || { echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD is required" >&2; exit 1; }
           cd apps/nian-desktop
-          ../../ui/node_modules/.bin/tauri build --config tauri.release.generated.conf.json --bundles appimage --ci
-
-      - name: Verify updater signature against configured public key
-        env:
-          NIAN_UPDATER_PUBLIC_KEY: ${{ secrets.NIAN_UPDATER_PUBLIC_KEY }}
-        run: |
-          set -Eeuo pipefail
-          configured_public_key="$(node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync("apps/nian-desktop/tauri.release.generated.conf.json","utf8")); process.stdout.write(c.plugins.updater.pubkey)')"
-          [[ "$configured_public_key" == "$NIAN_UPDATER_PUBLIC_KEY" ]] || { echo "generated updater public key differs from release configuration input" >&2; exit 1; }
-          mapfile -t images < <(find target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print | sort)
-          [[ "${#images[@]}" -eq 1 ]] || { echo "expected exactly one generated AppImage" >&2; exit 1; }
-          test -f "${images[0]}.sig" || { echo "generated AppImage signature is missing" >&2; exit 1; }
-          NIAN_UPDATER_PUBLIC_KEY="$configured_public_key" cargo run --quiet -p nian-release-verifier -- "${images[0]}" "${images[0]}.sig"
+          ../../ui/node_modules/.bin/tauri build --config tauri.release.generated.conf.json --no-bundle --ci
+          ../../ui/node_modules/.bin/tauri bundle --config tauri.release.generated.conf.json --bundles appimage --ci --no-sign
 
       - name: Dispose generated Tauri release configuration
         run: rm -f apps/nian-desktop/tauri.release.generated.conf.json
 
       - name: Smoke actual AppImage runtime and desktop startup
+        run: scripts/release/smoke-appimage.sh
+
+      - name: Upload unsigned Linux build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-unsigned-build
+          path: |
+            target/release/bundle/appimage/*.AppImage
+            dist/linux-x86_64/
+            ui/dist/
+          if-no-files-found: error
+          retention-days: 1
+
+
+  sign-linux:
+    name: Sign and finalize Linux candidate
+    needs: [release-preflight, build-linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: production-release
+    steps:
+      - name: Check out exact release source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Install pinned Node.js
+        run: |
+          set -Eeuo pipefail
+          node_version="26.7.0"
+          node_archive="node-v${node_version}-linux-x64.tar.xz"
+          curl --fail --silent --show-error --location --output "/tmp/${node_archive}" "https://nodejs.org/dist/v${node_version}/${node_archive}"
+          echo "982aa24dd8be4c889c6a8ab337ddff3b0896645b20f4239356e80552c16277ee  /tmp/${node_archive}" | sha256sum --check --strict -
+          sudo tar --extract --xz --file "/tmp/${node_archive}" --directory /usr/local --strip-components=1
+
+      - name: Install pinned Rust verifier and Tauri signing toolchain
+        run: |
+          set -Eeuo pipefail
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup override set 1.98.0
+          cargo install tauri-cli --version 2.11.4 --locked
+
+      - name: Download unsigned Linux build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linux-unsigned-build
+          path: .
+
+      - name: Scan staged Linux runtime and frontend boundary
+        env:
+          NIAN_RELEASE_SECRET_SENTINEL: ${{ secrets.NIAN_RELEASE_SECRET_SENTINEL }}
+        run: node scripts/release/scan-release-secrets.mjs dist/linux-x86_64 ui/dist
+
+      - name: Sign Linux updater artifact
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          mapfile -t images < <(find target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print | sort)
+          [[ "${#images[@]}" -eq 1 ]] || { echo "expected exactly one unsigned Linux AppImage" >&2; exit 1; }
+          cargo tauri signer sign "${images[0]}"
+
+      - name: Verify Linux updater signature
+        env:
+          NIAN_UPDATER_PUBLIC_KEY: ${{ vars.NIAN_UPDATER_PUBLIC_KEY }}
+        run: |
+          set -Eeuo pipefail
+          mapfile -t images < <(find target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print | sort)
+          NIAN_UPDATER_PUBLIC_KEY="$NIAN_UPDATER_PUBLIC_KEY" cargo run --quiet -p nian-release-verifier -- "${images[0]}" "${images[0]}.sig"
+
+      - name: Smoke signed Linux AppImage boundary
         env:
           NIAN_RELEASE_SECRET_SENTINEL: ${{ secrets.NIAN_RELEASE_SECRET_SENTINEL }}
         run: scripts/release/smoke-appimage.sh
 
-      - name: Finalize GitHub Release candidate
-        env:
-          NIAN_RELEASE_DOWNLOAD_BASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}
-        run: node scripts/release/finalize-linux-release.mjs
+      - name: Finalize Linux platform candidate
+        run: node scripts/release/finalize-platform-candidate.mjs linux
 
-      - name: Validate finalized updater metadata relationships
-        env:
-          NIAN_EXPECTED_RELEASE_BASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}
-          NIAN_EXPECTED_RELEASE_COMMIT: ${{ github.sha }}
-        run: node scripts/release/validate-release-output.mjs
-
-      - name: Verify checksum manifest
-        run: |
-          set -Eeuo pipefail
-          cd dist/release
-          sha256sum --check --strict SHA256SUMS.txt
-
-      - name: Final secret sentinel scan
+      - name: Scan finalized Linux candidate
         env:
           NIAN_RELEASE_SECRET_SENTINEL: ${{ secrets.NIAN_RELEASE_SECRET_SENTINEL }}
-        run: node scripts/release/scan-release-secrets.mjs ui/dist dist/release
+        run: node scripts/release/scan-release-secrets.mjs dist/candidate-linux
 
       - name: Upload Linux release candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-release-candidate
-          path: dist/release/
+          path: dist/candidate-linux/
           if-no-files-found: error
           retention-days: 1
 
+  build-windows:
+    name: Windows x86_64 build
+    needs: release-preflight
+    runs-on: windows-2022
+    timeout-minutes: 150
+    steps:
+      - name: Check out exact release source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Re-prove release source identity
+        shell: pwsh
+        run: |
+          git fetch --force --tags origin
+          if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA) { throw "Windows build checkout differs from GITHUB_SHA" }
+          if ((git rev-parse "$env:GITHUB_REF^{commit}").Trim() -ne $env:GITHUB_SHA) { throw "Windows build tag differs from GITHUB_SHA" }
+
+      - name: Install pinned Rust 1.98.0 MSVC toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.98.0-x86_64-pc-windows-msvc --profile minimal
+          rustup override set 1.98.0
+          rustc --version
+
+      - name: Install pinned Node.js 26.7.0
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'node-v26.7.0-win-x64.zip'
+          Invoke-WebRequest 'https://nodejs.org/dist/v26.7.0/node-v26.7.0-win-x64.zip' -OutFile $zip
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($hash -ne 'd3bd72755141ed32bbcd841228ee81897c8a98d50dfa7dae2179399a0a7c90f8') { throw 'Node.js Windows archive SHA-256 mismatch' }
+          Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP -Force
+          $nodeRoot = Join-Path $env:RUNNER_TEMP 'node-v26.7.0-win-x64'
+          Add-Content $env:GITHUB_PATH $nodeRoot
+          & (Join-Path $nodeRoot 'node.exe') --version
+
+      - name: Install pinned pnpm
+        shell: pwsh
+        run: |
+          npm install --global corepack@0.35.0
+          corepack enable
+          corepack install --global pnpm@11.22.0
+          pnpm --version
+
+      - name: Windows runner preflight
+        shell: pwsh
+        run: scripts/release/preflight-windows.ps1
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Release scripts and frontend quality
+        shell: pwsh
+        run: |
+          pnpm release:test
+          pnpm lint
+          pnpm typecheck
+          pnpm test
+          pnpm build
+
+      - name: Build pinned FFmpeg 8.0.3 Windows MSVC runtime
+        shell: pwsh
+        run: scripts/release/build-ffmpeg-windows.ps1
+
+      - name: Validate Windows release FFmpeg and Rust runtime
+        shell: pwsh
+        run: |
+          $env:NIAN_FFMPEG_LIB_DIR = Join-Path $pwd 'dist\ffmpeg-windows-x86_64\lib'
+          $env:PATH = "$(Join-Path $pwd 'dist\ffmpeg-windows-x86_64\bin');$env:PATH"
+          cargo test -p nian-media-ffmpeg --test media_integration
+          cargo fmt --all --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --workspace
+          cargo build -p nian-media-worker --target x86_64-pc-windows-msvc --release
+
+      - name: Stage and clean-smoke Windows runtime
+        shell: pwsh
+        run: scripts/release/stage-windows.ps1
+
+      - name: Generate public-only Windows Tauri configuration
+        env:
+          NIAN_UPDATER_PUBLIC_KEY: ${{ vars.NIAN_UPDATER_PUBLIC_KEY }}
+          NIAN_UPDATER_ENDPOINT: ${{ github.server_url }}/${{ github.repository }}/releases/latest/download/latest.json
+        run: node scripts/release/write-tauri-windows-release-config.mjs
+
+      - name: Build unsigned Windows desktop binary
+        shell: pwsh
+        env:
+          NIAN_UPDATER_CONFIGURED: "1"
+        run: |
+          $repo = $pwd.Path
+          $env:NIAN_FFMPEG_LIB_DIR = Join-Path $repo 'dist\ffmpeg-windows-x86_64\lib'
+          $env:PATH = "$(Join-Path $repo 'dist\ffmpeg-windows-x86_64\bin');$env:PATH"
+          Push-Location apps/nian-desktop
+          try {
+            & ..\..\ui\node_modules\.bin\tauri.CMD build --target x86_64-pc-windows-msvc --config tauri.windows.release.generated.conf.json --no-bundle --ci
+            if ($LASTEXITCODE -ne 0) { throw "Tauri Windows desktop build failed" }
+          }
+          finally { Pop-Location }
+
+      - name: Restage with desktop dependency closure
+        shell: pwsh
+        run: scripts/release/stage-windows.ps1
+
+      - name: Dispose generated Windows Tauri configuration
+        shell: pwsh
+        run: Remove-Item apps/nian-desktop/tauri.windows.release.generated.conf.json -Force
+
+      - name: Upload unsigned Windows build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-unsigned-build
+          path: |
+            target/x86_64-pc-windows-msvc/release/nian-desktop.exe
+            dist/windows-x86_64/
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-windows:
+    name: Sign, install-smoke and finalize Windows candidate
+    needs: [release-preflight, build-windows]
+    runs-on: windows-2022
+    timeout-minutes: 75
+    environment: production-release
+    steps:
+      - name: Check out exact release source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Install pinned Rust 1.98.0 MSVC and Tauri signing toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.98.0-x86_64-pc-windows-msvc --profile minimal
+          rustup override set 1.98.0
+          cargo install tauri-cli --version 2.11.4 --locked
+
+      - name: Install pinned Node.js
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'node-v26.7.0-win-x64.zip'
+          Invoke-WebRequest 'https://nodejs.org/dist/v26.7.0/node-v26.7.0-win-x64.zip' -OutFile $zip
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($hash -ne 'd3bd72755141ed32bbcd841228ee81897c8a98d50dfa7dae2179399a0a7c90f8') { throw 'Node.js Windows archive SHA-256 mismatch' }
+          Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP -Force
+          $nodeRoot = Join-Path $env:RUNNER_TEMP 'node-v26.7.0-win-x64'
+          $env:PATH = "$nodeRoot;$env:PATH"
+          Add-Content $env:GITHUB_PATH $nodeRoot
+
+      - name: Download unsigned Windows build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-unsigned-build
+          path: .
+
+      - name: Scan staged Windows runtime boundary
+        env:
+          NIAN_RELEASE_SECRET_SENTINEL: ${{ secrets.NIAN_RELEASE_SECRET_SENTINEL }}
+        run: node scripts/release/scan-release-secrets.mjs dist/windows-x86_64
+
+      - name: Generate Windows bundle configuration
+        env:
+          NIAN_UPDATER_PUBLIC_KEY: ${{ vars.NIAN_UPDATER_PUBLIC_KEY }}
+          NIAN_UPDATER_ENDPOINT: ${{ github.server_url }}/${{ github.repository }}/releases/latest/download/latest.json
+        run: node scripts/release/write-tauri-windows-release-config.mjs
+
+      - name: Authenticode-sign Windows application binaries when configured
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          WINDOWS_SIGNING_TIMESTAMP_URL: ${{ vars.WINDOWS_SIGNING_TIMESTAMP_URL }}
+          REQUIRE_WINDOWS_AUTHENTICODE: ${{ vars.REQUIRE_WINDOWS_AUTHENTICODE }}
+        run: |
+          scripts/release/sign-authenticode-windows.ps1 `
+            -Path @('target/x86_64-pc-windows-msvc/release/nian-desktop.exe','dist/windows-x86_64/runtime/nian-media-worker.exe') `
+            -StateFile 'dist/windows-authenticode-state.json'
+          Copy-Item -Force 'dist/windows-x86_64/runtime/nian-media-worker.exe' 'dist/windows-x86_64/tauri/nian-media-worker-x86_64-pc-windows-msvc.exe'
+
+      - name: Build NSIS installer from exact signed-or-explicitly-unsigned inputs
+        shell: pwsh
+        run: |
+          Push-Location apps/nian-desktop
+          try {
+            cargo tauri bundle --target x86_64-pc-windows-msvc --config tauri.windows.release.generated.conf.json --bundles nsis --ci --no-sign
+            if ($LASTEXITCODE -ne 0) { throw "Tauri Windows NSIS bundle failed" }
+          }
+          finally { Pop-Location }
+
+      - name: Dispose generated Windows Tauri configuration
+        shell: pwsh
+        run: Remove-Item apps/nian-desktop/tauri.windows.release.generated.conf.json -Force
+
+      - name: Authenticode-sign and verify final NSIS installer when configured
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          WINDOWS_SIGNING_TIMESTAMP_URL: ${{ vars.WINDOWS_SIGNING_TIMESTAMP_URL }}
+          REQUIRE_WINDOWS_AUTHENTICODE: ${{ vars.REQUIRE_WINDOWS_AUTHENTICODE }}
+        run: |
+          $installers = @(Get-ChildItem 'target/x86_64-pc-windows-msvc/release/bundle/nsis' -File -Filter '*-setup.exe')
+          if ($installers.Count -ne 1) { throw "expected exactly one NSIS installer" }
+          scripts/release/sign-authenticode-windows.ps1 -Path @($installers[0].FullName) -StateFile 'dist/windows-authenticode-state.json'
+
+      - name: Sign final Windows updater artifact
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $installers = @(Get-ChildItem 'target/x86_64-pc-windows-msvc/release/bundle/nsis' -File -Filter '*-setup.exe')
+          if ($installers.Count -ne 1) { throw "expected exactly one NSIS installer" }
+          cargo tauri signer sign $installers[0].FullName
+
+      - name: Verify Windows updater signature
+        shell: pwsh
+        env:
+          NIAN_UPDATER_PUBLIC_KEY: ${{ vars.NIAN_UPDATER_PUBLIC_KEY }}
+        run: |
+          $installers = @(Get-ChildItem 'target/x86_64-pc-windows-msvc/release/bundle/nsis' -File -Filter '*-setup.exe')
+          $env:NIAN_UPDATER_PUBLIC_KEY = $env:NIAN_UPDATER_PUBLIC_KEY
+          cargo run --quiet -p nian-release-verifier -- $installers[0].FullName "$($installers[0].FullName).sig"
+
+      - name: Smoke actual Windows NSIS install upgrade containment and uninstall
+        shell: pwsh
+        env:
+          NIAN_RELEASE_SECRET_SENTINEL: ${{ secrets.NIAN_RELEASE_SECRET_SENTINEL }}
+        run: |
+          $installers = @(Get-ChildItem 'target/x86_64-pc-windows-msvc/release/bundle/nsis' -File -Filter '*-setup.exe')
+          scripts/release/smoke-windows-installer.ps1 -Installer $installers[0].FullName -ExpectedVersion '${{ needs.release-preflight.outputs.version }}'
+
+      - name: Finalize Windows platform candidate
+        shell: pwsh
+        run: |
+          $state = Get-Content 'dist/windows-authenticode-state.json' -Raw | ConvertFrom-Json
+          $env:NIAN_WINDOWS_AUTHENTICODE_SIGNED = if ($state.authenticode_signed) { 'true' } else { 'false' }
+          node scripts/release/finalize-platform-candidate.mjs windows
+
+      - name: Scan finalized Windows candidate
+        env:
+          NIAN_RELEASE_SECRET_SENTINEL: ${{ secrets.NIAN_RELEASE_SECRET_SENTINEL }}
+        run: node scripts/release/scan-release-secrets.mjs dist/candidate-windows
+
+      - name: Upload Windows release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-release-candidate
+          path: dist/candidate-windows/
+          if-no-files-found: error
+          retention-days: 1
+
+
   verify-release:
-    name: Verify complete release candidate
-    needs: [release-preflight, build-linux]
+    name: Verify complete Linux and Windows release
+    needs: [release-preflight, sign-linux, sign-windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: production-release
@@ -259,9 +556,15 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: linux-release-candidate
-          path: dist/release
+          path: dist/candidate-linux
 
-      - name: Install pinned Node.js
+      - name: Download Windows release candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-release-candidate
+          path: dist/candidate-windows
+
+      - name: Install pinned Node.js and Rust verifier toolchain
         run: |
           set -Eeuo pipefail
           node_version="26.7.0"
@@ -269,36 +572,39 @@ jobs:
           curl --fail --silent --show-error --location --output "/tmp/${node_archive}" "https://nodejs.org/dist/v${node_version}/${node_archive}"
           echo "982aa24dd8be4c889c6a8ab337ddff3b0896645b20f4239356e80552c16277ee  /tmp/${node_archive}" | sha256sum --check --strict -
           sudo tar --extract --xz --file "/tmp/${node_archive}" --directory /usr/local --strip-components=1
-          node --version
-
-      - name: Install pinned Rust 1.98.0 verifier toolchain
-        run: |
-          set -Eeuo pipefail
           rustup toolchain install 1.98.0 --profile minimal
           rustup override set 1.98.0
-          rustc --version
 
-      - name: Revalidate candidate identity and metadata
+      - name: Assemble one public multi-platform release
+        env:
+          NIAN_RELEASE_DOWNLOAD_BASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}
+        run: node scripts/release/assemble-release.mjs
+
+      - name: Validate combined metadata hashes and required platforms
         env:
           NIAN_EXPECTED_RELEASE_BASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}
           NIAN_EXPECTED_RELEASE_COMMIT: ${{ github.sha }}
+          NIAN_REQUIRE_WINDOWS_AUTHENTICODE: ${{ vars.REQUIRE_WINDOWS_AUTHENTICODE }}
+        run: node scripts/release/validate-multiplatform-release.mjs
+
+      - name: Reverify both updater signatures
+        env:
+          NIAN_UPDATER_PUBLIC_KEY: ${{ vars.NIAN_UPDATER_PUBLIC_KEY }}
         run: |
           set -Eeuo pipefail
-          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]] || { echo "verification checkout differs from GITHUB_SHA" >&2; exit 1; }
-          node scripts/release/version-check.mjs --tag "$GITHUB_REF_NAME" --require-clean
-          node scripts/release/validate-release-output.mjs
+          version='${{ needs.release-preflight.outputs.version }}'
+          linux="dist/release/Nian-Vision_${version}_linux-x86_64.AppImage"
+          windows="dist/release/Nian-Vision_${version}_windows-x86_64-setup.exe"
+          NIAN_UPDATER_PUBLIC_KEY="$NIAN_UPDATER_PUBLIC_KEY" cargo run --quiet -p nian-release-verifier -- "$linux" "${linux}.sig"
+          NIAN_UPDATER_PUBLIC_KEY="$NIAN_UPDATER_PUBLIC_KEY" cargo run --quiet -p nian-release-verifier -- "$windows" "${windows}.sig"
+
+      - name: Verify global checksum manifest
+        run: |
+          set -Eeuo pipefail
           cd dist/release
           sha256sum --check --strict SHA256SUMS.txt
 
-      - name: Reverify finalized updater signature
-        env:
-          NIAN_UPDATER_PUBLIC_KEY: ${{ secrets.NIAN_UPDATER_PUBLIC_KEY }}
-        run: |
-          set -Eeuo pipefail
-          appimage="dist/release/Nian-Vision_${{ needs.release-preflight.outputs.version }}_linux-x86_64.AppImage"
-          NIAN_UPDATER_PUBLIC_KEY="$NIAN_UPDATER_PUBLIC_KEY" cargo run --quiet -p nian-release-verifier -- "$appimage" "${appimage}.sig"
-
-      - name: Re-scan verified release boundary
+      - name: Final multi-platform secret sentinel scan
         env:
           NIAN_RELEASE_SECRET_SENTINEL: ${{ secrets.NIAN_RELEASE_SECRET_SENTINEL }}
         run: node scripts/release/scan-release-secrets.mjs dist/release

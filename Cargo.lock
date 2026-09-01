@@ -2612,6 +2612,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nian-settings-fixture"
+version = "0.1.0"
+dependencies = [
+ "nian-domain",
+ "nian-settings",
+ "serde_json",
+]
+
+[[package]]
 name = "nian-storage"
 version = "0.1.0"
 dependencies = [

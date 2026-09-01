@@ -1,0 +1,198 @@
+param(
+    [Parameter(Mandatory = $true)][string]$Installer,
+    [Parameter(Mandatory = $true)][string]$ExpectedVersion
+)
+
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
+$Installer = (Resolve-Path $Installer).Path
+$Isolation = Join-Path $env:RUNNER_TEMP ("nian-windows-install-smoke-" + [Guid]::NewGuid().ToString("N"))
+$InstallRoot = Join-Path $Isolation "install"
+$AppData = Join-Path $Isolation "appdata"
+$LocalAppData = Join-Path $Isolation "localappdata"
+$Footage = Join-Path $Isolation "recordings"
+$Node = (Get-Command node.exe).Source
+New-Item -ItemType Directory -Force $AppData, $LocalAppData, $Footage | Out-Null
+
+function Wait-Exit([Diagnostics.Process]$Process, [int]$Seconds, [string]$Label) {
+    if (-not $Process.WaitForExit($Seconds * 1000)) {
+        try { $Process.Kill($true) } catch {}
+        throw "$Label timed out"
+    }
+    if ($Process.ExitCode -ne 0) { throw "$Label exited with code $($Process.ExitCode)" }
+}
+
+function Run-Installer {
+    $process = Start-Process -FilePath $Installer -ArgumentList @('/S', "/D=$InstallRoot") -PassThru -Wait
+    if ($process.ExitCode -ne 0) { throw "NSIS silent install failed with code $($process.ExitCode)" }
+}
+
+function Run-DesktopSmoke([string]$Desktop) {
+    $marker = Join-Path $Isolation ("desktop-ready-" + [Guid]::NewGuid().ToString("N") + ".txt")
+    $containment = Join-Path $Isolation ("containment-worker-" + [Guid]::NewGuid().ToString("N") + ".txt")
+    $power = Join-Path $Isolation ("power-subscription-" + [Guid]::NewGuid().ToString("N") + ".txt")
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $Desktop
+    $info.UseShellExecute = $false
+    $info.Environment['APPDATA'] = $AppData
+    $info.Environment['LOCALAPPDATA'] = $LocalAppData
+    $info.Environment['USERPROFILE'] = $Isolation
+    $info.Environment['NIAN_DESKTOP_STARTUP_SMOKE_FILE'] = $marker
+    $info.Environment['NIAN_DESKTOP_CONTAINMENT_SMOKE_FILE'] = $containment
+    $info.Environment['NIAN_DESKTOP_POWER_SMOKE_FILE'] = $power
+    $info.Environment.Remove('NIAN_FFMPEG_LIB_DIR')
+    $info.Environment.Remove('LD_LIBRARY_PATH')
+    $process = [Diagnostics.Process]::Start($info)
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while (-not (Test-Path $marker) -or -not (Test-Path $containment) -or -not (Test-Path $power)) {
+        if ($process.HasExited) { throw "installed desktop exited before startup readiness (code $($process.ExitCode))" }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            try { $process.Kill($true) } catch {}
+            throw "installed desktop startup readiness timed out"
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if ((Get-Content $marker -Raw).Trim() -ne 'desktop_startup_ready') {
+        try { $process.Kill($true) } catch {}
+        throw "installed desktop wrote an invalid readiness marker"
+    }
+    if ((Get-Content $power -Raw).Trim() -ne 'windows_power_subscription_ready') {
+        try { $process.Kill($true) } catch {}
+        throw "installed desktop did not prove the native Windows power subscription"
+    }
+    $workerPid = [int](Get-Content $containment -Raw).Trim()
+    if (-not (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)) {
+        try { $process.Kill($true) } catch {}
+        throw "installed desktop containment smoke worker is not alive"
+    }
+    Start-Sleep -Milliseconds 500
+    if ($process.HasExited) { throw "installed desktop crashed immediately after readiness" }
+    $process.Kill($true)
+    $process.WaitForExit()
+    $workerDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    while (Get-Process -Id $workerPid -ErrorAction SilentlyContinue) {
+        if ([DateTime]::UtcNow -ge $workerDeadline) {
+            Stop-Process -Id $workerPid -Force -ErrorAction SilentlyContinue
+            throw "Windows Job Object did not reap the installed media worker after hard desktop death"
+        }
+        Start-Sleep -Milliseconds 100
+    }
+}
+
+function Find-SettingsDatabase {
+    $matches = @(
+        Get-ChildItem $AppData, $LocalAppData -Recurse -File -Filter settings.sqlite3 -ErrorAction SilentlyContinue
+    )
+    if ($matches.Count -ne 1) { throw "expected exactly one isolated settings.sqlite3 after desktop startup, found $($matches.Count)" }
+    return $matches[0].FullName
+}
+
+function Verify-InstalledLayout {
+    $required = @(
+        "nian-desktop.exe",
+        "nian-media-worker.exe",
+        "avformat-62.dll",
+        "avcodec-62.dll",
+        "avutil-60.dll",
+        "release-evidence\THIRD_PARTY_NOTICES.txt",
+        "release-evidence\FFMPEG-LGPL-2.1.txt",
+        "release-evidence\FFMPEG_BUILD_FLAGS.txt",
+        "release-evidence\FFMPEG_CONFIG.h",
+        "release-evidence\BUILD_METADATA.json"
+    )
+    foreach ($relative in $required) {
+        if (-not (Test-Path (Join-Path $InstallRoot $relative))) { throw "installed Windows layout is missing: $relative" }
+    }
+
+    $desktopSource = Join-Path $RepoRoot 'target/x86_64-pc-windows-msvc/release/nian-desktop.exe'
+    if ((Get-FileHash -Algorithm SHA256 $desktopSource).Hash -ne (Get-FileHash -Algorithm SHA256 (Join-Path $InstallRoot 'nian-desktop.exe')).Hash) {
+        throw "installed desktop bytes differ from the exact signed bundle input"
+    }
+    $stageRuntime = Join-Path $RepoRoot 'dist/windows-x86_64/runtime'
+    foreach ($source in Get-ChildItem $stageRuntime -File | Where-Object { $_.Extension -ieq '.dll' -or $_.Name -ieq 'nian-media-worker.exe' }) {
+        $installed = Join-Path $InstallRoot $source.Name
+        if (-not (Test-Path $installed)) { throw "installed runtime closure is missing: $($source.Name)" }
+        if ((Get-FileHash -Algorithm SHA256 $source.FullName).Hash -ne (Get-FileHash -Algorithm SHA256 $installed).Hash) {
+            throw "installed runtime bytes differ from staged release input: $($source.Name)"
+        }
+    }
+}
+
+function Scan-InstalledSecrets {
+    if (-not [string]::IsNullOrEmpty($env:NIAN_RELEASE_SECRET_SENTINEL)) {
+        & $Node (Join-Path $RepoRoot "scripts/release/scan-release-secrets.mjs") $InstallRoot
+        if ($LASTEXITCODE -ne 0) {
+            throw "installed Windows application contains the configured release secret sentinel"
+        }
+    }
+}
+
+try {
+    Run-Installer
+    Verify-InstalledLayout
+    Scan-InstalledSecrets
+
+    $oldOverride = $env:NIAN_FFMPEG_LIB_DIR
+    $oldPath = $env:PATH
+    try {
+        Remove-Item Env:NIAN_FFMPEG_LIB_DIR -ErrorAction SilentlyContinue
+        $env:PATH = $InstallRoot
+        & $Node (Join-Path $RepoRoot "scripts/release/stage-runtime-smoke.mjs") `
+            (Join-Path $InstallRoot "nian-media-worker.exe") (Join-Path $Isolation "worker-smoke")
+        if ($LASTEXITCODE -ne 0) { throw "installed Windows worker smoke failed" }
+    }
+    finally {
+        $env:PATH = $oldPath
+        if ($null -ne $oldOverride) { $env:NIAN_FFMPEG_LIB_DIR = $oldOverride }
+    }
+
+    Run-DesktopSmoke (Join-Path $InstallRoot "nian-desktop.exe")
+    $freshRun = Get-ItemPropertyValue -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'Nian Vision' -ErrorAction SilentlyContinue
+    if ($freshRun) { throw "fresh install unexpectedly enabled launch-at-login" }
+
+    $settings = Find-SettingsDatabase
+    & cargo.exe run --quiet -p nian-settings-fixture -- create $settings $Footage
+    if ($LASTEXITCODE -ne 0) { throw "settings preservation fixture creation failed" }
+
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    New-Item $runKey -Force | Out-Null
+    Set-ItemProperty -Path $runKey -Name 'Nian Vision' -Value '"C:\stale-nian-vision\nian-desktop.exe" --startup-hidden'
+
+    # Same-version reinstall exercises the NSIS upgrade/maintenance path while
+    # preserving authoritative app-data and the user-selected recording root.
+    Run-Installer
+    Verify-InstalledLayout
+    Scan-InstalledSecrets
+    Run-DesktopSmoke (Join-Path $InstallRoot "nian-desktop.exe")
+    & cargo.exe run --quiet -p nian-settings-fixture -- verify $settings $Footage
+    if ($LASTEXITCODE -ne 0) { throw "settings preservation verification failed" }
+
+    $runValue = Get-ItemPropertyValue `
+        -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
+        -Name 'Nian Vision' -ErrorAction SilentlyContinue
+    if (-not $runValue) { throw "M7 launch-at-login reconciliation did not restore the Windows Run entry" }
+    $desktopPath = Join-Path $InstallRoot "nian-desktop.exe"
+    if ($runValue -notmatch [Regex]::Escape($desktopPath) -or $runValue -match 'stale-nian-vision') {
+        throw "M7 launch-at-login reconciliation did not repair the executable path"
+    }
+
+    $uninstallers = @(Get-ChildItem $InstallRoot -File -Filter '*uninstall*.exe')
+    if ($uninstallers.Count -ne 1) { throw "expected exactly one NSIS uninstaller, found $($uninstallers.Count)" }
+    $uninstall = Start-Process -FilePath $uninstallers[0].FullName -ArgumentList '/S' -PassThru -Wait
+    if ($uninstall.ExitCode -ne 0) { throw "NSIS silent uninstall failed with code $($uninstall.ExitCode)" }
+
+    foreach ($binary in @("nian-desktop.exe", "nian-media-worker.exe", "avformat-62.dll", "avcodec-62.dll", "avutil-60.dll")) {
+        if (Test-Path (Join-Path $InstallRoot $binary)) { throw "uninstall left application binary behind: $binary" }
+    }
+    if (-not (Test-Path $settings)) { throw "uninstall deleted authoritative settings.sqlite3" }
+    if (-not (Test-Path (Join-Path $Footage "preserve-me.mkv"))) { throw "uninstall deleted recording footage" }
+    $staleRun = Get-ItemPropertyValue `
+        -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
+        -Name 'Nian Vision' -ErrorAction SilentlyContinue
+    if ($staleRun) { throw "uninstall left stale Nian Vision launch-at-login registration" }
+    Write-Host "Windows NSIS install/upgrade/uninstall smoke passed for $ExpectedVersion"
+}
+finally {
+    Remove-Item -Recurse -Force $Isolation -ErrorAction SilentlyContinue
+}

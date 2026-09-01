@@ -17,6 +17,7 @@ apps/nian-desktop/gen/schemas/
 /ffmpeg-dist/
 /dist/
 apps/nian-desktop/tauri.release.generated.conf.json
+apps/nian-desktop/tauri.windows.release.generated.conf.json
 
 # Environment / secrets — never commit credentials
 .env
