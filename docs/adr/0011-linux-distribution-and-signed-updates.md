@@ -47,8 +47,10 @@ On Windows, FFmpeg is configured with `--toolchain=msvc`. The build must emit th
 MSVC import libraries `avformat.lib`, `avcodec.lib` and `avutil.lib` for the Rust
 `x86_64-pc-windows-msvc` link, while runtime DLLs are application-local. Staging
 recursively inspects `nian-media-worker.exe` and the FFmpeg DLLs with
-`dumpbin /dependents`. Dependencies must resolve from the staged runtime, copied VC
-redistributable DLLs, Windows API-sets or actual System32 files. MSYS2, vcpkg,
+`dumpbin /dependents`. Classification is deliberately ordered: already-local files
+recurse first; `VCRUNTIME*`, `MSVCP*` and `CONCRT*` are treated as VC redistributables
+and copied from `VCToolsRedistDir` before generic System32 detection; only then may
+Windows API-sets or actual OS dependencies remain system-provided. MSYS2, vcpkg,
 developer PATH, repository target directories and `NIAN_FFMPEG_LIB_DIR` are never
 installed runtime authorities. Global PATH, System32 copies and COM registration are
 not used.
@@ -75,8 +77,10 @@ The installed worker repeats the clean HELLO/ABI/probe/playback/shutdown smoke. 
 installed desktop must reach backend readiness, successfully register the real
 `nian-platform-windows` suspend/resume notification source, and preserve the accepted
 Windows Job Object containment: after hard desktop death the exact installed sibling
-worker must be reaped. Window focus/minimize events are not substitutes for power
-events.
+worker must be reaped. Direct reinstall is also exercised while the desktop and
+owned worker are running; NSIS/Tauri handles the desktop instance, Job Object closure
+reaps only its worker, and no global worker-process-name kill is part of the installer.
+Window focus/minimize events are not substitutes for power events.
 
 ### Upgrade and uninstall preserve authoritative user state
 
@@ -99,7 +103,10 @@ frontend has only narrow check/install commands. The host downloads and verifies
 platform updater artifact before changing lifecycle state. Only after verification
 does it close new admission and reuse M7's graceful shutdown ownership. Persisted
 desired recording intent is preserved; a failed installer handoff cannot leave the
-application stranded indefinitely in Quitting.
+application stranded indefinitely in Quitting. Linux performs exactly one explicit
+`app.restart()` after successful AppImage installation. Windows does not schedule a
+second restart after successful `Update::install`; the NSIS updater handoff owns the
+process exit/restart sequence.
 
 ### Compilation and signing are separate trust domains
 

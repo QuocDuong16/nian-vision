@@ -6,7 +6,10 @@ const workflow = readFileSync(new URL("../../.github/workflows/release.yml", imp
 const windowsConfigWriter = readFileSync(new URL("./write-tauri-windows-release-config.mjs", import.meta.url), "utf8");
 const windowsFfmpeg = readFileSync(new URL("./build-ffmpeg-windows.ps1", import.meta.url), "utf8");
 const windowsStage = readFileSync(new URL("./stage-windows.ps1", import.meta.url), "utf8");
+const windowsRuntimeClosure = readFileSync(new URL("./windows-runtime-closure.ps1", import.meta.url), "utf8");
+const windowsRuntimeClassifierTest = readFileSync(new URL("./test-windows-runtime-classifier.ps1", import.meta.url), "utf8");
 const windowsInstallerSmoke = readFileSync(new URL("./smoke-windows-installer.ps1", import.meta.url), "utf8");
+const windowsNsisHooks = readFileSync(new URL("../../apps/nian-desktop/windows/nsis-hooks.nsh", import.meta.url), "utf8");
 const desktop = readFileSync(new URL("../../apps/nian-desktop/src/lib.rs", import.meta.url), "utf8");
 const worker = readFileSync(new URL("../../apps/nian-media-worker/src/main.rs", import.meta.url), "utf8");
 
@@ -24,13 +27,38 @@ test("Windows FFmpeg build is MSVC shared LGPL and source-pinned", () => {
 
 test("Windows staging mechanically rejects missing and developer-resolved DLLs", () => {
   assert.match(windowsStage, /dumpbin\.exe \/nologo \/dependents/);
-  assert.match(windowsStage, /application-owned Windows dependency is missing from stage/);
+  assert.match(windowsRuntimeClosure, /application-owned Windows dependency is missing from stage/);
   assert.match(windowsStage, /msys64/);
   assert.match(windowsStage, /vcpkg/);
   assert.match(windowsStage, /target\/\$Target\/release\/nian-desktop\.exe/);
   assert.match(workflow, /Restage with desktop dependency closure/);
   assert.match(windowsStage, /Remove-Item Env:NIAN_FFMPEG_LIB_DIR/);
   assert.match(windowsStage, /stage-runtime-smoke\.mjs/);
+});
+
+test("Windows VC runtime classification precedes generic System32 detection and stages application-local", () => {
+  const localAt = windowsRuntimeClosure.indexOf("Kind = 'ApplicationLocal'");
+  const vcAt = windowsRuntimeClosure.indexOf("Test-VcRedistributableDependency $Name");
+  const apiAt = windowsRuntimeClosure.indexOf("API-MS-WIN-");
+  const system32At = windowsRuntimeClosure.indexOf("Join-Path $System32 $Name");
+  assert.ok(localAt >= 0 && vcAt > localAt && apiAt > vcAt && system32At > vcAt);
+  assert.match(windowsRuntimeClosure, /Copy-Item -Force \$resolution\.Source \$local/);
+  assert.match(windowsStage, /Stage-WindowsDependency \$dep \$object \$Runtime \$System32 \$env:VCToolsRedistDir/);
+  assert.match(workflow, /Test Windows VC runtime classifier and application-local staging[\s\S]*?test-windows-runtime-classifier\.ps1/);
+
+  for (const name of ["VCRUNTIME140.dll", "MSVCP140.dll", "VCRUNTIME140_1.dll", "CONCRT140.dll"]) {
+    assert.ok(windowsRuntimeClassifierTest.includes(name));
+  }
+  assert.match(windowsRuntimeClassifierTest, /runner-system-copy/);
+  assert.match(windowsRuntimeClassifierTest, /did not resolve from the configured VC redist source/);
+  assert.match(windowsRuntimeClassifierTest, /API-MS-WIN-CORE-FILE-L1-1-0\.DLL/);
+});
+
+test("final Windows closure includes the desktop and every application-local DLL", () => {
+  assert.match(windowsStage, /if \(Test-Path \$DesktopSource\) \{ \$closureRoots \+= \$DesktopSource \}/);
+  assert.match(windowsStage, /Get-ChildItem \$Runtime -File -Filter '\*\.dll'/);
+  assert.match(windowsStage, /Ensure-DependencyClosure @\(\$finalClosureRoots \| Sort-Object -Unique\)/);
+  assert.match(workflow, /Restage with desktop dependency closure/);
 });
 
 test("Windows Tauri config is NSIS-only with normal WebView2 bootstrapper and no updater private key", () => {
@@ -99,6 +127,24 @@ test("Windows desktop smoke proves native power subscription and Job Object hard
   assert.match(worker, /Deliberately independent of stdin and IPC/);
   assert.match(windowsInstallerSmoke, /Windows Job Object did not reap the installed media worker/);
   assert.match(windowsInstallerSmoke, /did not prove the native Windows power subscription/);
+});
+
+test("Windows installer upgrade relies on desktop ownership instead of global worker-name killing", () => {
+  assert.equal(/taskkill[\s\S]*?nian-media-worker\.exe/i.test(windowsNsisHooks), false);
+  assert.match(windowsNsisHooks, /Windows Job Object/);
+  assert.match(windowsNsisHooks, /DeleteRegValue HKCU/);
+  assert.match(windowsInstallerSmoke, /Start-DesktopContainmentSmoke/);
+  assert.match(windowsInstallerSmoke, /NSIS direct reinstall with running desktop/);
+  assert.match(windowsInstallerSmoke, /owned worker shutdown during direct reinstall/);
+  assert.match(windowsInstallerSmoke, /owned worker restarted or survived during installer file replacement/);
+  assert.match(windowsInstallerSmoke, /Run-DesktopSmoke \(Join-Path \$InstallRoot "nian-desktop\.exe"\)/);
+});
+
+test("Windows in-app updater policy supports NSIS without APPIMAGE and avoids a post-handoff restart", () => {
+  assert.match(desktop, /UpdateInstallPlatform::WindowsNsis/);
+  assert.match(desktop, /validate_update_install_platform\(platform, std::env::var_os\("APPIMAGE"\)\.is_some\(\)\)/);
+  assert.match(desktop, /if platform == UpdateInstallPlatform::LinuxAppImage[\s\S]*?restart\(\)/);
+  assert.equal(desktop.includes('application updates are only packaged for Linux'), false);
 });
 
 test("Windows install upgrade and uninstall preserve authoritative user data", () => {

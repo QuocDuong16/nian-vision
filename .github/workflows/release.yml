@@ -333,6 +333,10 @@ jobs:
         shell: pwsh
         run: scripts/release/preflight-windows.ps1
 
+      - name: Test Windows VC runtime classifier and application-local staging
+        shell: pwsh
+        run: scripts/release/test-windows-runtime-classifier.ps1
+
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 

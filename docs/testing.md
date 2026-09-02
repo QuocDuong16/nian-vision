@@ -503,10 +503,13 @@ vcpkg runtime authority, repository build paths and `NIAN_FFMPEG_LIB_DIR` runtim
 dependence.
 
 `scripts/release/stage-linux.sh` preserves the accepted Linux worker RUNPATH/ABI and
-fixture smoke. `scripts/release/stage-windows.ps1` recursively inspects the worker and
-FFmpeg DLL closure with `dumpbin /dependents`, copies required VC runtime DLLs
-application-locally, accepts only API-set/System32 dependencies outside that stage,
-and invokes the cross-platform worker smoke with a clean Windows environment. Worker
+fixture smoke. `scripts/release/stage-windows.ps1` recursively inspects the worker, final desktop
+and DLL closure with `dumpbin /dependents`. The shared classifier checks application-
+local files first, classifies `VCRUNTIME*`/`MSVCP*`/`CONCRT*` as redistributable before
+System32, copies them from `VCToolsRedistDir`, and only then accepts API-set/System32
+OS dependencies. A deterministic Windows regression simulates a conflicting System32
+VC runtime and proves the VC-redist bytes still win. The stage then invokes the cross-
+platform worker smoke with a clean Windows environment. Worker
 HELLO still proves IPC protocol, application version and FFmpeg ABI 62/62/60 before
 fixture `camera.probe`, fixture `playback.prepare` and clean shutdown.
 
@@ -521,7 +524,11 @@ Object reaps the exact installed worker after hard desktop death.
 
 Windows upgrade/data smoke creates settings through the real `nian-settings` API. It
 proves camera configuration, credential reference, persisted `recording_enabled`,
-`launch_at_login`, selected footage root and footage bytes survive reinstall. A stale
+`launch_at_login`, selected footage root and footage bytes survive reinstall. The
+second installer run is executed directly while the installed desktop and Job Object
+worker are alive; bounded readiness markers prove the desktop is handled by the NSIS
+app-running path, the owned worker exits with its desktop, file replacement succeeds
+without a global process-name kill, and the new desktop starts afterward. A stale
 Windows Run entry is deliberately seeded and startup reconciliation must repair it.
 Fresh install must keep launch-at-login off. Silent uninstall must remove application
 binaries and stale autostart registration while preserving authoritative settings and

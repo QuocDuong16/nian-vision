@@ -191,11 +191,14 @@ build and consumed through `NIAN_FFMPEG_LIB_DIR` only while compiling Rust.
 
 The Windows stage contains `nian-media-worker.exe`, the FFmpeg DLL closure, any
 required application-local Visual C++ redistributable DLLs and release evidence.
-`dumpbin /dependents` recursively validates the worker and FFmpeg DLLs. Anything not
-resolved from the stage must be a Windows API-set/System32 dependency; MSYS2, vcpkg,
-developer PATH and repository build directories are not runtime authorities. The
-clean worker smoke removes the FFmpeg development override and verifies HELLO,
-application version, ABI 62/62/60, fixture probe/playback and shutdown.
+`dumpbin /dependents` recursively validates the worker, final desktop and staged DLLs.
+Dependency classification is ordered: already-local files recurse first; VC runtime
+names (`VCRUNTIME*`, `MSVCP*`, `CONCRT*`) resolve from `VCToolsRedistDir` and are copied
+application-local before generic System32 detection; only then may Windows API-set or
+actual OS dependencies remain system-provided. MSYS2, vcpkg, developer PATH and
+repository build directories are not runtime authorities. The clean worker smoke
+removes the FFmpeg development override and verifies HELLO, application version, ABI
+62/62/60, fixture probe/playback and shutdown.
 
 The unsigned desktop is then built with a public-only Tauri configuration. NSIS is
 the canonical Windows bundle and WebView2 uses `downloadBootstrapper`. Runtime DLLs
@@ -226,6 +229,9 @@ directory. CI proves:
   native `nian-platform-windows` power subscription;
 - hard desktop termination causes the accepted Windows Job Object to reap the exact
   installed sibling media worker;
+- direct NSIS reinstall while the installed desktop is running succeeds through the
+  installer/Tauri app-running path; the owning desktop exits, its Job Object reaps the
+  worker, no global worker-name kill is used, and the new desktop starts afterward;
 - a fresh install leaves `launch_at_login=false`;
 - authoritative camera settings, credential refs, `recording_enabled`, selected
   recording root and footage bytes survive reinstall/upgrade;
@@ -308,8 +314,9 @@ check/update selection
 -> cancel/reap probe
 -> stop tray/power workers
 -> install verified update
--> restart through normal startup
--> persisted desired recording restores
+-> Linux: app.restart() exactly once after AppImage install
+-> Windows: NSIS handoff owns process exit/restart; no app.restart() is scheduled
+-> persisted desired recording restores through normal M7 startup
 ```
 
 Release-time signature verification catches signing-secret/public-key

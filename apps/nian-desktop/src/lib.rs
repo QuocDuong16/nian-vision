@@ -386,6 +386,70 @@ fn updater_configured() -> bool {
     matches!(option_env!("NIAN_UPDATER_CONFIGURED"), Some("1"))
 }
 
+#[allow(dead_code)] // Variants are target-specific; policy tests exercise all supported branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateInstallPlatform {
+    LinuxAppImage,
+    WindowsNsis,
+    Unsupported,
+}
+
+#[derive(Debug)]
+struct VerifiedUpdateBytes(Vec<u8>);
+
+fn current_update_install_platform() -> UpdateInstallPlatform {
+    #[cfg(target_os = "linux")]
+    {
+        UpdateInstallPlatform::LinuxAppImage
+    }
+    #[cfg(target_os = "windows")]
+    {
+        UpdateInstallPlatform::WindowsNsis
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        UpdateInstallPlatform::Unsupported
+    }
+}
+
+fn validate_update_install_platform(
+    platform: UpdateInstallPlatform,
+    appimage_present: bool,
+) -> Result<(), DesktopErrorDto> {
+    match platform {
+        UpdateInstallPlatform::LinuxAppImage if !appimage_present => Err(DesktopErrorDto::new(
+            "update_unsupported",
+            "in-app updates require the packaged Nian Vision AppImage",
+        )),
+        UpdateInstallPlatform::LinuxAppImage | UpdateInstallPlatform::WindowsNsis => Ok(()),
+        UpdateInstallPlatform::Unsupported => Err(DesktopErrorDto::new(
+            "update_unsupported",
+            "application updates are not packaged for this platform",
+        )),
+    }
+}
+
+fn handoff_verified_update(
+    platform: UpdateInstallPlatform,
+    bytes: VerifiedUpdateBytes,
+    mut shutdown: impl FnMut() -> Result<(), DesktopErrorDto>,
+    mut install: impl FnMut(Vec<u8>) -> Result<(), DesktopErrorDto>,
+    mut restart: impl FnMut(),
+) -> Result<(), DesktopErrorDto> {
+    if let Err(error) = shutdown() {
+        restart();
+        return Err(error);
+    }
+    if let Err(error) = install(bytes.0) {
+        restart();
+        return Err(error);
+    }
+    if platform == UpdateInstallPlatform::LinuxAppImage {
+        restart();
+    }
+    Ok(())
+}
+
 fn map_update_error(_error: tauri_plugin_updater::Error) -> DesktopErrorDto {
     DesktopErrorDto::new(
         "update_failed",
@@ -449,18 +513,8 @@ async fn update_install(
     state: tauri::State<'_, Arc<DesktopState>>,
     expected_version: String,
 ) -> Result<(), DesktopErrorDto> {
-    if !cfg!(target_os = "linux") {
-        return Err(DesktopErrorDto::new(
-            "update_unsupported",
-            "application updates are only packaged for Linux",
-        ));
-    }
-    if std::env::var_os("APPIMAGE").is_none() {
-        return Err(DesktopErrorDto::new(
-            "update_unsupported",
-            "in-app updates require the packaged Nian Vision AppImage",
-        ));
-    }
+    let platform = current_update_install_platform();
+    validate_update_install_platform(platform, std::env::var_os("APPIMAGE").is_some())?;
     if !updater_configured() {
         return Err(DesktopErrorDto::new(
             "update_unconfigured",
@@ -502,7 +556,7 @@ async fn update_install(
             .download(|_, _| {}, || {})
             .await
             .map_err(map_update_error)?;
-        Ok::<_, DesktopErrorDto>((update, bytes))
+        Ok::<_, DesktopErrorDto>((update, VerifiedUpdateBytes(bytes)))
     }
     .await;
 
@@ -516,26 +570,29 @@ async fn update_install(
         }
     };
 
-    // Only after the updater package has passed signature verification do we
-    // enter M7's terminal handoff. Desired recording intent is deliberately
-    // untouched, so startup restoration resumes it after the new binary starts.
-    if let Err(error) = begin_update_shutdown(&state) {
-        tracing::error!(
-            code = error.code,
-            "update lifecycle teardown failed; restarting current build"
-        );
-        app.restart();
-    }
-
-    if let Err(_error) = update.install(bytes) {
-        tracing::error!("signed updater handoff failed; restarting current build");
-        app.restart();
-    }
-
-    // Linux AppImage installation replaces the packaged image. Restart exactly
-    // once after the signed updater handoff so M7 restores desired recording
-    // intent through normal startup instead of inventing updater-only behavior.
-    app.restart();
+    // Update::download verifies the Tauri updater signature before returning.
+    // Only verified bytes may cross this boundary into M7's terminal teardown.
+    // Desired recording intent is deliberately untouched, so startup restoration
+    // resumes it after either platform's updater restarts the new build.
+    handoff_verified_update(
+        platform,
+        bytes,
+        || {
+            begin_update_shutdown(&state).inspect_err(|error| {
+                tracing::error!(
+                    code = error.code,
+                    "update lifecycle teardown failed; restarting current build"
+                );
+            })
+        },
+        |bytes| {
+            update.install(bytes).map_err(|error| {
+                tracing::error!(error = %error, "signed updater handoff failed; restarting current build");
+                map_update_error(error)
+            })
+        },
+        || app.restart(),
+    )
 }
 
 #[tauri::command]
@@ -2535,6 +2592,86 @@ mod tests {
             state.lifecycle.state().unwrap(),
             DesktopLifecycleState::Running
         );
+    }
+
+    #[test]
+    fn windows_update_install_is_supported_without_appimage() {
+        validate_update_install_platform(UpdateInstallPlatform::WindowsNsis, false).unwrap();
+        validate_update_install_platform(UpdateInstallPlatform::WindowsNsis, true).unwrap();
+    }
+
+    #[test]
+    fn linux_update_install_requires_appimage() {
+        let error = validate_update_install_platform(UpdateInstallPlatform::LinuxAppImage, false)
+            .unwrap_err();
+        assert_eq!(error.code, "update_unsupported");
+        validate_update_install_platform(UpdateInstallPlatform::LinuxAppImage, true).unwrap();
+    }
+
+    #[test]
+    fn unsupported_update_platform_is_rejected() {
+        let error = validate_update_install_platform(UpdateInstallPlatform::Unsupported, false)
+            .unwrap_err();
+        assert_eq!(error.code, "update_unsupported");
+    }
+
+    #[test]
+    fn windows_verified_update_tears_down_before_handoff_without_app_restart() {
+        let events = std::cell::RefCell::new(vec!["verified"]);
+        let restarts = std::cell::Cell::new(0usize);
+
+        handoff_verified_update(
+            UpdateInstallPlatform::WindowsNsis,
+            VerifiedUpdateBytes(vec![1, 2, 3]),
+            || {
+                events.borrow_mut().push("teardown");
+                Ok(())
+            },
+            |bytes| {
+                assert!(!bytes.is_empty());
+                events.borrow_mut().push("installer_handoff");
+                Ok(())
+            },
+            || restarts.set(restarts.get() + 1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            events.into_inner(),
+            vec!["verified", "teardown", "installer_handoff"]
+        );
+        assert_eq!(restarts.get(), 0);
+    }
+
+    #[test]
+    fn linux_verified_update_restarts_exactly_once_after_handoff() {
+        let events = std::cell::RefCell::new(vec!["verified"]);
+        let restarts = std::cell::Cell::new(0usize);
+
+        handoff_verified_update(
+            UpdateInstallPlatform::LinuxAppImage,
+            VerifiedUpdateBytes(vec![1, 2, 3]),
+            || {
+                events.borrow_mut().push("teardown");
+                Ok(())
+            },
+            |bytes| {
+                assert!(!bytes.is_empty());
+                events.borrow_mut().push("installer_handoff");
+                Ok(())
+            },
+            || {
+                restarts.set(restarts.get() + 1);
+                events.borrow_mut().push("restart");
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            events.into_inner(),
+            vec!["verified", "teardown", "installer_handoff", "restart"]
+        );
+        assert_eq!(restarts.get(), 1);
     }
 
     #[test]

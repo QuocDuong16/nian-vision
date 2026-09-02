@@ -11,6 +11,9 @@ $Target = $Config.windowsTarget
 $Node = (Get-Command node.exe).Source
 $WorkerSource = Join-Path $RepoRoot "target/$Target/release/nian-media-worker.exe"
 $DesktopSource = Join-Path $RepoRoot "target/$Target/release/nian-desktop.exe"
+$System32 = Join-Path $env:SystemRoot "System32"
+
+. (Join-Path $PSScriptRoot "windows-runtime-closure.ps1")
 
 function Import-VsDevEnvironment {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -42,21 +45,6 @@ function Get-Dependencies([string]$Path) {
     return $names | Sort-Object -Unique
 }
 
-function Is-SystemDependency([string]$Name) {
-    $upper = $Name.ToUpperInvariant()
-    if ($upper -match '^(API-MS-WIN-|EXT-MS-WIN-)') { return $true }
-    return Test-Path (Join-Path $env:SystemRoot "System32\$Name")
-}
-
-function Find-VcRuntime([string]$Name) {
-    if (-not $env:VCToolsRedistDir -or -not (Test-Path $env:VCToolsRedistDir)) { return $null }
-    $matches = Get-ChildItem $env:VCToolsRedistDir -Recurse -File -Filter $Name |
-        Where-Object FullName -Match '[\\/]x64[\\/]' |
-        Sort-Object FullName
-    if ($matches.Count -eq 0) { return $null }
-    return $matches[0].FullName
-}
-
 function Ensure-DependencyClosure([string[]]$Roots) {
     $queue = [Collections.Generic.Queue[string]]::new()
     foreach ($root in $Roots) { $queue.Enqueue($root) }
@@ -65,20 +53,8 @@ function Ensure-DependencyClosure([string[]]$Roots) {
         $object = $queue.Dequeue()
         foreach ($dep in Get-Dependencies $object) {
             if (-not $seen.Add($dep)) { continue }
-            $local = Join-Path $Runtime $dep
-            if (Test-Path $local) {
-                $queue.Enqueue($local)
-                continue
-            }
-            if (Is-SystemDependency $dep) { continue }
-            if ($dep -match '^(VCRUNTIME|MSVCP|CONCRT)[0-9A-Z_]*\.DLL$') {
-                $vc = Find-VcRuntime $dep
-                if (-not $vc) { throw "required Visual C++ runtime dependency is unavailable: $dep" }
-                Copy-Item -Force $vc $local
-                $queue.Enqueue($local)
-                continue
-            }
-            throw "application-owned Windows dependency is missing from stage: $dep required by $object"
+            $next = Stage-WindowsDependency $dep $object $Runtime $System32 $env:VCToolsRedistDir
+            if ($next) { $queue.Enqueue($next) }
         }
     }
 }
@@ -125,6 +101,13 @@ $closureRoots = @(
 )
 if (Test-Path $DesktopSource) { $closureRoots += $DesktopSource }
 Ensure-DependencyClosure $closureRoots
+
+# Revalidate from the final desktop plus every application-local DLL after the
+# first closure pass. This catches dependencies introduced only by the desktop
+# binary and recursively proves the exact VC/runtime closure that will be bundled.
+$finalClosureRoots = @($closureRoots)
+$finalClosureRoots += @(Get-ChildItem $Runtime -File -Filter '*.dll' | ForEach-Object { $_.FullName })
+Ensure-DependencyClosure @($finalClosureRoots | Sort-Object -Unique)
 
 $forbidden = @('msys64', 'vcpkg\\installed', 'nian-vision\\target', 'nian-vision/target')
 foreach ($file in Get-ChildItem $Stage -Recurse -File) {

@@ -23,12 +23,20 @@ function Wait-Exit([Diagnostics.Process]$Process, [int]$Seconds, [string]$Label)
     if ($Process.ExitCode -ne 0) { throw "$Label exited with code $($Process.ExitCode)" }
 }
 
-function Run-Installer {
-    $process = Start-Process -FilePath $Installer -ArgumentList @('/S', "/D=$InstallRoot") -PassThru -Wait
-    if ($process.ExitCode -ne 0) { throw "NSIS silent install failed with code $($process.ExitCode)" }
+function Run-Installer([string]$Label = 'NSIS silent install') {
+    $process = Start-Process -FilePath $Installer -ArgumentList @('/S', "/D=$InstallRoot") -PassThru
+    Wait-Exit $process 30 $Label
 }
 
-function Run-DesktopSmoke([string]$Desktop) {
+function Wait-ProcessGone([int]$ProcessId, [int]$Seconds, [string]$Label) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    while (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) {
+        if ([DateTime]::UtcNow -ge $deadline) { throw "$Label timed out" }
+        Start-Sleep -Milliseconds 100
+    }
+}
+
+function Start-DesktopContainmentSmoke([string]$Desktop) {
     $marker = Join-Path $Isolation ("desktop-ready-" + [Guid]::NewGuid().ToString("N") + ".txt")
     $containment = Join-Path $Isolation ("containment-worker-" + [Guid]::NewGuid().ToString("N") + ".txt")
     $power = Join-Path $Isolation ("power-subscription-" + [Guid]::NewGuid().ToString("N") + ".txt")
@@ -61,23 +69,30 @@ function Run-DesktopSmoke([string]$Desktop) {
         try { $process.Kill($true) } catch {}
         throw "installed desktop did not prove the native Windows power subscription"
     }
-    $workerPid = [int](Get-Content $containment -Raw).Trim()
-    if (-not (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)) {
+    $workerProcessId = [int](Get-Content $containment -Raw).Trim()
+    if (-not (Get-Process -Id $workerProcessId -ErrorAction SilentlyContinue)) {
         try { $process.Kill($true) } catch {}
         throw "installed desktop containment smoke worker is not alive"
     }
-    Start-Sleep -Milliseconds 500
     if ($process.HasExited) { throw "installed desktop crashed immediately after readiness" }
-    $process.Kill($true)
-    $process.WaitForExit()
-    $workerDeadline = [DateTime]::UtcNow.AddSeconds(5)
-    while (Get-Process -Id $workerPid -ErrorAction SilentlyContinue) {
-        if ([DateTime]::UtcNow -ge $workerDeadline) {
-            Stop-Process -Id $workerPid -Force -ErrorAction SilentlyContinue
-            throw "Windows Job Object did not reap the installed media worker after hard desktop death"
-        }
-        Start-Sleep -Milliseconds 100
+    return [pscustomobject]@{ Process = $process; WorkerProcessId = $workerProcessId }
+}
+
+function Stop-DesktopAndVerifyContainment($Session) {
+    $Session.Process.Kill($true)
+    $Session.Process.WaitForExit()
+    try {
+        Wait-ProcessGone $Session.WorkerProcessId 5 'Windows Job Object worker reap'
     }
+    catch {
+        Stop-Process -Id $Session.WorkerProcessId -Force -ErrorAction SilentlyContinue
+        throw "Windows Job Object did not reap the installed media worker after hard desktop death"
+    }
+}
+
+function Run-DesktopSmoke([string]$Desktop) {
+    $session = Start-DesktopContainmentSmoke $Desktop
+    Stop-DesktopAndVerifyContainment $session
 }
 
 function Find-SettingsDatabase {
@@ -159,11 +174,20 @@ try {
     New-Item $runKey -Force | Out-Null
     Set-ItemProperty -Path $runKey -Name 'Nian Vision' -Value '"C:\stale-nian-vision\nian-desktop.exe" --startup-hidden'
 
-    # Same-version reinstall exercises the NSIS upgrade/maintenance path while
-    # preserving authoritative app-data and the user-selected recording root.
-    Run-Installer
+    # Direct same-version reinstall while the installed desktop is running proves
+    # the NSIS/Tauri app-running path. The desktop owns the worker through its Job
+    # Object, so installer file replacement must succeed without a global worker kill.
+    $upgradeSession = Start-DesktopContainmentSmoke (Join-Path $InstallRoot "nian-desktop.exe")
+    $oldDesktopProcessId = $upgradeSession.Process.Id
+    $oldWorkerProcessId = $upgradeSession.WorkerProcessId
+    Run-Installer 'NSIS direct reinstall with running desktop'
+    Wait-ProcessGone $oldDesktopProcessId 10 'old desktop shutdown during direct reinstall'
+    Wait-ProcessGone $oldWorkerProcessId 10 'owned worker shutdown during direct reinstall'
     Verify-InstalledLayout
     Scan-InstalledSecrets
+    if (Get-Process -Id $oldWorkerProcessId -ErrorAction SilentlyContinue) {
+        throw "owned worker restarted or survived during installer file replacement"
+    }
     Run-DesktopSmoke (Join-Path $InstallRoot "nian-desktop.exe")
     & cargo.exe run --quiet -p nian-settings-fixture -- verify $settings $Footage
     if ($LASTEXITCODE -ne 0) { throw "settings preservation verification failed" }
