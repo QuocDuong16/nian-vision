@@ -1093,7 +1093,7 @@ fn map_camera_error(error: CameraServiceError) -> DesktopErrorDto {
             DesktopErrorDto::new("storage_failed", "recording storage is not configured")
         }
         CameraServiceError::Settings => {
-            DesktopErrorDto::new("internal", "application settings could not be persisted")
+            DesktopErrorDto::new("internal", "application settings are unavailable")
         }
     }
 }
@@ -1232,13 +1232,30 @@ fn reconcile_autostart(
     Ok(())
 }
 
-fn restoration_failure_category(error: &CameraServiceError) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestorationFailure {
+    CameraLocal(&'static str),
+    Authoritative,
+}
+
+fn classify_restoration_failure(error: &CameraServiceError) -> RestorationFailure {
     match error {
-        CameraServiceError::CredentialStore(_) => "credential_store",
-        CameraServiceError::StorageNotConfigured => "storage_failed",
-        CameraServiceError::CameraNotFound => "configuration",
-        CameraServiceError::Validation(_) => "validation",
-        _ => "lifecycle_failed",
+        CameraServiceError::CredentialStore(_) => {
+            RestorationFailure::CameraLocal("credential_store")
+        }
+        CameraServiceError::StorageNotConfigured => {
+            RestorationFailure::CameraLocal("storage_failed")
+        }
+        CameraServiceError::CameraNotFound => RestorationFailure::CameraLocal("configuration"),
+        CameraServiceError::Validation(_) => RestorationFailure::CameraLocal("validation"),
+        CameraServiceError::Settings => RestorationFailure::Authoritative,
+        CameraServiceError::DuplicateCamera
+        | CameraServiceError::CameraBusy
+        | CameraServiceError::CredentialRollbackCleanup { .. }
+        | CameraServiceError::CredentialRefGeneration(_)
+        | CameraServiceError::CredentialRefCollision => {
+            RestorationFailure::CameraLocal("lifecycle_failed")
+        }
     }
 }
 
@@ -1261,14 +1278,16 @@ fn restore_desired_recordings_locked(
         }
         let desired = match lock(&state.camera_service)?.prepare_recording(camera_id.as_str()) {
             Ok(desired) => desired,
-            Err(error) => {
-                let category = restoration_failure_category(&error);
-                let status = lock(&state.recording_controller)?
-                    .mark_failed(camera_id, category)
-                    .map_err(map_recording_error)?;
-                restored.push(status);
-                continue;
-            }
+            Err(error) => match classify_restoration_failure(&error) {
+                RestorationFailure::CameraLocal(category) => {
+                    let status = lock(&state.recording_controller)?
+                        .mark_failed(camera_id, category)
+                        .map_err(map_recording_error)?;
+                    restored.push(status);
+                    continue;
+                }
+                RestorationFailure::Authoritative => return Err(map_camera_error(error)),
+            },
         };
         let result = lock(&state.recording_controller)?.start(camera_id.clone(), desired);
         match result {
@@ -1307,31 +1326,69 @@ struct TrayProjection {
     stop_enabled: bool,
 }
 
-fn tray_projection(statuses: &[RecordingStatus], desired_count: usize) -> TrayProjection {
+fn recording_state_label(state: RecordingState) -> &'static str {
+    match state {
+        RecordingState::Stopped => "Stopped",
+        RecordingState::Starting => "Starting",
+        RecordingState::Recovering => "Recovering",
+        RecordingState::Connecting => "Connecting",
+        RecordingState::Recording => "Recording",
+        RecordingState::Backoff => "Backoff",
+        RecordingState::Stopping => "Stopping",
+        RecordingState::Failed => "Failed",
+    }
+}
+
+fn tray_projection(statuses: &[RecordingStatus], desired_cameras: &[CameraId]) -> TrayProjection {
     let active: Vec<_> = statuses
         .iter()
         .filter(|status| status.state.is_active())
         .collect();
-    let status_text = if active.is_empty() && desired_count == 0 {
-        "Recording: Stopped".to_owned()
-    } else if active.len() == 1 && desired_count <= 1 {
-        let label = match active[0].state {
-            RecordingState::Stopped => "Stopped",
-            RecordingState::Starting => "Starting",
-            RecordingState::Recovering => "Recovering",
-            RecordingState::Connecting => "Connecting",
-            RecordingState::Recording => "Recording",
-            RecordingState::Backoff => "Backoff",
-            RecordingState::Stopping => "Stopping",
-            RecordingState::Failed => "Failed",
-        };
-        format!("Recording: {label}")
+    let failed_desired = statuses
+        .iter()
+        .filter(|status| {
+            status.state == RecordingState::Failed
+                && status.camera_id.as_deref().is_some_and(|camera_id| {
+                    desired_cameras
+                        .iter()
+                        .any(|desired| desired.as_str() == camera_id)
+                })
+        })
+        .count();
+
+    let single_desired_status = if desired_cameras.len() == 1 {
+        statuses
+            .iter()
+            .find(|status| status.camera_id.as_deref() == Some(desired_cameras[0].as_str()))
     } else {
-        format!("Recording: {} cameras", desired_count.max(active.len()))
+        None
     };
+    let single_desired_is_only_active = desired_cameras.len() == 1
+        && (active.is_empty()
+            || active.len() == 1
+                && active[0].camera_id.as_deref() == Some(desired_cameras[0].as_str()));
+
+    let status_text = if desired_cameras.len() == 1 && single_desired_is_only_active {
+        match single_desired_status {
+            Some(status) => format!("Recording: {}", recording_state_label(status.state)),
+            None => "Recording: Stopped".to_owned(),
+        }
+    } else if desired_cameras.is_empty() && active.is_empty() {
+        "Recording: Stopped".to_owned()
+    } else if desired_cameras.is_empty() && active.len() == 1 {
+        format!("Recording: {}", recording_state_label(active[0].state))
+    } else if failed_desired > 0 {
+        format!(
+            "Recording: {} active · {failed_desired} failed",
+            active.len()
+        )
+    } else {
+        format!("Recording: {} active", active.len())
+    };
+
     TrayProjection {
         status_text,
-        stop_enabled: desired_count > 0
+        stop_enabled: !desired_cameras.is_empty()
             || active
                 .iter()
                 .any(|status| status.state != RecordingState::Stopping),
@@ -1345,12 +1402,12 @@ fn render_tray_status(app: &AppHandle) {
     let Some(tray) = app.try_state::<TrayUi>() else {
         return;
     };
-    let desired_count = match lock(&state.camera_service).and_then(|service| {
+    let desired_cameras = match lock(&state.camera_service).and_then(|service| {
         service
             .recording_enabled_cameras()
             .map_err(map_desired_state_error)
     }) {
-        Ok(cameras) => cameras.len(),
+        Ok(cameras) => cameras,
         Err(_) => return,
     };
     let statuses = match lock(&state.recording_controller)
@@ -1359,7 +1416,7 @@ fn render_tray_status(app: &AppHandle) {
         Ok(statuses) => statuses,
         Err(_) => return,
     };
-    let projection = tray_projection(&statuses, desired_count);
+    let projection = tray_projection(&statuses, &desired_cameras);
     let _ = tray.status.set_text(projection.status_text);
     let _ = tray.stop.set_enabled(projection.stop_enabled);
 }
@@ -2126,6 +2183,12 @@ mod tests {
         settings: nian_settings::ApplicationSettings,
         fail_save: bool,
         fail_desired_write: bool,
+        fail_get_camera_on_call: Option<usize>,
+        get_camera_calls: usize,
+        fail_application_settings_on_call: Option<usize>,
+        application_settings_calls: usize,
+        fail_recording_enabled_read_on_call: Option<usize>,
+        recording_enabled_read_calls: usize,
         cameras: Vec<nian_domain::CameraConfig>,
         desired_camera: Option<String>,
         extra_desired_camera: Option<String>,
@@ -2150,10 +2213,12 @@ mod tests {
             camera_id: &CameraId,
         ) -> Result<Option<nian_domain::CameraConfig>, nian_application::SettingsRepositoryError>
         {
-            Ok(self
-                .state
-                .lock()
-                .unwrap()
+            let mut state = self.state.lock().unwrap();
+            state.get_camera_calls += 1;
+            if state.fail_get_camera_on_call == Some(state.get_camera_calls) {
+                return Err(nian_application::SettingsRepositoryError::Persistence);
+            }
+            Ok(state
                 .cameras
                 .iter()
                 .find(|camera| camera.camera_id() == camera_id)
@@ -2201,7 +2266,12 @@ mod tests {
             &self,
         ) -> Result<nian_settings::ApplicationSettings, nian_application::SettingsRepositoryError>
         {
-            Ok(self.state.lock().unwrap().settings.clone())
+            let mut state = self.state.lock().unwrap();
+            state.application_settings_calls += 1;
+            if state.fail_application_settings_on_call == Some(state.application_settings_calls) {
+                return Err(nian_application::SettingsRepositoryError::Persistence);
+            }
+            Ok(state.settings.clone())
         }
 
         fn save_application_settings(
@@ -2219,7 +2289,12 @@ mod tests {
         fn recording_enabled_cameras(
             &self,
         ) -> Result<Vec<CameraId>, nian_application::SettingsRepositoryError> {
-            let state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
+            state.recording_enabled_read_calls += 1;
+            if state.fail_recording_enabled_read_on_call == Some(state.recording_enabled_read_calls)
+            {
+                return Err(nian_application::SettingsRepositoryError::Persistence);
+            }
             let mut cameras = state
                 .desired_camera
                 .iter()
@@ -2323,6 +2398,12 @@ mod tests {
             },
             fail_save: false,
             fail_desired_write: false,
+            fail_get_camera_on_call: None,
+            get_camera_calls: 0,
+            fail_application_settings_on_call: None,
+            application_settings_calls: 0,
+            fail_recording_enabled_read_on_call: None,
+            recording_enabled_read_calls: 0,
             cameras: Vec::new(),
             desired_camera: None,
             extra_desired_camera: None,
@@ -3257,27 +3338,76 @@ mod tests {
                 camera_id: Some("cam-b".to_owned()),
                 ..RecordingStatus::default()
             },
+            RecordingStatus {
+                state: RecordingState::Connecting,
+                camera_id: Some("cam-c".to_owned()),
+                ..RecordingStatus::default()
+            },
         ];
-        let projection = tray_projection(&statuses, 3);
-        assert_eq!(projection.status_text, "Recording: 3 cameras");
+        let desired = [
+            CameraId::parse("cam-a").unwrap(),
+            CameraId::parse("cam-b").unwrap(),
+            CameraId::parse("cam-c").unwrap(),
+        ];
+        let projection = tray_projection(&statuses, &desired);
+        assert_eq!(projection.status_text, "Recording: 3 active");
         assert!(projection.stop_enabled);
     }
 
     #[test]
-    fn tray_stop_enablement_includes_persisted_intent_but_not_off_stopping() {
-        assert!(!tray_projection(&[], 0).stop_enabled);
+    fn tray_projection_reports_single_desired_failure_without_claiming_recording() {
         let failed = RecordingStatus {
             state: RecordingState::Failed,
             camera_id: Some("cam-a".to_owned()),
             ..RecordingStatus::default()
         };
-        assert!(tray_projection(&[failed], 1).stop_enabled);
+        let desired = [CameraId::parse("cam-a").unwrap()];
+
+        let projection = tray_projection(&[failed], &desired);
+        assert_eq!(projection.status_text, "Recording: Failed");
+        assert!(projection.stop_enabled);
+    }
+
+    #[test]
+    fn tray_projection_distinguishes_active_and_failed_desired_cameras() {
+        let statuses = [
+            RecordingStatus {
+                state: RecordingState::Recording,
+                camera_id: Some("cam-a".to_owned()),
+                ..RecordingStatus::default()
+            },
+            RecordingStatus {
+                state: RecordingState::Failed,
+                camera_id: Some("cam-b".to_owned()),
+                ..RecordingStatus::default()
+            },
+        ];
+        let desired = [
+            CameraId::parse("cam-a").unwrap(),
+            CameraId::parse("cam-b").unwrap(),
+        ];
+
+        let projection = tray_projection(&statuses, &desired);
+        assert_eq!(projection.status_text, "Recording: 1 active · 1 failed");
+        assert!(projection.stop_enabled);
+    }
+
+    #[test]
+    fn tray_stop_enablement_includes_persisted_intent_but_not_off_stopping() {
+        assert!(!tray_projection(&[], &[]).stop_enabled);
+        let failed = RecordingStatus {
+            state: RecordingState::Failed,
+            camera_id: Some("cam-a".to_owned()),
+            ..RecordingStatus::default()
+        };
+        let desired = [CameraId::parse("cam-a").unwrap()];
+        assert!(tray_projection(&[failed], &desired).stop_enabled);
         let stopping = RecordingStatus {
             state: RecordingState::Stopping,
             camera_id: Some("cam-a".to_owned()),
             ..RecordingStatus::default()
         };
-        assert!(!tray_projection(&[stopping], 0).stop_enabled);
+        assert!(!tray_projection(&[stopping], &[]).stop_enabled);
     }
 
     #[test]
@@ -3541,8 +3671,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("recordings");
         let (state, repository, runner, _probe) = lifecycle_state(&root, true);
-        seed_named_recording_camera(&repository, "bad-camera", "missing-credential-ref");
-        repository.lock().unwrap().extra_desired_camera = Some("bad-camera".to_owned());
+        seed_named_recording_camera(&repository, "a-camera", "desktop-lifecycle-test-ref");
+        seed_named_recording_camera(&repository, "b-camera", "missing-credential-ref");
+        {
+            let mut repo = repository.lock().unwrap();
+            repo.desired_camera = Some("a-camera".to_owned());
+            repo.extra_desired_camera = Some("b-camera".to_owned());
+        }
 
         let restored = restore_desired_recordings_locked(&state).unwrap();
         wait_for_starts(&runner.starts, 1);
@@ -3551,7 +3686,7 @@ mod tests {
             .recording_controller
             .lock()
             .unwrap()
-            .status(&CameraId::parse("bad-camera").unwrap())
+            .status(&CameraId::parse("b-camera").unwrap())
             .unwrap();
         assert_eq!(bad.state, RecordingState::Failed);
         assert_eq!(bad.failure_category.as_deref(), Some("credential_store"));
@@ -3560,20 +3695,8 @@ mod tests {
                 .recording_controller
                 .lock()
                 .unwrap()
-                .is_owned(&CameraId::parse("front-door").unwrap())
+                .is_owned(&CameraId::parse("a-camera").unwrap())
                 .unwrap()
-        );
-        assert_eq!(
-            state
-                .camera_service
-                .lock()
-                .unwrap()
-                .recording_enabled_cameras()
-                .unwrap(),
-            vec![
-                CameraId::parse("bad-camera").unwrap(),
-                CameraId::parse("front-door").unwrap(),
-            ]
         );
         state
             .recording_controller
@@ -3581,6 +3704,92 @@ mod tests {
             .unwrap()
             .shutdown_all()
             .unwrap();
+    }
+
+    #[test]
+    fn restoration_aborts_after_authoritative_camera_read_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
+        for camera_id in ["a-camera", "b-camera", "c-camera"] {
+            seed_named_recording_camera(&repository, camera_id, "desktop-lifecycle-test-ref");
+        }
+        {
+            let mut repo = repository.lock().unwrap();
+            repo.desired_camera = Some("a-camera".to_owned());
+            repo.extra_desired_camera = Some("b-camera".to_owned());
+            repo.additional_desired_cameras = vec!["c-camera".to_owned()];
+            repo.fail_get_camera_on_call = Some(2);
+        }
+
+        let error = restore_desired_recordings_locked(&state).unwrap_err();
+        wait_for_starts(&runner.starts, 1);
+        assert_eq!(error.code, "internal");
+        assert_eq!(repository.lock().unwrap().get_camera_calls, 2);
+        let mut controller = state.recording_controller.lock().unwrap();
+        assert!(
+            controller
+                .is_owned(&CameraId::parse("a-camera").unwrap())
+                .unwrap()
+        );
+        assert!(
+            !controller
+                .is_owned(&CameraId::parse("b-camera").unwrap())
+                .unwrap()
+        );
+        assert!(
+            !controller
+                .is_owned(&CameraId::parse("c-camera").unwrap())
+                .unwrap()
+        );
+        assert_eq!(
+            controller
+                .status(&CameraId::parse("b-camera").unwrap())
+                .unwrap()
+                .state,
+            RecordingState::Stopped
+        );
+        controller.shutdown_all().unwrap();
+    }
+
+    #[test]
+    fn restoration_aborts_on_authoritative_application_settings_read_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
+        seed_named_recording_camera(&repository, "a-camera", "desktop-lifecycle-test-ref");
+        seed_named_recording_camera(&repository, "b-camera", "desktop-lifecycle-test-ref");
+        {
+            let mut repo = repository.lock().unwrap();
+            repo.desired_camera = Some("a-camera".to_owned());
+            repo.extra_desired_camera = Some("b-camera".to_owned());
+            repo.fail_application_settings_on_call = Some(1);
+        }
+
+        let error = restore_desired_recordings_locked(&state).unwrap_err();
+        assert_eq!(error.code, "internal");
+        assert_eq!(runner.starts.load(Ordering::SeqCst), 0);
+        let repo = repository.lock().unwrap();
+        assert_eq!(repo.application_settings_calls, 1);
+        assert_eq!(repo.get_camera_calls, 1);
+    }
+
+    #[test]
+    fn restoration_aborts_immediately_when_desired_camera_read_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
+        repository
+            .lock()
+            .unwrap()
+            .fail_recording_enabled_read_on_call = Some(1);
+
+        let error = restore_desired_recordings_locked(&state).unwrap_err();
+        assert_eq!(error.code, "desired_state_failed");
+        assert_eq!(runner.starts.load(Ordering::SeqCst), 0);
+        let repo = repository.lock().unwrap();
+        assert_eq!(repo.recording_enabled_read_calls, 1);
+        assert_eq!(repo.get_camera_calls, 0);
     }
 
     #[test]

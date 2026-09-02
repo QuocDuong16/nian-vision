@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { EmptyState } from "../components/EmptyState";
 import { desktopError, invokeDesktop, isTauri } from "../lib/tauri";
@@ -87,7 +87,8 @@ export function CamerasScreen() {
   const [probeResult, setProbeResult] = useState<ProbeResult | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<CameraSummary | null>(null);
   const [busyCamera, setBusyCamera] = useState<string | null>(null);
-  const [recordingBusyCamera, setRecordingBusyCamera] = useState<string | null>(null);
+  const recordingBusyRef = useRef<Set<string>>(new Set());
+  const [recordingBusyCameras, setRecordingBusyCameras] = useState<Set<string>>(() => new Set());
 
   const loadCameras = useCallback(async () => {
     if (!isTauri()) {
@@ -216,8 +217,9 @@ export function CamerasScreen() {
   }
 
   async function toggleRecording(camera: CameraSummary) {
-    if (recordingBusyCamera === camera.camera_id) return;
-    setRecordingBusyCamera(camera.camera_id);
+    if (recordingBusyRef.current.has(camera.camera_id)) return;
+    recordingBusyRef.current.add(camera.camera_id);
+    setRecordingBusyCameras(new Set(recordingBusyRef.current));
     setError(null);
     try {
       const desiredOn = intent.camera_ids.includes(camera.camera_id);
@@ -231,7 +233,8 @@ export function CamerasScreen() {
       setError(desktopError(cause));
       await refreshStatus();
     } finally {
-      setRecordingBusyCamera(null);
+      recordingBusyRef.current.delete(camera.camera_id);
+      setRecordingBusyCameras(new Set(recordingBusyRef.current));
     }
   }
 
@@ -281,7 +284,7 @@ export function CamerasScreen() {
             const state = runtime?.state ?? "stopped";
             const ownActive = runtime ? ACTIVE_STATES.has(runtime.state) : false;
             const desiredOn = intent.camera_ids.includes(camera.camera_id);
-            const rowBusy = recordingBusyCamera === camera.camera_id;
+            const rowBusy = recordingBusyCameras.has(camera.camera_id);
             const startDisabled = busyCamera !== null || rowBusy;
             return (
               <article className="camera-card" key={camera.camera_id}>

@@ -24,6 +24,15 @@ const backCamera: CameraSummary = {
   audio_policy: "copy_all",
 };
 
+const sideCamera: CameraSummary = {
+  camera_id: "side-door",
+  display_name: "Side door",
+  host: "192.168.1.52",
+  port: 554,
+  path: "/stream1",
+  audio_policy: "copy_all",
+};
+
 const stopped: RecordingStatus = {
   state: "stopped",
   camera_id: null,
@@ -149,23 +158,19 @@ describe("CamerasScreen", () => {
     expect(vi.mocked(invoke).mock.calls.some(([name]) => name === "recording_stop")).toBe(true);
   });
 
-  it("keeps unrelated camera controls usable while another row starts", async () => {
-    installDesktop([camera, backCamera]);
-    let desiredCameras = [camera.camera_id];
-    let runtime: RecordingStatus[] = [{
-      ...stopped,
-      state: "recording",
-      camera_id: camera.camera_id,
-    }];
-    let resolveBackStart: ((value: RecordingStatus) => void) | undefined;
+  it("tracks concurrent recording operations independently per camera", async () => {
+    installDesktop([camera, backCamera, sideCamera]);
+    let desiredCameras: string[] = [];
+    let runtime: RecordingStatus[] = [];
+    const resolvers = new Map<string, (value: RecordingStatus) => void>();
     vi.mocked(invoke).mockImplementation((command, args) => {
-      if (command === "camera_list") return Promise.resolve([camera, backCamera]);
+      if (command === "camera_list") return Promise.resolve([camera, backCamera, sideCamera]);
       if (command === "recording_statuses") return Promise.resolve(runtime);
       if (command === "recording_intent") return Promise.resolve({ camera_ids: desiredCameras });
       if (command === "recording_start") {
-        expect(args).toEqual({ cameraId: backCamera.camera_id });
+        const cameraId = (args as { cameraId: string }).cameraId;
         return new Promise((resolve) => {
-          resolveBackStart = resolve;
+          resolvers.set(cameraId, resolve);
         });
       }
       throw new Error(`unexpected command ${command}`);
@@ -173,22 +178,61 @@ describe("CamerasScreen", () => {
 
     render(<CamerasScreen />);
     await screen.findByText("Front door");
-    const backCard = screen.getByText("Back door").closest("article");
-    const frontCard = screen.getByText("Front door").closest("article");
-    expect(backCard).toBeTruthy();
-    expect(frontCard).toBeTruthy();
-    fireEvent.click(within(backCard as HTMLElement).getByRole("button", { name: "Start" }));
+    const frontCard = screen.getByText("Front door").closest("article") as HTMLElement;
+    const backCard = screen.getByText("Back door").closest("article") as HTMLElement;
+    const sideCard = screen.getByText("Side door").closest("article") as HTMLElement;
 
-    await waitFor(() => expect((within(backCard as HTMLElement).getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(true));
-    expect((within(frontCard as HTMLElement).getByRole("button", { name: "Stop" }) as HTMLButtonElement).disabled).toBe(false);
-    expect((within(frontCard as HTMLElement).getByRole("button", { name: "Edit" }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(within(frontCard).getByRole("button", { name: "Start" }));
+    await waitFor(() => {
+      expect((within(frontCard).getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(true);
+    });
+    expect((within(backCard).getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((within(backCard).getByRole("button", { name: "Edit" }) as HTMLButtonElement).disabled).toBe(false);
 
-    desiredCameras = [backCamera.camera_id, camera.camera_id];
-    const frontRecording = { ...stopped, state: "recording" as const, camera_id: camera.camera_id };
-    const backStarting = { ...stopped, state: "starting" as const, camera_id: backCamera.camera_id };
-    runtime = [frontRecording, backStarting];
-    resolveBackStart?.(backStarting);
-    await screen.findByText("Recording 2 cameras");
+    fireEvent.click(within(backCard).getByRole("button", { name: "Start" }));
+    await waitFor(() => {
+      expect((within(frontCard).getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(true);
+      expect((within(backCard).getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(true);
+    });
+    expect((within(sideCard).getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(false);
+
+    const frontStarting: RecordingStatus = { ...stopped, state: "starting", camera_id: camera.camera_id };
+    desiredCameras = [camera.camera_id];
+    runtime = [frontStarting];
+    resolvers.get(camera.camera_id)?.(frontStarting);
+    await waitFor(() => {
+      expect((within(frontCard).getByRole("button", { name: "Stop" }) as HTMLButtonElement).disabled).toBe(false);
+    });
+    expect((within(backCard).getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((within(sideCard).getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(false);
+
+    const backStarting: RecordingStatus = { ...stopped, state: "starting", camera_id: backCamera.camera_id };
+    desiredCameras = [camera.camera_id, backCamera.camera_id];
+    runtime = [frontStarting, backStarting];
+    resolvers.get(backCamera.camera_id)?.(backStarting);
+    await waitFor(() => {
+      expect((within(backCard).getByRole("button", { name: "Stop" }) as HTMLButtonElement).disabled).toBe(false);
+    });
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "recording_start")).toHaveLength(2);
+  });
+
+  it("admits only one same-camera recording command while the first is pending", async () => {
+    installDesktop([camera]);
+    vi.mocked(invoke).mockImplementation((command) => {
+      if (command === "camera_list") return Promise.resolve([camera]);
+      if (command === "recording_statuses") return Promise.resolve([]);
+      if (command === "recording_intent") return Promise.resolve({ camera_ids: [] });
+      if (command === "recording_start") return new Promise(() => {});
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<CamerasScreen />);
+    await screen.findByText("Front door");
+    const start = screen.getByRole("button", { name: "Start" });
+    fireEvent.click(start);
+    fireEvent.click(start);
+
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "recording_start")).toHaveLength(1);
   });
 
   it("displays backend errors instead of optimistic success", async () => {
