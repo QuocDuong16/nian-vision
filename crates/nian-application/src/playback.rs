@@ -1918,6 +1918,37 @@ mod tests {
         drop(lease);
     }
 
+    #[test]
+    fn finalized_playback_for_two_cameras_coexists_with_both_active_camera_leases() {
+        let a_relative = "cam-a/2026/08/29/08-30-00.mkv";
+        let b_relative = "cam-b/2026/08/29/08-31-00.mkv";
+        let (temp, mut controller) = controller_with_files(&[
+            (a_relative, b"old finalized a"),
+            (b_relative, b"old finalized b"),
+        ]);
+        let layout = RecordingsLayout::new(temp.path().join("recordings")).unwrap();
+        let a = CameraId::parse("cam-a").unwrap();
+        let b = CameraId::parse("cam-b").unwrap();
+        let a_lease = nian_storage::CameraLease::try_acquire(&layout, &a).unwrap();
+        let b_lease = nian_storage::CameraLease::try_acquire(&layout, &b).unwrap();
+
+        let a_opened = controller.open(a_relative).unwrap();
+        let b_opened = controller.open(b_relative).unwrap();
+        assert!(controller.session_active(&a_opened.session_id).unwrap());
+        assert!(controller.session_active(&b_opened.session_id).unwrap());
+        assert!(controller.pins.is_pinned(a_relative));
+        assert!(controller.pins.is_pinned(b_relative));
+
+        controller.close(&a_opened.session_id).unwrap();
+        assert!(!controller.pins.is_pinned(a_relative));
+        assert!(controller.pins.is_pinned(b_relative));
+        controller.close(&b_opened.session_id).unwrap();
+        assert!(!controller.pins.is_pinned(b_relative));
+
+        drop(b_lease);
+        drop(a_lease);
+    }
+
     #[cfg(unix)]
     #[test]
     fn active_session_revalidates_source_before_each_range_request() {

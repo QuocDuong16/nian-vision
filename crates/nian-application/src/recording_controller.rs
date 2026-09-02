@@ -1,5 +1,6 @@
-//! Desktop-friendly single-recording controller layered over WorkerSupervisor.
+//! Desktop-owned simultaneous multi-camera recording coordinator.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -9,6 +10,9 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::{ApplicationError, BinaryLauncher, DesiredRecording, WorkerEnd, WorkerSupervisor};
+
+/// Conservative process cap for the current desktop architecture.
+pub const MAX_SIMULTANEOUS_RECORDINGS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,12 +62,23 @@ impl Default for RecordingStatus {
     }
 }
 
+impl RecordingStatus {
+    fn stopped(camera_id: &CameraId) -> Self {
+        Self {
+            camera_id: Some(camera_id.as_str().to_owned()),
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RecordingControllerError {
-    #[error("another recording controller run is still owned")]
+    #[error("recording for this camera is still owned")]
     AlreadyRecording,
-    #[error("no recording is active")]
+    #[error("camera is not recording")]
     NotRecording,
+    #[error("recording capacity reached")]
+    Capacity,
     #[error("recording controller synchronization failed")]
     Synchronization,
     #[error("recording controller thread could not start")]
@@ -84,7 +99,38 @@ pub trait RecordingRunner: Send + Sync {
     ) -> Result<WorkerEnd, RecordingRunFailure>;
 }
 
-/// Thread creation seam used to test start rollback without exhausting OS threads.
+/// Creates an independent runner for one camera slot. Production returns a new
+/// WorkerSupervisor-backed runner for every camera so unrelated recordings are
+/// never serialized through one supervisor instance.
+pub trait RecordingRunnerFactory: Send + Sync {
+    fn create(&self, camera_id: &CameraId) -> Arc<dyn RecordingRunner>;
+}
+
+#[derive(Debug, Clone)]
+pub struct SupervisorRecordingRunnerFactory {
+    pub worker_program: String,
+}
+
+impl RecordingRunnerFactory for SupervisorRecordingRunnerFactory {
+    fn create(&self, _camera_id: &CameraId) -> Arc<dyn RecordingRunner> {
+        Arc::new(SupervisorRecordingRunner {
+            worker_program: self.worker_program.clone(),
+        })
+    }
+}
+
+/// Compatibility factory useful for tests whose runner is explicitly designed
+/// for concurrent calls. Production should use SupervisorRecordingRunnerFactory.
+struct SharedRecordingRunnerFactory {
+    runner: Arc<dyn RecordingRunner>,
+}
+
+impl RecordingRunnerFactory for SharedRecordingRunnerFactory {
+    fn create(&self, _camera_id: &CameraId) -> Arc<dyn RecordingRunner> {
+        self.runner.clone()
+    }
+}
+
 pub trait RecordingThreadSpawner: Send + Sync {
     fn spawn(
         &self,
@@ -133,48 +179,75 @@ impl RecordingRunner for SupervisorRecordingRunner {
 
 type StatusObserver = Arc<dyn Fn(RecordingStatus) + Send + Sync>;
 
-struct SharedStatus {
+struct SlotShared {
     status: Mutex<RecordingStatus>,
-    observer: Mutex<Option<StatusObserver>>,
+    observer: Arc<Mutex<Option<StatusObserver>>>,
+}
+
+struct RecordingSlot {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    shared: Arc<SlotShared>,
 }
 
 pub struct RecordingController {
-    runner: Arc<dyn RecordingRunner>,
+    runner_factory: Arc<dyn RecordingRunnerFactory>,
     spawner: Arc<dyn RecordingThreadSpawner>,
-    shared: Arc<SharedStatus>,
-    stop: Option<Arc<AtomicBool>>,
-    thread: Option<JoinHandle<()>>,
+    observer: Arc<Mutex<Option<StatusObserver>>>,
+    slots: HashMap<CameraId, RecordingSlot>,
+    terminal_statuses: HashMap<CameraId, RecordingStatus>,
 }
 
 impl std::fmt::Debug for RecordingController {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let status = self.shared.status.lock().ok().map(|status| status.clone());
         f.debug_struct("RecordingController")
-            .field("status", &status)
-            .field("thread_owned", &self.thread.is_some())
+            .field("slot_count", &self.slots.len())
+            .field("owned_count", &self.owned_count())
             .finish_non_exhaustive()
     }
 }
 
 impl RecordingController {
     pub fn new(runner: Arc<dyn RecordingRunner>) -> Self {
-        Self::with_spawner(runner, Arc::new(StdRecordingThreadSpawner))
+        Self::with_factory(Arc::new(SharedRecordingRunnerFactory { runner }))
+    }
+
+    pub fn with_factory(factory: Arc<dyn RecordingRunnerFactory>) -> Self {
+        Self::with_factory_and_spawner(factory, Arc::new(StdRecordingThreadSpawner))
     }
 
     pub fn with_spawner(
         runner: Arc<dyn RecordingRunner>,
         spawner: Arc<dyn RecordingThreadSpawner>,
     ) -> Self {
+        Self::with_factory_and_spawner(Arc::new(SharedRecordingRunnerFactory { runner }), spawner)
+    }
+
+    pub fn with_factory_and_spawner(
+        runner_factory: Arc<dyn RecordingRunnerFactory>,
+        spawner: Arc<dyn RecordingThreadSpawner>,
+    ) -> Self {
         Self {
-            runner,
+            runner_factory,
             spawner,
-            shared: Arc::new(SharedStatus {
-                status: Mutex::new(RecordingStatus::default()),
-                observer: Mutex::new(None),
-            }),
-            stop: None,
-            thread: None,
+            observer: Arc::new(Mutex::new(None)),
+            slots: HashMap::new(),
+            terminal_statuses: HashMap::new(),
         }
+    }
+
+    pub fn ensure_startable(
+        &mut self,
+        camera_id: &CameraId,
+    ) -> Result<(), RecordingControllerError> {
+        self.reap_finished_all()?;
+        if self.slots.contains_key(camera_id) {
+            return Err(RecordingControllerError::AlreadyRecording);
+        }
+        if self.owned_count() >= MAX_SIMULTANEOUS_RECORDINGS {
+            return Err(RecordingControllerError::Capacity);
+        }
+        Ok(())
     }
 
     pub fn start(
@@ -182,31 +255,31 @@ impl RecordingController {
         camera_id: CameraId,
         desired: DesiredRecording,
     ) -> Result<RecordingStatus, RecordingControllerError> {
-        self.ensure_startable()?;
-
-        self.replace_status(RecordingStatus {
-            state: RecordingState::Starting,
-            camera_id: Some(camera_id.as_str().to_owned()),
-            failure_category: None,
-            reconnect_attempt: 0,
-            finalized_segments: 0,
-        })?;
+        self.ensure_startable(&camera_id)?;
+        self.terminal_statuses.remove(&camera_id);
+        let shared = Arc::new(SlotShared {
+            status: Mutex::new(RecordingStatus {
+                state: RecordingState::Starting,
+                camera_id: Some(camera_id.as_str().to_owned()),
+                failure_category: None,
+                reconnect_attempt: 0,
+                finalized_segments: 0,
+            }),
+            observer: self.observer.clone(),
+        });
+        notify_slot(&shared)?;
 
         let stop = Arc::new(AtomicBool::new(false));
-        self.stop = Some(stop.clone());
-        let runner = self.runner.clone();
-        let shared = self.shared.clone();
-        let observer_shared = shared.clone();
-        let observer: Arc<dyn Fn(&serde_json::Value) + Send + Sync> = Arc::new(move |payload| {
-            apply_worker_progress(&observer_shared, payload);
-        });
+        let runner = self.runner_factory.create(&camera_id);
+        let thread_shared = shared.clone();
+        let worker_shared = shared.clone();
+        let worker_observer: Arc<dyn Fn(&serde_json::Value) + Send + Sync> =
+            Arc::new(move |payload| apply_worker_progress(&worker_shared, payload));
         let name = format!("recording-controller-{}", camera_id.as_str());
+        let task_stop = stop.clone();
         let task = Box::new(move || {
-            // Only this finalizer publishes terminal Stopped/Failed, and only
-            // after RecordingRunner::run has returned (including supervisor
-            // worker cleanup/reap semantics).
-            let result = runner.run(desired, stop, observer);
-            if let Ok(mut status) = shared.status.lock() {
+            let result = runner.run(desired, task_stop, worker_observer);
+            if let Ok(mut status) = thread_shared.status.lock() {
                 match result {
                     Ok(WorkerEnd::RequestedShutdown | WorkerEnd::JobCompletedCleanly) => {
                         status.state = RecordingState::Stopped;
@@ -223,63 +296,57 @@ impl RecordingController {
                 }
                 let snapshot = status.clone();
                 drop(status);
-                notify_status(&shared, snapshot);
+                notify_status_observer(&thread_shared, snapshot);
             }
         });
 
-        match self.spawner.spawn(name, task) {
-            Ok(thread) => self.thread = Some(thread),
+        let thread = match self.spawner.spawn(name, task) {
+            Ok(thread) => thread,
             Err(_) => {
-                self.stop = None;
-                self.replace_status(RecordingStatus {
+                let failed = RecordingStatus {
                     state: RecordingState::Failed,
-                    camera_id: None,
+                    camera_id: Some(camera_id.as_str().to_owned()),
                     failure_category: Some("worker_unavailable".to_owned()),
                     reconnect_attempt: 0,
                     finalized_segments: 0,
-                })?;
+                };
+                *shared
+                    .status
+                    .lock()
+                    .map_err(|_| RecordingControllerError::Synchronization)? = failed.clone();
+                notify_status_observer(&shared, failed.clone());
+                self.terminal_statuses.insert(camera_id, failed);
                 return Err(RecordingControllerError::ThreadStart);
             }
-        }
-        self.status()
-    }
+        };
 
-    /// Non-mutating admission check for a new recording run.
-    ///
-    /// JoinHandle ownership is authoritative. Finished runs are reaped before
-    /// the decision, but an owned live/Stopping runner always rejects a new
-    /// start. Desktop callers use this before mutating persisted desired state.
-    pub fn ensure_startable(&mut self) -> Result<(), RecordingControllerError> {
-        self.reap_finished()?;
-        if self.thread.is_some() {
-            return Err(RecordingControllerError::AlreadyRecording);
-        }
-        Ok(())
-    }
-
-    /// Registers a process-local observer for authoritative status changes.
-    /// The observer is invoked only after the status mutex is released and is
-    /// intended as a wake-up signal for host-owned projections such as tray UI.
-    pub fn set_status_observer(
-        &mut self,
-        observer: Arc<dyn Fn(RecordingStatus) + Send + Sync>,
-    ) -> Result<(), RecordingControllerError> {
-        *self
-            .shared
-            .observer
+        let status = shared
+            .status
             .lock()
-            .map_err(|_| RecordingControllerError::Synchronization)? = Some(observer);
-        notify_status(&self.shared, self.status_snapshot()?);
-        Ok(())
+            .map_err(|_| RecordingControllerError::Synchronization)?
+            .clone();
+        self.slots.insert(
+            camera_id,
+            RecordingSlot {
+                stop,
+                thread: Some(thread),
+                shared,
+            },
+        );
+        Ok(status)
     }
 
-    pub fn stop(&mut self) -> Result<RecordingStatus, RecordingControllerError> {
-        self.reap_finished()?;
-        if self.thread.is_none() {
-            return Err(RecordingControllerError::NotRecording);
-        }
-        let updated = {
-            let mut status = self
+    pub fn stop(
+        &mut self,
+        camera_id: &CameraId,
+    ) -> Result<RecordingStatus, RecordingControllerError> {
+        self.reap_finished(camera_id)?;
+        let slot = self
+            .slots
+            .get_mut(camera_id)
+            .ok_or(RecordingControllerError::NotRecording)?;
+        let snapshot = {
+            let mut status = slot
                 .shared
                 .status
                 .lock()
@@ -290,70 +357,87 @@ impl RecordingController {
             status.state = RecordingState::Stopping;
             status.clone()
         };
-        if let Some(stop) = &self.stop {
-            stop.store(true, Ordering::Release);
-        }
-        notify_status(&self.shared, updated.clone());
-        Ok(updated)
+        slot.stop.store(true, Ordering::Release);
+        notify_status_observer(&slot.shared, snapshot.clone());
+        Ok(snapshot)
     }
 
-    /// Lifecycle-side cooperative stop signal. Unlike the user Stop command this
-    /// is idempotent: suspend and Quit may race an already-running teardown.
-    pub fn request_lifecycle_stop(&mut self) -> Result<(), RecordingControllerError> {
-        self.reap_finished()?;
-        if self.thread.is_none() {
-            return Ok(());
-        }
-        if let Ok(mut status) = self.shared.status.lock() {
-            let changed = status.state.is_active() && status.state != RecordingState::Stopping;
-            if status.state.is_active() {
-                status.state = RecordingState::Stopping;
-            }
-            let snapshot = changed.then(|| status.clone());
-            drop(status);
+    /// Signals every owned slot before any join is attempted.
+    pub fn request_lifecycle_stop_all(&mut self) -> Result<(), RecordingControllerError> {
+        self.reap_finished_all()?;
+        let ids = self.sorted_slot_ids();
+        for camera_id in ids {
+            let Some(slot) = self.slots.get_mut(&camera_id) else {
+                continue;
+            };
+            let snapshot = {
+                let mut status = slot
+                    .shared
+                    .status
+                    .lock()
+                    .map_err(|_| RecordingControllerError::Synchronization)?;
+                let changed = status.state.is_active() && status.state != RecordingState::Stopping;
+                if status.state.is_active() {
+                    status.state = RecordingState::Stopping;
+                }
+                changed.then(|| status.clone())
+            };
+            slot.stop.store(true, Ordering::Release);
             if let Some(snapshot) = snapshot {
-                notify_status(&self.shared, snapshot);
+                notify_status_observer(&slot.shared, snapshot);
             }
-        } else {
-            return Err(RecordingControllerError::Synchronization);
-        }
-        if let Some(stop) = &self.stop {
-            stop.store(true, Ordering::Release);
         }
         Ok(())
     }
 
-    /// Explicit desktop Quit owns the JoinHandle through terminal completion.
-    /// WorkerSupervisor already provides the bounded graceful-then-force child
-    /// teardown semantics, so this join does not detach a live recorder.
-    pub fn shutdown(&mut self) -> Result<RecordingStatus, RecordingControllerError> {
-        self.reap_finished()?;
-        self.request_lifecycle_stop()?;
-        if let Some(thread) = self.thread.take() {
-            let join_result = thread.join();
-            self.stop = None;
-            if join_result.is_err() {
-                self.replace_status(RecordingStatus {
+    /// Terminal teardown: signal all first, then join all owned slots.
+    pub fn shutdown_all(&mut self) -> Result<Vec<RecordingStatus>, RecordingControllerError> {
+        self.request_lifecycle_stop_all()?;
+        let ids = self.sorted_slot_ids();
+        for camera_id in ids {
+            let mut slot = self
+                .slots
+                .remove(&camera_id)
+                .ok_or(RecordingControllerError::Synchronization)?;
+            let mut status = slot
+                .shared
+                .status
+                .lock()
+                .map_err(|_| RecordingControllerError::Synchronization)?
+                .clone();
+            if let Some(thread) = slot.thread.take()
+                && thread.join().is_err()
+            {
+                status = RecordingStatus {
                     state: RecordingState::Failed,
-                    camera_id: None,
+                    camera_id: Some(camera_id.as_str().to_owned()),
                     failure_category: Some("worker_unavailable".to_owned()),
                     reconnect_attempt: 0,
                     finalized_segments: 0,
-                })?;
+                };
+                notify_status_observer(&slot.shared, status.clone());
+            } else if let Ok(latest) = slot.shared.status.lock() {
+                status = latest.clone();
             }
+            self.terminal_statuses.insert(camera_id, status);
         }
-        self.status_snapshot()
+        self.statuses()
     }
 
-    /// Publishes a startup restoration failure without manufacturing a worker.
-    /// Desired recording intent remains persisted independently.
+    /// Backward-compatible alias used by older lifecycle call sites while they
+    /// are migrated to explicit multi-slot semantics.
+    pub fn shutdown(&mut self) -> Result<RecordingStatus, RecordingControllerError> {
+        let statuses = self.shutdown_all()?;
+        Ok(statuses.into_iter().next().unwrap_or_default())
+    }
+
     pub fn mark_failed(
         &mut self,
         camera_id: CameraId,
         failure_category: impl Into<String>,
     ) -> Result<RecordingStatus, RecordingControllerError> {
-        self.reap_finished()?;
-        if self.thread.is_some() {
+        self.reap_finished(&camera_id)?;
+        if self.slots.contains_key(&camera_id) {
             return Err(RecordingControllerError::AlreadyRecording);
         }
         let status = RecordingStatus {
@@ -363,102 +447,204 @@ impl RecordingController {
             reconnect_attempt: 0,
             finalized_segments: 0,
         };
-        self.replace_status(status.clone())?;
+        self.terminal_statuses.insert(camera_id, status.clone());
+        if let Some(observer) = self
+            .observer
+            .lock()
+            .map_err(|_| RecordingControllerError::Synchronization)?
+            .clone()
+        {
+            observer(status.clone());
+        }
         Ok(status)
     }
 
-    /// Returns a status snapshot after reaping a finished runner thread.
-    /// This makes runner panics observable to UI polling rather than leaving a
-    /// stale Recording state forever.
-    pub fn status(&mut self) -> Result<RecordingStatus, RecordingControllerError> {
-        self.reap_finished()?;
-        self.status_snapshot()
+    pub fn status(
+        &mut self,
+        camera_id: &CameraId,
+    ) -> Result<RecordingStatus, RecordingControllerError> {
+        self.reap_finished(camera_id)?;
+        if let Some(slot) = self.slots.get(camera_id) {
+            return slot
+                .shared
+                .status
+                .lock()
+                .map(|status| status.clone())
+                .map_err(|_| RecordingControllerError::Synchronization);
+        }
+        Ok(self
+            .terminal_statuses
+            .get(camera_id)
+            .cloned()
+            .unwrap_or_else(|| RecordingStatus::stopped(camera_id)))
+    }
+
+    pub fn statuses(&mut self) -> Result<Vec<RecordingStatus>, RecordingControllerError> {
+        self.reap_finished_all()?;
+        let mut ids = self.sorted_status_ids();
+        let mut result = Vec::with_capacity(ids.len());
+        for camera_id in ids.drain(..) {
+            if let Some(slot) = self.slots.get(&camera_id) {
+                result.push(
+                    slot.shared
+                        .status
+                        .lock()
+                        .map_err(|_| RecordingControllerError::Synchronization)?
+                        .clone(),
+                );
+            } else if let Some(status) = self.terminal_statuses.get(&camera_id) {
+                result.push(status.clone());
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn active_cameras(&mut self) -> Result<Vec<CameraId>, RecordingControllerError> {
+        self.reap_finished_all()?;
+        Ok(self.sorted_slot_ids())
     }
 
     pub fn active_camera(&mut self) -> Result<Option<CameraId>, RecordingControllerError> {
-        self.reap_finished()?;
-        if self.thread.is_none() {
-            return Ok(None);
+        Ok(self.active_cameras()?.into_iter().next())
+    }
+
+    pub fn is_owned(&mut self, camera_id: &CameraId) -> Result<bool, RecordingControllerError> {
+        self.reap_finished(camera_id)?;
+        Ok(self.slots.contains_key(camera_id))
+    }
+
+    pub fn any_active(&mut self) -> Result<bool, RecordingControllerError> {
+        self.reap_finished_all()?;
+        Ok(!self.slots.is_empty())
+    }
+
+    pub fn forget_status(&mut self, camera_id: &CameraId) -> Result<(), RecordingControllerError> {
+        self.reap_finished(camera_id)?;
+        if self.slots.contains_key(camera_id) {
+            return Err(RecordingControllerError::AlreadyRecording);
         }
-        let status = self.status_snapshot()?;
-        status
-            .camera_id
-            .as_deref()
-            .map(CameraId::parse)
-            .transpose()
-            .map_err(|_| RecordingControllerError::Synchronization)
-    }
-
-    fn status_snapshot(&self) -> Result<RecordingStatus, RecordingControllerError> {
-        self.shared
-            .status
-            .lock()
-            .map(|status| status.clone())
-            .map_err(|_| RecordingControllerError::Synchronization)
-    }
-
-    fn replace_status(&self, replacement: RecordingStatus) -> Result<(), RecordingControllerError> {
-        *self
-            .shared
-            .status
-            .lock()
-            .map_err(|_| RecordingControllerError::Synchronization)? = replacement.clone();
-        notify_status(&self.shared, replacement);
+        self.terminal_statuses.remove(camera_id);
         Ok(())
     }
 
-    fn reap_finished(&mut self) -> Result<(), RecordingControllerError> {
-        let thread_finished = self.thread.as_ref().is_some_and(JoinHandle::is_finished);
-        // The finalizer publishes Stopped/Failed only after the runner returns.
-        // A tiny scheduler window still exists before the thread function itself
-        // returns, so terminal status also proves that joining is now bounded.
-        // This keeps terminal ownership cleanup independent of scheduler timing.
-        let terminal_published = if self.thread.is_some() {
-            matches!(
-                self.status_snapshot()?.state,
-                RecordingState::Stopped | RecordingState::Failed
-            )
-        } else {
-            false
+    pub fn set_status_observer(
+        &mut self,
+        observer: Arc<dyn Fn(RecordingStatus) + Send + Sync>,
+    ) -> Result<(), RecordingControllerError> {
+        *self
+            .observer
+            .lock()
+            .map_err(|_| RecordingControllerError::Synchronization)? = Some(observer.clone());
+        for status in self.statuses()? {
+            observer(status);
+        }
+        Ok(())
+    }
+
+    fn owned_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn sorted_slot_ids(&self) -> Vec<CameraId> {
+        let mut ids: Vec<_> = self.slots.keys().cloned().collect();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        ids
+    }
+
+    fn sorted_status_ids(&self) -> Vec<CameraId> {
+        let mut ids: Vec<_> = self
+            .slots
+            .keys()
+            .chain(self.terminal_statuses.keys())
+            .cloned()
+            .collect();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        ids.dedup();
+        ids
+    }
+
+    fn reap_finished_all(&mut self) -> Result<(), RecordingControllerError> {
+        let ids = self.sorted_slot_ids();
+        for id in ids {
+            self.reap_finished(&id)?;
+        }
+        Ok(())
+    }
+
+    fn reap_finished(&mut self, camera_id: &CameraId) -> Result<(), RecordingControllerError> {
+        let should_join = match self.slots.get(camera_id) {
+            Some(slot) => {
+                let finished = slot.thread.as_ref().is_some_and(JoinHandle::is_finished);
+                let terminal = matches!(
+                    slot.shared
+                        .status
+                        .lock()
+                        .map_err(|_| RecordingControllerError::Synchronization)?
+                        .state,
+                    RecordingState::Stopped | RecordingState::Failed
+                );
+                finished || terminal
+            }
+            None => false,
         };
-        if !thread_finished && !terminal_published {
+        if !should_join {
             return Ok(());
         }
-
-        let Some(thread) = self.thread.take() else {
-            return Ok(());
-        };
-        let join_result = thread.join();
-        self.stop = None;
-        if join_result.is_err() {
-            self.replace_status(RecordingStatus {
+        let mut slot = self
+            .slots
+            .remove(camera_id)
+            .ok_or(RecordingControllerError::Synchronization)?;
+        let mut status = slot
+            .shared
+            .status
+            .lock()
+            .map_err(|_| RecordingControllerError::Synchronization)?
+            .clone();
+        if let Some(thread) = slot.thread.take()
+            && thread.join().is_err()
+        {
+            status = RecordingStatus {
                 state: RecordingState::Failed,
-                camera_id: None,
+                camera_id: Some(camera_id.as_str().to_owned()),
                 failure_category: Some("worker_unavailable".to_owned()),
                 reconnect_attempt: 0,
                 finalized_segments: 0,
-            })?;
+            };
+            notify_status_observer(&slot.shared, status.clone());
+        } else if let Ok(latest) = slot.shared.status.lock() {
+            status = latest.clone();
         }
+        self.terminal_statuses.insert(camera_id.clone(), status);
         Ok(())
     }
 }
 
 impl Drop for RecordingController {
     fn drop(&mut self) {
-        if let Some(stop) = &self.stop {
-            stop.store(true, Ordering::Release);
+        for slot in self.slots.values() {
+            if slot.thread.is_some() {
+                slot.stop.store(true, Ordering::Release);
+            }
         }
-        if let Some(thread) = self.thread.take() {
-            // Normal desktop teardown asks the existing supervisor for graceful
-            // shutdown through the stop closure, then waits for bounded M3
-            // shutdown semantics to finish. Runner panic must never panic host.
-            let _ = thread.join();
+        for slot in self.slots.values_mut() {
+            if let Some(thread) = slot.thread.take() {
+                let _ = thread.join();
+            }
         }
-        self.stop = None;
     }
 }
 
-fn notify_status(shared: &SharedStatus, status: RecordingStatus) {
+fn notify_slot(shared: &SlotShared) -> Result<(), RecordingControllerError> {
+    let snapshot = shared
+        .status
+        .lock()
+        .map_err(|_| RecordingControllerError::Synchronization)?
+        .clone();
+    notify_status_observer(shared, snapshot);
+    Ok(())
+}
+
+fn notify_status_observer(shared: &SlotShared, status: RecordingStatus) {
     let observer = shared
         .observer
         .lock()
@@ -469,7 +655,7 @@ fn notify_status(shared: &SharedStatus, status: RecordingStatus) {
     }
 }
 
-fn apply_worker_progress(shared: &SharedStatus, payload: &serde_json::Value) {
+fn apply_worker_progress(shared: &SlotShared, payload: &serde_json::Value) {
     let Some(worker_state) = payload.get("state").and_then(serde_json::Value::as_str) else {
         return;
     };
@@ -478,14 +664,10 @@ fn apply_worker_progress(shared: &SharedStatus, payload: &serde_json::Value) {
         "connecting" => RecordingState::Connecting,
         "recording" => RecordingState::Recording,
         "backoff" => RecordingState::Backoff,
-        // Terminal worker observations are intentionally ignored. The runner
-        // still owns bounded worker shutdown/kill/reap after seeing them.
         "stopped" | "completed" | "idle" | "failed" => return,
         _ => return,
     };
     if let Ok(mut status) = shared.status.lock() {
-        // Once a UI stop is requested, late worker progress must not visually
-        // resurrect Recording while graceful teardown is still in flight.
         if status.state != RecordingState::Stopping {
             status.state = mapped;
         }
@@ -501,7 +683,7 @@ fn apply_worker_progress(shared: &SharedStatus, payload: &serde_json::Value) {
         status.failure_category = None;
         let snapshot = status.clone();
         drop(status);
-        notify_status(shared, snapshot);
+        notify_status_observer(shared, snapshot);
     }
 }
 
@@ -519,43 +701,126 @@ fn failure_category(error: &ApplicationError) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::{Duration, Instant};
 
     use super::*;
 
-    struct FailFirstSpawner {
-        calls: AtomicUsize,
+    struct BlockingRunner {
+        starts: Arc<AtomicUsize>,
     }
 
-    impl RecordingThreadSpawner for FailFirstSpawner {
-        fn spawn(
+    impl RecordingRunner for BlockingRunner {
+        fn run(
             &self,
-            name: String,
-            task: Box<dyn FnOnce() + Send + 'static>,
-        ) -> std::io::Result<JoinHandle<()>> {
-            if self.calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
-                Err(std::io::Error::other("injected thread spawn failure"))
-            } else {
-                std::thread::Builder::new().name(name).spawn(task)
+            _desired: DesiredRecording,
+            stop: Arc<AtomicBool>,
+            _observer: Arc<dyn Fn(&serde_json::Value) + Send + Sync>,
+        ) -> Result<WorkerEnd, RecordingRunFailure> {
+            self.starts.fetch_add(1, AtomicOrdering::SeqCst);
+            while !stop.load(Ordering::Acquire) {
+                std::thread::yield_now();
             }
+            Ok(WorkerEnd::RequestedShutdown)
         }
     }
 
-    struct ImmediateRunner;
+    struct Factory {
+        starts: Arc<AtomicUsize>,
+        creates: Arc<AtomicUsize>,
+    }
 
-    impl RecordingRunner for ImmediateRunner {
+    impl RecordingRunnerFactory for Factory {
+        fn create(&self, _camera_id: &CameraId) -> Arc<dyn RecordingRunner> {
+            self.creates.fetch_add(1, AtomicOrdering::SeqCst);
+            Arc::new(BlockingRunner {
+                starts: self.starts.clone(),
+            })
+        }
+    }
+
+    struct FailingRunner;
+
+    impl RecordingRunner for FailingRunner {
         fn run(
             &self,
             _desired: DesiredRecording,
             _stop: Arc<AtomicBool>,
             _observer: Arc<dyn Fn(&serde_json::Value) + Send + Sync>,
         ) -> Result<WorkerEnd, RecordingRunFailure> {
-            Ok(WorkerEnd::JobCompletedCleanly)
+            Err(RecordingRunFailure::Permanent {
+                failure_category: Some("camera_in_use".to_owned()),
+            })
         }
     }
 
-    fn desired() -> DesiredRecording {
+    struct IsolatingFactory {
+        starts: Arc<AtomicUsize>,
+    }
+
+    impl RecordingRunnerFactory for IsolatingFactory {
+        fn create(&self, camera_id: &CameraId) -> Arc<dyn RecordingRunner> {
+            if camera_id.as_str() == "cam-a" {
+                Arc::new(FailingRunner)
+            } else {
+                Arc::new(BlockingRunner {
+                    starts: self.starts.clone(),
+                })
+            }
+        }
+    }
+
+    struct CoordinatedStopRunner {
+        starts: Arc<AtomicUsize>,
+        stop_observed: Arc<AtomicUsize>,
+        expected_stops: usize,
+        ordering_violated: Arc<AtomicBool>,
+    }
+
+    impl RecordingRunner for CoordinatedStopRunner {
+        fn run(
+            &self,
+            _desired: DesiredRecording,
+            stop: Arc<AtomicBool>,
+            _observer: Arc<dyn Fn(&serde_json::Value) + Send + Sync>,
+        ) -> Result<WorkerEnd, RecordingRunFailure> {
+            self.starts.fetch_add(1, AtomicOrdering::SeqCst);
+            while !stop.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            self.stop_observed.fetch_add(1, AtomicOrdering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while self.stop_observed.load(AtomicOrdering::SeqCst) < self.expected_stops {
+                if Instant::now() >= deadline {
+                    self.ordering_violated.store(true, Ordering::Release);
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            Ok(WorkerEnd::RequestedShutdown)
+        }
+    }
+
+    struct CoordinatedStopFactory {
+        starts: Arc<AtomicUsize>,
+        stop_observed: Arc<AtomicUsize>,
+        expected_stops: usize,
+        ordering_violated: Arc<AtomicBool>,
+    }
+
+    impl RecordingRunnerFactory for CoordinatedStopFactory {
+        fn create(&self, _camera_id: &CameraId) -> Arc<dyn RecordingRunner> {
+            Arc::new(CoordinatedStopRunner {
+                starts: self.starts.clone(),
+                stop_observed: self.stop_observed.clone(),
+                expected_stops: self.expected_stops,
+                ordering_violated: self.ordering_violated.clone(),
+            })
+        }
+    }
+
+    fn desired(camera: &str) -> DesiredRecording {
         DesiredRecording {
-            camera: "cam-a".to_owned(),
+            camera: camera.to_owned(),
             storage_root: "/tmp/nian-controller-test".to_owned(),
             source_json: serde_json::json!({"kind":"file","path":"fixture.mkv"}),
             segment_target_secs: 300,
@@ -563,49 +828,151 @@ mod tests {
         }
     }
 
-    #[test]
-    fn active_state_set_is_explicit() {
-        assert!(RecordingState::Starting.is_active());
-        assert!(RecordingState::Recording.is_active());
-        assert!(RecordingState::Stopping.is_active());
-        assert!(!RecordingState::Stopped.is_active());
-        assert!(!RecordingState::Failed.is_active());
-    }
-
-    #[test]
-    fn thread_spawn_failure_rolls_back_and_next_start_is_usable() {
-        let spawner = Arc::new(FailFirstSpawner {
-            calls: AtomicUsize::new(0),
-        });
-        let mut controller = RecordingController::with_spawner(Arc::new(ImmediateRunner), spawner);
-
-        assert_eq!(
-            controller
-                .start(CameraId::parse("cam-a").unwrap(), desired())
-                .unwrap_err(),
-            RecordingControllerError::ThreadStart
-        );
-        let failed = controller.status().unwrap();
-        assert_eq!(failed.state, RecordingState::Failed);
-        assert_eq!(failed.camera_id, None);
-        assert_eq!(
-            failed.failure_category.as_deref(),
-            Some("worker_unavailable")
-        );
-
-        controller
-            .start(CameraId::parse("cam-a").unwrap(), desired())
-            .unwrap();
-        // Polling reaps the immediate successful run. Use a bounded wall-clock
-        // deadline rather than a fixed yield count; the scheduler owes tests no
-        // particular number of turns under the full parallel workspace suite.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            if controller.status().unwrap().state == RecordingState::Stopped {
+    fn wait_for(value: &AtomicUsize, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if value.load(AtomicOrdering::SeqCst) >= expected {
                 return;
             }
             std::thread::yield_now();
         }
-        panic!("second run did not finish");
+        panic!("counter did not reach expected value");
+    }
+
+    #[test]
+    fn two_cameras_own_independent_runners_and_stop_is_isolated() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let creates = Arc::new(AtomicUsize::new(0));
+        let mut controller = RecordingController::with_factory(Arc::new(Factory {
+            starts: starts.clone(),
+            creates: creates.clone(),
+        }));
+        let a = CameraId::parse("cam-a").unwrap();
+        let b = CameraId::parse("cam-b").unwrap();
+        controller.start(a.clone(), desired("cam-a")).unwrap();
+        controller.start(b.clone(), desired("cam-b")).unwrap();
+        wait_for(&starts, 2);
+        assert_eq!(creates.load(AtomicOrdering::SeqCst), 2);
+        controller.stop(&a).unwrap();
+        assert!(controller.is_owned(&b).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && controller.is_owned(&a).unwrap() {
+            std::thread::yield_now();
+        }
+        assert!(!controller.is_owned(&a).unwrap());
+        assert!(controller.is_owned(&b).unwrap());
+        controller.shutdown_all().unwrap();
+    }
+
+    #[test]
+    fn duplicate_start_is_camera_scoped() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let mut controller = RecordingController::with_factory(Arc::new(Factory {
+            starts: starts.clone(),
+            creates: Arc::new(AtomicUsize::new(0)),
+        }));
+        let a = CameraId::parse("cam-a").unwrap();
+        let b = CameraId::parse("cam-b").unwrap();
+        controller.start(a.clone(), desired("cam-a")).unwrap();
+        assert_eq!(
+            controller.start(a.clone(), desired("cam-a")).unwrap_err(),
+            RecordingControllerError::AlreadyRecording
+        );
+        controller.start(b, desired("cam-b")).unwrap();
+        controller.shutdown_all().unwrap();
+    }
+
+    #[test]
+    fn shutdown_signals_all_before_joining() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stop_observed = Arc::new(AtomicUsize::new(0));
+        let ordering_violated = Arc::new(AtomicBool::new(false));
+        let mut controller = RecordingController::with_factory(Arc::new(CoordinatedStopFactory {
+            starts: starts.clone(),
+            stop_observed: stop_observed.clone(),
+            expected_stops: 3,
+            ordering_violated: ordering_violated.clone(),
+        }));
+        for name in ["cam-a", "cam-b", "cam-c"] {
+            controller
+                .start(CameraId::parse(name).unwrap(), desired(name))
+                .unwrap();
+        }
+        wait_for(&starts, 3);
+        controller.shutdown_all().unwrap();
+        assert_eq!(stop_observed.load(AtomicOrdering::SeqCst), 3);
+        assert!(!ordering_violated.load(Ordering::Acquire));
+        assert!(controller.active_cameras().unwrap().is_empty());
+    }
+
+    #[test]
+    fn finished_slot_is_removed_and_releases_capacity() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let mut controller = RecordingController::with_factory(Arc::new(Factory {
+            starts: starts.clone(),
+            creates: Arc::new(AtomicUsize::new(0)),
+        }));
+        let names = [
+            "cam-a", "cam-b", "cam-c", "cam-d", "cam-e", "cam-f", "cam-g", "cam-h",
+        ];
+        assert_eq!(names.len(), MAX_SIMULTANEOUS_RECORDINGS);
+        for name in names {
+            controller
+                .start(CameraId::parse(name).unwrap(), desired(name))
+                .unwrap();
+        }
+        wait_for(&starts, MAX_SIMULTANEOUS_RECORDINGS);
+        let overflow = CameraId::parse("cam-i").unwrap();
+        assert_eq!(
+            controller
+                .start(overflow.clone(), desired("cam-i"))
+                .unwrap_err(),
+            RecordingControllerError::Capacity
+        );
+
+        let released = CameraId::parse("cam-a").unwrap();
+        controller.stop(&released).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && controller.is_owned(&released).unwrap() {
+            std::thread::yield_now();
+        }
+        assert!(!controller.is_owned(&released).unwrap());
+        assert_eq!(
+            controller.status(&released).unwrap().state,
+            RecordingState::Stopped
+        );
+
+        controller
+            .start(overflow.clone(), desired("cam-i"))
+            .unwrap();
+        wait_for(&starts, MAX_SIMULTANEOUS_RECORDINGS + 1);
+        assert!(controller.is_owned(&overflow).unwrap());
+        controller.shutdown_all().unwrap();
+    }
+
+    #[test]
+    fn one_camera_failure_does_not_disturb_another_slot() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let mut controller = RecordingController::with_factory(Arc::new(IsolatingFactory {
+            starts: starts.clone(),
+        }));
+        let a = CameraId::parse("cam-a").unwrap();
+        let b = CameraId::parse("cam-b").unwrap();
+        controller.start(a.clone(), desired("cam-a")).unwrap();
+        controller.start(b.clone(), desired("cam-b")).unwrap();
+        wait_for(&starts, 1);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && controller.status(&a).unwrap().state != RecordingState::Failed
+        {
+            std::thread::yield_now();
+        }
+        let failed = controller.status(&a).unwrap();
+        assert_eq!(failed.state, RecordingState::Failed);
+        assert_eq!(failed.failure_category.as_deref(), Some("camera_in_use"));
+        assert!(!controller.is_owned(&a).unwrap());
+        assert!(controller.is_owned(&b).unwrap());
+        controller.shutdown_all().unwrap();
     }
 }

@@ -39,9 +39,10 @@ pub use probe_controller::{
     ProbeController, ProbeError, ProbeResult, ProbeRunner, WorkerProbeRunner,
 };
 pub use recording_controller::{
-    RecordingController, RecordingControllerError, RecordingRunFailure, RecordingRunner,
-    RecordingState, RecordingStatus, RecordingThreadSpawner, StdRecordingThreadSpawner,
-    SupervisorRecordingRunner,
+    MAX_SIMULTANEOUS_RECORDINGS, RecordingController, RecordingControllerError,
+    RecordingRunFailure, RecordingRunner, RecordingRunnerFactory, RecordingState, RecordingStatus,
+    RecordingThreadSpawner, StdRecordingThreadSpawner, SupervisorRecordingRunner,
+    SupervisorRecordingRunnerFactory,
 };
 pub use storage_manager::{
     ArtifactCleanupReport, PlaybackPins, ReconciliationFailure, ReconciliationFailureKind,

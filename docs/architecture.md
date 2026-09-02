@@ -414,16 +414,12 @@ A manual second launch activates the existing window; the exact autostart marker
 startup explicitly shows/unminimizes/focuses it, and Close hides it to the tray.
 Only explicit coordinated Quit tears down the backend.
 
-Authoritative settings schema v2 stores `launch_at_login` and one
-`recording_enabled` camera. A partial unique index enforces the existing
-single-camera desired-recording constraint. Start first proves runtime-controller
-admission while the desktop control gate and controller ownership are stable, then
-persists Desired=On, then starts the runtime controller. A rejected second-camera
-Start therefore cannot replace the previous desired intent, including while the
-previous controller is Stopping. User Stop persists Desired=Off before signalling
-runtime teardown. Suspend and Quit never rewrite desired intent. Startup and resume
-therefore restore Desired=On through the same `RecordingController` path, while
-runtime `Failed` remains independently visible to the UI.
+M7 originally introduced authoritative settings schema v2 with `launch_at_login`
+and one `recording_enabled` camera. A partial unique index deliberately enforced the
+then-current single-camera desired-recording constraint while lifecycle semantics
+were hardened. M9 supersedes only that single-camera constraint with schema v3 and
+per-camera recording ownership; the M7 admission, Desired-vs-Runtime and lifecycle
+ordering rules remain authoritative. See the M9 section below and ADR-0012.
 
 Recording status changes are projected to the native tray from Rust through a
 controller observer and host-owned tray watcher; React polling is not authoritative
@@ -542,6 +538,43 @@ publish. Drafts are not advertised by the stable
 `releases/latest/download/latest.json` endpoint.
 
 See ADR-0011 and `docs/releasing.md` for the release contract.
+
+## Simultaneous multi-camera recording (M9)
+
+M9 replaces the desktop-global recording run with a bounded coordinator keyed by
+`CameraId`. Every live camera slot owns an independent stop signal, thread handle,
+status and `RecordingRunner`; production creates a distinct `WorkerSupervisor` and
+`nian-media-worker` supervision tree per active camera. Finished threads are joined
+and removed independently, while terminal status may be retained outside the live
+slot map. The current explicit capacity is eight simultaneous recording slots.
+
+Settings schema v3 removes the M7 partial unique index while keeping
+`recording_enabled` on each camera row. Multiple cameras may therefore be Desired=On.
+The v2→v3 migration preserves existing desired state and is transactional. Desired
+cameras are read in deterministic CameraId order. Interactive Start/Stop mutate only
+their target camera; tray `Stop All Recordings` first clears every desired flag in one
+settings transaction and signals runtime slots only after that commit succeeds.
+
+Startup and Resume restore desired cameras independently in deterministic order.
+Credential/configuration/worker/capacity failure for A surfaces as A-specific Failed
+state and does not prevent unrelated B from starting. Excess desired cameras remain
+Desired=On when the capacity boundary is reached. Runtime state is exposed per camera
+through camera-scoped status plus a deterministic status collection; neither React
+nor the tray invents one synthetic global recording state. Recording-critical global
+settings remain immutable while any slot is active.
+
+Lifecycle fan-out preserves the M7 ordering contract. Suspend, Quit and signed-update
+teardown close admission and signal every recording slot before joining the first
+one. Suspend/Resume does not rewrite desired intent; update teardown likewise leaves
+all desired flags authoritative for the next normal startup. Windows keeps every
+worker in the desktop Job Object and Linux keeps ordinary child ownership/reaping.
+
+`CameraLease` remains per-camera cross-process writer/recovery authority. Separate
+leases for A and B may coexist, but a second writer/recovery owner for A still fails.
+Retention stays global-storage aware: active partials from every camera are excluded,
+settled finals remain eligible, and playback pins continue to protect only their
+specific finalized recording paths. Old finalized A/B recordings remain playable
+while A and B are concurrently recording new segments. See ADR-0012.
 
 ## Failure model
 

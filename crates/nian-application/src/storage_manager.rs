@@ -1596,6 +1596,74 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_camera_leases_do_not_block_pinned_playback_or_global_retention() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = RecordingsLayout::new(temp.path().join("recordings")).unwrap();
+        let camera_a = CameraId::parse("cam-a").unwrap();
+        let camera_b = CameraId::parse("cam-b").unwrap();
+        let started_at =
+            NaiveDateTime::parse_from_str("2026-08-20T08:30:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let final_a = layout
+            .day_dir(&camera_a, started_at.date())
+            .join("08-30-00.mkv");
+        let final_b = layout
+            .day_dir(&camera_b, started_at.date())
+            .join("08-30-00.mkv");
+        let partial_a = layout
+            .day_dir(&camera_a, started_at.date())
+            .join("09-00-00.partial.mkv");
+        let partial_b = layout
+            .day_dir(&camera_b, started_at.date())
+            .join("09-00-00.partial.mkv");
+        for path in [&final_a, &final_b, &partial_a, &partial_b] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"camera-scoped-media").unwrap();
+        }
+
+        let lease_a = CameraLease::try_acquire(&layout, &camera_a).unwrap();
+        let lease_b = CameraLease::try_acquire(&layout, &camera_b).unwrap();
+        let pins = PlaybackPins::default();
+        let mut manager = StorageManager::open_with_playback_pins(
+            layout,
+            RetentionPolicy {
+                max_age_days: Some(1),
+                max_storage_bytes: None,
+            },
+            None,
+            pins.clone(),
+        )
+        .unwrap();
+        let reconciliation = manager.reconcile().unwrap();
+        assert_eq!(reconciliation.active_partials, 2);
+
+        let relative_a = "cam-a/2026/08/20/08-30-00.mkv";
+        let pin = pins.pin(relative_a);
+        let report = manager
+            .run_retention(
+                NaiveDateTime::parse_from_str("2026-08-29T12:00:00", "%Y-%m-%dT%H:%M:%S").unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(report.skipped_playback, 1);
+        assert_eq!(report.deleted, 1);
+        assert!(final_a.is_file());
+        assert!(!final_b.exists());
+        assert!(partial_a.is_file());
+        assert!(partial_b.is_file());
+        assert!(manager.recording_by_id(relative_a).unwrap().is_some());
+        assert!(
+            manager
+                .recording_by_id("cam-b/2026/08/20/08-30-00.mkv")
+                .unwrap()
+                .is_none()
+        );
+
+        drop(pin);
+        drop(lease_a);
+        drop(lease_b);
+    }
+
+    #[test]
     fn playback_pin_created_after_retention_planning_wins_before_delete() {
         let temp = tempfile::tempdir().unwrap();
         let layout = RecordingsLayout::new(temp.path().join("recordings")).unwrap();

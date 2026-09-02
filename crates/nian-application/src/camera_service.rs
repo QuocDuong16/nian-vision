@@ -146,6 +146,7 @@ pub trait SettingsRepository: Send {
         camera_id: &CameraId,
         enabled: bool,
     ) -> Result<bool, SettingsRepositoryError>;
+    fn set_all_recording_enabled(&mut self, enabled: bool) -> Result<(), SettingsRepositoryError>;
 }
 
 impl SettingsRepository for SettingsStore {
@@ -193,6 +194,9 @@ impl SettingsRepository for SettingsStore {
         enabled: bool,
     ) -> Result<bool, SettingsRepositoryError> {
         SettingsStore::set_recording_enabled(self, camera_id, enabled).map_err(repository_error)
+    }
+    fn set_all_recording_enabled(&mut self, enabled: bool) -> Result<(), SettingsRepositoryError> {
+        SettingsStore::set_all_recording_enabled(self, enabled).map_err(repository_error)
     }
 }
 
@@ -268,8 +272,6 @@ pub enum CameraServiceError {
     CredentialRefCollision,
     #[error("recording storage is not configured")]
     StorageNotConfigured,
-    #[error("persisted recording intent violates the single-camera invariant")]
-    DesiredStateInvariant,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -645,16 +647,16 @@ impl CameraService {
         Ok(settings.into())
     }
 
-    pub fn desired_recording_camera(&self) -> Result<Option<CameraId>, CameraServiceError> {
-        let desired = self
-            .repository
+    pub fn recording_enabled_cameras(&self) -> Result<Vec<CameraId>, CameraServiceError> {
+        self.repository
             .recording_enabled_cameras()
-            .map_err(map_repository_service_error)?;
-        match desired.as_slice() {
-            [] => Ok(None),
-            [camera_id] => Ok(Some(camera_id.clone())),
-            _ => Err(CameraServiceError::DesiredStateInvariant),
-        }
+            .map_err(map_repository_service_error)
+    }
+
+    pub fn set_all_recording_enabled(&mut self, enabled: bool) -> Result<(), CameraServiceError> {
+        self.repository
+            .set_all_recording_enabled(enabled)
+            .map_err(map_repository_service_error)
     }
 
     pub fn set_recording_enabled(

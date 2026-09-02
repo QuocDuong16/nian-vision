@@ -11,13 +11,14 @@ Testing is part of the definition of done for every milestone (master spec
 |---|---|
 | `nian-domain` | camera-id path safety, credential redaction, URL encoding, retention validation, quota watermarks, backoff schedule, time-base math |
 | `nian-application` | config validation bounds, UI-safe error messages; stub-worker supervision matrix: crash-before-hello retryable, wedged-hello deadline-bounded, version mismatch permanent, transient refusal retries, configuration refusal stops, failed-job-observed-while-alive, shutdown interrupts backoff waits |
-| `nian-application` (M5) | camera CRUD/service validation, versioned credential-ref transaction failure boundaries, safe DTO/Debug output, storage-settings validation, single-active `RecordingController` transitions and probe admission |
+| `nian-application` (M5) | camera CRUD/service validation, versioned credential-ref transaction failure boundaries, safe DTO/Debug output, storage-settings validation, original single-active `RecordingController` transitions and probe admission |
 | `nian-settings` (M5) | schema v1 creation, reopen persistence, stable CameraId across rename, duplicate rejection, future-schema preservation, migration rollback, validated HIGH/LOW quota round-trip + corrupt/mismatched quota rejection, camera delete leaves footage untouched, password sentinel absent from DB bytes |
 | `nian-application` (M4) | `StorageManager`: reconciliation idempotency + fail-closed retention gate, startup/runtime corruption repair, convergent SQLite-family quarantine, lease-aware partial classification, whole-second incremental finalized upsert, age/quota OR semantics + target observability, settled-recovered retention during active recording, recovered transaction commit revalidation, filesystem-first crash convergence, conservative artifact cleanup |
 | `nian-index` (M4) | schema v1 migration/reopen, future-version refusal, migration rollback, verified WAL + `foreign_keys=ON`, timeline index, idempotent upsert/query, atomic snapshot replacement, random-byte/runtime corruption classification |
 | `nian-index` (M6) | complete-only camera range queries, start-inclusive/end-exclusive boundaries, normal + recovered ordering, same-second sequence ordering, available days, previous/next, duration writeback fenced by stable filesystem identity |
 | `nian-application` (M6) | playback path revalidation, explicit filesystem→index refresh, normal/recovered freshness with active-partial exclusion, session expiry/token handling, full/middle/suffix HTTP Range, 416/403/410 transport failures, rebuild-stable recording identity, lazy duration enrichment, symlink rejection, cross-process playback-cache instance locking, playback-pin retention skip and deterministic plan→pin→delete race closure |
 | `nian-application` / desktop (M7) | lifecycle admission (`Running`/`Suspending`/`Quitting`), persisted desired-recording restoration, lifecycle-owned recorder shutdown/join, probe cancellation/admission, playback suspend/resume/shutdown, single-instance activation policy, close-to-tray, autostart reconciliation/rollback, suspend/resume convergence and deterministic Quit ordering |
+| `nian-settings` / `nian-application` / desktop (M9) | schema v3 multi-desired migration + rollback, bounded per-camera recording slots, independent runner/supervisor ownership, camera-scoped Start/Stop/status, transactional Stop All, capacity ordering, failure isolation, multi-camera startup/suspend/resume/update restoration, concurrent admission races, tray/UI aggregation without synthetic global state |
 | `nian-storage` | recordings layout, partial/final naming round-trip, traversal rejection, exclusive claims (incl. sub-second clock regression), no-replace publication (success, collision refusal, recoverable abandoned partials) |
 | `nian-storage` (M3/M4) | partial-file classification plus deterministic exact-grammar filesystem inventory; normal + recovered first-class recordings; foreign/control artifacts excluded; recording-looking symlinks never followed; shared strict recovery-tombstone v2 validation; typed path-presence semantics where only `NotFound` proves absence; shared whole-second filesystem identity normalization |
 | `nian-ipc` | envelope round-trips, framing limits (1 MiB cap, CRLF, truncation), dispatch loop (ping/describe/shutdown/unknown), protocol version guard, handler event emission through the writer before replies (M3) |
@@ -461,10 +462,10 @@ prepares a real camera recording request after the commit and asserts its
 close-to-tray vs real Quit, exact `--startup-hidden` handling, truthful lifecycle
 activation errors, autostart OS drift/reconciliation plus rollback failure,
 launch-at-login-only changes while a recorder or playback session is active,
-persisted desired-state restoration/failure visibility, active/Stopping
-second-camera Start rejection without desired-intent replacement, queued
-Suspend/Resume delivery during startup initialization, duplicate-free
-suspend/resume, resume partial-failure convergence, Rust-authoritative tray
+persisted desired-state restoration/failure visibility, the historical M7
+single-camera admission behavior, queued Suspend/Resume delivery during startup
+initialization, duplicate-free suspend/resume, resume partial-failure convergence,
+Rust-authoritative tray
 Starting/Connecting/Recording/Backoff/Failed projection, Stop-button intent
 semantics, tray watcher Shutdown/join, and deterministic teardown ordering with
 process exit last.
@@ -550,13 +551,42 @@ both updater signatures, scans the combined release boundary, and only then emit
 `verified-release`. Draft publication still uploads every asset, downloads them back,
 compares the exact filename set and bytes, verifies the global checksums and publishes.
 
+### Simultaneous multi-camera recording (M9)
+
+Settings tests create/reopen schema v3, migrate real schema-v2 bytes while preserving
+the previously desired camera, prove the v2 partial unique index is removed, allow A
+and B to persist Desired=On simultaneously, and fault-inject v2→v3 migration failure
+to prove both schema version and old index state roll back atomically.
+
+`RecordingController` tests prove two camera IDs create independent runner instances,
+duplicate Start is scoped to one camera, Stop A leaves B owned, one camera failure does
+not disturb another, finished slots are joined/removed and release capacity, and
+lifecycle teardown signals every owned slot before any blocking join. The explicit
+capacity is eight live slots; terminal status history does not consume capacity.
+
+Desktop tests exercise camera-scoped Start/Stop/status, deterministic status
+collections, transactional Stop All rollback, concurrent Start A+B, duplicate
+concurrent Start A+A, deterministic restoration beyond capacity, missing-credential
+failure isolation, A+B Suspend/Resume, multi-intent update teardown, and Start races
+against Suspend/Quitting admission. Deletion tests prove Desired=On blocks deleting
+that camera, while an unrelated recording does not block deleting a stopped camera.
+Recording-critical settings still reject changes while any slot is active.
+
+UI tests render independent Desired/Runtime state per camera and prove starting one
+row does not disable another row's recording controls. Tray projection tests use
+aggregate counts and `Stop All Recordings`; they never fabricate one global runtime
+state from incompatible per-camera states.
+
+Storage/playback regressions hold concurrent CameraLease ownership for A and B while
+old finalized files exist. Retention must exclude active partials from both cameras,
+honor a playback pin on old A, and still delete eligible old B. PlaybackController
+must open old finalized A and B while both camera leases are held, proving active
+recording ownership does not become a camera-wide read lock.
+
 ## Planned per milestone
 
-* **M9+**: simultaneous multi-camera orchestration and M10 ONVIF. Windows x86_64
-  release automation is implemented in M8 but remains unmarked as validated until
-  the required `windows-2022` tag-release path completes successfully. macOS distribution,
-  live camera viewing, clip export, thumbnails/motion analysis and AI/cloud behavior
-  are outside the current Linux M8 release scope.
+* **M10+**: ONVIF. macOS distribution, live camera viewing, clip export,
+  thumbnails/motion analysis and AI/cloud behavior remain outside M9.
 * **Hardware/manual** (never in CI): real Tapo C200 via
   `NIAN_VISION_RTSP_URL` with
   `nian-media-worker record --rtsp-from-env ...` and/or an IPC-driven

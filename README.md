@@ -4,42 +4,40 @@ Local-first desktop NVR (network video recorder) for IP cameras. The first
 supported camera is the TP-Link Tapo C200 over RTSP, with a camera-agnostic
 domain so other RTSP/ONVIF cameras can follow.
 
-**Status**: milestone **M8 (Linux distribution)** is implemented and security-hardened on top
-of M0–M7. The desktop persists camera definitions, recorder/storage settings,
-launch-at-login preference and the single-camera desired recording intent in an
+**Status**: milestone **M9 (simultaneous multi-camera recording)** is implemented on top
+of M0–M8. The desktop persists camera definitions, recorder/storage settings,
+launch-at-login preference and independent per-camera desired recording intent in
 authoritative platform app-data `settings.sqlite3`, while camera passwords remain
 in the operating system credential store. The M4 recording catalog at
 `<storage_root>/.nian/recordings.sqlite3` remains disposable and rebuildable from
 footage. Users can add/edit/delete saved RTSP cameras, test a connection through
-the media worker, start/stop the single active recording, and observe Desired and
-Runtime recording state separately. M6 provides recording-day/range queries,
+the media worker, start/stop multiple cameras independently, and observe Desired
+and Runtime recording state per camera. M6 provides recording-day/range queries,
 filesystem-revalidated normal/recovered playback, lazy duration enrichment,
 seekable packet-copy H.264/AAC fragmented-MP4 playback over tokenized loopback
 HTTP, and retention playback pins. M7 adds single-instance activation,
 close-to-tray, explicit coordinated Quit, launch-at-login with hidden startup,
 persisted recording restoration, Windows suspend/resume handling, and Windows
 Job Object containment so hard desktop termination cannot orphan media workers.
-M8 adds Linux x86_64 AppImage and Windows x86_64 NSIS release paths with a pinned
-LGPL FFmpeg 8.0.3 runtime, desktop/worker release-version compatibility, signed
-Tauri updater artifacts, explicit update confirmation, deterministic lifecycle
-handoff, release provenance/checksums, release-time updater key-pair verification,
-secret-canary scans and installed-runtime smoke tests. Linux x86_64 is the current
-validated release target. The Windows implementation uses the explicit GitHub-hosted
-`windows-2022` runner, `x86_64-pc-windows-msvc`, an application-local FFmpeg DLL
-closure, NSIS install/upgrade/uninstall smoke, Job Object/power-subscription checks
-and the same updater trust root. Windows remains unmarked as validated until that
-hosted tag-release path completes successfully. macOS distribution is deferred.
-Live camera viewing, simultaneous multi-camera
-recording and ONVIF remain outside M8.
+M8 provides validated Linux x86_64 AppImage and Windows x86_64 NSIS release paths
+with the same pinned LGPL FFmpeg 8.0.3 source authority, signed Tauri updater trust
+root, deterministic lifecycle handoff, provenance/checksums and installed-runtime
+smoke. M9 replaces the one-slot recording controller with independent per-camera
+slots: one WorkerSupervisor, media-worker process and CameraLease per active camera,
+with a conservative eight-recording safety cap. Startup, suspend/resume, Quit and
+update teardown operate over all owned slots without clearing desired intent.
+macOS distribution remains deferred. Live camera viewing, ONVIF discovery, motion
+analysis, AI, cloud and remote streaming remain outside M9.
 
 ## What it does today
 
-* Tauri 2 desktop application (React/TypeScript/Vite UI) with managed M7 state:
-  camera CRUD, pre-save connection testing, Start/Stop controls, typed recording
+* Tauri 2 desktop application (React/TypeScript/Vite UI) with managed M9 state:
+  camera CRUD, pre-save connection testing, per-camera Start/Stop controls, typed recording
   status, delete confirmation, persisted storage/retention settings, recording-day
   navigation, a gap-aware timeline, native video playback controls and adjacent
   recording navigation, tray controls and launch-at-login preference. Recording
-  cards show persisted Desired state independently from transient Runtime state.
+  cards show persisted Desired state independently from transient Runtime state and
+  a small aggregate summary without manufacturing a fake global RecordingState.
   Closing the main window hides it; explicit Quit owns backend teardown. The
   webview never receives an absolute recording path;
   privileged work flows through narrow Tauri commands.
@@ -115,7 +113,8 @@ React UI ─ typed Tauri commands ─ nian-desktop host
 See `docs/architecture.md` and `docs/adr/` for the decisions behind this
 layout (process isolation, FFmpeg strategy, container choice, storage
 model, authoritative-settings/native-secret split, M6 playback transport, M7
-desktop lifecycle/worker containment and M8 Linux distribution/updater design).
+desktop lifecycle/worker containment, M8 distribution/updater design and M9
+per-camera recording coordination).
 
 ## Requirements
 

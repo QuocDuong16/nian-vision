@@ -17,7 +17,7 @@ use nian_domain::{
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
@@ -186,9 +186,7 @@ impl SettingsStore {
         )? > 0)
     }
 
-    /// Returns the persisted recording intent. More than one row is returned
-    /// deliberately if the database was externally corrupted so the
-    /// application layer can fail closed instead of silently picking a camera.
+    /// Returns persisted recording intent in deterministic CameraId order.
     pub fn recording_enabled_cameras(&self) -> Result<Vec<CameraId>, SettingsError> {
         let mut statement = self.connection.prepare(
             "SELECT camera_id FROM cameras WHERE recording_enabled=1 ORDER BY camera_id",
@@ -202,7 +200,7 @@ impl SettingsStore {
             .collect()
     }
 
-    /// Persists M7's single-camera desired recording state transactionally.
+    /// Persists one camera desired recording state without touching others.
     pub fn set_recording_enabled(
         &mut self,
         camera_id: &CameraId,
@@ -217,18 +215,23 @@ impl SettingsStore {
         if !exists {
             return Ok(false);
         }
-        if enabled {
-            transaction.execute(
-                "UPDATE cameras SET recording_enabled=0 WHERE recording_enabled<>0",
-                [],
-            )?;
-        }
         let affected = transaction.execute(
             "UPDATE cameras SET recording_enabled=?2 WHERE camera_id=?1",
             params![camera_id.as_str(), if enabled { 1_i64 } else { 0_i64 }],
         )?;
         transaction.commit()?;
         Ok(affected == 1)
+    }
+
+    /// Atomically changes every persisted recording intent.
+    pub fn set_all_recording_enabled(&mut self, enabled: bool) -> Result<(), SettingsError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE cameras SET recording_enabled=?1",
+            [if enabled { 1_i64 } else { 0_i64 }],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn application_settings(&self) -> Result<ApplicationSettings, SettingsError> {
@@ -409,6 +412,15 @@ fn migrate(connection: &mut Connection) -> Result<(), SettingsError> {
              CREATE UNIQUE INDEX cameras_single_recording_enabled \
                 ON cameras(recording_enabled) WHERE recording_enabled=1;\
              PRAGMA user_version=2;",
+        )?;
+        transaction.commit()?;
+        version = 2;
+    }
+    if version == 2 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "DROP INDEX cameras_single_recording_enabled;\
+             PRAGMA user_version=3;",
         )?;
         transaction.commit()?;
     }

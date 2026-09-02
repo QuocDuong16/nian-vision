@@ -18,7 +18,7 @@ use nian_application::{
     CredentialStore, CredentialStoreError, DesktopLifecycle, DesktopLifecycleError,
     DesktopLifecycleState, PlaybackController, PlaybackError, PlaybackOpenDto, ProbeController,
     ProbeError, ProbeResult, RecordingController, RecordingControllerError, RecordingDto,
-    RecordingState, RecordingStatus, SupervisorRecordingRunner, WorkerProbeRunner,
+    RecordingState, RecordingStatus, SupervisorRecordingRunnerFactory, WorkerProbeRunner,
 };
 use nian_domain::{
     AudioPolicy, CameraId, CredentialRef, Credentials, RetentionPolicy, StorageQuota,
@@ -59,7 +59,7 @@ pub struct UpdateCheckDto {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecordingIntentDto {
-    pub camera_id: Option<String>,
+    pub camera_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -623,12 +623,45 @@ fn camera_update(
 ) -> Result<nian_application::CameraMutation<CameraSummary>, DesktopErrorDto> {
     let _gate = lock(&state.control_gate)?;
     require_running(&state)?;
+    let camera_id = CameraId::parse(&input.camera_id)
+        .map_err(|error| DesktopErrorDto::new("validation", error.to_string()))?;
     let active = lock(&state.recording_controller)?
-        .active_camera()
+        .is_owned(&camera_id)
         .map_err(map_recording_error)?;
     lock(&state.camera_service)?
-        .update_camera(input.into_draft()?, active.as_ref())
+        .update_camera(input.into_draft()?, active.then_some(&camera_id))
         .map_err(map_camera_error)
+}
+
+fn delete_camera_config(
+    state: &DesktopState,
+    camera_id: &str,
+) -> Result<nian_application::CameraMutation<CameraSummary>, DesktopErrorDto> {
+    let _gate = lock(&state.control_gate)?;
+    require_running(state)?;
+    let id = CameraId::parse(camera_id)
+        .map_err(|error| DesktopErrorDto::new("validation", error.to_string()))?;
+    let active = lock(&state.recording_controller)?
+        .is_owned(&id)
+        .map_err(map_recording_error)?;
+    let desired = lock(&state.camera_service)?
+        .recording_enabled_cameras()
+        .map_err(map_desired_state_error)?
+        .iter()
+        .any(|desired| desired == &id);
+    if desired {
+        return Err(DesktopErrorDto::new(
+            "camera_busy",
+            "camera must be stopped before deletion",
+        ));
+    }
+    let deleted = lock(&state.camera_service)?
+        .delete_camera(camera_id, active.then_some(&id))
+        .map_err(map_camera_error)?;
+    lock(&state.recording_controller)?
+        .forget_status(&id)
+        .map_err(map_recording_error)?;
+    Ok(deleted)
 }
 
 #[tauri::command]
@@ -636,14 +669,7 @@ fn camera_delete(
     state: tauri::State<'_, Arc<DesktopState>>,
     camera_id: String,
 ) -> Result<nian_application::CameraMutation<CameraSummary>, DesktopErrorDto> {
-    let _gate = lock(&state.control_gate)?;
-    require_running(&state)?;
-    let active = lock(&state.recording_controller)?
-        .active_camera()
-        .map_err(map_recording_error)?;
-    lock(&state.camera_service)?
-        .delete_camera(&camera_id, active.as_ref())
-        .map_err(map_camera_error)
+    delete_camera_config(&state, &camera_id)
 }
 
 #[tauri::command]
@@ -679,16 +705,13 @@ fn start_recording(
         .prepare_recording(camera_id)
         .map_err(map_camera_error)?;
     let mut controller = lock(&state.recording_controller)?;
-    // Admission is proven before desired-state mutation. The control gate and
-    // controller guard remain owned until runtime start, so a rejected second
-    // camera can never replace the authoritative persisted intent.
-    controller.ensure_startable().map_err(map_recording_error)?;
+    controller
+        .ensure_startable(&id)
+        .map_err(map_recording_error)?;
     lock(&state.camera_service)?
         .set_recording_enabled(camera_id, true)
         .map_err(map_desired_state_error)?;
     wake_tray_intent(state);
-    // From here on desired=true is intentionally durable. Genuine thread/worker
-    // startup failures leave it On so restart/restoration can retry user intent.
     controller.start(id, desired).map_err(map_recording_error)
 }
 
@@ -700,47 +723,89 @@ fn recording_start(
     start_recording(&state, &camera_id)
 }
 
-fn stop_recording(state: &DesktopState) -> Result<RecordingStatus, DesktopErrorDto> {
+fn stop_recording(
+    state: &DesktopState,
+    camera_id: &str,
+) -> Result<RecordingStatus, DesktopErrorDto> {
     let _gate = lock(&state.control_gate)?;
     require_running(state)?;
-    // Persist Off before touching the runtime controller. A crash while the
-    // worker is stopping must not resurrect a recording the user stopped.
-    let desired_camera = lock(&state.camera_service)?
-        .desired_recording_camera()
-        .map_err(map_desired_state_error)?;
-    if let Some(desired_camera) = desired_camera.as_ref() {
+    let id = CameraId::parse(camera_id)
+        .map_err(|error| DesktopErrorDto::new("validation", error.to_string()))?;
+    let desired_on = lock(&state.camera_service)?
+        .recording_enabled_cameras()
+        .map_err(map_desired_state_error)?
+        .iter()
+        .any(|desired| desired == &id);
+    if desired_on {
         lock(&state.camera_service)?
-            .set_recording_enabled(desired_camera.as_str(), false)
+            .set_recording_enabled(camera_id, false)
             .map_err(map_desired_state_error)?;
         wake_tray_intent(state);
     }
     let mut controller = lock(&state.recording_controller)?;
-    let status = controller.status().map_err(map_recording_error)?;
+    let status = controller.status(&id).map_err(map_recording_error)?;
     if status.state.is_active() && status.state != RecordingState::Stopping {
-        return controller.stop().map_err(map_recording_error);
+        return match controller.stop(&id) {
+            Ok(status) => Ok(status),
+            Err(RecordingControllerError::NotRecording) if desired_on => {
+                controller.status(&id).map_err(map_recording_error)
+            }
+            Err(error) => Err(map_recording_error(error)),
+        };
     }
-    if desired_camera.is_some() {
-        // A persisted Desired=On may legitimately have no live worker after a
-        // startup restoration failure. Turning the intent Off is still a
-        // successful Stop operation; do not manufacture a NotRecording error.
+    if desired_on {
         return Ok(status);
     }
-    controller.stop().map_err(map_recording_error)
+    controller.stop(&id).map_err(map_recording_error)
 }
 
 #[tauri::command]
 fn recording_stop(
     state: tauri::State<'_, Arc<DesktopState>>,
+    camera_id: String,
 ) -> Result<RecordingStatus, DesktopErrorDto> {
-    stop_recording(&state)
+    stop_recording(&state, &camera_id)
+}
+
+fn stop_all_recordings(state: &DesktopState) -> Result<Vec<RecordingStatus>, DesktopErrorDto> {
+    let _gate = lock(&state.control_gate)?;
+    require_running(state)?;
+    lock(&state.camera_service)?
+        .set_all_recording_enabled(false)
+        .map_err(map_desired_state_error)?;
+    wake_tray_intent(state);
+    let mut controller = lock(&state.recording_controller)?;
+    controller
+        .request_lifecycle_stop_all()
+        .map_err(map_recording_error)?;
+    controller.statuses().map_err(map_recording_error)
+}
+
+#[tauri::command]
+fn recording_stop_all(
+    state: tauri::State<'_, Arc<DesktopState>>,
+) -> Result<Vec<RecordingStatus>, DesktopErrorDto> {
+    stop_all_recordings(&state)
 }
 
 #[tauri::command]
 fn recording_status(
     state: tauri::State<'_, Arc<DesktopState>>,
+    camera_id: String,
 ) -> Result<RecordingStatus, DesktopErrorDto> {
+    let id = CameraId::parse(&camera_id)
+        .map_err(|error| DesktopErrorDto::new("validation", error.to_string()))?;
     lock(&state.recording_controller)?
-        .status()
+        .status(&id)
+        .map_err(map_recording_error)
+}
+
+#[tauri::command]
+fn recording_statuses(
+    state: tauri::State<'_, Arc<DesktopState>>,
+) -> Result<Vec<RecordingStatus>, DesktopErrorDto> {
+    lock(&state.recording_controller)?
+        .statuses()
         .map_err(map_recording_error)
 }
 
@@ -748,11 +813,13 @@ fn recording_status(
 fn recording_intent(
     state: tauri::State<'_, Arc<DesktopState>>,
 ) -> Result<RecordingIntentDto, DesktopErrorDto> {
-    let camera_id = lock(&state.camera_service)?
-        .desired_recording_camera()
+    let camera_ids = lock(&state.camera_service)?
+        .recording_enabled_cameras()
         .map_err(map_desired_state_error)?
-        .map(|camera| camera.as_str().to_owned());
-    Ok(RecordingIntentDto { camera_id })
+        .into_iter()
+        .map(|camera| camera.as_str().to_owned())
+        .collect();
+    Ok(RecordingIntentDto { camera_ids })
 }
 
 #[tauri::command]
@@ -878,10 +945,8 @@ fn settings_update(
     let _gate = lock(&state.control_gate)?;
     require_running(&state)?;
     let active = lock(&state.recording_controller)?
-        .status()
-        .map_err(map_recording_error)?
-        .state
-        .is_active();
+        .any_active()
+        .map_err(map_recording_error)?;
     let mut camera_service = lock(&state.camera_service)?;
     let mut playback = lock(&state.playback_controller)?;
     let autostart = NativeAutostartService { app: &app };
@@ -1030,10 +1095,6 @@ fn map_camera_error(error: CameraServiceError) -> DesktopErrorDto {
         CameraServiceError::Settings => {
             DesktopErrorDto::new("internal", "application settings could not be persisted")
         }
-        CameraServiceError::DesiredStateInvariant => DesktopErrorDto::new(
-            "desired_state_failed",
-            "persisted recording intent violates the single-camera invariant",
-        ),
     }
 }
 
@@ -1045,11 +1106,15 @@ fn map_desired_state_error(error: CameraServiceError) -> DesktopErrorDto {
 fn map_recording_error(error: RecordingControllerError) -> DesktopErrorDto {
     match error {
         RecordingControllerError::AlreadyRecording => {
-            DesktopErrorDto::new("already_recording", "another camera is already recording")
+            DesktopErrorDto::new("already_recording", "camera is already recording")
         }
         RecordingControllerError::NotRecording => {
-            DesktopErrorDto::new("camera_in_use", "no active recording can be stopped")
+            DesktopErrorDto::new("not_recording", "camera is not recording")
         }
+        RecordingControllerError::Capacity => DesktopErrorDto::new(
+            "recording_capacity",
+            "simultaneous recording capacity has been reached",
+        ),
         RecordingControllerError::Synchronization | RecordingControllerError::ThreadStart => {
             DesktopErrorDto::new("worker_unavailable", "recording controller is unavailable")
         }
@@ -1173,38 +1238,67 @@ fn restoration_failure_category(error: &CameraServiceError) -> &'static str {
         CameraServiceError::StorageNotConfigured => "storage_failed",
         CameraServiceError::CameraNotFound => "configuration",
         CameraServiceError::Validation(_) => "validation",
-        CameraServiceError::DesiredStateInvariant => "desired_state_failed",
         _ => "lifecycle_failed",
     }
 }
 
 /// Caller owns `control_gate` or is still in single-threaded startup.
-fn restore_desired_recording_locked(
+fn restore_desired_recordings_locked(
     state: &DesktopState,
-) -> Result<Option<RecordingStatus>, DesktopErrorDto> {
+) -> Result<Vec<RecordingStatus>, DesktopErrorDto> {
     require_running(state)?;
-    let desired_camera = lock(&state.camera_service)?
-        .desired_recording_camera()
+    let desired_cameras = lock(&state.camera_service)?
+        .recording_enabled_cameras()
         .map_err(map_desired_state_error)?;
-    let Some(camera_id) = desired_camera else {
-        return Ok(None);
-    };
+    let mut restored = Vec::new();
 
-    let desired = match lock(&state.camera_service)?.prepare_recording(camera_id.as_str()) {
-        Ok(desired) => desired,
-        Err(error) => {
-            let category = restoration_failure_category(&error);
-            let mapped = map_camera_error(error);
-            let _ = lock(&state.recording_controller)?
-                .mark_failed(camera_id, category)
-                .map_err(map_recording_error)?;
-            return Err(mapped);
+    for camera_id in desired_cameras {
+        if lock(&state.recording_controller)?
+            .is_owned(&camera_id)
+            .map_err(map_recording_error)?
+        {
+            continue;
         }
-    };
-    lock(&state.recording_controller)?
-        .start(camera_id, desired)
-        .map(Some)
-        .map_err(map_recording_error)
+        let desired = match lock(&state.camera_service)?.prepare_recording(camera_id.as_str()) {
+            Ok(desired) => desired,
+            Err(error) => {
+                let category = restoration_failure_category(&error);
+                let status = lock(&state.recording_controller)?
+                    .mark_failed(camera_id, category)
+                    .map_err(map_recording_error)?;
+                restored.push(status);
+                continue;
+            }
+        };
+        let result = lock(&state.recording_controller)?.start(camera_id.clone(), desired);
+        match result {
+            Ok(status) => restored.push(status),
+            Err(RecordingControllerError::AlreadyRecording) => {}
+            Err(RecordingControllerError::Capacity) => {
+                restored.push(
+                    lock(&state.recording_controller)?
+                        .mark_failed(camera_id, "recording_capacity")
+                        .map_err(map_recording_error)?,
+                );
+            }
+            Err(RecordingControllerError::ThreadStart) => {
+                restored.push(
+                    lock(&state.recording_controller)?
+                        .status(&camera_id)
+                        .map_err(map_recording_error)?,
+                );
+            }
+            Err(error) => {
+                restored.push(
+                    lock(&state.recording_controller)?
+                        .mark_failed(camera_id, "worker_unavailable")
+                        .map_err(map_recording_error)?,
+                );
+                tracing::warn!(error = %error, "recording restoration slot failed");
+            }
+        }
+    }
+    Ok(restored)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1213,70 +1307,73 @@ struct TrayProjection {
     stop_enabled: bool,
 }
 
-fn tray_projection(status: &RecordingStatus, desired_on: bool) -> TrayProjection {
-    let label = match status.state {
-        RecordingState::Stopped => "Stopped",
-        RecordingState::Starting => "Starting",
-        RecordingState::Recovering => "Recovering",
-        RecordingState::Connecting => "Connecting",
-        RecordingState::Recording => "Recording",
-        RecordingState::Backoff => "Backoff",
-        RecordingState::Stopping => "Stopping",
-        RecordingState::Failed => "Failed",
+fn tray_projection(statuses: &[RecordingStatus], desired_count: usize) -> TrayProjection {
+    let active: Vec<_> = statuses
+        .iter()
+        .filter(|status| status.state.is_active())
+        .collect();
+    let status_text = if active.is_empty() && desired_count == 0 {
+        "Recording: Stopped".to_owned()
+    } else if active.len() == 1 && desired_count <= 1 {
+        let label = match active[0].state {
+            RecordingState::Stopped => "Stopped",
+            RecordingState::Starting => "Starting",
+            RecordingState::Recovering => "Recovering",
+            RecordingState::Connecting => "Connecting",
+            RecordingState::Recording => "Recording",
+            RecordingState::Backoff => "Backoff",
+            RecordingState::Stopping => "Stopping",
+            RecordingState::Failed => "Failed",
+        };
+        format!("Recording: {label}")
+    } else {
+        format!("Recording: {} cameras", desired_count.max(active.len()))
     };
     TrayProjection {
-        status_text: format!("Recording status: {label}"),
-        stop_enabled: desired_on
-            || (status.state.is_active() && status.state != RecordingState::Stopping),
+        status_text,
+        stop_enabled: desired_count > 0
+            || active
+                .iter()
+                .any(|status| status.state != RecordingState::Stopping),
     }
 }
 
-fn render_tray_status(app: &AppHandle, status: &RecordingStatus) {
+fn render_tray_status(app: &AppHandle) {
     let Some(state) = app.try_state::<Arc<DesktopState>>() else {
         return;
     };
     let Some(tray) = app.try_state::<TrayUi>() else {
         return;
     };
-    let desired_on = lock(&state.camera_service)
-        .and_then(|service| {
-            service
-                .desired_recording_camera()
-                .map_err(map_desired_state_error)
-        })
-        .ok()
-        .flatten()
-        .is_some();
-    let projection = tray_projection(status, desired_on);
+    let desired_count = match lock(&state.camera_service).and_then(|service| {
+        service
+            .recording_enabled_cameras()
+            .map_err(map_desired_state_error)
+    }) {
+        Ok(cameras) => cameras.len(),
+        Err(_) => return,
+    };
+    let statuses = match lock(&state.recording_controller)
+        .and_then(|mut controller| controller.statuses().map_err(map_recording_error))
+    {
+        Ok(statuses) => statuses,
+        Err(_) => return,
+    };
+    let projection = tray_projection(&statuses, desired_count);
     let _ = tray.status.set_text(projection.status_text);
     let _ = tray.stop.set_enabled(projection.stop_enabled);
 }
 
 fn refresh_tray(app: &AppHandle) {
-    let Some(state) = app.try_state::<Arc<DesktopState>>() else {
-        return;
-    };
-    let status = match lock(&state.recording_controller)
-        .and_then(|mut c| c.status().map_err(map_recording_error))
-    {
-        Ok(status) => status,
-        Err(_) => return,
-    };
-    render_tray_status(app, &status);
+    render_tray_status(app);
 }
 
 fn run_tray_watch_loop<F>(rx: mpsc::Receiver<TrayWatchMessage>, mut refresh: F)
 where
-    F: FnMut(&RecordingStatus),
+    F: FnMut(),
 {
-    let mut status = RecordingStatus::default();
-    loop {
-        match rx.recv() {
-            Ok(TrayWatchMessage::Status(next)) => status = next,
-            Ok(TrayWatchMessage::RefreshIntent) => {}
-            Ok(TrayWatchMessage::Shutdown) | Err(_) => break,
-        }
-        refresh(&status);
+    while let Ok(TrayWatchMessage::Status(_)) | Ok(TrayWatchMessage::RefreshIntent) = rx.recv() {
+        refresh();
     }
 }
 
@@ -1289,7 +1386,7 @@ fn start_tray_watcher(
     let thread = std::thread::Builder::new()
         .name("desktop-tray-status".to_owned())
         .spawn(move || {
-            run_tray_watch_loop(rx, |status| render_tray_status(&app_handle, status));
+            run_tray_watch_loop(rx, || render_tray_status(&app_handle));
         })
         .map_err(|_| {
             DesktopErrorDto::new("lifecycle_failed", "tray status worker could not start")
@@ -1321,10 +1418,10 @@ fn shutdown_tray_watcher(state: &DesktopState) {
 
 fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     let open = MenuItemBuilder::with_id("tray-open", "Open Nian Vision").build(app)?;
-    let status = MenuItemBuilder::with_id("tray-recording-status", "Recording status: Stopped")
+    let status = MenuItemBuilder::with_id("tray-recording-status", "Recording: Stopped")
         .enabled(false)
         .build(app)?;
-    let stop = MenuItemBuilder::with_id("tray-stop-recording", "Stop recording")
+    let stop = MenuItemBuilder::with_id("tray-stop-recording", "Stop All Recordings")
         .enabled(false)
         .build(app)?;
     let quit = MenuItemBuilder::with_id("tray-quit", "Quit").build(app)?;
@@ -1341,7 +1438,7 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
             }
             "tray-stop-recording" => {
                 if let Some(state) = app.try_state::<Arc<DesktopState>>() {
-                    let _ = stop_recording(&state);
+                    let _ = stop_all_recordings(&state);
                     refresh_tray(app);
                 }
             }
@@ -1424,7 +1521,7 @@ fn shutdown_runtime_resources(state: &DesktopState) -> Result<(), DesktopErrorDt
     let mut first_error = None;
     match state.recording_controller.lock() {
         Ok(mut controller) => {
-            if let Err(error) = controller.shutdown() {
+            if let Err(error) = controller.shutdown_all() {
                 capture_first_error(&mut first_error, map_recording_error(error));
             }
         }
@@ -1477,7 +1574,7 @@ fn begin_update_shutdown(state: &DesktopState) -> Result<(), DesktopErrorDto> {
         }
         match state.recording_controller.lock() {
             Ok(mut controller) => {
-                if let Err(error) = controller.request_lifecycle_stop() {
+                if let Err(error) = controller.request_lifecycle_stop_all() {
                     capture_first_error(&mut admission_error, map_recording_error(error));
                 }
             }
@@ -1519,7 +1616,7 @@ fn request_quit(app: &AppHandle) -> Result<(), DesktopErrorDto> {
         }
         match state.recording_controller.lock() {
             Ok(mut controller) => {
-                if let Err(error) = controller.request_lifecycle_stop() {
+                if let Err(error) = controller.request_lifecycle_stop_all() {
                     capture_first_error(&mut admission_error, map_recording_error(error));
                 }
             }
@@ -1584,7 +1681,7 @@ fn handle_power_event(
             }
             match state.recording_controller.lock() {
                 Ok(mut controller) => {
-                    if let Err(error) = controller.request_lifecycle_stop() {
+                    if let Err(error) = controller.request_lifecycle_stop_all() {
                         capture_first_error(&mut first_error, map_recording_error(error));
                     }
                 }
@@ -1620,7 +1717,7 @@ fn handle_power_event(
             // that controller before any restoration, then reuse normal start.
             match state.recording_controller.lock() {
                 Ok(mut controller) => {
-                    if let Err(error) = controller.shutdown() {
+                    if let Err(error) = controller.shutdown_all() {
                         capture_first_error(&mut first_error, map_recording_error(error));
                     }
                 }
@@ -1646,7 +1743,7 @@ fn handle_power_event(
                 }
             };
             if active.is_none()
-                && let Err(error) = restore_desired_recording_locked(state)
+                && let Err(error) = restore_desired_recordings_locked(state)
             {
                 capture_first_error(&mut first_error, error);
             }
@@ -1841,7 +1938,7 @@ pub fn run() {
             let worker_program = worker_path.to_string_lossy().into_owned();
             let (tray_watch_tx, tray_watch_rx) = mpsc::channel();
             let mut recording_controller =
-                RecordingController::new(Arc::new(SupervisorRecordingRunner {
+                RecordingController::with_factory(Arc::new(SupervisorRecordingRunnerFactory {
                     worker_program: worker_program.clone(),
                 }));
             let tray_status_tx = tray_watch_tx.clone();
@@ -1915,7 +2012,7 @@ pub fn run() {
 
                 let _gate = lock(&state.control_gate)
                     .map_err(|error| std::io::Error::other(error.message))?;
-                if let Err(error) = restore_desired_recording_locked(&state) {
+                if let Err(error) = restore_desired_recordings_locked(&state) {
                     tracing::warn!(code = error.code, "desired recording restoration failed");
                     if let Ok(mut startup_error) = state.startup_error.lock()
                         && startup_error.is_none()
@@ -1972,7 +2069,9 @@ pub fn run() {
             camera_probe,
             recording_start,
             recording_stop,
+            recording_stop_all,
             recording_status,
+            recording_statuses,
             recording_intent,
             desktop_lifecycle_status,
             recordings_refresh,
@@ -2030,6 +2129,7 @@ mod tests {
         cameras: Vec<nian_domain::CameraConfig>,
         desired_camera: Option<String>,
         extra_desired_camera: Option<String>,
+        additional_desired_cameras: Vec<String>,
     }
 
     #[derive(Clone)]
@@ -2076,9 +2176,25 @@ mod tests {
 
         fn delete_camera(
             &mut self,
-            _camera_id: &CameraId,
+            camera_id: &CameraId,
         ) -> Result<bool, nian_application::SettingsRepositoryError> {
-            Ok(false)
+            let mut state = self.state.lock().unwrap();
+            let before = state.cameras.len();
+            state
+                .cameras
+                .retain(|camera| camera.camera_id() != camera_id);
+            state.desired_camera = state
+                .desired_camera
+                .take()
+                .filter(|id| id != camera_id.as_str());
+            state.extra_desired_camera = state
+                .extra_desired_camera
+                .take()
+                .filter(|id| id != camera_id.as_str());
+            state
+                .additional_desired_cameras
+                .retain(|id| id != camera_id.as_str());
+            Ok(state.cameras.len() != before)
         }
 
         fn application_settings(
@@ -2104,13 +2220,16 @@ mod tests {
             &self,
         ) -> Result<Vec<CameraId>, nian_application::SettingsRepositoryError> {
             let state = self.state.lock().unwrap();
-            state
+            let mut cameras = state
                 .desired_camera
                 .iter()
                 .chain(state.extra_desired_camera.iter())
+                .chain(state.additional_desired_cameras.iter())
                 .map(CameraId::parse)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| nian_application::SettingsRepositoryError::Persistence)
+                .map_err(|_| nian_application::SettingsRepositoryError::Persistence)?;
+            cameras.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            Ok(cameras)
         }
 
         fn set_recording_enabled(
@@ -2129,8 +2248,61 @@ mod tests {
             {
                 return Ok(false);
             }
-            state.desired_camera = enabled.then(|| camera_id.as_str().to_owned());
+            if enabled {
+                let already_enabled = state.desired_camera.as_deref() == Some(camera_id.as_str())
+                    || state.extra_desired_camera.as_deref() == Some(camera_id.as_str())
+                    || state
+                        .additional_desired_cameras
+                        .iter()
+                        .any(|id| id == camera_id.as_str());
+                if !already_enabled {
+                    if state.desired_camera.is_none() {
+                        state.desired_camera = Some(camera_id.as_str().to_owned());
+                    } else if state.extra_desired_camera.is_none() {
+                        state.extra_desired_camera = Some(camera_id.as_str().to_owned());
+                    } else {
+                        state
+                            .additional_desired_cameras
+                            .push(camera_id.as_str().to_owned());
+                    }
+                }
+            } else {
+                if state.desired_camera.as_deref() == Some(camera_id.as_str()) {
+                    state.desired_camera = None;
+                }
+                if state.extra_desired_camera.as_deref() == Some(camera_id.as_str()) {
+                    state.extra_desired_camera = None;
+                }
+                state
+                    .additional_desired_cameras
+                    .retain(|id| id != camera_id.as_str());
+            }
             Ok(true)
+        }
+
+        fn set_all_recording_enabled(
+            &mut self,
+            enabled: bool,
+        ) -> Result<(), nian_application::SettingsRepositoryError> {
+            let mut state = self.state.lock().unwrap();
+            if state.fail_desired_write {
+                return Err(nian_application::SettingsRepositoryError::Persistence);
+            }
+            if enabled {
+                let ids = state
+                    .cameras
+                    .iter()
+                    .map(|camera| camera.camera_id().as_str().to_owned())
+                    .collect::<Vec<_>>();
+                state.desired_camera = ids.first().cloned();
+                state.extra_desired_camera = ids.get(1).cloned();
+                state.additional_desired_cameras = ids.into_iter().skip(2).collect();
+            } else {
+                state.desired_camera = None;
+                state.extra_desired_camera = None;
+                state.additional_desired_cameras.clear();
+            }
+            Ok(())
         }
     }
 
@@ -2154,6 +2326,7 @@ mod tests {
             cameras: Vec::new(),
             desired_camera: None,
             extra_desired_camera: None,
+            additional_desired_cameras: Vec::new(),
         }));
         let repository = TestRepository {
             state: state.clone(),
@@ -2447,6 +2620,30 @@ mod tests {
         );
     }
 
+    fn seed_named_recording_camera(
+        repository: &Arc<Mutex<TestRepositoryState>>,
+        camera_id: &str,
+        credential_ref: &str,
+    ) {
+        repository.lock().unwrap().cameras.push(
+            nian_domain::CameraConfig::new(
+                CameraId::parse(camera_id).unwrap(),
+                camera_id,
+                nian_domain::CameraSource::Rtsp(
+                    nian_domain::CameraEndpoint::new(
+                        nian_domain::Host::parse("192.168.1.99").unwrap(),
+                        554,
+                        "/stream1",
+                    )
+                    .unwrap(),
+                ),
+                AudioPolicy::CopyAll,
+                CredentialRef::parse(credential_ref).unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+
     fn lifecycle_state(
         root: &std::path::Path,
         configure_playback_storage: bool,
@@ -2492,9 +2689,9 @@ mod tests {
         )
     }
 
-    fn wait_for_starts(runner: &CountingRecordingRunner, expected: usize) {
+    fn wait_for_starts(starts: &AtomicUsize, expected: usize) {
         for _ in 0..200 {
-            if runner.starts.load(Ordering::SeqCst) >= expected {
+            if starts.load(Ordering::SeqCst) >= expected {
                 return;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -2679,7 +2876,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("recordings");
         let (state, repository, _runner, _probe) = lifecycle_state(&root, false);
-        restore_desired_recording_locked(&state).unwrap();
+        restore_desired_recordings_locked(&state).unwrap();
 
         state.update_installing.store(true, Ordering::Release);
         begin_update_shutdown(&state).unwrap();
@@ -2697,10 +2894,100 @@ mod tests {
                 .recording_controller
                 .lock()
                 .unwrap()
-                .status()
+                .status(&CameraId::parse("front-door").unwrap())
                 .unwrap()
                 .state,
             RecordingState::Stopped,
+        );
+    }
+
+    #[test]
+    fn update_shutdown_preserves_all_desired_recording_intents() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, runner, _probe) = lifecycle_state(&root, false);
+        seed_second_recording_camera(&repository);
+        repository.lock().unwrap().extra_desired_camera = Some("back-door".to_owned());
+        restore_desired_recordings_locked(&state).unwrap();
+        wait_for_starts(&runner.starts, 2);
+
+        state.update_installing.store(true, Ordering::Release);
+        begin_update_shutdown(&state).unwrap();
+
+        assert_eq!(
+            state.lifecycle.state().unwrap(),
+            DesktopLifecycleState::Quitting
+        );
+        assert_eq!(
+            state
+                .camera_service
+                .lock()
+                .unwrap()
+                .recording_enabled_cameras()
+                .unwrap(),
+            vec![
+                CameraId::parse("back-door").unwrap(),
+                CameraId::parse("front-door").unwrap(),
+            ]
+        );
+        assert!(
+            state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .active_cameras()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn suspending_admission_wins_over_waiting_camera_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, _runner, _probe) = lifecycle_state(&root, true);
+        seed_second_recording_camera(&repository);
+        repository.lock().unwrap().desired_camera = None;
+        let state = Arc::new(state);
+        let gate = state.control_gate.lock().unwrap();
+        let start_state = state.clone();
+        let start = std::thread::spawn(move || start_recording(&start_state, "back-door"));
+        state.lifecycle.begin_suspend().unwrap();
+        drop(gate);
+        let error = start.join().unwrap().unwrap_err();
+        assert_eq!(error.code, "suspending");
+        assert!(
+            !state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .is_owned(&CameraId::parse("back-door").unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn quitting_admission_wins_over_waiting_camera_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, _runner, _probe) = lifecycle_state(&root, true);
+        seed_second_recording_camera(&repository);
+        repository.lock().unwrap().desired_camera = None;
+        let state = Arc::new(state);
+        let gate = state.control_gate.lock().unwrap();
+        let start_state = state.clone();
+        let start = std::thread::spawn(move || start_recording(&start_state, "back-door"));
+        state.lifecycle.begin_quit().unwrap();
+        drop(gate);
+        let error = start.join().unwrap().unwrap_err();
+        assert_eq!(error.code, "quitting");
+        assert!(
+            !state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .is_owned(&CameraId::parse("back-door").unwrap())
+                .unwrap()
         );
     }
 
@@ -2820,16 +3107,16 @@ mod tests {
     }
 
     #[test]
-    fn recording_status_observer_drives_tray_projection_without_frontend_polling() {
+    fn recording_status_observer_drives_tray_refresh_without_frontend_polling() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("recordings");
         let (state, _repository, _runner, _probe) = lifecycle_state(&root, true);
         let (tx, rx) = mpsc::channel();
-        let projections = Arc::new(Mutex::new(Vec::new()));
-        let captured = projections.clone();
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let captured = refreshes.clone();
         let watcher = std::thread::spawn(move || {
-            run_tray_watch_loop(rx, |status| {
-                captured.lock().unwrap().push(tray_projection(status, true));
+            run_tray_watch_loop(rx, || {
+                captured.fetch_add(1, Ordering::SeqCst);
             });
         });
 
@@ -2843,8 +3130,14 @@ mod tests {
         *state.recording_controller.lock().unwrap() = controller;
 
         start_recording(&state, "front-door").unwrap();
+        let camera_id = CameraId::parse("front-door").unwrap();
         for _ in 0..200 {
-            let status = state.recording_controller.lock().unwrap().status().unwrap();
+            let status = state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .status(&camera_id)
+                .unwrap();
             if status.state == RecordingState::Failed {
                 break;
             }
@@ -2852,35 +3145,11 @@ mod tests {
         }
         tx.send(TrayWatchMessage::Shutdown).unwrap();
         watcher.join().unwrap();
-
-        let projections = projections.lock().unwrap();
-        let labels = projections
-            .iter()
-            .map(|projection| projection.status_text.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            labels,
-            vec![
-                "Recording status: Stopped",
-                "Recording status: Starting",
-                "Recording status: Recovering",
-                "Recording status: Connecting",
-                "Recording status: Recording",
-                "Recording status: Backoff",
-                "Recording status: Failed",
-            ]
-        );
-        assert!(projections.last().unwrap().stop_enabled);
-        state
-            .recording_controller
-            .lock()
-            .unwrap()
-            .shutdown()
-            .unwrap();
+        assert!(refreshes.load(Ordering::SeqCst) >= 5);
     }
 
     #[test]
-    fn tray_stop_clears_intent_before_publishing_stopping_runtime() {
+    fn tray_stop_all_clears_intent_before_publishing_stopping_runtime() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("recordings");
         let (state, repository, _default_runner, _probe) = lifecycle_state(&root, true);
@@ -2900,16 +3169,15 @@ mod tests {
             .unwrap();
 
         start_recording(&state, "front-door").unwrap();
-        for _ in 0..200 {
-            if runner.starts.load(Ordering::SeqCst) == 1 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_for_starts(&runner.starts, 1);
         while rx.try_recv().is_ok() {}
 
-        let stopped = stop_recording(&state).unwrap();
-        assert_eq!(stopped.state, RecordingState::Stopping);
+        let statuses = stop_all_recordings(&state).unwrap();
+        assert!(
+            statuses
+                .iter()
+                .any(|status| status.state == RecordingState::Stopping)
+        );
         assert!(repository.lock().unwrap().desired_camera.is_none());
         assert_eq!(
             rx.recv_timeout(Duration::from_millis(50)).unwrap(),
@@ -2928,23 +3196,88 @@ mod tests {
             .recording_controller
             .lock()
             .unwrap()
-            .shutdown()
+            .shutdown_all()
             .unwrap();
     }
 
     #[test]
+    fn stop_all_persistence_failure_leaves_every_runtime_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
+        seed_second_recording_camera(&repository);
+        repository.lock().unwrap().extra_desired_camera = Some("back-door".to_owned());
+        restore_desired_recordings_locked(&state).unwrap();
+        wait_for_starts(&runner.starts, 2);
+        repository.lock().unwrap().fail_desired_write = true;
+
+        let error = stop_all_recordings(&state).unwrap_err();
+        assert_eq!(error.code, "desired_state_failed");
+        assert_eq!(
+            state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .active_cameras()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            state
+                .camera_service
+                .lock()
+                .unwrap()
+                .recording_enabled_cameras()
+                .unwrap(),
+            vec![
+                CameraId::parse("back-door").unwrap(),
+                CameraId::parse("front-door").unwrap(),
+            ]
+        );
+        repository.lock().unwrap().fail_desired_write = false;
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown_all()
+            .unwrap();
+    }
+
+    #[test]
+    fn tray_projection_summarizes_multiple_cameras_without_fake_global_state() {
+        let statuses = vec![
+            RecordingStatus {
+                state: RecordingState::Recording,
+                camera_id: Some("cam-a".to_owned()),
+                ..RecordingStatus::default()
+            },
+            RecordingStatus {
+                state: RecordingState::Backoff,
+                camera_id: Some("cam-b".to_owned()),
+                ..RecordingStatus::default()
+            },
+        ];
+        let projection = tray_projection(&statuses, 3);
+        assert_eq!(projection.status_text, "Recording: 3 cameras");
+        assert!(projection.stop_enabled);
+    }
+
+    #[test]
     fn tray_stop_enablement_includes_persisted_intent_but_not_off_stopping() {
-        assert!(!tray_projection(&RecordingStatus::default(), false).stop_enabled);
+        assert!(!tray_projection(&[], 0).stop_enabled);
         let failed = RecordingStatus {
             state: RecordingState::Failed,
+            camera_id: Some("cam-a".to_owned()),
             ..RecordingStatus::default()
         };
-        assert!(tray_projection(&failed, true).stop_enabled);
+        assert!(tray_projection(&[failed], 1).stop_enabled);
         let stopping = RecordingStatus {
             state: RecordingState::Stopping,
+            camera_id: Some("cam-a".to_owned()),
             ..RecordingStatus::default()
         };
-        assert!(!tray_projection(&stopping, false).stop_enabled);
+        assert!(!tray_projection(&[stopping], 0).stop_enabled);
     }
 
     #[test]
@@ -2956,14 +3289,12 @@ mod tests {
         let exited = Arc::new(AtomicBool::new(false));
         let thread_exited = exited.clone();
         let thread = std::thread::spawn(move || {
-            run_tray_watch_loop(rx, |_| {});
+            run_tray_watch_loop(rx, || {});
             thread_exited.store(true, Ordering::Release);
         });
         *state.tray_watch_tx.lock().unwrap() = Some(tx);
         *state.tray_thread.lock().unwrap() = Some(thread);
-
         shutdown_tray_watcher(&state);
-
         assert!(exited.load(Ordering::Acquire));
         assert!(state.tray_thread.lock().unwrap().is_none());
     }
@@ -2974,30 +3305,28 @@ mod tests {
         let root = temp.path().join("recordings");
         let (state, repository, runner, _probe) = lifecycle_state(&root, true);
 
-        let restored = restore_desired_recording_locked(&state).unwrap().unwrap();
-        assert_eq!(restored.camera_id.as_deref(), Some("front-door"));
-        wait_for_starts(&runner, 1);
+        let restored = restore_desired_recordings_locked(&state).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].camera_id.as_deref(), Some("front-door"));
+        wait_for_starts(&runner.starts, 1);
         assert_eq!(
             state
                 .recording_controller
                 .lock()
                 .unwrap()
-                .active_camera()
-                .unwrap()
-                .as_ref()
-                .map(CameraId::as_str),
-            Some("front-door")
+                .active_cameras()
+                .unwrap(),
+            vec![CameraId::parse("front-door").unwrap()]
         );
         assert_eq!(
             repository.lock().unwrap().desired_camera.as_deref(),
             Some("front-door")
         );
-
         state
             .recording_controller
             .lock()
             .unwrap()
-            .shutdown()
+            .shutdown_all()
             .unwrap();
     }
 
@@ -3013,118 +3342,307 @@ mod tests {
         );
 
         let error = start_recording(&state, "front-door").unwrap_err();
-
         assert_eq!(error.code, "worker_unavailable");
         assert_eq!(
             repository.lock().unwrap().desired_camera.as_deref(),
             Some("front-door")
         );
         assert_eq!(runner.starts.load(Ordering::SeqCst), 0);
-        let status = state.recording_controller.lock().unwrap().status().unwrap();
+        let status = state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .status(&CameraId::parse("front-door").unwrap())
+            .unwrap();
         assert_eq!(status.state, RecordingState::Failed);
     }
 
     #[test]
-    fn rejected_second_camera_start_preserves_intent_until_prior_runner_is_reaped() {
+    fn concurrent_start_of_different_cameras_admits_both() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("recordings");
-        let (state, repository, _default_runner, _probe) = lifecycle_state(&root, true);
+        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
         seed_second_recording_camera(&repository);
         repository.lock().unwrap().desired_camera = None;
-        let runner = Arc::new(ParkedStoppingRunner::default());
-        *state.recording_controller.lock().unwrap() = RecordingController::new(runner.clone());
-
-        start_recording(&state, "front-door").unwrap();
-        for _ in 0..200 {
-            if runner.starts.load(Ordering::SeqCst) == 1 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+        let state = Arc::new(state);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut joins = Vec::new();
+        for camera_id in ["front-door", "back-door"] {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                start_recording(&state, camera_id)
+            }));
         }
-        assert_eq!(runner.starts.load(Ordering::SeqCst), 1);
+        barrier.wait();
+        let results = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(results.iter().all(Result::is_ok));
+        wait_for_starts(&runner.starts, 2);
         assert_eq!(
-            repository.lock().unwrap().desired_camera.as_deref(),
-            Some("front-door")
-        );
-
-        let error = start_recording(&state, "back-door").unwrap_err();
-        assert_eq!(error.code, "already_recording");
-        assert_eq!(
-            repository.lock().unwrap().desired_camera.as_deref(),
-            Some("front-door")
-        );
-        assert_eq!(runner.starts.load(Ordering::SeqCst), 1);
-
-        let stopped = stop_recording(&state).unwrap();
-        assert_eq!(stopped.state, RecordingState::Stopping);
-        assert!(repository.lock().unwrap().desired_camera.is_none());
-        for _ in 0..200 {
-            if runner.stop_seen.load(Ordering::Acquire) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(runner.stop_seen.load(Ordering::Acquire));
-
-        let error = start_recording(&state, "back-door").unwrap_err();
-        assert_eq!(error.code, "already_recording");
-        assert!(repository.lock().unwrap().desired_camera.is_none());
-        assert_eq!(runner.starts.load(Ordering::SeqCst), 1);
-
-        runner.release.store(true, Ordering::Release);
-        for _ in 0..200 {
-            if state
+            state
                 .recording_controller
                 .lock()
                 .unwrap()
-                .ensure_startable()
-                .is_ok()
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-
-        start_recording(&state, "back-door").unwrap();
-        for _ in 0..200 {
-            if runner.starts.load(Ordering::SeqCst) == 2 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(runner.starts.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            repository.lock().unwrap().desired_camera.as_deref(),
-            Some("back-door")
+                .active_cameras()
+                .unwrap()
+                .len(),
+            2
         );
         state
             .recording_controller
             .lock()
             .unwrap()
-            .shutdown()
+            .shutdown_all()
             .unwrap();
     }
 
     #[test]
-    fn multiple_persisted_desired_cameras_fail_closed_without_spawning() {
+    fn concurrent_duplicate_start_creates_exactly_one_camera_slot() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("recordings");
         let (state, repository, runner, _probe) = lifecycle_state(&root, true);
-        repository.lock().unwrap().extra_desired_camera = Some("back-door".to_owned());
+        repository.lock().unwrap().desired_camera = None;
+        let state = Arc::new(state);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                start_recording(&state, "front-door")
+            }));
+        }
+        barrier.wait();
+        let results = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .filter(|error| error.code == "already_recording")
+                .count(),
+            1
+        );
+        wait_for_starts(&runner.starts, 1);
+        assert_eq!(runner.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .active_cameras()
+                .unwrap()
+                .len(),
+            1
+        );
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown_all()
+            .unwrap();
+    }
 
-        let error = restore_desired_recording_locked(&state).unwrap_err();
+    #[test]
+    fn second_camera_start_is_independent_and_stopping_first_preserves_second() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
+        seed_second_recording_camera(&repository);
+        {
+            let mut repo = repository.lock().unwrap();
+            repo.desired_camera = None;
+            repo.extra_desired_camera = None;
+        }
 
-        assert_eq!(error.code, "desired_state_failed");
-        assert_eq!(runner.starts.load(Ordering::SeqCst), 0);
+        start_recording(&state, "front-door").unwrap();
+        start_recording(&state, "back-door").unwrap();
+        wait_for_starts(&runner.starts, 2);
+        let desired = state
+            .camera_service
+            .lock()
+            .unwrap()
+            .recording_enabled_cameras()
+            .unwrap();
+        assert_eq!(
+            desired,
+            vec![
+                CameraId::parse("back-door").unwrap(),
+                CameraId::parse("front-door").unwrap()
+            ]
+        );
+
+        let stopped = stop_recording(&state, "front-door").unwrap();
+        assert_eq!(stopped.state, RecordingState::Stopping);
         assert!(
             state
                 .recording_controller
                 .lock()
                 .unwrap()
-                .active_camera()
+                .is_owned(&CameraId::parse("back-door").unwrap())
                 .unwrap()
-                .is_none()
         );
+        assert_eq!(
+            state
+                .camera_service
+                .lock()
+                .unwrap()
+                .recording_enabled_cameras()
+                .unwrap(),
+            vec![CameraId::parse("back-door").unwrap()]
+        );
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown_all()
+            .unwrap();
+    }
+
+    #[test]
+    fn multiple_persisted_desired_cameras_restore_independently() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
+        seed_second_recording_camera(&repository);
+        repository.lock().unwrap().extra_desired_camera = Some("back-door".to_owned());
+
+        let restored = restore_desired_recordings_locked(&state).unwrap();
+        wait_for_starts(&runner.starts, 2);
+        assert_eq!(restored.len(), 2);
+        assert_eq!(
+            state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .active_cameras()
+                .unwrap()
+                .len(),
+            2
+        );
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown_all()
+            .unwrap();
+    }
+
+    #[test]
+    fn restoration_isolates_missing_credentials_from_other_desired_cameras() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
+        seed_named_recording_camera(&repository, "bad-camera", "missing-credential-ref");
+        repository.lock().unwrap().extra_desired_camera = Some("bad-camera".to_owned());
+
+        let restored = restore_desired_recordings_locked(&state).unwrap();
+        wait_for_starts(&runner.starts, 1);
+        assert_eq!(restored.len(), 2);
+        let bad = state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .status(&CameraId::parse("bad-camera").unwrap())
+            .unwrap();
+        assert_eq!(bad.state, RecordingState::Failed);
+        assert_eq!(bad.failure_category.as_deref(), Some("credential_store"));
+        assert!(
+            state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .is_owned(&CameraId::parse("front-door").unwrap())
+                .unwrap()
+        );
+        assert_eq!(
+            state
+                .camera_service
+                .lock()
+                .unwrap()
+                .recording_enabled_cameras()
+                .unwrap(),
+            vec![
+                CameraId::parse("bad-camera").unwrap(),
+                CameraId::parse("front-door").unwrap(),
+            ]
+        );
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown_all()
+            .unwrap();
+    }
+
+    #[test]
+    fn restoration_applies_capacity_in_camera_id_order_without_clearing_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
+        let extra = [
+            "cam-01", "cam-02", "cam-03", "cam-04", "cam-05", "cam-06", "cam-07", "cam-08",
+        ];
+        for camera_id in extra {
+            seed_named_recording_camera(&repository, camera_id, "desktop-lifecycle-test-ref");
+        }
+        repository.lock().unwrap().additional_desired_cameras = extra
+            .iter()
+            .map(|camera_id| (*camera_id).to_owned())
+            .collect();
+
+        let restored = restore_desired_recordings_locked(&state).unwrap();
+        wait_for_starts(
+            &runner.starts,
+            nian_application::MAX_SIMULTANEOUS_RECORDINGS,
+        );
+        assert_eq!(restored.len(), extra.len() + 1);
+        let active = state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .active_cameras()
+            .unwrap();
+        assert_eq!(active.len(), nian_application::MAX_SIMULTANEOUS_RECORDINGS);
+        assert_eq!(
+            active.iter().map(CameraId::as_str).collect::<Vec<_>>(),
+            extra.to_vec()
+        );
+        let excess = state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .status(&CameraId::parse("front-door").unwrap())
+            .unwrap();
+        assert_eq!(excess.state, RecordingState::Failed);
+        assert_eq!(
+            excess.failure_category.as_deref(),
+            Some("recording_capacity")
+        );
+        assert_eq!(
+            state
+                .camera_service
+                .lock()
+                .unwrap()
+                .recording_enabled_cameras()
+                .unwrap()
+                .len(),
+            extra.len() + 1
+        );
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown_all()
+            .unwrap();
     }
 
     #[test]
@@ -3134,10 +3652,14 @@ mod tests {
         let (state, repository, _runner, _probe) = lifecycle_state(&root, true);
         repository.lock().unwrap().settings.storage_root = None;
 
-        let error = restore_desired_recording_locked(&state).unwrap_err();
-
-        assert_eq!(error.code, "storage_failed");
-        let status = state.recording_controller.lock().unwrap().status().unwrap();
+        let restored = restore_desired_recordings_locked(&state).unwrap();
+        assert_eq!(restored.len(), 1);
+        let status = state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .status(&CameraId::parse("front-door").unwrap())
+            .unwrap();
         assert_eq!(status.state, RecordingState::Failed);
         assert_eq!(status.camera_id.as_deref(), Some("front-door"));
         assert_eq!(
@@ -3152,20 +3674,18 @@ mod tests {
         let root = temp.path().join("recordings");
         let (state, repository, _runner, _probe) = lifecycle_state(&root, true);
         repository.lock().unwrap().settings.storage_root = None;
-        restore_desired_recording_locked(&state).unwrap_err();
+        restore_desired_recordings_locked(&state).unwrap();
 
-        let status = stop_recording(&state).unwrap();
-
+        let status = stop_recording(&state, "front-door").unwrap();
         assert_eq!(status.state, RecordingState::Failed);
         assert!(repository.lock().unwrap().desired_camera.is_none());
         assert!(
-            state
+            !state
                 .recording_controller
                 .lock()
                 .unwrap()
-                .active_camera()
+                .is_owned(&CameraId::parse("front-door").unwrap())
                 .unwrap()
-                .is_none()
         );
     }
 
@@ -3174,11 +3694,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("recordings");
         let (state, repository, runner, _probe) = lifecycle_state(&root, true);
-        restore_desired_recording_locked(&state).unwrap();
-        wait_for_starts(&runner, 1);
+        restore_desired_recordings_locked(&state).unwrap();
+        wait_for_starts(&runner.starts, 1);
         repository.lock().unwrap().fail_desired_write = true;
 
-        let error = stop_recording(&state).unwrap_err();
+        let error = stop_recording(&state, "front-door").unwrap_err();
 
         assert_eq!(error.code, "desired_state_failed");
         assert_eq!(
@@ -3186,7 +3706,9 @@ mod tests {
             Some("front-door")
         );
         let mut controller = state.recording_controller.lock().unwrap();
-        let status = controller.status().unwrap();
+        let status = controller
+            .status(&CameraId::parse("front-door").unwrap())
+            .unwrap();
         assert_ne!(status.state, RecordingState::Stopping);
         assert_eq!(
             controller
@@ -3202,7 +3724,62 @@ mod tests {
             .recording_controller
             .lock()
             .unwrap()
-            .shutdown()
+            .shutdown_all()
+            .unwrap();
+    }
+
+    #[test]
+    fn suspend_resume_stops_and_restores_all_desired_cameras_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
+        seed_second_recording_camera(&repository);
+        repository.lock().unwrap().extra_desired_camera = Some("back-door".to_owned());
+        restore_desired_recordings_locked(&state).unwrap();
+        wait_for_starts(&runner.starts, 2);
+
+        handle_power_event(&state, nian_platform_windows::PowerEvent::Suspend).unwrap();
+        assert_eq!(
+            state.lifecycle.state().unwrap(),
+            DesktopLifecycleState::Suspending
+        );
+        handle_power_event(&state, nian_platform_windows::PowerEvent::Resume).unwrap();
+        wait_for_starts(&runner.starts, 4);
+        assert_eq!(
+            state.lifecycle.state().unwrap(),
+            DesktopLifecycleState::Running
+        );
+        assert_eq!(
+            state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .active_cameras()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            state
+                .camera_service
+                .lock()
+                .unwrap()
+                .recording_enabled_cameras()
+                .unwrap(),
+            vec![
+                CameraId::parse("back-door").unwrap(),
+                CameraId::parse("front-door").unwrap(),
+            ]
+        );
+
+        handle_power_event(&state, nian_platform_windows::PowerEvent::Resume).unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(runner.starts.load(Ordering::SeqCst), 4);
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown_all()
             .unwrap();
     }
 
@@ -3211,8 +3788,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("recordings");
         let (state, repository, runner, _probe) = lifecycle_state(&root, true);
-        restore_desired_recording_locked(&state).unwrap();
-        wait_for_starts(&runner, 1);
+        restore_desired_recordings_locked(&state).unwrap();
+        wait_for_starts(&runner.starts, 1);
 
         handle_power_event(&state, nian_platform_windows::PowerEvent::Suspend).unwrap();
         assert_eq!(
@@ -3220,7 +3797,7 @@ mod tests {
             DesktopLifecycleState::Suspending
         );
         handle_power_event(&state, nian_platform_windows::PowerEvent::Resume).unwrap();
-        wait_for_starts(&runner, 2);
+        wait_for_starts(&runner.starts, 2);
         assert_eq!(
             state.lifecycle.state().unwrap(),
             DesktopLifecycleState::Running
@@ -3237,7 +3814,7 @@ mod tests {
             .recording_controller
             .lock()
             .unwrap()
-            .shutdown()
+            .shutdown_all()
             .unwrap();
     }
 
@@ -3248,12 +3825,12 @@ mod tests {
         let (state, _repository, runner, _probe) = lifecycle_state(&root, true);
         state.lifecycle.begin_suspend().unwrap();
 
-        let error = restore_desired_recording_locked(&state).unwrap_err();
+        let error = restore_desired_recordings_locked(&state).unwrap_err();
 
         assert_eq!(error.code, "suspending");
         assert_eq!(runner.starts.load(Ordering::SeqCst), 0);
         state.lifecycle.begin_quit().unwrap();
-        let error = restore_desired_recording_locked(&state).unwrap_err();
+        let error = restore_desired_recordings_locked(&state).unwrap_err();
         assert_eq!(error.code, "quitting");
         assert_eq!(runner.starts.load(Ordering::SeqCst), 0);
     }
@@ -3272,8 +3849,8 @@ mod tests {
 
         {
             let _gate = state.control_gate.lock().unwrap();
-            restore_desired_recording_locked(&state).unwrap();
-            wait_for_starts(&runner, 1);
+            restore_desired_recordings_locked(&state).unwrap();
+            wait_for_starts(&runner.starts, 1);
             assert_eq!(
                 state.lifecycle.state().unwrap(),
                 DesktopLifecycleState::Running
@@ -3290,7 +3867,7 @@ mod tests {
             .recording_controller
             .lock()
             .unwrap()
-            .shutdown()
+            .shutdown_all()
             .unwrap();
     }
 
@@ -3312,11 +3889,11 @@ mod tests {
 
         {
             let _gate = state.control_gate.lock().unwrap();
-            restore_desired_recording_locked(&state).unwrap();
-            wait_for_starts(&runner, 1);
+            restore_desired_recordings_locked(&state).unwrap();
+            wait_for_starts(&runner.starts, 1);
         }
         run_power_dispatch_loop(rx, |event| handle_power_event(&state, event).unwrap());
-        wait_for_starts(&runner, 2);
+        wait_for_starts(&runner.starts, 2);
 
         assert_eq!(
             state.lifecycle.state().unwrap(),
@@ -3336,7 +3913,7 @@ mod tests {
             .recording_controller
             .lock()
             .unwrap()
-            .shutdown()
+            .shutdown_all()
             .unwrap();
     }
 
@@ -3345,15 +3922,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("recordings");
         let (state, _repository, runner, probe) = lifecycle_state(&root, false);
-        restore_desired_recording_locked(&state).unwrap();
-        wait_for_starts(&runner, 1);
+        restore_desired_recordings_locked(&state).unwrap();
+        wait_for_starts(&runner.starts, 1);
 
         handle_power_event(&state, nian_platform_windows::PowerEvent::Suspend).unwrap();
         let error =
             handle_power_event(&state, nian_platform_windows::PowerEvent::Resume).unwrap_err();
 
         assert_eq!(error.code, "internal");
-        wait_for_starts(&runner, 2);
+        wait_for_starts(&runner.starts, 2);
         assert_eq!(
             state.lifecycle.state().unwrap(),
             DesktopLifecycleState::Running
@@ -3380,7 +3957,7 @@ mod tests {
             .recording_controller
             .lock()
             .unwrap()
-            .shutdown()
+            .shutdown_all()
             .unwrap();
     }
 
@@ -3405,8 +3982,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("recordings");
         let (state, _repository, runner, _probe) = lifecycle_state(&root, true);
-        restore_desired_recording_locked(&state).unwrap();
-        wait_for_starts(&runner, 1);
+        restore_desired_recordings_locked(&state).unwrap();
+        wait_for_starts(&runner.starts, 1);
         let autostart = FakeAutostart::default();
 
         {
@@ -3434,7 +4011,7 @@ mod tests {
             .recording_controller
             .lock()
             .unwrap()
-            .shutdown()
+            .shutdown_all()
             .unwrap();
     }
 
@@ -3472,6 +4049,61 @@ mod tests {
         assert_eq!(playback.configured_storage_root(), Some(root.as_path()));
         assert!(playback.session_active(&opened.session_id).unwrap());
         playback.close(&opened.session_id).unwrap();
+    }
+
+    #[test]
+    fn desired_camera_cannot_be_deleted_even_without_a_live_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, _runner, _probe) = lifecycle_state(&root, true);
+
+        let error = delete_camera_config(&state, "front-door").unwrap_err();
+        assert_eq!(error.code, "camera_busy");
+        assert!(
+            repository
+                .lock()
+                .unwrap()
+                .cameras
+                .iter()
+                .any(|camera| camera.camera_id().as_str() == "front-door")
+        );
+    }
+
+    #[test]
+    fn unrelated_recording_does_not_block_deleting_a_stopped_camera() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
+        seed_second_recording_camera(&repository);
+        seed_named_recording_camera(&repository, "stopped-camera", "desktop-lifecycle-test-ref");
+        repository.lock().unwrap().desired_camera = None;
+        start_recording(&state, "back-door").unwrap();
+        wait_for_starts(&runner.starts, 1);
+
+        let deleted = delete_camera_config(&state, "stopped-camera").unwrap();
+        assert_eq!(deleted.value.camera_id, "stopped-camera");
+        assert!(
+            state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .is_owned(&CameraId::parse("back-door").unwrap())
+                .unwrap()
+        );
+        assert!(
+            !repository
+                .lock()
+                .unwrap()
+                .cameras
+                .iter()
+                .any(|camera| camera.camera_id().as_str() == "stopped-camera")
+        );
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown_all()
+            .unwrap();
     }
 
     #[test]

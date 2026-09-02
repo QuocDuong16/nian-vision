@@ -1,7 +1,7 @@
 // Integration tests use panicking assertions/setup helpers deliberately.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,7 +27,7 @@ struct RepoState {
     fail_update: bool,
     fail_delete: bool,
     hide_get_camera_once: bool,
-    desired_camera: Option<String>,
+    desired_cameras: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -107,12 +107,10 @@ impl SettingsRepository for FakeRepo {
         self.0
             .lock()
             .unwrap()
-            .desired_camera
-            .as_deref()
-            .map(CameraId::parse)
-            .transpose()
-            .map(|camera| camera.into_iter().collect())
-            .map_err(|_| SettingsRepositoryError::Persistence)
+            .desired_cameras
+            .iter()
+            .map(|camera| CameraId::parse(camera).map_err(|_| SettingsRepositoryError::Persistence))
+            .collect()
     }
     fn set_recording_enabled(
         &mut self,
@@ -124,11 +122,20 @@ impl SettingsRepository for FakeRepo {
             return Ok(false);
         }
         if enabled {
-            state.desired_camera = Some(camera_id.as_str().to_owned());
-        } else if state.desired_camera.as_deref() == Some(camera_id.as_str()) {
-            state.desired_camera = None;
+            state.desired_cameras.insert(camera_id.as_str().to_owned());
+        } else {
+            state.desired_cameras.remove(camera_id.as_str());
         }
         Ok(true)
+    }
+    fn set_all_recording_enabled(&mut self, enabled: bool) -> Result<(), SettingsRepositoryError> {
+        let mut state = self.0.lock().unwrap();
+        if enabled {
+            state.desired_cameras = state.cameras.keys().cloned().collect();
+        } else {
+            state.desired_cameras.clear();
+        }
+        Ok(())
     }
 }
 

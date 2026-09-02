@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CamerasScreen } from "./CamerasScreen";
@@ -10,6 +10,15 @@ const camera: CameraSummary = {
   camera_id: "front-door",
   display_name: "Front door",
   host: "192.168.1.50",
+  port: 554,
+  path: "/stream1",
+  audio_policy: "copy_all",
+};
+
+const backCamera: CameraSummary = {
+  camera_id: "back-door",
+  display_name: "Back door",
+  host: "192.168.1.51",
   port: 554,
   path: "/stream1",
   audio_policy: "copy_all",
@@ -30,8 +39,8 @@ function installDesktop(cameras: CameraSummary[] = [], status: RecordingStatus =
   });
   vi.mocked(invoke).mockImplementation(async (command) => {
     if (command === "camera_list") return cameras;
-    if (command === "recording_status") return status;
-    if (command === "recording_intent") return { camera_id: status.camera_id };
+    if (command === "recording_statuses") return status.camera_id ? [status] : [];
+    if (command === "recording_intent") return { camera_ids: status.camera_id ? [status.camera_id] : [] };
     throw new Error(`unexpected command ${command}`);
   });
 }
@@ -83,7 +92,8 @@ describe("CamerasScreen", () => {
     let resolveProbe: ((value: unknown) => void) | undefined;
     vi.mocked(invoke).mockImplementation((command) => {
       if (command === "camera_list") return Promise.resolve([]);
-      if (command === "recording_status") return Promise.resolve(stopped);
+      if (command === "recording_statuses") return Promise.resolve([]);
+      if (command === "recording_intent") return Promise.resolve({ camera_ids: [] });
       if (command === "camera_probe") {
         return new Promise((resolve) => { resolveProbe = resolve; });
       }
@@ -109,18 +119,23 @@ describe("CamerasScreen", () => {
 
   it("uses backend recording state for Start and Stop transitions", async () => {
     installDesktop([camera]);
-    let desiredCamera: string | null = null;
-    vi.mocked(invoke).mockImplementation(async (command) => {
+    let desiredCameras: string[] = [];
+    let runtime: RecordingStatus[] = [];
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
       if (command === "camera_list") return [camera];
-      if (command === "recording_status") return stopped;
-      if (command === "recording_intent") return { camera_id: desiredCamera };
+      if (command === "recording_statuses") return runtime;
+      if (command === "recording_intent") return { camera_ids: desiredCameras };
       if (command === "recording_start") {
-        desiredCamera = camera.camera_id;
-        return { ...stopped, state: "starting", camera_id: camera.camera_id };
+        expect(args).toEqual({ cameraId: camera.camera_id });
+        desiredCameras = [camera.camera_id];
+        runtime = [{ ...stopped, state: "starting", camera_id: camera.camera_id }];
+        return runtime[0];
       }
       if (command === "recording_stop") {
-        desiredCamera = null;
-        return { ...stopped, state: "stopping", camera_id: camera.camera_id };
+        expect(args).toEqual({ cameraId: camera.camera_id });
+        desiredCameras = [];
+        runtime = [{ ...stopped, state: "stopping", camera_id: camera.camera_id }];
+        return runtime[0];
       }
       throw new Error(`unexpected command ${command}`);
     });
@@ -134,12 +149,54 @@ describe("CamerasScreen", () => {
     expect(vi.mocked(invoke).mock.calls.some(([name]) => name === "recording_stop")).toBe(true);
   });
 
+  it("keeps unrelated camera controls usable while another row starts", async () => {
+    installDesktop([camera, backCamera]);
+    let desiredCameras = [camera.camera_id];
+    let runtime: RecordingStatus[] = [{
+      ...stopped,
+      state: "recording",
+      camera_id: camera.camera_id,
+    }];
+    let resolveBackStart: ((value: RecordingStatus) => void) | undefined;
+    vi.mocked(invoke).mockImplementation((command, args) => {
+      if (command === "camera_list") return Promise.resolve([camera, backCamera]);
+      if (command === "recording_statuses") return Promise.resolve(runtime);
+      if (command === "recording_intent") return Promise.resolve({ camera_ids: desiredCameras });
+      if (command === "recording_start") {
+        expect(args).toEqual({ cameraId: backCamera.camera_id });
+        return new Promise((resolve) => {
+          resolveBackStart = resolve;
+        });
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<CamerasScreen />);
+    await screen.findByText("Front door");
+    const backCard = screen.getByText("Back door").closest("article");
+    const frontCard = screen.getByText("Front door").closest("article");
+    expect(backCard).toBeTruthy();
+    expect(frontCard).toBeTruthy();
+    fireEvent.click(within(backCard as HTMLElement).getByRole("button", { name: "Start" }));
+
+    await waitFor(() => expect((within(backCard as HTMLElement).getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(true));
+    expect((within(frontCard as HTMLElement).getByRole("button", { name: "Stop" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((within(frontCard as HTMLElement).getByRole("button", { name: "Edit" }) as HTMLButtonElement).disabled).toBe(false);
+
+    desiredCameras = [backCamera.camera_id, camera.camera_id];
+    const frontRecording = { ...stopped, state: "recording" as const, camera_id: camera.camera_id };
+    const backStarting = { ...stopped, state: "starting" as const, camera_id: backCamera.camera_id };
+    runtime = [frontRecording, backStarting];
+    resolveBackStart?.(backStarting);
+    await screen.findByText("Recording 2 cameras");
+  });
+
   it("displays backend errors instead of optimistic success", async () => {
     installDesktop([camera]);
     vi.mocked(invoke).mockImplementation(async (command) => {
       if (command === "camera_list") return [camera];
-      if (command === "recording_status") return stopped;
-      if (command === "recording_intent") return { camera_id: null };
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
       if (command === "recording_start") throw { code: "storage_failed", message: "recording storage is not configured" };
       throw new Error(`unexpected command ${command}`);
     });
@@ -153,8 +210,8 @@ describe("CamerasScreen", () => {
     installDesktop([camera]);
     vi.mocked(invoke).mockImplementation(async (command) => {
       if (command === "camera_list") return [camera];
-      if (command === "recording_status") return stopped;
-      if (command === "recording_intent") return { camera_id: null };
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
       if (command === "camera_delete") return { value: camera, warning: null };
       throw new Error(`unexpected command ${command}`);
     });

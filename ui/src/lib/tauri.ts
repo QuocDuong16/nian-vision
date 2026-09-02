@@ -76,7 +76,7 @@ export interface ApplicationSettings {
 }
 
 export interface RecordingIntent {
-  camera_id: string | null;
+  camera_ids: string[];
 }
 
 export interface DesktopError {

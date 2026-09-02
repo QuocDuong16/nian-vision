@@ -153,39 +153,39 @@ fn desired(camera: &str) -> DesiredRecording {
     }
 }
 
-fn wait_for(controller: &mut RecordingController, state: RecordingState) {
+fn wait_for(controller: &mut RecordingController, camera: &str, state: RecordingState) {
+    let camera_id = CameraId::parse(camera).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if controller.status().unwrap().state == state {
+        if controller.status(&camera_id).unwrap().state == state {
             return;
         }
         std::thread::yield_now();
     }
     panic!(
         "state did not reach {state:?}; current={:?}",
-        controller.status().unwrap()
+        controller.status(&camera_id).unwrap()
     );
 }
 
 #[test]
-fn start_recording_stop_transitions_and_second_camera_is_rejected() {
+fn simultaneous_cameras_start_and_stopping_one_preserves_the_other() {
     let mut controller = RecordingController::new(Arc::new(HappyRunner));
-    controller
-        .start(CameraId::parse("cam-a").unwrap(), desired("cam-a"))
-        .unwrap();
-    wait_for(&mut controller, RecordingState::Recording);
-    let status = controller.status().unwrap();
-    assert_eq!(status.finalized_segments, 1);
+    let a = CameraId::parse("cam-a").unwrap();
+    let b = CameraId::parse("cam-b").unwrap();
+    controller.start(a.clone(), desired("cam-a")).unwrap();
+    controller.start(b.clone(), desired("cam-b")).unwrap();
+    wait_for(&mut controller, "cam-a", RecordingState::Recording);
+    wait_for(&mut controller, "cam-b", RecordingState::Recording);
+    assert_eq!(controller.status(&a).unwrap().finalized_segments, 1);
+    assert_eq!(controller.status(&b).unwrap().finalized_segments, 1);
 
-    let error = controller
-        .start(CameraId::parse("cam-b").unwrap(), desired("cam-b"))
-        .unwrap_err();
-    assert_eq!(error, RecordingControllerError::AlreadyRecording);
-
-    let stopping = controller.stop().unwrap();
+    let stopping = controller.stop(&a).unwrap();
     assert_eq!(stopping.state, RecordingState::Stopping);
-    wait_for(&mut controller, RecordingState::Stopped);
-    assert_eq!(controller.active_camera().unwrap(), None);
+    wait_for(&mut controller, "cam-a", RecordingState::Stopped);
+    assert!(controller.is_owned(&b).unwrap());
+    controller.stop(&b).unwrap();
+    wait_for(&mut controller, "cam-b", RecordingState::Stopped);
 }
 
 #[test]
@@ -194,13 +194,15 @@ fn permanent_runner_failure_becomes_failed_without_infinite_restart() {
     controller
         .start(CameraId::parse("cam-a").unwrap(), desired("cam-a"))
         .unwrap();
-    wait_for(&mut controller, RecordingState::Failed);
-    let status = controller.status().unwrap();
+    wait_for(&mut controller, "cam-a", RecordingState::Failed);
+    let status = controller
+        .status(&CameraId::parse("cam-a").unwrap())
+        .unwrap();
     assert_eq!(status.failure_category.as_deref(), Some("storage_failed"));
     assert_eq!(controller.active_camera().unwrap(), None);
 }
 
-fn assert_terminal_before_return_blocks_second_start(first_terminal: &'static str) {
+fn assert_terminal_before_return_blocks_same_camera_restart(first_terminal: &'static str) {
     let entered = Arc::new(Barrier::new(2));
     let release = Arc::new((Mutex::new(false), Condvar::new()));
     let runner = Arc::new(TerminalBeforeReturnRunner {
@@ -210,20 +212,17 @@ fn assert_terminal_before_return_blocks_second_start(first_terminal: &'static st
         release: Arc::clone(&release),
     });
     let mut controller = RecordingController::new(runner);
+    let a = CameraId::parse("cam-a").unwrap();
 
-    controller
-        .start(CameraId::parse("cam-a").unwrap(), desired("cam-a"))
-        .unwrap();
+    controller.start(a.clone(), desired("cam-a")).unwrap();
     entered.wait();
-
-    // A terminal-looking worker observation must not release controller
-    // ownership while the runner is still parked before return.
-    assert_ne!(controller.status().unwrap().state, RecordingState::Failed);
-    assert_ne!(controller.status().unwrap().state, RecordingState::Stopped);
+    assert_ne!(controller.status(&a).unwrap().state, RecordingState::Failed);
+    assert_ne!(
+        controller.status(&a).unwrap().state,
+        RecordingState::Stopped
+    );
     assert_eq!(
-        controller
-            .start(CameraId::parse("cam-b").unwrap(), desired("cam-b"))
-            .unwrap_err(),
+        controller.start(a.clone(), desired("cam-a")).unwrap_err(),
         RecordingControllerError::AlreadyRecording
     );
 
@@ -235,36 +234,21 @@ fn assert_terminal_before_return_blocks_second_start(first_terminal: &'static st
     } else {
         RecordingState::Stopped
     };
-    wait_for(&mut controller, expected_terminal);
-
-    controller
-        .start(CameraId::parse("cam-b").unwrap(), desired("cam-b"))
-        .unwrap();
-    wait_for(&mut controller, RecordingState::Recording);
-    let b = controller.status().unwrap();
-    assert_eq!(b.camera_id.as_deref(), Some("cam-b"));
-    assert_eq!(b.state, RecordingState::Recording);
-
-    // A was joined before B was admitted, so no stale A finalizer can mutate B.
-    for _ in 0..100 {
-        std::thread::yield_now();
-    }
-    let still_b = controller.status().unwrap();
-    assert_eq!(still_b.camera_id.as_deref(), Some("cam-b"));
-    assert_eq!(still_b.state, RecordingState::Recording);
-
-    controller.stop().unwrap();
-    wait_for(&mut controller, RecordingState::Stopped);
+    wait_for(&mut controller, "cam-a", expected_terminal);
+    controller.start(a.clone(), desired("cam-a")).unwrap();
+    wait_for(&mut controller, "cam-a", RecordingState::Recording);
+    controller.stop(&a).unwrap();
+    wait_for(&mut controller, "cam-a", RecordingState::Stopped);
 }
 
 #[test]
 fn failed_terminal_observation_before_runner_return_cannot_admit_second_run() {
-    assert_terminal_before_return_blocks_second_start("failed");
+    assert_terminal_before_return_blocks_same_camera_restart("failed");
 }
 
 #[test]
 fn completed_terminal_observation_before_runner_return_cannot_admit_second_run() {
-    assert_terminal_before_return_blocks_second_start("completed");
+    assert_terminal_before_return_blocks_same_camera_restart("completed");
 }
 
 #[test]
@@ -277,24 +261,30 @@ fn runner_panic_becomes_failed_and_controller_remains_reusable() {
         .start(CameraId::parse("cam-a").unwrap(), desired("cam-a"))
         .unwrap();
 
-    wait_for(&mut controller, RecordingState::Failed);
-    let failed = controller.status().unwrap();
+    wait_for(&mut controller, "cam-a", RecordingState::Failed);
+    let failed = controller
+        .status(&CameraId::parse("cam-a").unwrap())
+        .unwrap();
     assert_eq!(
         failed.failure_category.as_deref(),
         Some("worker_unavailable")
     );
-    assert_eq!(failed.camera_id, None);
+    assert_eq!(failed.camera_id.as_deref(), Some("cam-a"));
 
     controller
         .start(CameraId::parse("cam-b").unwrap(), desired("cam-b"))
         .unwrap();
-    wait_for(&mut controller, RecordingState::Recording);
+    wait_for(&mut controller, "cam-b", RecordingState::Recording);
     assert_eq!(
-        controller.status().unwrap().camera_id.as_deref(),
+        controller
+            .status(&CameraId::parse("cam-b").unwrap())
+            .unwrap()
+            .camera_id
+            .as_deref(),
         Some("cam-b")
     );
-    controller.stop().unwrap();
-    wait_for(&mut controller, RecordingState::Stopped);
+    controller.stop(&CameraId::parse("cam-b").unwrap()).unwrap();
+    wait_for(&mut controller, "cam-b", RecordingState::Stopped);
 }
 
 #[test]
@@ -309,9 +299,11 @@ fn thread_spawn_failure_rolls_back_ownership_and_next_start_is_usable() {
         .unwrap_err();
     assert_eq!(error, RecordingControllerError::ThreadStart);
 
-    let failed = controller.status().unwrap();
+    let failed = controller
+        .status(&CameraId::parse("cam-a").unwrap())
+        .unwrap();
     assert_eq!(failed.state, RecordingState::Failed);
-    assert_eq!(failed.camera_id, None);
+    assert_eq!(failed.camera_id.as_deref(), Some("cam-a"));
     assert_eq!(
         failed.failure_category.as_deref(),
         Some("worker_unavailable")
@@ -321,13 +313,13 @@ fn thread_spawn_failure_rolls_back_ownership_and_next_start_is_usable() {
     controller
         .start(CameraId::parse("cam-b").unwrap(), desired("cam-b"))
         .unwrap();
-    wait_for(&mut controller, RecordingState::Recording);
+    wait_for(&mut controller, "cam-b", RecordingState::Recording);
     assert_eq!(
         controller.active_camera().unwrap().unwrap().as_str(),
         "cam-b"
     );
-    controller.stop().unwrap();
-    wait_for(&mut controller, RecordingState::Stopped);
+    controller.stop(&CameraId::parse("cam-b").unwrap()).unwrap();
+    wait_for(&mut controller, "cam-b", RecordingState::Stopped);
 }
 
 #[test]

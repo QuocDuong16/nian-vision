@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import { EmptyState } from "../components/EmptyState";
-import { STOPPED_STATUS, desktopError, invokeDesktop, isTauri } from "../lib/tauri";
+import { desktopError, invokeDesktop, isTauri } from "../lib/tauri";
 import type {
   CameraCommandInput,
   CameraMutation,
@@ -64,10 +64,6 @@ function statusLabel(state: RecordingState): string {
   return state.replaceAll("_", " ");
 }
 
-function cameraState(cameraId: string, status: RecordingStatus): RecordingState {
-  return status.camera_id === cameraId ? status.state : "stopped";
-}
-
 function ProbeSummary({ result }: { result: ProbeResult }) {
   return (
     <p className="success-message" role="status">
@@ -80,8 +76,8 @@ function ProbeSummary({ result }: { result: ProbeResult }) {
 
 export function CamerasScreen() {
   const [cameras, setCameras] = useState<CameraSummary[]>([]);
-  const [recording, setRecording] = useState<RecordingStatus>(STOPPED_STATUS);
-  const [intent, setIntent] = useState<RecordingIntent>({ camera_id: null });
+  const [recordings, setRecordings] = useState<RecordingStatus[]>([]);
+  const [intent, setIntent] = useState<RecordingIntent>({ camera_ids: [] });
   const [loading, setLoading] = useState(isTauri());
   const [error, setError] = useState<DesktopError | null>(null);
   const [form, setForm] = useState<CameraFormState | null>(null);
@@ -91,6 +87,7 @@ export function CamerasScreen() {
   const [probeResult, setProbeResult] = useState<ProbeResult | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<CameraSummary | null>(null);
   const [busyCamera, setBusyCamera] = useState<string | null>(null);
+  const [recordingBusyCamera, setRecordingBusyCamera] = useState<string | null>(null);
 
   const loadCameras = useCallback(async () => {
     if (!isTauri()) {
@@ -111,10 +108,10 @@ export function CamerasScreen() {
     if (!isTauri()) return;
     try {
       const [runtime, desired] = await Promise.all([
-        invokeDesktop<RecordingStatus>("recording_status"),
+        invokeDesktop<RecordingStatus[]>("recording_statuses"),
         invokeDesktop<RecordingIntent>("recording_intent"),
       ]);
-      setRecording(runtime);
+      setRecordings(runtime);
       setIntent(desired);
     } catch (cause) {
       setError(desktopError(cause));
@@ -129,9 +126,15 @@ export function CamerasScreen() {
     return () => window.clearInterval(timer);
   }, [loadCameras, refreshStatus]);
 
-  const globalActive = ACTIVE_STATES.has(recording.state);
-  const formCameraActive = form !== null && recording.camera_id === form.camera_id && globalActive;
+  const statusByCamera = useMemo(
+    () => new Map(recordings.filter((status) => status.camera_id).map((status) => [status.camera_id as string, status])),
+    [recordings],
+  );
+  const formStatus = form ? statusByCamera.get(form.camera_id) : undefined;
+  const formCameraActive = formStatus ? ACTIVE_STATES.has(formStatus.state) : false;
   const criticalFieldsDisabled = formCameraActive;
+  const activeCount = recordings.filter((status) => ACTIVE_STATES.has(status.state)).length;
+  const reconnectingCount = recordings.filter((status) => status.state === "backoff").length;
   const sortedCameras = useMemo(
     () => [...cameras].sort((a, b) => a.display_name.localeCompare(b.display_name)),
     [cameras],
@@ -213,21 +216,22 @@ export function CamerasScreen() {
   }
 
   async function toggleRecording(camera: CameraSummary) {
-    if (busyCamera) return;
-    setBusyCamera(camera.camera_id);
+    if (recordingBusyCamera === camera.camera_id) return;
+    setRecordingBusyCamera(camera.camera_id);
     setError(null);
     try {
-      const desiredOn = intent.camera_id === camera.camera_id;
-      const next = desiredOn
-        ? await invokeDesktop<RecordingStatus>("recording_stop")
-        : await invokeDesktop<RecordingStatus>("recording_start", { cameraId: camera.camera_id });
-      setRecording(next);
-      setIntent(await invokeDesktop<RecordingIntent>("recording_intent"));
+      const desiredOn = intent.camera_ids.includes(camera.camera_id);
+      if (desiredOn) {
+        await invokeDesktop<RecordingStatus>("recording_stop", { cameraId: camera.camera_id });
+      } else {
+        await invokeDesktop<RecordingStatus>("recording_start", { cameraId: camera.camera_id });
+      }
+      await refreshStatus();
     } catch (cause) {
       setError(desktopError(cause));
       await refreshStatus();
     } finally {
-      setBusyCamera(null);
+      setRecordingBusyCamera(null);
     }
   }
 
@@ -257,10 +261,12 @@ export function CamerasScreen() {
       <div className="screen-toolbar">
         <div>
           <h2>Cameras</h2>
-          <p className="muted">Saved RTSP cameras. M5 records one camera at a time.</p>
+          <p className="muted">Saved RTSP cameras. M9 records independent cameras simultaneously.</p>
         </div>
         <button className="primary-button" onClick={openCreate} disabled={saving}>Add camera</button>
       </div>
+
+      <p className="muted">Recording {activeCount} camera{activeCount === 1 ? "" : "s"}{reconnectingCount ? ` · ${reconnectingCount} reconnecting` : ""}</p>
 
       {error && <div className="error-banner" role="alert"><strong>{error.code}</strong>: {error.message}</div>}
 
@@ -271,10 +277,12 @@ export function CamerasScreen() {
       ) : (
         <div className="camera-grid">
           {sortedCameras.map((camera) => {
-            const state = cameraState(camera.camera_id, recording);
-            const ownActive = recording.camera_id === camera.camera_id && ACTIVE_STATES.has(recording.state);
-            const desiredOn = intent.camera_id === camera.camera_id;
-            const startDisabled = busyCamera !== null || (!ownActive && !desiredOn && globalActive);
+            const runtime = statusByCamera.get(camera.camera_id);
+            const state = runtime?.state ?? "stopped";
+            const ownActive = runtime ? ACTIVE_STATES.has(runtime.state) : false;
+            const desiredOn = intent.camera_ids.includes(camera.camera_id);
+            const rowBusy = recordingBusyCamera === camera.camera_id;
+            const startDisabled = busyCamera !== null || rowBusy;
             return (
               <article className="camera-card" key={camera.camera_id}>
                 <div className="camera-card-head">
@@ -285,13 +293,13 @@ export function CamerasScreen() {
                   <span className={`chip chip-${state}`}>{statusLabel(state)}</span>
                 </div>
                 <div className="camera-placeholder" aria-label="Live view unavailable">
-                  <span>No live view in M5</span>
+                  <span>No live view in M9</span>
                 </div>
                 <p className="camera-metrics muted">Desired: {desiredOn ? "On" : "Off"} · Runtime: {statusLabel(state)}</p>
-                {recording.camera_id === camera.camera_id && (
+                {runtime && (
                   <p className="camera-metrics muted">
-                    Segments: {recording.finalized_segments} · Reconnect attempt: {recording.reconnect_attempt}
-                    {recording.failure_category ? ` · ${recording.failure_category}` : ""}
+                    Segments: {runtime.finalized_segments} · Reconnect attempt: {runtime.reconnect_attempt}
+                    {runtime.failure_category ? ` · ${runtime.failure_category}` : ""}
                   </p>
                 )}
                 <div className="button-row">
@@ -302,10 +310,10 @@ export function CamerasScreen() {
                   >
                     {desiredOn ? (state === "stopping" ? "Stopping…" : "Stop") : "Start"}
                   </button>
-                  <button onClick={() => openEdit(camera)} disabled={busyCamera !== null}>Edit</button>
+                  <button onClick={() => openEdit(camera)} disabled={busyCamera !== null || rowBusy}>Edit</button>
                   <button
                     onClick={() => setDeleteTarget(camera)}
-                    disabled={busyCamera !== null || ownActive || desiredOn}
+                    disabled={busyCamera !== null || rowBusy || ownActive || desiredOn}
                     title={ownActive || desiredOn ? "Turn off recording intent before deleting this camera" : undefined}
                   >Delete</button>
                 </div>
