@@ -1340,21 +1340,34 @@ fn recording_state_label(state: RecordingState) -> &'static str {
 }
 
 fn tray_projection(statuses: &[RecordingStatus], desired_cameras: &[CameraId]) -> TrayProjection {
-    let active: Vec<_> = statuses
-        .iter()
-        .filter(|status| status.state.is_active())
-        .collect();
-    let failed_desired = statuses
+    let is_desired = |camera_id: &str| {
+        desired_cameras
+            .iter()
+            .any(|desired| desired.as_str() == camera_id)
+    };
+
+    let mut desired_active = 0usize;
+    let mut failed_desired = 0usize;
+    let mut desired_not_running = 0usize;
+    for desired in desired_cameras {
+        match statuses
+            .iter()
+            .find(|status| status.camera_id.as_deref() == Some(desired.as_str()))
+            .map(|status| status.state)
+        {
+            Some(state) if state.is_active() => desired_active += 1,
+            Some(RecordingState::Failed) => failed_desired += 1,
+            Some(RecordingState::Stopped) | None => desired_not_running += 1,
+            Some(_) => desired_not_running += 1,
+        }
+    }
+
+    let runtime_only_active: Vec<_> = statuses
         .iter()
         .filter(|status| {
-            status.state == RecordingState::Failed
-                && status.camera_id.as_deref().is_some_and(|camera_id| {
-                    desired_cameras
-                        .iter()
-                        .any(|desired| desired.as_str() == camera_id)
-                })
+            status.state.is_active() && !status.camera_id.as_deref().is_some_and(&is_desired)
         })
-        .count();
+        .collect();
 
     let single_desired_status = if desired_cameras.len() == 1 {
         statuses
@@ -1363,35 +1376,48 @@ fn tray_projection(statuses: &[RecordingStatus], desired_cameras: &[CameraId]) -
     } else {
         None
     };
-    let single_desired_is_only_active = desired_cameras.len() == 1
-        && (active.is_empty()
-            || active.len() == 1
-                && active[0].camera_id.as_deref() == Some(desired_cameras[0].as_str()));
 
-    let status_text = if desired_cameras.len() == 1 && single_desired_is_only_active {
+    let status_text = if desired_cameras.len() == 1 && runtime_only_active.is_empty() {
         match single_desired_status {
-            Some(status) => format!("Recording: {}", recording_state_label(status.state)),
-            None => "Recording: Stopped".to_owned(),
+            Some(status) if status.state.is_active() => {
+                format!("Recording: {}", recording_state_label(status.state))
+            }
+            Some(status) if status.state == RecordingState::Failed => {
+                "Recording: Failed".to_owned()
+            }
+            Some(_) | None => "Recording: Desired On · not running".to_owned(),
         }
-    } else if desired_cameras.is_empty() && active.is_empty() {
+    } else if desired_cameras.is_empty() && runtime_only_active.is_empty() {
         "Recording: Stopped".to_owned()
-    } else if desired_cameras.is_empty() && active.len() == 1 {
-        format!("Recording: {}", recording_state_label(active[0].state))
-    } else if failed_desired > 0 {
-        format!(
-            "Recording: {} active · {failed_desired} failed",
-            active.len()
-        )
+    } else if desired_cameras.is_empty() && runtime_only_active.len() == 1 {
+        "Recording: Desired Off · stopping".to_owned()
     } else {
-        format!("Recording: {} active", active.len())
+        let mut parts = Vec::new();
+        if desired_active > 0 {
+            parts.push(format!("{desired_active} active"));
+        }
+        if failed_desired > 0 {
+            parts.push(format!("{failed_desired} failed"));
+        }
+        if desired_not_running > 0 {
+            parts.push(format!("{desired_not_running} not running"));
+        }
+        if !runtime_only_active.is_empty() {
+            parts.push(format!("{} stopping", runtime_only_active.len()));
+        }
+        if parts.is_empty() {
+            "Recording: Stopped".to_owned()
+        } else {
+            format!("Recording: {}", parts.join(" · "))
+        }
     };
 
     TrayProjection {
         status_text,
         stop_enabled: !desired_cameras.is_empty()
-            || active
+            || statuses
                 .iter()
-                .any(|status| status.state != RecordingState::Stopping),
+                .any(|status| status.state.is_active() && status.state != RecordingState::Stopping),
     }
 }
 
@@ -3369,6 +3395,82 @@ mod tests {
     }
 
     #[test]
+    fn tray_projection_reports_missing_desired_runtime_as_not_running() {
+        let desired = [CameraId::parse("cam-a").unwrap()];
+
+        let projection = tray_projection(&[], &desired);
+        assert_eq!(
+            projection.status_text,
+            "Recording: Desired On · not running"
+        );
+        assert!(projection.stop_enabled);
+    }
+
+    #[test]
+    fn tray_projection_reports_stopped_desired_runtime_as_not_running() {
+        let stopped = RecordingStatus {
+            state: RecordingState::Stopped,
+            camera_id: Some("cam-a".to_owned()),
+            ..RecordingStatus::default()
+        };
+        let desired = [CameraId::parse("cam-a").unwrap()];
+
+        let projection = tray_projection(&[stopped], &desired);
+        assert_eq!(
+            projection.status_text,
+            "Recording: Desired On · not running"
+        );
+        assert!(projection.stop_enabled);
+    }
+
+    #[test]
+    fn tray_projection_keeps_missing_desired_camera_visible_beside_active_camera() {
+        let recording = RecordingStatus {
+            state: RecordingState::Recording,
+            camera_id: Some("cam-a".to_owned()),
+            ..RecordingStatus::default()
+        };
+        let desired = [
+            CameraId::parse("cam-a").unwrap(),
+            CameraId::parse("cam-b").unwrap(),
+        ];
+
+        let projection = tray_projection(&[recording], &desired);
+        assert_eq!(
+            projection.status_text,
+            "Recording: 1 active · 1 not running"
+        );
+        assert!(projection.stop_enabled);
+    }
+
+    #[test]
+    fn tray_projection_keeps_stopped_desired_camera_visible_beside_active_camera() {
+        let statuses = [
+            RecordingStatus {
+                state: RecordingState::Recording,
+                camera_id: Some("cam-a".to_owned()),
+                ..RecordingStatus::default()
+            },
+            RecordingStatus {
+                state: RecordingState::Stopped,
+                camera_id: Some("cam-b".to_owned()),
+                ..RecordingStatus::default()
+            },
+        ];
+        let desired = [
+            CameraId::parse("cam-a").unwrap(),
+            CameraId::parse("cam-b").unwrap(),
+        ];
+
+        let projection = tray_projection(&statuses, &desired);
+        assert_eq!(
+            projection.status_text,
+            "Recording: 1 active · 1 not running"
+        );
+        assert!(projection.stop_enabled);
+    }
+
+    #[test]
     fn tray_projection_distinguishes_active_and_failed_desired_cameras() {
         let statuses = [
             RecordingStatus {
@@ -3407,7 +3509,24 @@ mod tests {
             camera_id: Some("cam-a".to_owned()),
             ..RecordingStatus::default()
         };
-        assert!(!tray_projection(&[stopping], &[]).stop_enabled);
+        let off_stopping = tray_projection(&[stopping], &[]);
+        assert_eq!(
+            off_stopping.status_text,
+            "Recording: Desired Off · stopping"
+        );
+        assert!(!off_stopping.stop_enabled);
+
+        let recording = RecordingStatus {
+            state: RecordingState::Recording,
+            camera_id: Some("cam-a".to_owned()),
+            ..RecordingStatus::default()
+        };
+        let off_recording = tray_projection(&[recording], &[]);
+        assert_eq!(
+            off_recording.status_text,
+            "Recording: Desired Off · stopping"
+        );
+        assert!(off_recording.stop_enabled);
     }
 
     #[test]

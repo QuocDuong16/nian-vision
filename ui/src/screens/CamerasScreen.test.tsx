@@ -216,6 +216,51 @@ describe("CamerasScreen", () => {
     expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "recording_start")).toHaveLength(2);
   });
 
+  it("blocks Start while Desired is Off but runtime remains active, then re-enables after convergence", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      value: {},
+      configurable: true,
+    });
+    let desiredCameras = [camera.camera_id];
+    let runtime: RecordingStatus[] = [{ ...stopped, state: "recording", camera_id: camera.camera_id }];
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "camera_list") return [camera, backCamera];
+      if (command === "recording_statuses") return runtime;
+      if (command === "recording_intent") return { camera_ids: desiredCameras };
+      if (command === "recording_start") throw new Error("recording_start must not be admitted during convergence");
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<CamerasScreen />);
+    await screen.findByText("Front door");
+    const frontCard = screen.getByText("Front door").closest("article") as HTMLElement;
+    const backCard = screen.getByText("Back door").closest("article") as HTMLElement;
+    expect((within(frontCard).getByRole("button", { name: "Stop" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((within(backCard).getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByText("Active 1 camera")).toBeTruthy();
+
+    desiredCameras = [];
+    await waitFor(
+      () => {
+        const stopping = within(frontCard).getByRole("button", { name: "Stopping…" }) as HTMLButtonElement;
+        expect(stopping.disabled).toBe(true);
+      },
+      { timeout: 1_500 },
+    );
+    expect((within(backCard).getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "recording_start")).toHaveLength(0);
+
+    runtime = [{ ...stopped, camera_id: camera.camera_id }];
+    await waitFor(
+      () => {
+        const start = within(frontCard).getByRole("button", { name: "Start" }) as HTMLButtonElement;
+        expect(start.disabled).toBe(false);
+      },
+      { timeout: 1_500 },
+    );
+    expect((within(backCard).getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it("admits only one same-camera recording command while the first is pending", async () => {
     installDesktop([camera]);
     vi.mocked(invoke).mockImplementation((command) => {

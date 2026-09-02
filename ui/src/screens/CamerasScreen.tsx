@@ -218,11 +218,13 @@ export function CamerasScreen() {
 
   async function toggleRecording(camera: CameraSummary) {
     if (recordingBusyRef.current.has(camera.camera_id)) return;
+    const desiredOn = intent.camera_ids.includes(camera.camera_id);
+    const runtime = statusByCamera.get(camera.camera_id);
+    if (!desiredOn && runtime && ACTIVE_STATES.has(runtime.state)) return;
     recordingBusyRef.current.add(camera.camera_id);
     setRecordingBusyCameras(new Set(recordingBusyRef.current));
     setError(null);
     try {
-      const desiredOn = intent.camera_ids.includes(camera.camera_id);
       if (desiredOn) {
         await invokeDesktop<RecordingStatus>("recording_stop", { cameraId: camera.camera_id });
       } else {
@@ -269,7 +271,7 @@ export function CamerasScreen() {
         <button className="primary-button" onClick={openCreate} disabled={saving}>Add camera</button>
       </div>
 
-      <p className="muted">Recording {activeCount} camera{activeCount === 1 ? "" : "s"}{reconnectingCount ? ` · ${reconnectingCount} reconnecting` : ""}</p>
+      <p className="muted">Active {activeCount} camera{activeCount === 1 ? "" : "s"}{reconnectingCount ? ` · ${reconnectingCount} reconnecting` : ""}</p>
 
       {error && <div className="error-banner" role="alert"><strong>{error.code}</strong>: {error.message}</div>}
 
@@ -284,8 +286,12 @@ export function CamerasScreen() {
             const state = runtime?.state ?? "stopped";
             const ownActive = runtime ? ACTIVE_STATES.has(runtime.state) : false;
             const desiredOn = intent.camera_ids.includes(camera.camera_id);
+            const desiredOffRuntimeActive = !desiredOn && ownActive;
             const rowBusy = recordingBusyCameras.has(camera.camera_id);
-            const startDisabled = busyCamera !== null || rowBusy;
+            const recordingControlDisabled = busyCamera !== null || rowBusy || state === "stopping" || desiredOffRuntimeActive;
+            const recordingControlLabel = desiredOn
+              ? (state === "stopping" ? "Stopping…" : "Stop")
+              : (desiredOffRuntimeActive ? "Stopping…" : "Start");
             return (
               <article className="camera-card" key={camera.camera_id}>
                 <div className="camera-card-head">
@@ -307,11 +313,11 @@ export function CamerasScreen() {
                 )}
                 <div className="button-row">
                   <button
-                    className={desiredOn ? "danger-button" : "primary-button"}
-                    disabled={startDisabled || state === "stopping"}
+                    className={desiredOn || desiredOffRuntimeActive ? "danger-button" : "primary-button"}
+                    disabled={recordingControlDisabled}
                     onClick={() => void toggleRecording(camera)}
                   >
-                    {desiredOn ? (state === "stopping" ? "Stopping…" : "Stop") : "Start"}
+                    {recordingControlLabel}
                   </button>
                   <button onClick={() => openEdit(camera)} disabled={busyCamera !== null || rowBusy}>Edit</button>
                   <button
