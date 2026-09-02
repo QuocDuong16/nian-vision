@@ -66,6 +66,54 @@ export interface ProbeResult {
   audio_stream_count: number;
 }
 
+export interface OnvifDiscoveredDevice {
+  device_id: string;
+  endpoint_reference: string;
+  label: string;
+  network_address: string;
+}
+
+export interface OnvifDiscovery {
+  session_id: string;
+  devices: OnvifDiscoveredDevice[];
+}
+
+export interface OnvifMediaProfile {
+  token: string;
+  name: string | null;
+  video_codec: string | null;
+  width: number | null;
+  height: number | null;
+  framerate: number | null;
+  bitrate_kbps: number | null;
+  audio_codec: string | null;
+  supported: boolean;
+  recommended: boolean;
+}
+
+export interface OnvifConnection {
+  session_id: string;
+  device_id: string;
+  manufacturer: string | null;
+  model: string | null;
+  firmware_version: string | null;
+  serial_number: string | null;
+  hostname: string | null;
+  profiles: OnvifMediaProfile[];
+  proposed_camera_id: string;
+  proposed_display_name: string;
+}
+
+export interface OnvifPreparedProfile {
+  session_id: string;
+  device_id: string;
+  profile_token: string;
+  host: string;
+  port: number;
+  path: string;
+  host_mismatch: boolean;
+}
+
 export interface ApplicationSettings {
   storage_root: string | null;
   segment_target_secs: number;

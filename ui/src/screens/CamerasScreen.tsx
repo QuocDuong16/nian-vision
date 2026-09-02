@@ -3,10 +3,16 @@ import type { FormEvent } from "react";
 import { EmptyState } from "../components/EmptyState";
 import { desktopError, invokeDesktop, isTauri } from "../lib/tauri";
 import type {
+  AudioPolicy,
   CameraCommandInput,
   CameraMutation,
   CameraSummary,
   DesktopError,
+  OnvifConnection,
+  OnvifDiscoveredDevice,
+  OnvifDiscovery,
+  OnvifMediaProfile,
+  OnvifPreparedProfile,
   ProbeResult,
   RecordingState,
   RecordingIntent,
@@ -14,6 +20,7 @@ import type {
 } from "../lib/tauri";
 
 type CameraFormState = CameraCommandInput;
+type OnvifStep = "idle" | "scanning" | "devices" | "credentials" | "profiles" | "ready";
 
 const ACTIVE_STATES = new Set<RecordingState>([
   "starting",
@@ -74,6 +81,13 @@ function ProbeSummary({ result }: { result: ProbeResult }) {
   );
 }
 
+function profileSummary(profile: OnvifMediaProfile): string {
+  const resolution = profile.width && profile.height ? `${profile.width}×${profile.height}` : "resolution unknown";
+  const fps = profile.framerate ? ` · ${profile.framerate} fps` : "";
+  const bitrate = profile.bitrate_kbps ? ` · ${profile.bitrate_kbps} kbps` : "";
+  return `${profile.video_codec ?? "codec unknown"} · ${resolution}${fps}${bitrate}`;
+}
+
 export function CamerasScreen() {
   const [cameras, setCameras] = useState<CameraSummary[]>([]);
   const [recordings, setRecordings] = useState<RecordingStatus[]>([]);
@@ -82,6 +96,7 @@ export function CamerasScreen() {
   const [error, setError] = useState<DesktopError | null>(null);
   const [form, setForm] = useState<CameraFormState | null>(null);
   const [creating, setCreating] = useState(false);
+  const [showAddChoice, setShowAddChoice] = useState(false);
   const [saving, setSaving] = useState(false);
   const [probing, setProbing] = useState(false);
   const [probeResult, setProbeResult] = useState<ProbeResult | null>(null);
@@ -89,6 +104,20 @@ export function CamerasScreen() {
   const [busyCamera, setBusyCamera] = useState<string | null>(null);
   const recordingBusyRef = useRef<Set<string>>(new Set());
   const [recordingBusyCameras, setRecordingBusyCameras] = useState<Set<string>>(() => new Set());
+
+  const [onvifStep, setOnvifStep] = useState<OnvifStep>("idle");
+  const [onvifBusy, setOnvifBusy] = useState(false);
+  const [onvifSessionId, setOnvifSessionId] = useState<string | null>(null);
+  const [onvifDevices, setOnvifDevices] = useState<OnvifDiscoveredDevice[]>([]);
+  const [onvifDevice, setOnvifDevice] = useState<OnvifDiscoveredDevice | null>(null);
+  const [onvifUsername, setOnvifUsername] = useState("");
+  const [onvifPassword, setOnvifPassword] = useState("");
+  const [onvifConnection, setOnvifConnection] = useState<OnvifConnection | null>(null);
+  const [onvifProfileToken, setOnvifProfileToken] = useState<string | null>(null);
+  const [onvifPrepared, setOnvifPrepared] = useState<OnvifPreparedProfile | null>(null);
+  const [onvifCameraId, setOnvifCameraId] = useState("");
+  const [onvifDisplayName, setOnvifDisplayName] = useState("");
+  const [onvifAudioPolicy, setOnvifAudioPolicy] = useState<AudioPolicy>("exclude");
 
   const loadCameras = useCallback(async () => {
     if (!isTauri()) {
@@ -127,6 +156,34 @@ export function CamerasScreen() {
     return () => window.clearInterval(timer);
   }, [loadCameras, refreshStatus]);
 
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) =>
+        getCurrentWindow().onCloseRequested(() => {
+          resetOnvifLocal();
+          setError(null);
+        }),
+      )
+      .then((cleanup) => {
+        if (disposed) cleanup();
+        else unlisten = cleanup;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (isTauri()) void invokeDesktop<void>("onvif_cancel").catch(() => undefined);
+    };
+  }, []);
+
   const statusByCamera = useMemo(
     () => new Map(recordings.filter((status) => status.camera_id).map((status) => [status.camera_id as string, status])),
     [recordings],
@@ -140,8 +197,48 @@ export function CamerasScreen() {
     () => [...cameras].sort((a, b) => a.display_name.localeCompare(b.display_name)),
     [cameras],
   );
+  const selectedOnvifProfile = onvifConnection?.profiles.find((profile) => profile.token === onvifProfileToken) ?? null;
+  const compatibleOnvifAudio = selectedOnvifProfile?.audio_codec?.toLowerCase() === "aac";
+
+  function resetOnvifLocal() {
+    setOnvifStep("idle");
+    setOnvifBusy(false);
+    setOnvifSessionId(null);
+    setOnvifDevices([]);
+    setOnvifDevice(null);
+    setOnvifUsername("");
+    setOnvifPassword("");
+    setOnvifConnection(null);
+    setOnvifProfileToken(null);
+    setOnvifPrepared(null);
+    setOnvifCameraId("");
+    setOnvifDisplayName("");
+    setOnvifAudioPolicy("exclude");
+  }
+
+  async function closeOnvif() {
+    const sessionId = onvifSessionId;
+    resetOnvifLocal();
+    setError(null);
+    if (!isTauri()) return;
+    try {
+      await invokeDesktop<void>("onvif_cancel", sessionId ? { sessionId } : undefined);
+    } catch {
+      // Closing is best-effort; lifecycle cleanup is authoritative in Rust.
+    }
+  }
 
   function openCreate() {
+    setShowAddChoice(true);
+    setForm(null);
+    setProbeResult(null);
+    setError(null);
+  }
+
+  function openManualCreate() {
+    setShowAddChoice(false);
+    if (onvifStep !== "idle") void closeOnvif();
+    else resetOnvifLocal();
     setCreating(true);
     setForm(blankCamera());
     setProbeResult(null);
@@ -149,10 +246,135 @@ export function CamerasScreen() {
   }
 
   function openEdit(camera: CameraSummary) {
+    setShowAddChoice(false);
+    if (onvifStep !== "idle") void closeOnvif();
+    else resetOnvifLocal();
     setCreating(false);
     setForm(editCamera(camera));
     setProbeResult(null);
     setError(null);
+  }
+
+  async function startOnvifDiscovery() {
+    if (!isTauri() || onvifBusy) return;
+    setShowAddChoice(false);
+    setForm(null);
+    setError(null);
+    setOnvifBusy(true);
+    setOnvifStep("scanning");
+    setOnvifDevices([]);
+    setOnvifDevice(null);
+    setOnvifConnection(null);
+    setOnvifPrepared(null);
+    try {
+      const discovery = await invokeDesktop<OnvifDiscovery>("onvif_discover");
+      setOnvifSessionId(discovery.session_id);
+      setOnvifDevices(discovery.devices);
+      setOnvifStep("devices");
+    } catch (cause) {
+      setError(desktopError(cause));
+      setOnvifStep("devices");
+    } finally {
+      setOnvifBusy(false);
+    }
+  }
+
+  function chooseOnvifDevice(device: OnvifDiscoveredDevice) {
+    setOnvifDevice(device);
+    setOnvifUsername("");
+    setOnvifPassword("");
+    setOnvifConnection(null);
+    setOnvifProfileToken(null);
+    setOnvifPrepared(null);
+    setError(null);
+    setOnvifStep("credentials");
+  }
+
+  async function connectOnvifDevice(event: FormEvent) {
+    event.preventDefault();
+    if (!onvifSessionId || !onvifDevice || onvifBusy) return;
+    if (!onvifUsername.trim() || !onvifPassword) {
+      setError({ code: "validation", message: "Username and password are required." });
+      return;
+    }
+    const username = onvifUsername;
+    const password = onvifPassword;
+    setOnvifPassword("");
+    setOnvifBusy(true);
+    setError(null);
+    try {
+      const connection = await invokeDesktop<OnvifConnection>("onvif_connect", {
+        input: {
+          session_id: onvifSessionId,
+          device_id: onvifDevice.device_id,
+          username,
+          password,
+        },
+      });
+      setOnvifConnection(connection);
+      const supported = connection.profiles.filter((profile) => profile.supported);
+      setOnvifProfileToken(supported.length === 1 ? (supported[0]?.token ?? null) : null);
+      setOnvifPrepared(null);
+      setOnvifCameraId(connection.proposed_camera_id);
+      setOnvifDisplayName(connection.proposed_display_name);
+      setOnvifStep("profiles");
+    } catch (cause) {
+      setError(desktopError(cause));
+    } finally {
+      setOnvifBusy(false);
+    }
+  }
+
+  async function prepareOnvifProfile(profile: OnvifMediaProfile) {
+    if (!onvifSessionId || !onvifDevice || onvifBusy || !profile.supported) return;
+    setOnvifBusy(true);
+    setError(null);
+    setOnvifProfileToken(profile.token);
+    setOnvifPrepared(null);
+    try {
+      const prepared = await invokeDesktop<OnvifPreparedProfile>("onvif_prepare_profile", {
+        input: {
+          session_id: onvifSessionId,
+          device_id: onvifDevice.device_id,
+          profile_token: profile.token,
+        },
+      });
+      setOnvifPrepared(prepared);
+      setOnvifAudioPolicy(profile.audio_codec?.toLowerCase() === "aac" ? "copy_all" : "exclude");
+      setOnvifStep("ready");
+    } catch (cause) {
+      setError(desktopError(cause));
+    } finally {
+      setOnvifBusy(false);
+    }
+  }
+
+  async function addOnvifCamera() {
+    if (!onvifSessionId || !onvifDevice || !onvifProfileToken || !onvifPrepared || onvifBusy) return;
+    if (!onvifCameraId.trim() || !onvifDisplayName.trim()) {
+      setError({ code: "validation", message: "Camera ID and display name are required." });
+      return;
+    }
+    setOnvifBusy(true);
+    setError(null);
+    try {
+      await invokeDesktop<CameraMutation<CameraSummary>>("onvif_add_camera", {
+        input: {
+          session_id: onvifSessionId,
+          device_id: onvifDevice.device_id,
+          profile_token: onvifProfileToken,
+          camera_id: onvifCameraId,
+          display_name: onvifDisplayName,
+          audio_policy: onvifAudioPolicy,
+        },
+      });
+      resetOnvifLocal();
+      await loadCameras();
+    } catch (cause) {
+      setError(desktopError(cause));
+    } finally {
+      setOnvifBusy(false);
+    }
   }
 
   function patchForm<K extends keyof CameraFormState>(key: K, value: CameraFormState[K]) {
@@ -266,9 +488,9 @@ export function CamerasScreen() {
       <div className="screen-toolbar">
         <div>
           <h2>Cameras</h2>
-          <p className="muted">Saved RTSP cameras. M9 records independent cameras simultaneously.</p>
+          <p className="muted">Saved RTSP cameras. ONVIF is used only for local discovery and provisioning.</p>
         </div>
-        <button className="primary-button" onClick={openCreate} disabled={saving}>Add camera</button>
+        <button className="primary-button" onClick={openCreate} disabled={saving || onvifBusy}>Add camera</button>
       </div>
 
       <p className="muted">Active {activeCount} camera{activeCount === 1 ? "" : "s"}{reconnectingCount ? ` · ${reconnectingCount} reconnecting` : ""}</p>
@@ -278,7 +500,7 @@ export function CamerasScreen() {
       {loading ? (
         <p className="muted" role="status">Loading cameras…</p>
       ) : sortedCameras.length === 0 ? (
-        <EmptyState title="No cameras configured" hint="Add an RTSP camera, test the connection, then start recording." />
+        <EmptyState title="No cameras configured" hint="Add an RTSP camera manually or discover a local ONVIF camera." />
       ) : (
         <div className="camera-grid">
           {sortedCameras.map((camera) => {
@@ -302,7 +524,7 @@ export function CamerasScreen() {
                   <span className={`chip chip-${state}`}>{statusLabel(state)}</span>
                 </div>
                 <div className="camera-placeholder" aria-label="Live view unavailable">
-                  <span>No live view in M9</span>
+                  <span>No live view in M10</span>
                 </div>
                 <p className="camera-metrics muted">Desired: {desiredOn ? "On" : "Off"} · Runtime: {statusLabel(state)}</p>
                 {runtime && (
@@ -332,11 +554,150 @@ export function CamerasScreen() {
         </div>
       )}
 
+      {showAddChoice && (
+        <div className="panel" role="dialog" aria-label="Add camera method">
+          <div className="panel-heading">
+            <div>
+              <h3>Add camera</h3>
+              <p className="muted">Use ONVIF for local discovery, or enter an RTSP endpoint manually.</p>
+            </div>
+            <button onClick={() => setShowAddChoice(false)}>Close</button>
+          </div>
+          <div className="button-row">
+            <button className="primary-button" onClick={() => void startOnvifDiscovery()}>Discover ONVIF cameras</button>
+            <button onClick={openManualCreate}>Add RTSP manually</button>
+          </div>
+        </div>
+      )}
+
+      {onvifStep !== "idle" && (
+        <div className="panel form-grid" role="dialog" aria-label="ONVIF camera onboarding">
+          <div className="panel-heading">
+            <div>
+              <h3>Discover ONVIF camera</h3>
+              <p className="muted">Discovery and provisioning only. Recording will use the resolved RTSP stream.</p>
+            </div>
+            <button type="button" onClick={() => void closeOnvif()}>Close</button>
+          </div>
+
+          {onvifStep === "scanning" && (
+            <div>
+              <p role="status">Scanning for ONVIF cameras…</p>
+              <button type="button" onClick={() => void closeOnvif()}>Cancel discovery</button>
+            </div>
+          )}
+
+          {onvifStep === "devices" && (
+            <div>
+              {onvifDevices.length === 0 ? (
+                <p role="status">No ONVIF cameras found.</p>
+              ) : (
+                <div className="camera-grid">
+                  {onvifDevices.map((device) => (
+                    <article className="camera-card" key={device.device_id}>
+                      <h4>{device.label}</h4>
+                      <p className="muted">{device.network_address}</p>
+                      <code>{device.endpoint_reference}</code>
+                      <div className="button-row">
+                        <button type="button" onClick={() => chooseOnvifDevice(device)}>Select</button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
+              <div className="button-row">
+                <button type="button" onClick={() => void startOnvifDiscovery()} disabled={onvifBusy}>
+                  {onvifBusy ? "Scanning…" : "Refresh"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {onvifStep === "credentials" && onvifDevice && (
+            <form className="form-grid" onSubmit={(event) => void connectOnvifDevice(event)}>
+              <p>Authenticate to <strong>{onvifDevice.label}</strong>.</p>
+              <label>ONVIF username
+                <input aria-label="ONVIF username" autoComplete="off" value={onvifUsername} onChange={(event) => setOnvifUsername(event.target.value)} />
+              </label>
+              <label>ONVIF password
+                <input aria-label="ONVIF password" type="password" autoComplete="new-password" value={onvifPassword} onChange={(event) => setOnvifPassword(event.target.value)} />
+              </label>
+              <div className="button-row">
+                <button type="button" onClick={() => setOnvifStep("devices")} disabled={onvifBusy}>Back</button>
+                <button className="primary-button" type="submit" disabled={onvifBusy}>{onvifBusy ? "Connecting…" : "Connect"}</button>
+              </div>
+            </form>
+          )}
+
+          {onvifStep === "profiles" && onvifConnection && (
+            <div>
+              <p className="muted">
+                {[onvifConnection.manufacturer, onvifConnection.model, onvifConnection.hostname].filter(Boolean).join(" · ")}
+              </p>
+              <h4>Media profiles</h4>
+              <div className="camera-grid">
+                {onvifConnection.profiles.map((profile) => (
+                  <article className="camera-card" key={profile.token}>
+                    <div className="camera-card-head">
+                      <h4>{profile.name ?? profile.token}</h4>
+                      {profile.recommended && <span className="chip">Recommended</span>}
+                    </div>
+                    <p>{profileSummary(profile)}</p>
+                    <p className="muted">Audio: {profile.audio_codec ?? "none/unknown"}</p>
+                    {!profile.supported && <p className="warning-message">Not supported for M10 recording. H.264 is required.</p>}
+                    <button
+                      type="button"
+                      className={profile.supported ? "primary-button" : undefined}
+                      disabled={!profile.supported || onvifBusy}
+                      onClick={() => void prepareOnvifProfile(profile)}
+                    >
+                      {onvifBusy && onvifProfileToken === profile.token ? "Resolving…" : "Use profile"}
+                    </button>
+                  </article>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {onvifStep === "ready" && onvifPrepared && selectedOnvifProfile && (
+            <div className="form-grid">
+              <p className="success-message" role="status">ONVIF profile resolved to a safe RTSP endpoint.</p>
+              <p><strong>Stream:</strong> <code>{onvifPrepared.host}:{onvifPrepared.port}{onvifPrepared.path}</code></p>
+              {onvifPrepared.host_mismatch && (
+                <p className="warning-message">The stream host differs from the ONVIF device-service host but is still a local address. Verify it before saving.</p>
+              )}
+              <p><strong>Profile:</strong> {selectedOnvifProfile.name ?? selectedOnvifProfile.token} · {profileSummary(selectedOnvifProfile)}</p>
+              <label>Camera ID
+                <input aria-label="ONVIF camera ID" value={onvifCameraId} onChange={(event) => setOnvifCameraId(event.target.value)} />
+              </label>
+              <label>Display name
+                <input aria-label="ONVIF display name" value={onvifDisplayName} onChange={(event) => setOnvifDisplayName(event.target.value)} />
+              </label>
+              <label>Audio policy
+                <select aria-label="ONVIF audio policy" value={onvifAudioPolicy} onChange={(event) => setOnvifAudioPolicy(event.target.value as AudioPolicy)}>
+                  <option value="exclude">Video only</option>
+                  <option value="copy_all" disabled={!compatibleOnvifAudio}>Record AAC audio</option>
+                </select>
+              </label>
+              {!compatibleOnvifAudio && selectedOnvifProfile.audio_codec && (
+                <p className="warning-message">Audio codec {selectedOnvifProfile.audio_codec} is not enabled by this onboarding flow; video-only remains available.</p>
+              )}
+              <div className="button-row">
+                <button type="button" onClick={() => setOnvifStep("profiles")} disabled={onvifBusy}>Back</button>
+                <button className="primary-button" type="button" onClick={() => void addOnvifCamera()} disabled={onvifBusy}>
+                  {onvifBusy ? "Testing & adding…" : "Test & Add"}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {form && (
         <form className="panel form-grid" onSubmit={(event) => void submitCamera(event)}>
           <div className="panel-heading">
             <div>
-              <h3>{creating ? "Add camera" : `Edit ${form.display_name}`}</h3>
+              <h3>{creating ? "Add camera manually" : `Edit ${form.display_name}`}</h3>
               {!creating && <p className="muted">Camera ID: <code>{form.camera_id}</code></p>}
             </div>
             <button type="button" onClick={() => setForm(null)} disabled={saving || probing}>Close</button>

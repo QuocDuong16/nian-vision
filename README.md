@@ -4,35 +4,36 @@ Local-first desktop NVR (network video recorder) for IP cameras. The first
 supported camera is the TP-Link Tapo C200 over RTSP, with a camera-agnostic
 domain so other RTSP/ONVIF cameras can follow.
 
-**Status**: milestone **M9 (simultaneous multi-camera recording)** is implemented on top
-of M0–M8. The desktop persists camera definitions, recorder/storage settings,
-launch-at-login preference and independent per-camera desired recording intent in
-authoritative platform app-data `settings.sqlite3`, while camera passwords remain
-in the operating system credential store. The M4 recording catalog at
+**Status**: milestones **M0–M10** are implemented. M10 adds local ONVIF discovery
+and provisioning without changing the accepted RTSP recording architecture. The
+desktop persists camera definitions, recorder/storage settings, launch-at-login
+preference and independent per-camera desired recording intent in authoritative
+platform app-data `settings.sqlite3`, while camera passwords remain in the operating
+system credential store. The M4 recording catalog at
 `<storage_root>/.nian/recordings.sqlite3` remains disposable and rebuildable from
-footage. Users can add/edit/delete saved RTSP cameras, test a connection through
-the media worker, start/stop multiple cameras independently, and observe Desired
-and Runtime recording state per camera. M6 provides recording-day/range queries,
-filesystem-revalidated normal/recovered playback, lazy duration enrichment,
-seekable packet-copy H.264/AAC fragmented-MP4 playback over tokenized loopback
-HTTP, and retention playback pins. M7 adds single-instance activation,
-close-to-tray, explicit coordinated Quit, launch-at-login with hidden startup,
-persisted recording restoration, Windows suspend/resume handling, and Windows
-Job Object containment so hard desktop termination cannot orphan media workers.
-M8 provides validated Linux x86_64 AppImage and Windows x86_64 NSIS release paths
-with the same pinned LGPL FFmpeg 8.0.3 source authority, signed Tauri updater trust
-root, deterministic lifecycle handoff, provenance/checksums and installed-runtime
-smoke. M9 replaces the one-slot recording controller with independent per-camera
-slots: one WorkerSupervisor, media-worker process and CameraLease per active camera,
-with a conservative eight-recording safety cap. Startup, suspend/resume, Quit and
-update teardown operate over all owned slots without clearing desired intent.
-macOS distribution remains deferred. Live camera viewing, ONVIF discovery, motion
-analysis, AI, cloud and remote streaming remain outside M9.
+footage. Users can add cameras manually by RTSP or discover ONVIF devices on the
+local network, authenticate transiently, inspect H.264 media profiles, resolve and
+verify the selected RTSP stream through the existing media worker, then provision it
+into the same camera model and credential-reference transaction used by manual setup.
+M6 provides recording-day/range queries, filesystem-revalidated normal/recovered
+playback, lazy duration enrichment, seekable packet-copy H.264/AAC fragmented-MP4
+playback over tokenized loopback HTTP, and retention playback pins. M7 adds
+single-instance activation, close-to-tray, coordinated Quit, launch-at-login,
+persisted recording restoration, Windows suspend/resume handling and Job Object
+worker containment. M8 provides validated Linux x86_64 AppImage and Windows x86_64
+NSIS release paths with the same pinned LGPL FFmpeg 8.0.3 source authority and signed
+Tauri updater trust root. M9 owns independent per-camera recording slots with a
+conservative eight-recording safety cap and separate Desired/Runtime state. M10 keeps
+ONVIF observational until explicit provisioning and never makes ONVIF availability a
+prerequisite for an already configured RTSP camera. macOS distribution, live camera
+viewing, PTZ/events, H.265 recording, transcoding, motion analysis, AI, cloud and
+remote streaming remain outside M10.
 
 ## What it does today
 
-* Tauri 2 desktop application (React/TypeScript/Vite UI) with managed M9 state:
-  camera CRUD, pre-save connection testing, per-camera Start/Stop controls, typed recording
+* Tauri 2 desktop application (React/TypeScript/Vite UI) with managed M10 state:
+  camera CRUD, manual RTSP plus ONVIF onboarding, pre-save connection testing,
+  per-camera Start/Stop controls, typed recording
   status, delete confirmation, persisted storage/retention settings, recording-day
   navigation, a gap-aware timeline, native video playback controls and adjacent
   recording navigation, tray controls and launch-at-login preference. Recording
@@ -41,6 +42,13 @@ analysis, AI, cloud and remote streaming remain outside M9.
   Closing the main window hides it; explicit Quit owns backend teardown. The
   webview never receives an absolute recording path;
   privileged work flows through narrow Tauri commands.
+* ONVIF onboarding is local and explicit. Discovery returns opaque Rust-owned
+  session/device handles plus safe display metadata; discovery XAddrs, raw SOAP/XML,
+  passwords and authenticated RTSP URLs never enter persisted settings or frontend
+  output. Device Management discovers services, Media2 is preferred with legacy
+  Media fallback, and H.264 profiles remain the M10 compatibility boundary. Final
+  `Test & Add` must pass the existing media-worker RTSP probe before the ordinary
+  camera/credential transaction is committed.
 * Playback sessions bind only an ephemeral `127.0.0.1` port. An unguessable
   per-session token maps to one already-validated finalized recording; HTTP Range
   requests provide browser seeking without a directory listing, arbitrary path
@@ -88,7 +96,8 @@ analysis, AI, cloud and remote streaming remain outside M9.
   stays unknown until worker inspection. Playback holds a read handle plus a
   `PlaybackPin`; retention skips pinned finals and rechecks the pin immediately
   before deletion, independently of `CameraLease`.
-* Clean crate boundaries with `unsafe` confined to the FFmpeg layers plus audited
+* Clean crate boundaries with ONVIF protocol/network handling isolated in safe-Rust
+  `nian-onvif`; `unsafe` remains confined to the FFmpeg layers plus audited
   Windows-only platform boundaries: storage no-replace publication and the M7
   `nian-platform-windows` power-notification/Job-Object wrapper. Application and
   desktop orchestration remain safe Rust. The workspace keeps a race-safe storage
@@ -102,6 +111,7 @@ React UI ─ typed Tauri commands ─ nian-desktop host
                  │                  │
                  │                  ├─ platform app-data/settings.sqlite3
                  │                  ├─ native OS credential store
+                 │                  ├─ nian-onvif → local WS-Discovery / ONVIF SOAP
                  │                  ├─ tray/autostart/power + worker containment
                  │                  ├─ loopback HTTP playback (127.0.0.1 only)
                  │                  │ NDJSON control IPC (stdio)
@@ -113,8 +123,8 @@ React UI ─ typed Tauri commands ─ nian-desktop host
 See `docs/architecture.md` and `docs/adr/` for the decisions behind this
 layout (process isolation, FFmpeg strategy, container choice, storage
 model, authoritative-settings/native-secret split, M6 playback transport, M7
-desktop lifecycle/worker containment, M8 distribution/updater design and M9
-per-camera recording coordination).
+desktop lifecycle/worker containment, M8 distribution/updater design, M9
+per-camera recording coordination and M10 ONVIF discovery/provisioning).
 
 ## Requirements
 
@@ -168,7 +178,40 @@ ADR-0011. macOS packaging remains deferred.
 
 * RTSP (H.264) — implemented at the media layer, manual smoke test via
   `NIAN_VISION_RTSP_URL` (credentials never go on the command line).
-* ONVIF — planned for M10, after RTSP recording is mature.
+* ONVIF — implemented for local discovery and provisioning. Device Management plus
+  Media2/legacy Media profile discovery resolves a selected H.264 profile to a
+  sanitized RTSP endpoint; recording itself still uses RTSP through the existing
+  media worker. PTZ/events and H.265 recording are not M10 features.
+
+## ONVIF camera setup
+
+Choose **Add camera → Discover ONVIF cameras** to scan the local network, select a
+device, enter that camera's ONVIF credentials, choose a supported H.264 profile and
+use **Test & Add**. The password is submitted only to the Rust host; after successful
+authentication the wizard operates with opaque session/device/profile handles. The
+resolved stream is probed through the same media worker used by manual RTSP setup
+before credentials/settings are persisted. **Add RTSP manually** remains available
+and does not depend on ONVIF.
+
+Troubleshooting:
+
+* **No devices found**: confirm the desktop and camera are on the same local network
+  and that host/firewall/network policy permits WS-Discovery multicast. Discovery is
+  bounded and does not scan the internet; manual RTSP configuration remains available.
+* **Authentication failed**: use credentials authorized for the camera's ONVIF
+  service. Passwords are not shown again after submission.
+* **No compatible profile**: M10 provisions H.264 only. Enable/select an H.264 camera
+  profile rather than H.265/other codecs; M10 does not transcode.
+* **Resolved stream rejected or unreachable**: Nian Vision validates the returned
+  RTSP authority and then opens the stream through the existing media worker. Cameras
+  returning unusable ONVIF addresses can still be configured with the known-good RTSP
+  host/port/path using the manual path.
+
+Automated Forgejo tests use deterministic fixtures/local servers and do not require a
+physical ONVIF camera or LAN multicast access. Physical-camera interoperability is
+therefore a manual validation boundary, not a CI guarantee.
+
+**Milestone status:** M0–M10 complete; M11 has not been started.
 
 ## License notes
 

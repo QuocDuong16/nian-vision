@@ -16,13 +16,16 @@ use chrono::NaiveDateTime;
 use nian_application::{
     ApplicationSettingsDto, CameraDraft, CameraService, CameraServiceError, CameraSummary,
     CredentialStore, CredentialStoreError, DesktopLifecycle, DesktopLifecycleError,
-    DesktopLifecycleState, PlaybackController, PlaybackError, PlaybackOpenDto, ProbeController,
-    ProbeError, ProbeResult, RecordingController, RecordingControllerError, RecordingDto,
-    RecordingState, RecordingStatus, SupervisorRecordingRunnerFactory, WorkerProbeRunner,
+    DesktopLifecycleState, OnvifConnectionDto, OnvifController, OnvifControllerError,
+    OnvifDiscoveryDto, OnvifPreparedProfileDto, PlaybackController, PlaybackError, PlaybackOpenDto,
+    ProbeController, ProbeError, ProbeResult, RecordingController, RecordingControllerError,
+    RecordingDto, RecordingState, RecordingStatus, SupervisorRecordingRunnerFactory,
+    WorkerProbeRunner,
 };
 use nian_domain::{
     AudioPolicy, CameraId, CredentialRef, Credentials, RetentionPolicy, StorageQuota,
 };
+use nian_onvif::OnvifError;
 use nian_settings::SettingsStore;
 use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
@@ -131,6 +134,31 @@ struct ProbeCommandInput {
     timeout_ms: u64,
 }
 
+#[derive(Deserialize)]
+struct OnvifConnectInput {
+    session_id: String,
+    device_id: String,
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OnvifProfileInput {
+    session_id: String,
+    device_id: String,
+    profile_token: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OnvifAddInput {
+    session_id: String,
+    device_id: String,
+    profile_token: String,
+    camera_id: String,
+    display_name: String,
+    audio_policy: AudioPolicy,
+}
+
 const fn default_probe_timeout_ms() -> u64 {
     10_000
 }
@@ -196,6 +224,7 @@ struct DesktopState {
     recording_controller: Mutex<RecordingController>,
     playback_controller: Mutex<PlaybackController>,
     probe_controller: ProbeController,
+    onvif_controller: OnvifController,
     lifecycle: DesktopLifecycle,
     power_subscription: Mutex<Option<Box<dyn PowerEventSubscription>>>,
     power_dispatch_tx: Mutex<Option<mpsc::Sender<PowerDispatchMessage>>>,
@@ -691,6 +720,165 @@ fn camera_probe(
         .probe_controller
         .probe(request)
         .map_err(map_probe_error)
+}
+
+#[tauri::command]
+async fn onvif_discover(
+    state: tauri::State<'_, Arc<DesktopState>>,
+) -> Result<OnvifDiscoveryDto, DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state.onvif_controller.discover().map_err(map_onvif_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("onvif_internal", "ONVIF discovery task failed"))?
+}
+
+#[tauri::command]
+fn onvif_cancel(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    session_id: Option<String>,
+) -> Result<(), DesktopErrorDto> {
+    state
+        .onvif_controller
+        .cancel(session_id.as_deref())
+        .map_err(map_onvif_error)
+}
+
+#[tauri::command]
+async fn onvif_connect(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    input: OnvifConnectInput,
+) -> Result<OnvifConnectionDto, DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    if input.username.trim().is_empty() || input.password.is_empty() {
+        return Err(DesktopErrorDto::new(
+            "validation",
+            "username and password are required",
+        ));
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .onvif_controller
+            .connect(
+                &input.session_id,
+                &input.device_id,
+                Credentials::new(input.username, input.password),
+            )
+            .map_err(map_onvif_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("onvif_internal", "ONVIF probe task failed"))?
+}
+
+#[tauri::command]
+async fn onvif_prepare_profile(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    input: OnvifProfileInput,
+) -> Result<OnvifPreparedProfileDto, DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .onvif_controller
+            .prepare_profile(&input.session_id, &input.device_id, &input.profile_token)
+            .map_err(map_onvif_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("onvif_internal", "ONVIF profile task failed"))?
+}
+
+fn add_onvif_camera(
+    state: &DesktopState,
+    input: OnvifAddInput,
+) -> Result<nian_application::CameraMutation<CameraSummary>, DesktopErrorDto> {
+    // Resolve the already prepared ONVIF profile into the ordinary RTSP draft
+    // under lifecycle admission, then release every global application lock
+    // before the media worker performs network I/O.
+    let probe_request = {
+        let _gate = lock(&state.control_gate)?;
+        require_running(state)?;
+        let draft = state
+            .onvif_controller
+            .camera_draft(
+                &input.session_id,
+                &input.device_id,
+                &input.profile_token,
+                input.camera_id.clone(),
+                input.display_name.clone(),
+                input.audio_policy,
+            )
+            .map_err(map_onvif_error)?;
+        lock(&state.camera_service)?
+            .prepare_probe_draft(&draft, default_probe_timeout_ms())
+            .map_err(map_camera_error)?
+    };
+
+    let result = state
+        .probe_controller
+        .probe(probe_request)
+        .map_err(map_probe_error)?;
+    if !result.reachable || !result.video_stream_found {
+        return Err(DesktopErrorDto::new(
+            "onvif_stream_unavailable",
+            "selected ONVIF stream could not be opened",
+        ));
+    }
+    if !result
+        .codec
+        .as_deref()
+        .is_some_and(|codec| codec.eq_ignore_ascii_case("h264"))
+    {
+        return Err(DesktopErrorDto::new(
+            "onvif_no_compatible_profile",
+            "selected stream is not H.264 compatible",
+        ));
+    }
+
+    let created = {
+        let _gate = lock(&state.control_gate)?;
+        require_running(state)?;
+        // Re-resolve after the blocking RTSP probe. Refresh/cancel/suspend that
+        // happened while probing makes the session stale and prevents persistence.
+        let draft = state
+            .onvif_controller
+            .camera_draft(
+                &input.session_id,
+                &input.device_id,
+                &input.profile_token,
+                input.camera_id,
+                input.display_name,
+                input.audio_policy,
+            )
+            .map_err(map_onvif_error)?;
+        lock(&state.camera_service)?
+            .create_camera(draft)
+            .map_err(map_camera_error)?
+    };
+    let _ = state.onvif_controller.cancel_session(&input.session_id);
+    Ok(created)
+}
+
+#[tauri::command]
+async fn onvif_add_camera(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    input: OnvifAddInput,
+) -> Result<nian_application::CameraMutation<CameraSummary>, DesktopErrorDto> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || add_onvif_camera(&state, input))
+        .await
+        .map_err(|_| DesktopErrorDto::new("onvif_internal", "ONVIF provisioning task failed"))?
 }
 
 fn start_recording(
@@ -1194,6 +1382,76 @@ fn map_probe_error(error: ProbeError) -> DesktopErrorDto {
     }
 }
 
+fn map_onvif_error(error: OnvifControllerError) -> DesktopErrorDto {
+    match error {
+        OnvifControllerError::NotAccepting => DesktopErrorDto::new(
+            "cancelled",
+            "ONVIF onboarding is unavailable during lifecycle transition",
+        ),
+        OnvifControllerError::SessionExpired | OnvifControllerError::DeviceExpired => {
+            DesktopErrorDto::new(
+                "onvif_discovery_expired",
+                "ONVIF discovery results expired; run discovery again",
+            )
+        }
+        OnvifControllerError::ProfileNotFound => DesktopErrorDto::new(
+            "onvif_profile_not_found",
+            "selected ONVIF media profile is no longer available",
+        ),
+        OnvifControllerError::Validation => {
+            DesktopErrorDto::new("validation", "ONVIF credentials or selection are invalid")
+        }
+        OnvifControllerError::Internal => {
+            DesktopErrorDto::new("onvif_internal", "ONVIF onboarding state is unavailable")
+        }
+        OnvifControllerError::Protocol(error) => match error {
+            OnvifError::Busy => {
+                DesktopErrorDto::new("onvif_busy", "another ONVIF operation is already running")
+            }
+            OnvifError::Timeout => {
+                DesktopErrorDto::new("onvif_timeout", "ONVIF device request timed out")
+            }
+            OnvifError::DeviceUnreachable => DesktopErrorDto::new(
+                "onvif_device_unreachable",
+                "ONVIF device could not be reached",
+            ),
+            OnvifError::AuthFailed => {
+                DesktopErrorDto::new("onvif_auth_failed", "ONVIF authentication failed")
+            }
+            OnvifError::Protocol => DesktopErrorDto::new(
+                "onvif_protocol",
+                "camera returned a malformed ONVIF response",
+            ),
+            OnvifError::ResponseTooLarge => DesktopErrorDto::new(
+                "onvif_response_too_large",
+                "camera returned an ONVIF response that exceeded safety limits",
+            ),
+            OnvifError::Unsupported => DesktopErrorDto::new(
+                "onvif_unsupported",
+                "camera does not expose the required ONVIF media capability",
+            ),
+            OnvifError::NoCompatibleProfile => DesktopErrorDto::new(
+                "onvif_no_compatible_profile",
+                "camera has no compatible H.264 media profile",
+            ),
+            OnvifError::InvalidStreamUri => DesktopErrorDto::new(
+                "onvif_invalid_stream_uri",
+                "camera returned an invalid RTSP stream address",
+            ),
+            OnvifError::AuthorityRejected => DesktopErrorDto::new(
+                "onvif_authority_rejected",
+                "camera returned an unsafe or unrelated network address",
+            ),
+            OnvifError::Cancelled => {
+                DesktopErrorDto::new("cancelled", "ONVIF operation was cancelled")
+            }
+            OnvifError::Internal => {
+                DesktopErrorDto::new("onvif_internal", "ONVIF operation failed")
+            }
+        },
+    }
+}
+
 fn startup_hidden_args<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,
@@ -1602,6 +1860,9 @@ fn shutdown_power_runtime(state: &DesktopState) {
 
 fn shutdown_runtime_resources(state: &DesktopState) -> Result<(), DesktopErrorDto> {
     let mut first_error = None;
+    if let Err(error) = state.onvif_controller.stop_accepting_and_cancel() {
+        capture_first_error(&mut first_error, map_onvif_error(error));
+    }
     match state.recording_controller.lock() {
         Ok(mut controller) => {
             if let Err(error) = controller.shutdown_all() {
@@ -1646,6 +1907,9 @@ fn begin_update_shutdown(state: &DesktopState) -> Result<(), DesktopErrorDto> {
                 "quitting",
                 "application is already quitting",
             ));
+        }
+        if let Err(error) = state.onvif_controller.stop_accepting_and_cancel() {
+            capture_first_error(&mut admission_error, map_onvif_error(error));
         }
         state.probe_controller.stop_accepting_and_cancel();
         match state.playback_controller.lock() {
@@ -1754,6 +2018,9 @@ fn handle_power_event(
                 return Ok(());
             }
             let mut first_error = None;
+            if let Err(error) = state.onvif_controller.stop_accepting_and_cancel() {
+                capture_first_error(&mut first_error, map_onvif_error(error));
+            }
             state.probe_controller.stop_accepting_and_cancel();
             match state.playback_controller.lock() {
                 Ok(mut playback) => playback.stop_accepting(),
@@ -1831,6 +2098,7 @@ fn handle_power_event(
                 capture_first_error(&mut first_error, error);
             }
             state.probe_controller.resume_accepting();
+            state.onvif_controller.resume_accepting();
             if let Some(error) = first_error {
                 return Err(error);
             }
@@ -1995,6 +2263,7 @@ pub fn run() {
                     Ok(CloseAction::HideAndPrevent)
                 )
             {
+                let _ = state.onvif_controller.cancel(None);
                 api.prevent_close();
                 let _ = WindowActions::hide(window);
             }
@@ -2035,6 +2304,8 @@ pub fn run() {
             let probe_controller = ProbeController::new(Arc::new(WorkerProbeRunner {
                 worker_program: worker_program.clone(),
             }));
+            let onvif_controller = OnvifController::production()
+                .map_err(|_| std::io::Error::other("ONVIF service could not start"))?;
             let mut playback_controller =
                 PlaybackController::new(worker_program, app_data.join("playback-cache"))
                     .map_err(|_| std::io::Error::other("playback service could not start"))?;
@@ -2058,6 +2329,7 @@ pub fn run() {
                 recording_controller: Mutex::new(recording_controller),
                 playback_controller: Mutex::new(playback_controller),
                 probe_controller,
+                onvif_controller,
                 lifecycle: DesktopLifecycle::new(),
                 power_subscription: Mutex::new(None),
                 power_dispatch_tx: Mutex::new(None),
@@ -2150,6 +2422,11 @@ pub fn run() {
             camera_update,
             camera_delete,
             camera_probe,
+            onvif_discover,
+            onvif_cancel,
+            onvif_connect,
+            onvif_prepare_profile,
+            onvif_add_camera,
             recording_start,
             recording_stop,
             recording_stop_all,
@@ -2779,6 +3056,7 @@ mod tests {
                 recording_controller: Mutex::new(recording_controller),
                 playback_controller: Mutex::new(playback_controller),
                 probe_controller,
+                onvif_controller: OnvifController::production().unwrap(),
                 lifecycle: DesktopLifecycle::new(),
                 power_subscription: Mutex::new(None),
                 power_dispatch_tx: Mutex::new(None),

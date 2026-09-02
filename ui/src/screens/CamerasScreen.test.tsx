@@ -1,10 +1,24 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CamerasScreen } from "./CamerasScreen";
 import type { CameraSummary, RecordingStatus } from "../lib/tauri";
 
+const tauriWindowMock = vi.hoisted(() => ({
+  closeHandler: undefined as undefined | (() => void),
+}));
+
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({
+    onCloseRequested: async (handler: () => void) => {
+      tauriWindowMock.closeHandler = handler;
+      return () => {
+        if (tauriWindowMock.closeHandler === handler) tauriWindowMock.closeHandler = undefined;
+      };
+    },
+  }),
+}));
 
 const camera: CameraSummary = {
   camera_id: "front-door",
@@ -41,6 +55,66 @@ const stopped: RecordingStatus = {
   finalized_segments: 0,
 };
 
+const onvifDiscovery = {
+  session_id: "session-1",
+  devices: [
+    {
+      device_id: "device-1",
+      endpoint_reference: "urn:uuid:front-onvif",
+      label: "Front ONVIF",
+      network_address: "192.168.1.80",
+    },
+  ],
+};
+
+const onvifConnection = {
+  session_id: "session-1",
+  device_id: "device-1",
+  manufacturer: "Fixture Corp",
+  model: "Fixture Cam",
+  firmware_version: "1.0",
+  serial_number: "fixture-001",
+  hostname: "front-onvif",
+  profiles: [
+    {
+      token: "main",
+      name: "Main H264",
+      video_codec: "H264",
+      width: 1920,
+      height: 1080,
+      framerate: 25,
+      bitrate_kbps: 4096,
+      audio_codec: "AAC",
+      supported: true,
+      recommended: true,
+    },
+    {
+      token: "hevc",
+      name: "Main H265",
+      video_codec: "H265",
+      width: 3840,
+      height: 2160,
+      framerate: 25,
+      bitrate_kbps: 8192,
+      audio_codec: null,
+      supported: false,
+      recommended: false,
+    },
+  ],
+  proposed_camera_id: "onvif-front",
+  proposed_display_name: "Front provisioned",
+};
+
+const onvifPrepared = {
+  session_id: "session-1",
+  device_id: "device-1",
+  profile_token: "main",
+  host: "192.168.1.80",
+  port: 8554,
+  path: "/live/main",
+  host_mismatch: false,
+};
+
 function installDesktop(cameras: CameraSummary[] = [], status: RecordingStatus = stopped) {
   Object.defineProperty(window, "__TAURI_INTERNALS__", {
     value: {},
@@ -56,6 +130,7 @@ function installDesktop(cameras: CameraSummary[] = [], status: RecordingStatus =
 
 function fillNewCamera() {
   fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
+  fireEvent.click(screen.getByRole("button", { name: "Add RTSP manually" }));
   fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Back yard" } });
   fireEvent.change(screen.getByLabelText("Host / IP"), { target: { value: "192.168.1.51" } });
   fireEvent.change(screen.getByLabelText("Username"), { target: { value: "admin" } });
@@ -64,6 +139,7 @@ function fillNewCamera() {
 
 beforeEach(() => {
   vi.mocked(invoke).mockReset();
+  tauriWindowMock.closeHandler = undefined;
 });
 
 afterEach(() => {
@@ -83,6 +159,7 @@ describe("CamerasScreen", () => {
     render(<CamerasScreen />);
     await screen.findByText("No cameras configured");
     fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add RTSP manually" }));
     fireEvent.click(screen.getByRole("button", { name: "Save camera" }));
     expect(screen.getByRole("alert").textContent).toContain("Display name is required");
     expect(vi.mocked(invoke).mock.calls.some(([name]) => name === "camera_create")).toBe(false);
@@ -332,4 +409,215 @@ describe("CamerasScreen", () => {
     expect((screen.getByLabelText("Password") as HTMLInputElement).disabled).toBe(true);
     expect(screen.getByText(/Endpoint, credentials and audio policy are locked/)).toBeTruthy();
   });
+
+  it("shows an empty ONVIF discovery result without adopting a camera", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "camera_list") return [];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "onvif_discover") return { session_id: "empty-session", devices: [] };
+      if (command === "onvif_cancel") return undefined;
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<CamerasScreen />);
+    await screen.findByText("No cameras configured");
+    fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discover ONVIF cameras" }));
+
+    expect(await screen.findByText("No ONVIF cameras found.")).toBeTruthy();
+    expect(vi.mocked(invoke).mock.calls.some(([name]) => name === "camera_create")).toBe(false);
+    expect(vi.mocked(invoke).mock.calls.some(([name]) => name === "onvif_add_camera")).toBe(false);
+  });
+
+  it("clears the submitted ONVIF password after an authentication failure", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "camera_list") return [];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "onvif_discover") return onvifDiscovery;
+      if (command === "onvif_connect") {
+        throw { code: "onvif_auth_failed", message: "ONVIF authentication failed" };
+      }
+      if (command === "onvif_cancel") return undefined;
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<CamerasScreen />);
+    await screen.findByText("No cameras configured");
+    fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discover ONVIF cameras" }));
+    await screen.findByText("Front ONVIF");
+    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    fireEvent.change(screen.getByLabelText("ONVIF username"), { target: { value: "admin" } });
+    fireEvent.change(screen.getByLabelText("ONVIF password"), { target: { value: "SENTINEL-onvif-password" } });
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("ONVIF authentication failed"));
+    expect((screen.getByLabelText("ONVIF password") as HTMLInputElement).value).toBe("");
+    expect(document.body.textContent).not.toContain("SENTINEL-onvif-password");
+  });
+
+  it("clears ONVIF wizard state and typed credentials on a native close request", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "camera_list") return [];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "onvif_discover") return onvifDiscovery;
+      if (command === "onvif_cancel") return undefined;
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<CamerasScreen />);
+    await screen.findByText("No cameras configured");
+    await waitFor(() => expect(tauriWindowMock.closeHandler).toBeTypeOf("function"));
+    fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discover ONVIF cameras" }));
+    await screen.findByText("Front ONVIF");
+    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    fireEvent.change(screen.getByLabelText("ONVIF username"), { target: { value: "admin" } });
+    fireEvent.change(screen.getByLabelText("ONVIF password"), {
+      target: { value: "SENTINEL-close-password" },
+    });
+
+    act(() => tauriWindowMock.closeHandler?.());
+
+    await waitFor(() => expect(screen.queryByLabelText("ONVIF password")).toBeNull());
+    expect(screen.queryByText("Front ONVIF")).toBeNull();
+    expect(document.body.textContent).not.toContain("SENTINEL-close-password");
+  });
+
+
+  it("provisions an H264 ONVIF profile without exposing credentials or an authenticated RTSP URI", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    let saved = false;
+    let addArgs: unknown;
+    const provisioned: CameraSummary = {
+      camera_id: "onvif-front",
+      display_name: "Front provisioned",
+      host: "192.168.1.80",
+      port: 8554,
+      path: "/live/main",
+      audio_policy: "copy_all",
+    };
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "camera_list") return saved ? [camera, provisioned] : [camera];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "onvif_discover") return onvifDiscovery;
+      if (command === "onvif_connect") return onvifConnection;
+      if (command === "onvif_prepare_profile") return onvifPrepared;
+      if (command === "onvif_add_camera") {
+        addArgs = args;
+        saved = true;
+        return { value: provisioned, warning: null };
+      }
+      if (command === "onvif_cancel") return undefined;
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<CamerasScreen />);
+    await screen.findByText("Front door");
+    expect((screen.getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discover ONVIF cameras" }));
+    await screen.findByText("Front ONVIF");
+    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    fireEvent.change(screen.getByLabelText("ONVIF username"), { target: { value: "admin" } });
+    fireEvent.change(screen.getByLabelText("ONVIF password"), { target: { value: "SENTINEL-onvif-password" } });
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    const h264 = await screen.findByText("Main H264");
+    const h264Card = h264.closest("article") as HTMLElement;
+    const h265Card = screen.getByText("Main H265").closest("article") as HTMLElement;
+    expect((within(h265Card).getByRole("button", { name: "Use profile" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(document.body.textContent).not.toContain("SENTINEL-onvif-password");
+    fireEvent.click(within(h264Card).getByRole("button", { name: "Use profile" }));
+
+    expect(await screen.findByText("192.168.1.80:8554/live/main")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("rtsp://");
+    expect(document.body.textContent).not.toContain("SENTINEL-onvif-password");
+    fireEvent.click(screen.getByRole("button", { name: "Test & Add" }));
+
+    await screen.findByText("Front provisioned");
+    const serialized = JSON.stringify(addArgs);
+    expect(serialized).not.toContain("username");
+    expect(serialized).not.toContain("password");
+    expect(serialized).not.toContain("rtsp://");
+    expect(serialized).toContain("profile_token");
+    expect((screen.getAllByRole("button", { name: "Start" })[0] as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("keeps the ONVIF review open when final provisioning fails", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "camera_list") return [];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "onvif_discover") return onvifDiscovery;
+      if (command === "onvif_connect") return onvifConnection;
+      if (command === "onvif_prepare_profile") return onvifPrepared;
+      if (command === "onvif_add_camera") {
+        throw { code: "source_open_failed", message: "camera source could not be opened" };
+      }
+      if (command === "onvif_cancel") return undefined;
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<CamerasScreen />);
+    await screen.findByText("No cameras configured");
+    fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discover ONVIF cameras" }));
+    await screen.findByText("Front ONVIF");
+    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    fireEvent.change(screen.getByLabelText("ONVIF username"), { target: { value: "admin" } });
+    fireEvent.change(screen.getByLabelText("ONVIF password"), { target: { value: "secret" } });
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    const h264Card = (await screen.findByText("Main H264")).closest("article") as HTMLElement;
+    fireEvent.click(within(h264Card).getByRole("button", { name: "Use profile" }));
+    await screen.findByText("192.168.1.80:8554/live/main");
+    fireEvent.click(screen.getByRole("button", { name: "Test & Add" }));
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("camera source could not be opened"));
+    expect(screen.getByRole("button", { name: "Test & Add" })).toBeTruthy();
+  });
+
+  it("refreshes discovery into a new session and removes stale device choices", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    let discoveryCount = 0;
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "camera_list") return [];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "onvif_discover") {
+        discoveryCount += 1;
+        if (discoveryCount === 1) return onvifDiscovery;
+        return {
+          session_id: "session-2",
+          devices: [{
+            device_id: "device-2",
+            endpoint_reference: "urn:uuid:garage-onvif",
+            label: "Garage ONVIF",
+            network_address: "192.168.1.81",
+          }],
+        };
+      }
+      if (command === "onvif_cancel") return undefined;
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<CamerasScreen />);
+    await screen.findByText("No cameras configured");
+    fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discover ONVIF cameras" }));
+    await screen.findByText("Front ONVIF");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    expect(await screen.findByText("Garage ONVIF")).toBeTruthy();
+    expect(screen.queryByText("Front ONVIF")).toBeNull();
+  });
+
 });

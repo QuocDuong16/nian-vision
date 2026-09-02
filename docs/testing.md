@@ -19,6 +19,7 @@ Testing is part of the definition of done for every milestone (master spec
 | `nian-application` (M6) | playback path revalidation, explicit filesystem→index refresh, normal/recovered freshness with active-partial exclusion, session expiry/token handling, full/middle/suffix HTTP Range, 416/403/410 transport failures, rebuild-stable recording identity, lazy duration enrichment, symlink rejection, cross-process playback-cache instance locking, playback-pin retention skip and deterministic plan→pin→delete race closure |
 | `nian-application` / desktop (M7) | lifecycle admission (`Running`/`Suspending`/`Quitting`), persisted desired-recording restoration, lifecycle-owned recorder shutdown/join, probe cancellation/admission, playback suspend/resume/shutdown, single-instance activation policy, close-to-tray, autostart reconciliation/rollback, suspend/resume convergence and deterministic Quit ordering |
 | `nian-settings` / `nian-application` / desktop (M9) | schema v3 multi-desired migration + rollback, bounded per-camera recording slots, independent runner/supervisor ownership, camera-scoped Start/Stop/status, transactional Stop All, capacity ordering, failure isolation, multi-camera startup/suspend/resume/update restoration, concurrent admission races, tray/UI aggregation without synthetic global state |
+| `nian-onvif` / `nian-application` / desktop/UI (M10) | bounded/cancellable discovery aggregation, hostile XML and authority validation, Device/Media2/legacy Media fixtures, Digest/UsernameToken secret safety, H.264 profile selection, stream-URI sanitation, opaque session invalidation, per-device failure isolation, lifecycle cancellation and ONVIF/manual onboarding UI |
 | `nian-storage` | recordings layout, partial/final naming round-trip, traversal rejection, exclusive claims (incl. sub-second clock regression), no-replace publication (success, collision refusal, recoverable abandoned partials) |
 | `nian-storage` (M3/M4) | partial-file classification plus deterministic exact-grammar filesystem inventory; normal + recovered first-class recordings; foreign/control artifacts excluded; recording-looking symlinks never followed; shared strict recovery-tombstone v2 validation; typed path-presence semantics where only `NotFound` proves absence; shared whole-second filesystem identity normalization |
 | `nian-ipc` | envelope round-trips, framing limits (1 MiB cap, CRLF, truncation), dispatch loop (ping/describe/shutdown/unknown), protocol version guard, handler event emission through the writer before replies (M3) |
@@ -583,10 +584,54 @@ honor a playback pin on old A, and still delete eligible old B. PlaybackControll
 must open old finalized A and B while both camera leases are held, proving active
 recording ownership does not become a camera-wide read lock.
 
+### ONVIF discovery and provisioning (M10)
+
+`nian-onvif` unit and local HTTP fixture tests cover discovery response parsing,
+duplicate endpoint merging, multiple devices, malformed datagram tolerance, empty
+bounded collection and cancellation. Protocol fixtures exercise Device Management,
+Media2 profile enumeration, legacy Media fallback, HTTPS-before-HTTP endpoint selection,
+credential-free HTTP Digest negotiation, UsernameToken legacy fallback, bare
+authentication failure, redirect refusal and `GetStreamUri` sanitation including
+embedded userinfo, non-default RTSP port/path and XML-escaped query parameters. The
+UsernameToken-mode cache is asserted to remember only the authority/mode decision, not
+the password. Hostile-input tests reject oversized XML, excessive nesting,
+DTD/entity expansion, namespace spoofing of recognized ONVIF fields and excessive
+namespace bindings.
+No normal CI test requires multicast LAN access or a physical camera.
+
+Application tests use fake discovery/device backends to prove opaque discovery handles,
+refresh/session invalidation, secret-free serialized DTOs, typed authentication
+failures, prepared RTSP drafts with transient credentials, suspend cleanup without
+resume resurrection, and isolation where one unreachable discovered device does not
+prevent another device in the same discovery session from connecting. Direct
+provisioning regressions then feed an ONVIF-produced `CameraDraft` through the real
+`CameraService`: one asserts the ordinary RTSP camera/credential-reference model is
+committed, and one injects a settings insert failure and proves the newly written
+credential is rolled back with no camera row left behind.
+
+Desktop regression coverage keeps the accepted M9 lifecycle suite green while ONVIF
+admission is cancelled on suspend/quit/update and reopened only on resume. Close-to-tray
+also invalidates transient ONVIF sessions, while the UI clears any in-progress wizard
+credential state. A deterministic application regression proves cancellation wins even
+after discovery network work completes but before a session can be committed. The final
+provisioning path passes through the existing media-worker RTSP probe before
+`CameraService::create_camera`, so ONVIF retains the existing keyring/settings
+transaction instead of inventing a second persistence model.
+
+`CamerasScreen` tests retain manual RTSP create/probe behavior and add empty discovery,
+authentication failure with password clearing, H.264/H.265 profile presentation,
+successful Test & Add using only opaque handles/safe fields, provisioning failure and
+discovery refresh/stale-result behavior. Assertions forbid passwords or authenticated
+RTSP URIs from rendered output or provisioning command arguments. Existing per-camera
+recording concurrency/convergence tests remain unchanged.
+
+Physical ONVIF camera validation is optional/manual and never a Forgejo CI dependency.
+No hardware model is claimed validated by the M10 automated suite.
+
 ## Planned per milestone
 
-* **M10+**: ONVIF. macOS distribution, live camera viewing, clip export,
-  thumbnails/motion analysis and AI/cloud behavior remain outside M9.
+* **M11+**: PTZ/events/live-view expansion if separately specified. macOS distribution,
+  clip export, thumbnails/motion analysis and AI/cloud behavior remain outside M10.
 * **Hardware/manual** (never in CI): real Tapo C200 via
   `NIAN_VISION_RTSP_URL` with
   `nian-media-worker record --rtsp-from-env ...` and/or an IPC-driven

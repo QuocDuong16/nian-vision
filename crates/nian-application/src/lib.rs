@@ -14,6 +14,7 @@ pub mod camera_service;
 pub mod config;
 pub mod desktop_lifecycle;
 pub mod error;
+pub mod onvif_controller;
 pub mod playback;
 pub mod probe_controller;
 pub mod recording_controller;
@@ -30,6 +31,10 @@ pub use camera_service::{
 pub use config::{AppConfig, SegmentTargetDuration};
 pub use desktop_lifecycle::{DesktopLifecycle, DesktopLifecycleError, DesktopLifecycleState};
 pub use error::ApplicationError;
+pub use onvif_controller::{
+    OnvifConnectionDto, OnvifController, OnvifControllerError, OnvifDiscoveredDeviceDto,
+    OnvifDiscoveryDto, OnvifMediaProfileDto, OnvifPreparedProfileDto,
+};
 pub use playback::{
     AdjacentRecordingsDto, PlaybackBackend, PlaybackController, PlaybackError, PlaybackErrorCode,
     PlaybackInspectDto, PlaybackOpenDto, PreparedPlaybackStorage, RecordingDto,

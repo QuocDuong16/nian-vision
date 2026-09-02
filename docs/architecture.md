@@ -60,7 +60,8 @@ Key properties:
 | Crate | Role | Notes |
 |---|---|---|
 | `nian-domain` | Camera/Recording/Media vocabulary | path-safe IDs, redacted credentials, backoff schedule |
-| `nian-application` | config validation and orchestration policies | `WorkerSupervisor` (M3), `StorageManager` (M4), M5 camera/record/probe controllers, M6 `PlaybackController` + playback pins, M7 lifecycle admission |
+| `nian-application` | config validation and orchestration policies | `WorkerSupervisor` (M3), `StorageManager` (M4), camera/record/probe controllers, M6 `PlaybackController`, M7 lifecycle admission, M10 `OnvifController` session/authority boundary |
+| `nian-onvif` | ONVIF discovery/protocol infrastructure | bounded WS-Discovery, SOAP Device/Media2/Media client, XML/authority hardening; no Tauri, settings, keyring or FFmpeg |
 | `nian-index` | rebuildable SQLite recording catalog | bundled SQLite, schema v1 migrations, WAL, timeline queries; no camera settings or credentials (M4) |
 | `nian-settings` | authoritative non-secret desktop configuration | app-data `settings.sqlite3`, schema v2 camera/storage + desired-recording/autostart settings; no FFmpeg/Tauri/process logic |
 | `nian-storage` | recordings layout, claiming, publication, inventory/transaction facts | traversal-proof paths, race-safe `claim_segment`, atomic no-replace publish, lease-aware partial primitives, symlink-safe deterministic inventory (M4) |
@@ -575,6 +576,61 @@ Retention stays global-storage aware: active partials from every camera are excl
 settled finals remain eligible, and playback pins continue to protect only their
 specific finalized recording paths. Old finalized A/B recordings remain playable
 while A and B are concurrently recording new segments. See ADR-0012.
+
+## ONVIF discovery and provisioning (M10)
+
+M10 adds ONVIF only as a local discovery/provisioning layer. It does not change
+recording transport or persistence: a successfully provisioned camera is still an
+ordinary `CameraConfig` with a structured RTSP host/port/path plus a native
+credential reference, and recording still enters the existing media-worker/FFmpeg
+path. Manually configured RTSP cameras remain independent of ONVIF availability.
+
+`nian-onvif` owns untrusted network protocol handling. WS-Discovery sends bounded
+multicast probes on practical non-loopback IPv4 interfaces, tolerates malformed
+datagrams, deduplicates repeated endpoint identities and caps device/XAddr/scope
+collection. SOAP responses are body/depth/text/count bounded; DTD/custom entity
+expansion and recognized-field namespace spoofing are rejected. HTTPS discovery and
+service candidates are preferred ahead of HTTP when the same trusted local authority
+offers both. HTTP redirects are disabled, HTTPS uses the normal rustls certificate
+verifier, and service/stream authorities are validated before use.
+Authenticated stream URIs are sanitized immediately: userinfo never crosses into a
+DTO, log, error or persistent camera row.
+
+Authentication credentials are transient. React submits username/password only to
+the connect command; `OnvifController` keeps the validated credentials in a Rust
+session and exposes opaque `session_id`/`device_id` handles plus safe device/profile
+metadata. Discovery XAddrs and raw SOAP/XML never enter React. A previously unseen
+authority is first probed without credentials so an HTTP Digest challenge can be
+negotiated; Digest is preferred when available. WS-Security UsernameToken
+PasswordDigest is the legacy fallback when the camera does not expose a usable Digest
+path. Only the selected authentication mode is cached per authority, never credentials
+or reusable challenges. The protocol crate itself owns no secret persistence.
+
+Device interrogation retrieves Device Management information and service endpoints,
+prefers Media2 and falls back to legacy Media for profile enumeration. H.264 is the
+only M10 recording-compatible video codec. Multiple H.264 profiles remain visible
+for explicit user choice; H.265/other profiles may be displayed as unsupported but
+are never silently selected or transcoded. `GetStreamUri` is resolved only after a
+profile choice, then normalized into safe RTSP host/port/path fields.
+
+Provisioning is deliberately two-phase. The desktop resolves an opaque ONVIF
+session/profile into an unsaved `CameraDraft`, releases lifecycle admission locks,
+uses the existing `ProbeController`/media worker to prove that the resulting RTSP
+source really opens, then reacquires admission and re-resolves the same session
+before `CameraService::create_camera`. A refresh/cancel/suspend/quit/update during
+the probe therefore makes the handle stale and prevents persistence. Final credential
+write + settings insert uses the existing credential-reference allocation and rollback
+semantics; ONVIF does not introduce a second camera database or secret store.
+
+Discovery/probe work runs off the Tauri main thread and does not hold recording
+controller or global lifecycle locks across network I/O. Suspend, Quit and update
+close ONVIF admission and clear transient sessions; Resume reopens admission but does
+not restart discovery or resurrect credentials. One failed discovered device does not
+poison another device/session operation.
+
+M10 explicitly excludes PTZ, presets, events/motion subscriptions, talkback, live-view
+redesign, H.265 recording, transcoding, cloud/remote discovery and automatic camera
+adoption. See ADR-0013.
 
 ## Failure model
 

@@ -10,6 +10,7 @@ members = [
     "crates/nian-index",
     "crates/nian-media",
     "crates/nian-media-ffmpeg",
+    "crates/nian-onvif",
     "crates/nian-platform-windows",
     "crates/nian-recorder",
     "crates/nian-settings",
@@ -30,6 +31,7 @@ default-members = [
     "crates/nian-index",
     "crates/nian-media",
     "crates/nian-media-ffmpeg",
+    "crates/nian-onvif",
     "crates/nian-platform-windows",
     "crates/nian-recorder",
     "crates/nian-settings",
@@ -60,6 +62,7 @@ nian-ipc = { path = "crates/nian-ipc" }
 nian-index = { path = "crates/nian-index" }
 nian-media = { path = "crates/nian-media" }
 nian-media-ffmpeg = { path = "crates/nian-media-ffmpeg" }
+nian-onvif = { path = "crates/nian-onvif" }
 nian-platform-windows = { path = "crates/nian-platform-windows" }
 nian-recorder = { path = "crates/nian-recorder" }
 nian-settings = { path = "crates/nian-settings" }
@@ -94,6 +97,13 @@ tauri-plugin-single-instance = "=2.4.3"
 tauri-plugin-updater = "=2.10.1"
 base64 = "=0.22.1"
 minisign-verify = "=0.2.5"
+if-addrs = "=0.15.0"
+md-5 = "=0.11.0"
+quick-xml = "=0.42.0"
+reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "rustls"] }
+sha1 = "=0.11.0"
+sha2 = "=0.11.0"
+url = "=2.5.8"
 
 [profile.release]
 lto = "thin"
