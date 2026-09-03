@@ -29,9 +29,19 @@ authentication, media profile parsing and stream URI authority validation. It ha
 Tauri, FFmpeg, SQLite, settings or keyring dependency. Discovery is bounded and
 cancellable, deduplicates endpoint identities and limits datagram/device/XAddr/scope
 allocation. SOAP parsing caps body/depth/text/profile counts and rejects DTD/custom
-entity expansion plus namespace spoofing of recognized ONVIF fields. HTTPS candidates
-are preferred ahead of HTTP for discovery/service authority selection. HTTP redirects
-are disabled; HTTPS keeps normal certificate verification.
+entity expansion plus namespace spoofing of recognized ONVIF fields. Every ONVIF HTTP/SOAP
+client explicitly disables automatic system/environment proxy discovery; local camera
+authentication never relies on `NO_PROXY`. HTTP redirects are disabled and HTTPS keeps
+normal certificate verification.
+
+Discovery responder identity is part of the authority proof. M10 accepts a discovered
+device-service XAddr only when its IP literal equals the UDP responder; hostname aliases
+are not automatically trusted because they end in `.local`/`.lan` or otherwise look
+private. Duplicate EndpointReferences from different responder addresses remain separate
+discovery identities rather than merging their XAddrs. After device authentication, a
+service XAddr may receive those credentials only when its host exactly matches the
+authenticated device host; another port/path is allowed, but an unrelated RFC1918,
+link-local or other local authority is not.
 
 ### Frontend authority is opaque and Rust-owned
 
@@ -51,16 +61,20 @@ fallback when no usable Digest challenge is exposed. Only the chosen authenticat
 mode is cached per authority; passwords and challenges are not cached there. Passwords
 are never serialized by protocol or application DTOs and credential-bearing input
 structs deliberately avoid `Debug` and `Serialize`. Authenticated stream URI userinfo
-is stripped before any endpoint crosses the protocol boundary. Redirects cannot carry
-authentication to another authority.
+is stripped before any endpoint crosses the protocol boundary, arbitrary RTSP query
+strings are rejected rather than persisted/exposed, and the stream host must remain
+bound to the authenticated device host. Redirects cannot carry authentication to another
+authority.
 
 ### Media2 is preferred; H.264 remains the recording compatibility boundary
 
-Device Management discovers service endpoints. Media2 is used when available, with
-legacy Media fallback for cameras that do not provide usable Media2 profiles. Profile
-metadata remains user-visible enough to choose among meaningful H.264 streams. Other
-codecs, including H.265, may be reported but are unsupported for M10 selection. M10
-does not transcode or broaden the recorder codec contract.
+Device Management discovers service endpoints. Validated candidates are retained and
+tried deterministically, preferring Media2 before legacy Media and HTTPS before HTTP.
+Timeout, unreachable, protocol and unsupported failures may advance to the next validated
+candidate; `AuthFailed` stops immediately, and authority rejection never weakens the trust
+model. Profile metadata remains user-visible enough to choose among meaningful H.264
+streams. Other codecs, including H.265, may be reported but are unsupported for M10
+selection. M10 does not transcode or broaden the recorder codec contract.
 
 ### Final provisioning must prove the resolved RTSP source
 
@@ -85,6 +99,9 @@ does not invalidate unrelated configured cameras.
   media-worker IPC or M9 recording slots.
 - Normal CI can use deterministic UDP/XML/HTTP fixtures; LAN broadcast and physical
   camera access remain optional manual validation.
+- Cameras that advertise only hostname-based ONVIF device-service aliases are not
+  auto-provisioned in M10 because no bounded alias-equivalence resolver is implemented;
+  manual RTSP remains available.
 - Cameras with unsupported/malformed ONVIF implementations can still be configured
   manually by RTSP.
 - M10 intentionally does not include PTZ, presets, events, talkback, live-view

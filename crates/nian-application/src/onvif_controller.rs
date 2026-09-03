@@ -407,6 +407,12 @@ impl OnvifController {
             &network_credentials,
             &profile,
         )?;
+        // Defense in depth: production `nian-onvif` rejects RTSP queries before
+        // constructing a StreamEndpoint. Keep the application/UI persistence
+        // boundary query-free even if a future backend regresses.
+        if endpoint.path.contains('?') {
+            return Err(OnvifError::InvalidStreamUri.into());
+        }
         self.require_accepting()?;
 
         let mut sessions = self
@@ -767,6 +773,80 @@ mod tests {
             draft.replacement_credentials.unwrap().password(),
             "SENTINEL-secret"
         );
+    }
+
+    #[test]
+    fn rtsp_query_cannot_cross_into_ui_or_camera_draft_even_if_backend_regresses() {
+        #[derive(Debug)]
+        struct QueryEndpointDevice;
+
+        impl DeviceBackend for QueryEndpointDevice {
+            fn interrogate(
+                &self,
+                device_service: &str,
+                credentials: &OnvifCredentials,
+            ) -> Result<OnvifInterrogation, OnvifError> {
+                FakeDevice {
+                    auth_failure: false,
+                }
+                .interrogate(device_service, credentials)
+            }
+
+            fn stream_endpoint(
+                &self,
+                _device_service: &str,
+                _media_service: &str,
+                _credentials: &OnvifCredentials,
+                _profile: &MediaProfile,
+            ) -> Result<StreamEndpoint, OnvifError> {
+                Ok(StreamEndpoint {
+                    host: "192.168.1.8".into(),
+                    port: 554,
+                    path: "/live?opaque=SENTINEL-query-secret".into(),
+                    host_mismatch: false,
+                })
+            }
+        }
+
+        let controller = OnvifController::with_backends(
+            Arc::new(FakeDiscovery {
+                devices: vec![DiscoveredDevice {
+                    endpoint_reference: "urn:uuid:fixture".into(),
+                    xaddrs: vec!["http://192.168.1.8/onvif/device_service".into()],
+                    scopes: Vec::new(),
+                    network_address: "192.168.1.8".into(),
+                }],
+            }),
+            Arc::new(QueryEndpointDevice),
+        );
+        let discovery = controller.discover().unwrap();
+        let device = &discovery.devices[0];
+        controller
+            .connect(
+                &discovery.session_id,
+                &device.device_id,
+                Credentials::new("admin", "secret"),
+            )
+            .unwrap();
+        let error = controller
+            .prepare_profile(&discovery.session_id, &device.device_id, "main")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OnvifControllerError::Protocol(OnvifError::InvalidStreamUri)
+        ));
+        assert!(!format!("{error:?}").contains("SENTINEL-query-secret"));
+        assert!(matches!(
+            controller.camera_draft(
+                &discovery.session_id,
+                &device.device_id,
+                "main",
+                "camera".into(),
+                "Camera".into(),
+                AudioPolicy::Exclude,
+            ),
+            Err(OnvifControllerError::ProfileNotFound)
+        ));
     }
 
     #[test]

@@ -63,7 +63,7 @@ fn collect_responses(
     cancel: &AtomicBool,
 ) -> Result<Vec<DiscoveredDevice>, OnvifError> {
     let deadline = Instant::now() + timeout;
-    let mut devices: BTreeMap<String, DiscoveredDevice> = BTreeMap::new();
+    let mut devices: BTreeMap<(String, IpAddr), DiscoveredDevice> = BTreeMap::new();
     let mut buffer = vec![0u8; MAX_DISCOVERY_DATAGRAM_BYTES];
 
     while Instant::now() < deadline && devices.len() < max_devices {
@@ -100,7 +100,7 @@ fn collect_responses(
 }
 
 fn ingest_datagram(
-    devices: &mut BTreeMap<String, DiscoveredDevice>,
+    devices: &mut BTreeMap<(String, IpAddr), DiscoveredDevice>,
     datagram: &[u8],
     source: IpAddr,
     max_devices: usize,
@@ -129,15 +129,14 @@ fn ingest_datagram(
         if safe_xaddrs.is_empty() {
             continue;
         }
-        let key = probe_match.endpoint_reference.clone();
-        let entry = devices
-            .entry(key.clone())
-            .or_insert_with(|| DiscoveredDevice {
-                endpoint_reference: key,
-                xaddrs: Vec::new(),
-                scopes: Vec::new(),
-                network_address: source.to_string(),
-            });
+        let endpoint_reference = probe_match.endpoint_reference.clone();
+        let key = (endpoint_reference.clone(), source);
+        let entry = devices.entry(key).or_insert_with(|| DiscoveredDevice {
+            endpoint_reference,
+            xaddrs: Vec::new(),
+            scopes: Vec::new(),
+            network_address: source.to_string(),
+        });
         for xaddr in safe_xaddrs {
             if entry.xaddrs.len() < MAX_XADDRS_PER_DEVICE && !entry.xaddrs.contains(&xaddr) {
                 entry.xaddrs.push(xaddr);
@@ -209,7 +208,7 @@ mod tests {
     use crate::types::ProbeMatch;
 
     fn merge_fixture(
-        devices: &mut BTreeMap<String, DiscoveredDevice>,
+        devices: &mut BTreeMap<(String, IpAddr), DiscoveredDevice>,
         source: IpAddr,
         fixture: ProbeMatch,
     ) {
@@ -221,14 +220,13 @@ mod tests {
         if safe.is_empty() {
             return;
         }
-        let entry = devices
-            .entry(fixture.endpoint_reference.clone())
-            .or_insert(DiscoveredDevice {
-                endpoint_reference: fixture.endpoint_reference,
-                xaddrs: Vec::new(),
-                scopes: Vec::new(),
-                network_address: source.to_string(),
-            });
+        let key = (fixture.endpoint_reference.clone(), source);
+        let entry = devices.entry(key).or_insert(DiscoveredDevice {
+            endpoint_reference: fixture.endpoint_reference,
+            xaddrs: Vec::new(),
+            scopes: Vec::new(),
+            network_address: source.to_string(),
+        });
         for xaddr in safe {
             if !entry.xaddrs.contains(&xaddr) {
                 entry.xaddrs.push(xaddr);
@@ -242,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_identity_merges_addresses_and_scopes() {
+    fn duplicate_identity_from_same_responder_merges_addresses_and_scopes() {
         let source: IpAddr = "192.168.1.8".parse().unwrap();
         let mut devices = BTreeMap::new();
         merge_fixture(
@@ -260,7 +258,7 @@ mod tests {
             source,
             ProbeMatch {
                 endpoint_reference: "urn:uuid:one".to_owned(),
-                xaddrs: vec!["http://camera.local/onvif/device_service".to_owned()],
+                xaddrs: vec!["http://192.168.1.8:8080/onvif/device_service".to_owned()],
                 scopes: vec!["scope:b".to_owned()],
                 is_network_video_transmitter: true,
             },
@@ -269,6 +267,43 @@ mod tests {
         let device = devices.values().next().unwrap();
         assert_eq!(device.xaddrs.len(), 2);
         assert_eq!(device.scopes.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_endpoint_reference_from_unrelated_responder_cannot_inject_authority() {
+        let mut devices = BTreeMap::new();
+        for (source, xaddr) in [
+            ("192.168.1.20", "http://192.168.1.20/onvif/device_service"),
+            ("192.168.1.90", "http://192.168.1.90/onvif/device_service"),
+        ] {
+            merge_fixture(
+                &mut devices,
+                source.parse().unwrap(),
+                ProbeMatch {
+                    endpoint_reference: "urn:uuid:shared".to_owned(),
+                    xaddrs: vec![xaddr.to_owned()],
+                    scopes: Vec::new(),
+                    is_network_video_transmitter: true,
+                },
+            );
+        }
+        assert_eq!(devices.len(), 2);
+        let trusted = devices
+            .get(&(
+                "urn:uuid:shared".to_owned(),
+                "192.168.1.20".parse().unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(
+            trusted.xaddrs,
+            vec!["http://192.168.1.20/onvif/device_service"]
+        );
+        assert!(
+            !trusted
+                .xaddrs
+                .iter()
+                .any(|xaddr| xaddr.contains("192.168.1.90"))
+        );
     }
 
     #[test]
@@ -294,8 +329,8 @@ mod tests {
             MAX_DISCOVERED_DEVICES,
         );
         assert_eq!(devices.len(), 2);
-        assert!(devices.contains_key("urn:uuid:one"));
-        assert!(devices.contains_key("urn:uuid:two"));
+        assert!(devices.contains_key(&("urn:uuid:one".to_owned(), "192.168.1.8".parse().unwrap())));
+        assert!(devices.contains_key(&("urn:uuid:two".to_owned(), "192.168.1.8".parse().unwrap())));
     }
 
     #[test]

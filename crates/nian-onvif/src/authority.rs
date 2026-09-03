@@ -4,22 +4,6 @@ use url::{Host, Url};
 
 use crate::{MAX_URL_BYTES, OnvifError, StreamEndpoint};
 
-fn is_local_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local() || ip.is_loopback(),
-        IpAddr::V6(ip) => {
-            ip.is_loopback() || ip.is_unicast_link_local() || (ip.segments()[0] & 0xfe00) == 0xfc00
-        }
-    }
-}
-
-fn local_hostname(host: &str) -> bool {
-    host.parse::<IpAddr>().is_ok_and(is_local_ip)
-        || host.eq_ignore_ascii_case("localhost")
-        || host.to_ascii_lowercase().ends_with(".local")
-        || host.to_ascii_lowercase().ends_with(".lan")
-}
-
 fn host_string(url: &Url) -> Result<String, OnvifError> {
     match url.host().ok_or(OnvifError::AuthorityRejected)? {
         Host::Domain(host) => Ok(host.to_owned()),
@@ -44,8 +28,10 @@ pub(crate) fn validate_discovery_xaddr(
         return Err(OnvifError::AuthorityRejected);
     }
     let host = host_string(&url)?;
-    let responder_matches = host.parse::<IpAddr>().is_ok_and(|ip| ip == responder);
-    if !responder_matches && !local_hostname(&host) {
+    // M10 accepts only an IP literal that is exactly the UDP responder.
+    // Hostname aliases require an explicit bounded equivalence proof and are
+    // rejected rather than trusted merely because they look local.
+    if !host.parse::<IpAddr>().is_ok_and(|ip| ip == responder) {
         return Err(OnvifError::AuthorityRejected);
     }
     Ok(url.to_string())
@@ -69,7 +55,7 @@ pub(crate) fn validate_service_xaddr(
     }
     let candidate_host = host_string(&candidate)?;
     let device_host = host_string(&device)?;
-    if !candidate_host.eq_ignore_ascii_case(&device_host) && !local_hostname(&candidate_host) {
+    if !candidate_host.eq_ignore_ascii_case(&device_host) {
         return Err(OnvifError::AuthorityRejected);
     }
     Ok(candidate.to_string())
@@ -93,11 +79,10 @@ pub(crate) fn parse_stream_uri(
         .map_err(|_| OnvifError::InvalidStreamUri)?;
     let host = host_string(&url).map_err(|_| OnvifError::InvalidStreamUri)?;
     let port = url.port_or_known_default().unwrap_or(554);
-    let mut path = url.path().to_owned();
-    if let Some(query) = url.query() {
-        path.push('?');
-        path.push_str(query);
+    if url.query().is_some() {
+        return Err(OnvifError::InvalidStreamUri);
     }
+    let path = url.path().to_owned();
     if !path.starts_with('/')
         || path.len() > 4096
         || path
@@ -110,7 +95,7 @@ pub(crate) fn parse_stream_uri(
     let device = Url::parse(device_service).map_err(|_| OnvifError::InvalidStreamUri)?;
     let device_host = host_string(&device).map_err(|_| OnvifError::InvalidStreamUri)?;
     let host_mismatch = !host.eq_ignore_ascii_case(&device_host);
-    if host_mismatch && !local_hostname(&host) {
+    if host_mismatch {
         return Err(OnvifError::AuthorityRejected);
     }
 
@@ -140,25 +125,72 @@ mod tests {
     }
 
     #[test]
-    fn stream_uri_strips_userinfo_and_preserves_port_path() {
+    fn discovery_requires_exact_responder_ip_and_rejects_hostname_aliases() {
+        let responder: IpAddr = "192.168.1.20".parse().unwrap();
+        assert!(
+            validate_discovery_xaddr("http://192.168.1.20/onvif/device_service", responder).is_ok()
+        );
+        assert_eq!(
+            validate_discovery_xaddr("http://192.168.1.90/onvif/device_service", responder),
+            Err(OnvifError::AuthorityRejected)
+        );
+        assert_eq!(
+            validate_discovery_xaddr("http://camera.local/onvif/device_service", responder),
+            Err(OnvifError::AuthorityRejected)
+        );
+    }
+
+    #[test]
+    fn service_authority_requires_same_host_but_allows_different_port_and_path() {
+        assert!(
+            validate_service_xaddr(
+                "https://192.168.1.20:8443/onvif/media2",
+                "http://192.168.1.20/onvif/device_service"
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            validate_service_xaddr(
+                "http://192.168.1.90/onvif/media",
+                "http://192.168.1.20/onvif/device_service"
+            ),
+            Err(OnvifError::AuthorityRejected)
+        );
+        assert_eq!(
+            validate_service_xaddr(
+                "http://camera.local/onvif/media",
+                "http://192.168.1.20/onvif/device_service"
+            ),
+            Err(OnvifError::AuthorityRejected)
+        );
+    }
+
+    #[test]
+    fn stream_uri_strips_userinfo_and_preserves_safe_path() {
         let endpoint = parse_stream_uri(
-            "rtsp://admin:secret@192.168.1.9:8554/live/main?transport=tcp",
-            "http://192.168.1.5/onvif/device_service",
+            "rtsp://admin:secret@192.168.1.20:8554/live/main",
+            "http://192.168.1.20/onvif/device_service",
         )
         .unwrap();
-        assert_eq!(endpoint.host, "192.168.1.9");
+        assert_eq!(endpoint.host, "192.168.1.20");
         assert_eq!(endpoint.port, 8554);
-        assert_eq!(endpoint.path, "/live/main?transport=tcp");
-        assert!(endpoint.host_mismatch);
+        assert_eq!(endpoint.path, "/live/main");
+        assert!(!endpoint.host_mismatch);
         assert!(!format!("{endpoint:?}").contains("secret"));
     }
 
     #[test]
-    fn stream_uri_rejects_public_host_mismatch() {
+    fn stream_uri_rejects_query_and_any_host_mismatch_without_leaking_secret() {
+        let query_result = parse_stream_uri(
+            "rtsp://192.168.1.20/live?opaque=SENTINEL-stream-token",
+            "http://192.168.1.20/onvif/device_service",
+        );
+        assert_eq!(query_result, Err(OnvifError::InvalidStreamUri));
+        assert!(!format!("{query_result:?}").contains("SENTINEL-stream-token"));
         assert_eq!(
             parse_stream_uri(
-                "rtsp://203.0.113.9/live",
-                "http://192.168.1.5/onvif/device_service"
+                "rtsp://192.168.1.90/live",
+                "http://192.168.1.20/onvif/device_service"
             ),
             Err(OnvifError::AuthorityRejected)
         );

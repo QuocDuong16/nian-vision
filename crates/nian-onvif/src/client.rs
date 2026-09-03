@@ -41,13 +41,12 @@ impl std::fmt::Debug for OnvifClient {
 
 impl OnvifClient {
     pub fn new() -> Result<Self, OnvifError> {
-        let http = Client::builder()
-            .timeout(Duration::from_millis(HTTP_TIMEOUT_MS))
-            .redirect(Policy::none())
-            .build()
-            .map_err(|_| OnvifError::Internal)?;
+        Self::with_timeout(Duration::from_millis(HTTP_TIMEOUT_MS))
+    }
+
+    fn with_timeout(timeout: Duration) -> Result<Self, OnvifError> {
         Ok(Self {
-            http,
+            http: build_http_client(timeout)?,
             username_token_authorities: Arc::new(Mutex::new(HashSet::new())),
         })
     }
@@ -81,28 +80,19 @@ impl OnvifClient {
             "<tds:GetServices><tds:IncludeCapability>false</tds:IncludeCapability></tds:GetServices>",
         )?;
         let services = parse_services(&services_xml)?;
-        let media2 = preferred_service_xaddr(&services, "/ver20/media/wsdl", device_service);
-        let media1 = preferred_service_xaddr(&services, "/ver10/media/wsdl", device_service);
-
-        let (media_service, media_service_kind, mut profiles) = if let Some(service) = media2 {
-            match self.get_profiles(&service, credentials, MediaServiceKind::Media2) {
-                Ok(profiles) if !profiles.is_empty() => {
-                    (service, MediaServiceKind::Media2, profiles)
-                }
-                Ok(_) | Err(OnvifError::Protocol | OnvifError::Unsupported) => {
-                    let service = media1.ok_or(OnvifError::Unsupported)?;
-                    let profiles =
-                        self.get_profiles(&service, credentials, MediaServiceKind::LegacyMedia)?;
-                    (service, MediaServiceKind::LegacyMedia, profiles)
-                }
-                Err(error) => return Err(error),
-            }
-        } else {
-            let service = media1.ok_or(OnvifError::Unsupported)?;
-            let profiles =
-                self.get_profiles(&service, credentials, MediaServiceKind::LegacyMedia)?;
-            (service, MediaServiceKind::LegacyMedia, profiles)
-        };
+        let (media2, rejected_media2) =
+            validated_service_xaddrs(&services, "/ver20/media/wsdl", device_service);
+        let (media1, rejected_media1) =
+            validated_service_xaddrs(&services, "/ver10/media/wsdl", device_service);
+        if media2.is_empty() && media1.is_empty() {
+            return Err(if rejected_media2 || rejected_media1 {
+                OnvifError::AuthorityRejected
+            } else {
+                OnvifError::Unsupported
+            });
+        }
+        let (media_service, media_service_kind, mut profiles) =
+            self.select_media_profiles(&media2, &media1, credentials)?;
 
         profiles.sort_by(|left, right| {
             right
@@ -153,6 +143,46 @@ impl OnvifClient {
         normalize_stream_uri(&raw, device_service)
     }
 
+    fn select_media_profiles(
+        &self,
+        media2: &[String],
+        media1: &[String],
+        credentials: &OnvifCredentials,
+    ) -> Result<(String, MediaServiceKind, Vec<MediaProfile>), OnvifError> {
+        let mut saw_profile_response = false;
+        let mut last_retryable = None;
+        for (kind, candidates) in [
+            (MediaServiceKind::Media2, media2),
+            (MediaServiceKind::LegacyMedia, media1),
+        ] {
+            for service in candidates {
+                match self.get_profiles(service, credentials, kind) {
+                    Ok(profiles) => {
+                        saw_profile_response = true;
+                        if profiles.iter().any(MediaProfile::is_h264_compatible) {
+                            return Ok((service.clone(), kind, profiles));
+                        }
+                    }
+                    Err(OnvifError::AuthFailed) => return Err(OnvifError::AuthFailed),
+                    Err(
+                        error @ (OnvifError::AuthorityRejected
+                        | OnvifError::Timeout
+                        | OnvifError::DeviceUnreachable
+                        | OnvifError::Protocol
+                        | OnvifError::Unsupported),
+                    ) => {
+                        last_retryable = Some(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        if saw_profile_response {
+            Err(OnvifError::NoCompatibleProfile)
+        } else {
+            Err(last_retryable.unwrap_or(OnvifError::Unsupported))
+        }
+    }
     fn get_profiles(
         &self,
         service: &str,
@@ -268,21 +298,39 @@ impl OnvifClient {
     }
 }
 
-fn preferred_service_xaddr(
+fn build_http_client(timeout: Duration) -> Result<Client, OnvifError> {
+    Client::builder()
+        .no_proxy()
+        .timeout(timeout)
+        .redirect(Policy::none())
+        .build()
+        .map_err(|_| OnvifError::Internal)
+}
+
+fn validated_service_xaddrs(
     services: &[ServiceEndpoint],
     namespace_fragment: &str,
     device_service: &str,
-) -> Option<String> {
-    services
+) -> (Vec<String>, bool) {
+    let mut rejected = false;
+    let mut candidates = Vec::new();
+    for service in services
         .iter()
         .filter(|service| service.namespace.contains(namespace_fragment))
-        .filter_map(|service| validate_service_xaddr(&service.xaddr, device_service).ok())
-        .min_by(|left, right| {
-            right
-                .starts_with("https://")
-                .cmp(&left.starts_with("https://"))
-                .then_with(|| left.cmp(right))
-        })
+    {
+        match validate_service_xaddr(&service.xaddr, device_service) {
+            Ok(xaddr) if !candidates.contains(&xaddr) => candidates.push(xaddr),
+            Ok(_) => {}
+            Err(_) => rejected = true,
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .starts_with("https://")
+            .cmp(&left.starts_with("https://"))
+            .then_with(|| left.cmp(right))
+    });
+    (candidates, rejected)
 }
 
 fn auth_authority_key(url: &Url) -> Result<String, OnvifError> {
@@ -533,10 +581,16 @@ mod tests {
                 xaddr: "https://192.168.1.8/media2-secure".into(),
             },
         ];
-        let selected =
-            preferred_service_xaddr(&services, "/ver20/media/wsdl", "http://192.168.1.8/device")
-                .unwrap();
-        assert_eq!(selected, "https://192.168.1.8/media2-secure");
+        let (selected, rejected) =
+            validated_service_xaddrs(&services, "/ver20/media/wsdl", "http://192.168.1.8/device");
+        assert!(rejected);
+        assert_eq!(
+            selected,
+            vec![
+                "https://192.168.1.8/media2-secure".to_owned(),
+                "http://192.168.1.8/media2".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -722,7 +776,7 @@ mod tests {
                 } else if request.contains("GetProfiles") {
                     "<Envelope><Body><GetProfilesResponse><Profiles token=\"main\"><Name>Main</Name><VideoEncoderConfiguration><Encoding>H264</Encoding><Resolution><Width>1920</Width><Height>1080</Height></Resolution><RateControl><FrameRateLimit>25</FrameRateLimit><BitrateLimit>4096</BitrateLimit></RateControl></VideoEncoderConfiguration><AudioEncoderConfiguration><Encoding>AAC</Encoding></AudioEncoderConfiguration></Profiles><Profiles token=\"hevc\"><Name>HEVC</Name><VideoEncoderConfiguration><Encoding>H265</Encoding><Resolution><Width>3840</Width><Height>2160</Height></Resolution></VideoEncoderConfiguration></Profiles></GetProfilesResponse></Body></Envelope>".to_owned()
                 } else if request.contains("GetStreamUri") {
-                    "<Envelope><Body><GetStreamUriResponse><Uri>rtsp://admin:SENTINEL-fixture-password@127.0.0.1:8554/live/main?x=1&amp;y=2</Uri></GetStreamUriResponse></Body></Envelope>".to_owned()
+                    "<Envelope><Body><GetStreamUriResponse><Uri>rtsp://admin:SENTINEL-fixture-password@127.0.0.1:8554/live/main</Uri></GetStreamUriResponse></Body></Envelope>".to_owned()
                 } else {
                     panic!("unexpected fixture request")
                 };
@@ -757,7 +811,7 @@ mod tests {
             .unwrap();
         assert_eq!(endpoint.host, "127.0.0.1");
         assert_eq!(endpoint.port, 8554);
-        assert_eq!(endpoint.path, "/live/main?x=1&y=2");
+        assert_eq!(endpoint.path, "/live/main");
         let requests = server.join().unwrap();
         assert!(
             requests
@@ -769,6 +823,47 @@ mod tests {
                 .iter()
                 .all(|request| !request.contains("PasswordDigest"))
         );
+    }
+
+    #[test]
+    fn stream_uri_query_is_rejected_before_any_endpoint_can_cross_the_boundary() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                &[],
+                "<Envelope><Uri>rtsp://127.0.0.1/live?opaque=SENTINEL-query-secret</Uri></Envelope>",
+            );
+        });
+        let client = OnvifClient::new().unwrap();
+        let credentials = OnvifCredentials {
+            username: "admin".into(),
+            password: "secret".into(),
+        };
+        let profile = MediaProfile {
+            token: "main".into(),
+            name: None,
+            video_codec: Some("H264".into()),
+            width: None,
+            height: None,
+            framerate: None,
+            bitrate_kbps: None,
+            audio_codec: None,
+            service_kind: MediaServiceKind::Media2,
+        };
+        let result = client.stream_endpoint(
+            &format!("http://{address}/device"),
+            &format!("http://{address}/media2"),
+            &credentials,
+            &profile,
+        );
+        assert_eq!(result, Err(OnvifError::InvalidStreamUri));
+        assert!(!format!("{result:?}").contains("SENTINEL-query-secret"));
+        server.join().unwrap();
     }
 
     #[test]
@@ -826,6 +921,208 @@ mod tests {
         );
         assert_eq!(interrogation.profiles[0].token, "legacy-main");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn onvif_http_client_with_explicit_proxy_bypass_constructs() {
+        build_http_client(Duration::from_millis(50)).unwrap();
+    }
+
+    #[test]
+    fn first_media2_unreachable_then_second_media2_succeeds() {
+        let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unavailable_address = unavailable.local_addr().unwrap();
+        drop(unavailable);
+        let good = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let good_address = good.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = good.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                &[],
+                "<Envelope><Profiles token=\"main\"><VideoEncoderConfiguration><Encoding>H264</Encoding></VideoEncoderConfiguration></Profiles></Envelope>",
+            );
+        });
+        let client = OnvifClient::with_timeout(Duration::from_millis(100)).unwrap();
+        let credentials = OnvifCredentials {
+            username: "admin".into(),
+            password: "secret".into(),
+        };
+        let media2 = vec![
+            format!("http://{unavailable_address}/media2-a"),
+            format!("http://{good_address}/media2-b"),
+        ];
+        let (selected, kind, profiles) = client
+            .select_media_profiles(&media2, &[], &credentials)
+            .unwrap();
+        assert_eq!(selected, media2[1]);
+        assert_eq!(kind, MediaServiceKind::Media2);
+        assert!(profiles.iter().any(MediaProfile::is_h264_compatible));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn media2_timeout_then_media1_succeeds() {
+        let slow = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let slow_address = slow.local_addr().unwrap();
+        let good = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let good_address = good.local_addr().unwrap();
+        let slow_server = std::thread::spawn(move || {
+            let (mut stream, _) = slow.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            std::thread::sleep(Duration::from_millis(120));
+        });
+        let good_server = std::thread::spawn(move || {
+            let (mut stream, _) = good.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                &[],
+                "<Envelope><Profiles token=\"legacy\"><VideoEncoderConfiguration><Encoding>H264</Encoding></VideoEncoderConfiguration></Profiles></Envelope>",
+            );
+        });
+        let client = OnvifClient::with_timeout(Duration::from_millis(30)).unwrap();
+        let credentials = OnvifCredentials {
+            username: "admin".into(),
+            password: "secret".into(),
+        };
+        let media2 = vec![format!("http://{slow_address}/media2")];
+        let media1 = vec![format!("http://{good_address}/media1")];
+        let (selected, kind, _) = client
+            .select_media_profiles(&media2, &media1, &credentials)
+            .unwrap();
+        assert_eq!(selected, media1[0]);
+        assert_eq!(kind, MediaServiceKind::LegacyMedia);
+        slow_server.join().unwrap();
+        good_server.join().unwrap();
+    }
+
+    #[test]
+    fn auth_failed_stops_before_remaining_media_authorities() {
+        let auth = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let auth_address = auth.local_addr().unwrap();
+        let untouched = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        untouched.set_nonblocking(true).unwrap();
+        let untouched_address = untouched.local_addr().unwrap();
+        let auth_server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = auth.accept().unwrap();
+                let _ = read_http_request(&mut stream);
+                write_http_response(&mut stream, "401 Unauthorized", &[], "");
+            }
+        });
+        let client = OnvifClient::with_timeout(Duration::from_millis(100)).unwrap();
+        let credentials = OnvifCredentials {
+            username: "admin".into(),
+            password: "secret".into(),
+        };
+        let media2 = vec![
+            format!("http://{auth_address}/media2-a"),
+            format!("http://{untouched_address}/media2-b"),
+        ];
+        assert_eq!(
+            client.select_media_profiles(&media2, &[], &credentials),
+            Err(OnvifError::AuthFailed)
+        );
+        auth_server.join().unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            matches!(untouched.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn unsafe_alternate_service_is_filtered_and_never_contacted() {
+        let safe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let safe_address = safe.local_addr().unwrap();
+        let unsafe_listener = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
+        unsafe_listener.set_nonblocking(true).unwrap();
+        let unsafe_address = unsafe_listener.local_addr().unwrap();
+        let services = vec![
+            ServiceEndpoint {
+                namespace: MEDIA2_NS.into(),
+                xaddr: format!("http://{unsafe_address}/media2-a"),
+            },
+            ServiceEndpoint {
+                namespace: MEDIA2_NS.into(),
+                xaddr: format!("http://{safe_address}/media2-b"),
+            },
+        ];
+        let (candidates, rejected) = validated_service_xaddrs(
+            &services,
+            "/ver20/media/wsdl",
+            &format!("http://127.0.0.1:{}/device", safe_address.port()),
+        );
+        assert!(rejected);
+        assert_eq!(candidates, vec![format!("http://{safe_address}/media2-b")]);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = safe.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                &[],
+                "<Envelope><Profiles token=\"main\"><VideoEncoderConfiguration><Encoding>H264</Encoding></VideoEncoderConfiguration></Profiles></Envelope>",
+            );
+        });
+        let client = OnvifClient::with_timeout(Duration::from_millis(100)).unwrap();
+        let credentials = OnvifCredentials {
+            username: "admin".into(),
+            password: "secret".into(),
+        };
+        client
+            .select_media_profiles(&candidates, &[], &credentials)
+            .unwrap();
+        server.join().unwrap();
+        assert!(
+            matches!(unsafe_listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn all_validated_candidates_without_h264_return_no_compatible_profile() {
+        let media2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let media2_address = media2.local_addr().unwrap();
+        let media1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let media1_address = media1.local_addr().unwrap();
+        let server2 = std::thread::spawn(move || {
+            let (mut stream, _) = media2.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                &[],
+                "<Envelope><Profiles token=\"hevc2\"><VideoEncoderConfiguration><Encoding>H265</Encoding></VideoEncoderConfiguration></Profiles></Envelope>",
+            );
+        });
+        let server1 = std::thread::spawn(move || {
+            let (mut stream, _) = media1.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                &[],
+                "<Envelope><Profiles token=\"hevc1\"><VideoEncoderConfiguration><Encoding>H265</Encoding></VideoEncoderConfiguration></Profiles></Envelope>",
+            );
+        });
+        let client = OnvifClient::with_timeout(Duration::from_millis(100)).unwrap();
+        let credentials = OnvifCredentials {
+            username: "admin".into(),
+            password: "secret".into(),
+        };
+        assert_eq!(
+            client.select_media_profiles(
+                &[format!("http://{media2_address}/media2")],
+                &[format!("http://{media1_address}/media1")],
+                &credentials,
+            ),
+            Err(OnvifError::NoCompatibleProfile)
+        );
+        server2.join().unwrap();
+        server1.join().unwrap();
     }
 
     #[test]
