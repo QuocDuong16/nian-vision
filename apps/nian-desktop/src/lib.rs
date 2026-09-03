@@ -371,8 +371,14 @@ fn close_action(lifecycle: &DesktopLifecycle) -> Result<CloseAction, DesktopErro
     }
 }
 
-fn release_hidden_window_resources(state: &DesktopState) {
+fn begin_hidden_window_resource_release(state: &DesktopState) {
     let _ = state.onvif_controller.cancel(None);
+    state.live_controller.stop_accepting();
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn release_hidden_window_resources(state: &DesktopState) {
+    begin_hidden_window_resource_release(state);
     state.live_controller.close_all();
 }
 fn activate_window(
@@ -392,7 +398,9 @@ fn activate_main_window(app: &AppHandle) -> Result<(), DesktopErrorDto> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| DesktopErrorDto::new("lifecycle_failed", "main window is unavailable"))?;
-    activate_window(&state.lifecycle, &window)
+    activate_window(&state.lifecycle, &window)?;
+    state.live_controller.resume_accepting();
+    Ok(())
 }
 
 fn require_running(state: &DesktopState) -> Result<(), DesktopErrorDto> {
@@ -1049,14 +1057,19 @@ async fn live_open(
 }
 
 #[tauri::command]
-fn live_close(
+async fn live_close(
     state: tauri::State<'_, Arc<DesktopState>>,
     session_id: String,
 ) -> Result<(), DesktopErrorDto> {
-    state
-        .live_controller
-        .close(&session_id)
-        .map_err(map_live_error)
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .live_controller
+            .close(&session_id)
+            .map_err(map_live_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("worker_unavailable", "live close task failed"))?
 }
 
 #[tauri::command]
@@ -1071,10 +1084,15 @@ fn live_keepalive(
 }
 
 #[tauri::command]
-fn live_statuses(
+async fn live_statuses(
     state: tauri::State<'_, Arc<DesktopState>>,
 ) -> Result<Vec<LiveStatus>, DesktopErrorDto> {
-    state.live_controller.statuses().map_err(map_live_error)
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state.live_controller.statuses().map_err(map_live_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("worker_unavailable", "live status task failed"))?
 }
 
 #[tauri::command]
@@ -2370,9 +2388,13 @@ pub fn run() {
                     Ok(CloseAction::HideAndPrevent)
                 )
             {
-                release_hidden_window_resources(&state);
+                begin_hidden_window_resource_release(&state);
                 api.prevent_close();
                 let _ = WindowActions::hide(window);
+                let state = state.inner().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    state.live_controller.close_all();
+                });
             }
         })
         .setup(move |app| {
@@ -3146,6 +3168,16 @@ mod tests {
     struct DesktopLiveRunner;
 
     impl nian_application::LiveRunner for DesktopLiveRunner {
+        fn start(
+            &mut self,
+            _source_json: serde_json::Value,
+            output_dir: &std::path::Path,
+            _cancel: Arc<AtomicBool>,
+        ) -> Result<(), nian_application::LiveError> {
+            std::fs::write(output_dir.join("fragment-000000000000.mp4"), b"fake-live")
+                .map_err(|_| nian_application::LiveError::Internal)
+        }
+
         fn status(
             &mut self,
         ) -> Result<nian_application::LiveWorkerStatus, nian_application::LiveError> {
@@ -3156,19 +3188,17 @@ mod tests {
             })
         }
 
-        fn stop(&mut self) {}
+        fn request_stop(&mut self) {}
+
+        fn join_or_reap(&mut self) {}
     }
 
     struct DesktopLiveFactory;
 
     impl nian_application::LiveRunnerFactory for DesktopLiveFactory {
-        fn start(
+        fn spawn(
             &self,
-            _source_json: serde_json::Value,
-            output_path: &std::path::Path,
         ) -> Result<Box<dyn nian_application::LiveRunner>, nian_application::LiveError> {
-            std::fs::write(output_path, b"fake-live")
-                .map_err(|_| nian_application::LiveError::Internal)?;
             Ok(Box::new(DesktopLiveRunner))
         }
     }
@@ -4803,7 +4833,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_csp_allows_only_loopback_playback_media() {
+    fn desktop_csp_allows_only_loopback_media_and_live_fetches() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let csp = config["app"]["security"]["csp"].as_str().unwrap();
@@ -4812,8 +4842,15 @@ mod tests {
             .map(str::trim)
             .find(|directive| directive.starts_with("media-src "))
             .unwrap();
-        assert_eq!(media, "media-src 'self' http://127.0.0.1:*");
+        assert_eq!(media, "media-src 'self' blob: http://127.0.0.1:*");
+        let connect = csp
+            .split(';')
+            .map(str::trim)
+            .find(|directive| directive.starts_with("connect-src "))
+            .unwrap();
+        assert_eq!(connect, "connect-src 'self' http://127.0.0.1:*");
         assert!(!media.split_whitespace().any(|source| source == "*"));
+        assert!(!connect.split_whitespace().any(|source| source == "*"));
         assert!(!csp.contains("192.168."));
         assert!(!csp.contains("default-src http:"));
     }

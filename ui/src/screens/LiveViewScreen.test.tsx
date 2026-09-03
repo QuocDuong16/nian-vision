@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LiveViewScreen } from "./LiveViewScreen";
 import type {
   CameraSummary,
+  LiveOpenDto,
   LiveStatus,
   RecordingIntent,
   RecordingStatus,
@@ -39,7 +40,10 @@ function stopped(cameraId: string): RecordingStatus {
   };
 }
 
-function installDesktop(stateForCamera?: (cameraId: string, sessionId: string) => LiveStatus) {
+function installDesktop(
+  stateForCamera?: (cameraId: string, sessionId: string) => LiveStatus,
+  openOverride?: (cameraId: string) => Promise<LiveOpenDto>,
+) {
   Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
   let live: LiveStatus[] = [];
   let recording: RecordingStatus[] = [stopped(front.camera_id), stopped(garage.camera_id)];
@@ -54,23 +58,25 @@ function installDesktop(stateForCamera?: (cameraId: string, sessionId: string) =
     if (command === "live_keepalive") return undefined;
     if (command === "live_open") {
       const cameraId = (args as { cameraId: string }).cameraId;
-      const sessionId = `00000000-0000-4000-8000-${String(++sequence).padStart(12, "0")}`;
+      const opened = openOverride
+        ? await openOverride(cameraId)
+        : {
+            session_id: `00000000-0000-4000-8000-${String(++sequence).padStart(12, "0")}`,
+            camera_id: cameraId,
+            url: `http://127.0.0.1:43100/live/00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`,
+            state: "starting" as const,
+          };
       live = [
         ...live.filter((status) => status.camera_id !== cameraId),
-        stateForCamera?.(cameraId, sessionId) ?? {
-          session_id: sessionId,
+        stateForCamera?.(cameraId, opened.session_id) ?? {
+          session_id: opened.session_id,
           camera_id: cameraId,
           state: "live",
           failure_category: null,
           reconnect_attempt: 0,
         },
       ];
-      return {
-        session_id: sessionId,
-        camera_id: cameraId,
-        url: `http://127.0.0.1:43100/live/${sessionId}`,
-        state: "starting",
-      };
+      return opened;
     }
     if (command === "live_close") {
       const sessionId = (args as { sessionId: string }).sessionId;
@@ -112,12 +118,33 @@ function installDesktop(stateForCamera?: (cameraId: string, sessionId: string) =
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function liveOpen(cameraId: string, sequence: number): LiveOpenDto {
+  const sessionId = `00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`;
+  return {
+    session_id: sessionId,
+    camera_id: cameraId,
+    url: `http://127.0.0.1:43100/live/${sessionId}`,
+    state: "starting",
+  };
+}
+
 beforeEach(() => {
   vi.mocked(invoke).mockReset();
 });
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
 });
 
@@ -220,6 +247,131 @@ describe("LiveViewScreen", () => {
       },
       { timeout: 2_500 },
     );
+  });
+
+  it("removes a pending camera immediately and closes the late live_open result without owning it", async () => {
+    const pending = deferred<LiveOpenDto>();
+    let keepaliveTick: (() => void) | undefined;
+    const realSetInterval = window.setInterval.bind(window);
+    vi.spyOn(window, "setInterval").mockImplementation((handler, timeout, ...args) => {
+      if (timeout === 30_000 && typeof handler === "function") {
+        keepaliveTick = () => handler(...args);
+      }
+      return realSetInterval(handler, timeout, ...args);
+    });
+    installDesktop(undefined, async () => pending.promise);
+    const view = render(<LiveViewScreen />);
+
+    await screen.findByText("No live cameras selected");
+    fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+    const tile = await screen.findByRole("article", { name: "Front door live camera" });
+    expect(tile.querySelector("video")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(screen.queryByRole("article", { name: "Front door live camera" })).toBeNull());
+
+    const late = liveOpen(front.camera_id, 41);
+    pending.resolve(late);
+    await waitFor(() => {
+      expect(
+        vi.mocked(invoke).mock.calls.some(
+          ([command, args]) => command === "live_close" && (args as { sessionId?: string })?.sessionId === late.session_id,
+        ),
+      ).toBe(true);
+    });
+    expect(document.querySelector("video")).toBeNull();
+    expect(keepaliveTick).toBeTruthy();
+    keepaliveTick?.();
+    await Promise.resolve();
+    expect(
+      vi.mocked(invoke).mock.calls.some(
+        ([command, args]) => command === "live_keepalive" && (args as { sessionId?: string })?.sessionId === late.session_id,
+      ),
+    ).toBe(false);
+
+    const closesBeforeUnmount = vi.mocked(invoke).mock.calls.filter(
+      ([command, args]) => command === "live_close" && (args as { sessionId?: string })?.sessionId === late.session_id,
+    ).length;
+    view.unmount();
+    await Promise.resolve();
+    const closesAfterUnmount = vi.mocked(invoke).mock.calls.filter(
+      ([command, args]) => command === "live_close" && (args as { sessionId?: string })?.sessionId === late.session_id,
+    ).length;
+    expect(closesAfterUnmount).toBe(closesBeforeUnmount);
+  });
+
+  it("closes every late session after unmount while two live_open calls are pending", async () => {
+    const pendingFront = deferred<LiveOpenDto>();
+    const pendingGarage = deferred<LiveOpenDto>();
+    installDesktop(undefined, async (cameraId) =>
+      cameraId === front.camera_id ? pendingFront.promise : pendingGarage.promise,
+    );
+    const view = render(<LiveViewScreen />);
+
+    await screen.findByText("No live cameras selected");
+    fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+    await screen.findByRole("article", { name: "Front door live camera" });
+    await waitFor(() => {
+      const picker = screen.getByRole("combobox", { name: "Camera to add" }) as HTMLSelectElement;
+      expect(picker.value).toBe(garage.camera_id);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+    await screen.findByRole("article", { name: "Garage live camera" });
+    view.unmount();
+
+    const lateFront = liveOpen(front.camera_id, 51);
+    const lateGarage = liveOpen(garage.camera_id, 52);
+    pendingFront.resolve(lateFront);
+    pendingGarage.resolve(lateGarage);
+    await waitFor(() => {
+      const closes = vi.mocked(invoke).mock.calls
+        .filter(([command]) => command === "live_close")
+        .map(([, args]) => (args as { sessionId?: string })?.sessionId);
+      expect(closes).toContain(lateFront.session_id);
+      expect(closes).toContain(lateGarage.session_id);
+    });
+  });
+
+  it("queues a newer generation behind a pending open and never lets the stale result replace it", async () => {
+    const first = deferred<LiveOpenDto>();
+    const second = deferred<LiveOpenDto>();
+    let opens = 0;
+    installDesktop(undefined, async () => {
+      opens += 1;
+      return opens === 1 ? first.promise : second.promise;
+    });
+    render(<LiveViewScreen />);
+
+    await screen.findByText("No live cameras selected");
+    fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+    await screen.findByRole("article", { name: "Front door live camera" });
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(screen.queryByRole("article", { name: "Front door live camera" })).toBeNull());
+    const picker = screen.getByRole("combobox", { name: "Camera to add" }) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: front.camera_id } });
+    expect(picker.value).toBe(front.camera_id);
+    fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+    await screen.findByRole("article", { name: "Front door live camera" });
+    expect(opens).toBe(1);
+
+    const stale = liveOpen(front.camera_id, 61);
+    first.resolve(stale);
+    await waitFor(() => expect(opens).toBe(2));
+    await waitFor(() => {
+      expect(
+        vi.mocked(invoke).mock.calls.some(
+          ([command, args]) => command === "live_close" && (args as { sessionId?: string })?.sessionId === stale.session_id,
+        ),
+      ).toBe(true);
+    });
+
+    const fresh = liveOpen(front.camera_id, 62);
+    second.resolve(fresh);
+    const tile = await screen.findByRole("article", { name: "Front door live camera" });
+    await waitFor(() => {
+      const video = tile.querySelector("video") as HTMLVideoElement | null;
+      expect(video?.src).toContain(fresh.session_id);
+      expect(video?.src).not.toContain(stale.session_id);
+    });
   });
 
   it("closes the backend session on media failure and unmount", async () => {

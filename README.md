@@ -7,10 +7,13 @@ domain so other RTSP/ONVIF cameras can follow.
 **Status**: milestones **M0–M11** are implemented. M10 adds local ONVIF discovery
 and provisioning without changing the accepted RTSP recording architecture. M11 adds
 a separate user-selected Live View surface for up to four H.264 cameras. Each live
-camera owns an independent worker/session and opaque loopback fragmented-MP4 URL; live
-capacity, lifecycle and failures remain separate from M9 recording Desired/Runtime
-ownership. Explicit keepalive plus a background reaper cleans abandoned sessions even
-after frontend failure. The desktop persists camera definitions, recorder/storage
+camera owns an independent worker/session and opaque loopback capability; live capacity,
+lifecycle and failures remain separate from M9 recording Desired/Runtime ownership. Live
+media is a bounded rolling fragmented-MP4 window (2-second target, six retained fragments,
+16 MiB hard fragment limit) rather than an ever-growing session file. Explicit keepalive
+plus a background reaper cleans abandoned sessions/cache, and controller-owned in-flight
+openings make hide/suspend/quit/update cancellation deterministic. The desktop persists
+camera definitions, recorder/storage
 settings, launch-at-login preference and independent per-camera desired recording intent
 in authoritative platform app-data `settings.sqlite3`, while camera passwords remain in
 the operating system credential store. The M4 recording catalog at
@@ -43,9 +46,12 @@ motion analysis, AI, cloud and remote streaming remain outside M11.
   from transient Runtime state and a small aggregate summary without manufacturing a fake
   global RecordingState. A dedicated Live View screen lets the user select up to four
   configured cameras; tiles expose independent live/reconnect/failure state beside the
-  existing recording Desired/Runtime controls. Unselected cameras consume no live-view
-  capacity. Closing the main window hides it and releases transient live sessions while
-  recording intent remains authoritative; explicit Quit owns backend teardown. The
+  existing recording Desired/Runtime controls. A MediaSource client consumes a small
+  loopback manifest plus bounded session-scoped MP4 fragments; stale fragments are reclaimed
+  only after active HTTP readers release them. Unselected cameras consume no live-view
+  capacity. Closing the main window hides promptly and releases transient live ownership on
+  backend blocking work while recording intent remains authoritative; explicit Quit owns
+  deterministic teardown. The
   webview never receives an absolute recording path or authenticated RTSP live URL;
   privileged work flows through narrow Tauri commands.
 * ONVIF onboarding is local and explicit. Discovery returns opaque Rust-owned
@@ -70,7 +76,9 @@ motion analysis, AI, cloud and remote streaming remain outside M11.
     stdin/stdout with the `recording.*` namespace (one supervised job per
     worker; start/stop/status plus typed reconnect events), bounded `camera.probe`
     source-only connection tests and M11 `live.start`/`live.status`/`live.stop` for
-    one H.264 packet-copy live job per live worker. M6 `playback.prepare` inspects a
+    one H.264 packet-copy live job per live worker. Live output is independently finalized
+    rolling MP4 fragments under the application-owned transient live cache, with retention
+    enforced by the application. M6 `playback.prepare` inspects a
     host-validated finalized MKV and packet-copy remuxes supported H.264 plus AAC
     into fragmented MP4 under the application playback cache;
   * `nian-media-worker record --storage <DIR> --camera <ID> ...` is the

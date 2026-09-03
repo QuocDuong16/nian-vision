@@ -635,53 +635,80 @@ adoption. See ADR-0013.
 
 ## Independent multi-camera live view (M11)
 
-M11 adds live viewing as a transient subsystem beside recording rather than as another
-recording mode. `CameraService::prepare_live` resolves an existing camera plus native
-credential reference entirely inside Rust. The secret-bearing authenticated RTSP source
-is handed only to a dedicated live worker; React receives an opaque UUID session id,
-typed live status and an ephemeral `http://127.0.0.1:<port>/live/<uuid>` URL. No settings
-schema or persistent live-layout state is added.
+M11 is a transient subsystem beside recording, not another recording mode.
+`CameraService::prepare_live` resolves an existing camera plus native credential reference
+entirely inside Rust. The authenticated RTSP source is handed only to a dedicated live
+worker; React receives camera identity, typed state, an opaque UUID session id and an
+ephemeral `http://127.0.0.1:<port>/live/<uuid>` capability. No settings schema or persisted
+live-layout state is added.
 
-`LiveViewController` admits at most four simultaneous cameras and at most one opening or
-active live session per camera. Admission reserves camera/capacity under a short registry
-lock, worker spawn/hello/start happens outside that registry lock, then commit installs the
-session. Admission and started handles release reservations on drop, so cancellation or
-thread failure cannot strand capacity. Each committed session owns its runner behind a
-per-session mutex; aggregate status polling queries sessions independently and converts a
-failed worker status request into a failure for that camera rather than failing the whole
-status set. Recording slots and live slots are separate; the same camera may record and
-view live concurrently using independent RTSP connections.
+`LiveViewController` admits at most four opening/active cameras and at most one live owner
+per camera. Admission reserves camera/capacity under a short registry lock. The worker
+process is then spawned outside that registry lock and installed immediately into a
+controller-owned `OpeningState` before hello or `live.start` is awaited. `OpeningState`
+owns the cancellation flag, runner, temporary session directory and completion condition,
+so hide/suspend/quit/update can enumerate, cancel and reap startup work even while the IPC
+handshake is blocked. Admission/started RAII handles remain the fallback that releases
+reservations and temporary resources on task failure. A cancelled/stale opening cannot
+commit or erase a newer reservation.
 
-The worker accepts `live.start`, `live.status` and `live.stop`. It opens RTSP through the
-existing FFmpeg wrapper, requires H.264 video and packet-copies only that video stream into
-fragmented MP4. There is no decode/transcode path. Transient source/media loss retries at
-1/2/4/8/15 seconds with a five-attempt bound. Lifecycle cancellation interrupts active
-FFmpeg work and aborts backoff promptly.
+The worker accepts `live.start`, `live.status` and `live.stop`, requires H.264 and
+packet-copies video only. Instead of one growing MP4, it writes independently finalized
+fragmented-MP4 files beginning on keyframes. Production limits are: four live sessions, a
+2-second fragment target, a six-fragment retained target per session (nominally about a
+12-second live window), an eight-finalized-fragment hard ceiling that accounts for two
+possible reader pins, 16 MiB maximum per fragment, two HTTP readers per session and eight
+concurrent live HTTP requests globally. The worker backpressures at a keyframe boundary when
+the hard fragment-count ceiling is full, uses byte pressure as a second rotation trigger,
+and fails pathological media that cannot stay within the hard fragment-size bound; no
+decode/transcode path is introduced. Transient source/media loss retains the bounded
+1/2/4/8/15-second, five-attempt reconnect policy.
 
-The live HTTP server binds only `127.0.0.1` on an ephemeral port. `/live/<uuid>` maps one
-opaque session to one application-created media file; the request cannot supply a camera
-URL or filesystem path. GET/HEAD only, loopback Host checks, expected desktop/development
-Origin checks, UUID grammar, bounded headers and bounded concurrent HTTP requests keep the
-endpoint a narrow capability rather than a LAN/file proxy. Closing or expiring a session
-removes the mapping and stale requests return a gone response. The existing desktop CSP
-continues to allow media only from self plus loopback HTTP.
+The application reaper continuously trims finalized fragments. Every fragment HTTP request
+acquires explicit reader ownership, and trimming skips reader-owned files. Reader release
+retriggers trimming. A fragment is capped before loading and at most one bounded fragment
+is copied into memory for an HTTP response. Session teardown has a bounded reader-drain
+deadline; it never truncates/deletes a file underneath an active reader, and the last reader
+performs deferred directory cleanup after capability invalidation when necessary.
 
-The frontend uses one aggregate one-second status poll and one 30-second keepalive loop.
-Keepalive is not the sole cleanup mechanism: sessions have a two-minute expiry and a
-background application reaper removes abandoned sessions even when the frontend crashes
-and sends no further command. Expiry stops the worker, removes the HTTP capability and
-releases live capacity. During worker backoff the tile unmounts its `<video>` element; on
-return to `live` with a new reconnect attempt it remounts the element against the same
-opaque session URL. A media-element error closes the backend session before Retry creates
-a fresh session.
+The live-cache root is transient app-data. At application startup only direct children with
+the canonical `session-<uuid>` owned layout and real-directory type are eligible for stale
+cleanup; lookalikes, symlinks and unrelated files are preserved. Cleanup failure is logged
+without widening deletion authority.
 
-Close-to-tray releases live sessions but does not alter recording Desired/Runtime state.
-Suspend stops live admission and clears sessions; Resume only reopens live admission and
-never resurrects stale session ids. Quit and update stop admission and tear down live
-workers as part of deterministic desktop shutdown. Recording restoration continues through
-the M9 Desired path and is independent of live cleanup. PTZ/events, H.265 live view,
-transcoding, WebRTC, remote streaming and persisted live layouts remain outside M11. See
-ADR-0014.
+The loopback server remains bound only to `127.0.0.1`. Session routes expose only the small
+manifest and fixed-grammar fragment names under the opaque UUID. Requests cannot supply a
+camera URL or filesystem path. GET/HEAD, Host/Origin validation, UUID/fragment grammar and
+request/header/reader caps keep the endpoint a narrow capability. The desktop CSP permits
+`connect-src` only from self plus loopback HTTP and permits media only from self, `blob:`
+and loopback HTTP. React uses `MediaSource` to poll the manifest, fetch unseen fragments,
+append H.264 MP4 data and trim older buffered media. It tracks only the highest successfully
+appended fragment sequence, so frontend bookkeeping stays O(1) for arbitrarily long sessions.
+
+Keepalive is deliberately cheap: `live_keepalive` validates one active session and updates
+its timestamp only. The two-minute timeout and background reaper own expensive expiry and
+teardown. `live_open`, `live_close` and `live_statuses` move blocking worker/filesystem work
+to Tauri `spawn_blocking`; keepalive does not.
+
+Teardown is two-phase. First, HTTP capabilities are invalidated and every in-flight opening
+and committed runner receives cancellation/stop. Only after all stop signals have been
+issued does bounded fan-out join/reap workers and remove session resources. A slow camera
+therefore cannot delay cancellation delivery to the other cameras. Close-to-tray stops live
+admission, hides the window promptly, and performs teardown on the blocking runtime.
+Suspend/quit/update do not report required lifecycle completion until in-flight and active
+live workers have been reaped. Recording Desired/Runtime ownership remains untouched by
+window-hide live cleanup and Resume only reopens live admission.
+
+The Live View UI uses per-camera generations plus mounted/selected/session refs as
+authoritative ownership across `await` boundaries. Remove, unmount, retry and media error
+invalidate the generation first. A late `live_open` result that no longer matches current
+ownership is immediately `live_close`d, never enters React session state and therefore
+never joins the keepalive set. A newer generation queued behind a pending open cannot be
+replaced by the stale result.
+
+Recording slots and live slots remain separate; the same camera may record and view live
+using independent RTSP workers. PTZ/events, H.265 live view, transcoding, WebRTC, remote
+streaming, motion/AI and persisted live layouts remain outside M11. See ADR-0014.
 
 ## Failure model
 

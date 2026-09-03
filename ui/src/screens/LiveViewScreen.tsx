@@ -37,6 +37,174 @@ function liveChipClass(state: LiveState): string {
   return `chip-${state}`;
 }
 
+type LiveManifest = {
+  session_id: string;
+  fragments: number[];
+};
+
+function fragmentName(sequence: number): string {
+  return `fragment-${String(sequence).padStart(12, "0")}.mp4`;
+}
+
+function detectAvcMime(bytes: Uint8Array): string | null {
+  for (let index = 0; index + 8 < bytes.length; index += 1) {
+    if (
+      bytes[index] === 0x61 &&
+      bytes[index + 1] === 0x76 &&
+      bytes[index + 2] === 0x63 &&
+      bytes[index + 3] === 0x43
+    ) {
+      const profile = bytes[index + 5]!;
+      const compatibility = bytes[index + 6]!;
+      const level = bytes[index + 7]!;
+      const hex = [profile, compatibility, level]
+        .map((value) => value.toString(16).padStart(2, "0"))
+        .join("");
+      return `video/mp4; codecs="avc1.${hex}"`;
+    }
+  }
+  return null;
+}
+
+function waitForSourceBuffer(sourceBuffer: SourceBuffer): Promise<void> {
+  if (!sourceBuffer.updating) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const onEnd = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error("live source buffer failed"));
+    };
+    const cleanup = () => {
+      sourceBuffer.removeEventListener("updateend", onEnd);
+      sourceBuffer.removeEventListener("error", onError);
+    };
+    sourceBuffer.addEventListener("updateend", onEnd, { once: true });
+    sourceBuffer.addEventListener("error", onError, { once: true });
+  });
+}
+
+function LiveMedia({
+  session,
+  reconnectAttempt,
+  onError,
+}: {
+  session: LiveOpenDto;
+  reconnectAttempt: number;
+  onError: () => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const onErrorRef = useRef(onError);
+
+  useEffect(() => {
+    onErrorRef.current = onError;
+  }, [onError]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || typeof window.MediaSource === "undefined") return;
+
+    const mediaSource = new MediaSource();
+    const objectUrl = URL.createObjectURL(mediaSource);
+    const abort = new AbortController();
+    let disposed = false;
+    let timer: number | null = null;
+    let sourceBuffer: SourceBuffer | null = null;
+    let lastAppendedSequence = -1;
+
+    video.src = objectUrl;
+
+    const fail = () => {
+      if (!disposed && !abort.signal.aborted) onErrorRef.current();
+    };
+
+    const appendFragment = async (sequence: number) => {
+      const response = await fetch(`${session.url}/fragment/${fragmentName(sequence)}`, {
+        cache: "no-store",
+        signal: abort.signal,
+      });
+      if (response.status === 404 || response.status === 410) return;
+      if (!response.ok) throw new Error(`live fragment failed: ${response.status}`);
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (!bytes.length || disposed || abort.signal.aborted) return;
+
+      if (!sourceBuffer) {
+        const mime = detectAvcMime(bytes);
+        if (!mime || !MediaSource.isTypeSupported(mime)) {
+          throw new Error("live H.264 MediaSource type is unsupported");
+        }
+        sourceBuffer = mediaSource.addSourceBuffer(mime);
+        sourceBuffer.mode = "sequence";
+      }
+      await waitForSourceBuffer(sourceBuffer);
+      sourceBuffer.appendBuffer(bytes);
+      await waitForSourceBuffer(sourceBuffer);
+      lastAppendedSequence = Math.max(lastAppendedSequence, sequence);
+
+      if (video.buffered.length > 0) {
+        const end = video.buffered.end(video.buffered.length - 1);
+        if (end - video.currentTime > 8) video.currentTime = Math.max(0, end - 3);
+        const removeBefore = Math.max(0, end - 20);
+        if (removeBefore > 0 && !sourceBuffer.updating) {
+          sourceBuffer.remove(0, removeBefore);
+          await waitForSourceBuffer(sourceBuffer);
+        }
+      }
+      void video.play().catch(() => undefined);
+    };
+
+    const pump = async () => {
+      try {
+        const response = await fetch(`${session.url}/manifest`, {
+          cache: "no-store",
+          signal: abort.signal,
+        });
+        if (!response.ok) throw new Error(`live manifest failed: ${response.status}`);
+        const manifest = (await response.json()) as LiveManifest;
+        if (manifest.session_id !== session.session_id || !Array.isArray(manifest.fragments)) {
+          throw new Error("live manifest identity mismatch");
+        }
+        for (const sequence of manifest.fragments) {
+          if (!Number.isSafeInteger(sequence) || sequence < 0 || sequence <= lastAppendedSequence) continue;
+          await appendFragment(sequence);
+        }
+        if (!disposed) timer = window.setTimeout(() => void pump(), 500);
+      } catch (cause) {
+        if (cause instanceof DOMException && cause.name === "AbortError") return;
+        fail();
+      }
+    };
+
+    const onSourceOpen = () => void pump();
+    mediaSource.addEventListener("sourceopen", onSourceOpen, { once: true });
+
+    return () => {
+      disposed = true;
+      abort.abort();
+      if (timer !== null) window.clearTimeout(timer);
+      mediaSource.removeEventListener("sourceopen", onSourceOpen);
+      video.removeAttribute("src");
+      video.load();
+      URL.revokeObjectURL(objectUrl);
+    };
+  }, [reconnectAttempt, session.session_id, session.url]);
+
+  const fallback = typeof window.MediaSource === "undefined";
+  return (
+    <video
+      ref={videoRef}
+      className="live-video"
+      src={fallback ? session.url : undefined}
+      autoPlay
+      muted
+      playsInline
+      onError={() => onErrorRef.current()}
+    />
+  );
+}
+
 export function LiveViewScreen() {
   const [cameras, setCameras] = useState<CameraSummary[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
@@ -51,24 +219,41 @@ export function LiveViewScreen() {
   const [loading, setLoading] = useState(isTauri());
   const [error, setError] = useState<DesktopError | null>(null);
   const sessionsRef = useRef(sessions);
-  const openingRef = useRef(opening);
+  const selectedRef = useRef<Set<string>>(new Set());
+  const mountedRef = useRef(true);
+  const generationRef = useRef<Map<string, number>>(new Map());
+  const pendingOpenRef = useRef<Map<string, number>>(new Map());
+
+  const setSessionForCamera = useCallback((cameraId: string, session: LiveOpenDto | null) => {
+    const next = new Map(sessionsRef.current);
+    if (session) next.set(cameraId, session);
+    else next.delete(cameraId);
+    sessionsRef.current = next;
+    if (mountedRef.current) setSessions(next);
+  }, []);
+
+  const nextGeneration = useCallback((cameraId: string) => {
+    const generation = (generationRef.current.get(cameraId) ?? 0) + 1;
+    generationRef.current.set(cameraId, generation);
+    return generation;
+  }, []);
 
   useEffect(() => {
-    sessionsRef.current = sessions;
-  }, [sessions]);
-
-  useEffect(() => {
-    openingRef.current = opening;
-  }, [opening]);
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const refreshStatuses = useCallback(async () => {
-    if (!isTauri()) return;
+    if (!isTauri() || !mountedRef.current) return;
     try {
       const [live, runtime, desired] = await Promise.all([
         invokeDesktop<LiveStatus[]>("live_statuses"),
         invokeDesktop<RecordingStatus[]>("recording_statuses"),
         invokeDesktop<RecordingIntent>("recording_intent"),
       ]);
+      if (!mountedRef.current) return;
       setStatuses(live);
       setRecordings(runtime);
       setIntent(desired);
@@ -76,16 +261,15 @@ export function LiveViewScreen() {
       const backendSessions = new Set(live.map((status) => status.session_id));
       const staleCameras: string[] = [];
       for (const [cameraId, session] of sessionsRef.current) {
-        if (!backendSessions.has(session.session_id) && !openingRef.current.has(cameraId)) {
+        if (!backendSessions.has(session.session_id) && !pendingOpenRef.current.has(cameraId)) {
           staleCameras.push(cameraId);
         }
       }
       if (staleCameras.length) {
-        setSessions((current) => {
-          const next = new Map(current);
-          for (const cameraId of staleCameras) next.delete(cameraId);
-          return next;
-        });
+        const nextSessions = new Map(sessionsRef.current);
+        for (const cameraId of staleCameras) nextSessions.delete(cameraId);
+        sessionsRef.current = nextSessions;
+        setSessions(nextSessions);
         setTileErrors((current) => {
           const next = new Map(current);
           for (const cameraId of staleCameras) {
@@ -98,7 +282,7 @@ export function LiveViewScreen() {
         });
       }
     } catch (cause) {
-      setError(desktopError(cause));
+      if (mountedRef.current) setError(desktopError(cause));
     }
   }, []);
 
@@ -171,43 +355,85 @@ export function LiveViewScreen() {
     setPickerCameraId(availableCameras[0]?.camera_id ?? "");
   }, [availableCameras, pickerCameraId]);
 
-  async function openCamera(cameraId: string) {
-    if (!isTauri() || openingRef.current.has(cameraId)) return;
+  const ownsGeneration = useCallback((cameraId: string, generation: number) => {
+    return (
+      mountedRef.current &&
+      selectedRef.current.has(cameraId) &&
+      generationRef.current.get(cameraId) === generation
+    );
+  }, []);
+
+  const startOpenGeneration = useCallback(async (cameraId: string, generation: number) => {
+    if (!isTauri() || !mountedRef.current || pendingOpenRef.current.has(cameraId)) return;
+    pendingOpenRef.current.set(cameraId, generation);
     setOpening((current) => new Set(current).add(cameraId));
     setTileErrors((current) => {
       const next = new Map(current);
       next.delete(cameraId);
       return next;
     });
+
     try {
       const opened = await invokeDesktop<LiveOpenDto>("live_open", { cameraId });
-      setSessions((current) => new Map(current).set(cameraId, opened));
+      if (!ownsGeneration(cameraId, generation)) {
+        await invokeDesktop<void>("live_close", { sessionId: opened.session_id }).catch(() => undefined);
+        return;
+      }
+      setSessionForCamera(cameraId, opened);
       await refreshStatuses();
     } catch (cause) {
-      setTileErrors((current) => new Map(current).set(cameraId, desktopError(cause)));
+      if (ownsGeneration(cameraId, generation)) {
+        setTileErrors((current) => new Map(current).set(cameraId, desktopError(cause)));
+      }
     } finally {
-      setOpening((current) => {
-        const next = new Set(current);
-        next.delete(cameraId);
-        return next;
-      });
+      if (pendingOpenRef.current.get(cameraId) === generation) {
+        pendingOpenRef.current.delete(cameraId);
+      }
+      const desiredGeneration = generationRef.current.get(cameraId);
+      const shouldRestart =
+        mountedRef.current &&
+        selectedRef.current.has(cameraId) &&
+        desiredGeneration !== undefined &&
+        desiredGeneration !== generation &&
+        !sessionsRef.current.has(cameraId) &&
+        !pendingOpenRef.current.has(cameraId);
+      if (shouldRestart) {
+        void startOpenGeneration(cameraId, desiredGeneration);
+      } else if (mountedRef.current && !pendingOpenRef.current.has(cameraId)) {
+        setOpening((current) => {
+          const next = new Set(current);
+          next.delete(cameraId);
+          return next;
+        });
+      }
     }
-  }
+  }, [ownsGeneration, refreshStatuses, setSessionForCamera]);
+
+  const requestOpen = useCallback((cameraId: string) => {
+    const generation = nextGeneration(cameraId);
+    if (!pendingOpenRef.current.has(cameraId)) {
+      void startOpenGeneration(cameraId, generation);
+    }
+    return generation;
+  }, [nextGeneration, startOpenGeneration]);
 
   function addSelectedCamera() {
-    if (!pickerCameraId || selected.includes(pickerCameraId) || selected.length >= MAX_LIVE_VIEWS) return;
-    setSelected((current) => [...current, pickerCameraId]);
-    void openCamera(pickerCameraId);
+    if (!pickerCameraId || selectedRef.current.has(pickerCameraId) || selectedRef.current.size >= MAX_LIVE_VIEWS) return;
+    const nextSelected = new Set(selectedRef.current);
+    nextSelected.add(pickerCameraId);
+    selectedRef.current = nextSelected;
+    setSelected([...nextSelected]);
+    requestOpen(pickerCameraId);
   }
 
   async function removeCamera(cameraId: string) {
+    const nextSelected = new Set(selectedRef.current);
+    nextSelected.delete(cameraId);
+    selectedRef.current = nextSelected;
+    nextGeneration(cameraId);
     const session = sessionsRef.current.get(cameraId);
-    setSelected((current) => current.filter((id) => id !== cameraId));
-    setSessions((current) => {
-      const next = new Map(current);
-      next.delete(cameraId);
-      return next;
-    });
+    setSelected([...nextSelected]);
+    setSessionForCamera(cameraId, null);
     setTileErrors((current) => {
       const next = new Map(current);
       next.delete(cameraId);
@@ -220,27 +446,22 @@ export function LiveViewScreen() {
 
   async function retryCamera(cameraId: string) {
     const session = sessionsRef.current.get(cameraId);
+    nextGeneration(cameraId);
+    setSessionForCamera(cameraId, null);
     if (session && isTauri()) {
       await invokeDesktop<void>("live_close", { sessionId: session.session_id }).catch(() => undefined);
-      setSessions((current) => {
-        const next = new Map(current);
-        next.delete(cameraId);
-        return next;
-      });
     }
-    await openCamera(cameraId);
+    requestOpen(cameraId);
   }
 
   async function handleMediaError(cameraId: string) {
     const session = sessionsRef.current.get(cameraId);
+    nextGeneration(cameraId);
+    setSessionForCamera(cameraId, null);
     if (session && isTauri()) {
       await invokeDesktop<void>("live_close", { sessionId: session.session_id }).catch(() => undefined);
     }
-    setSessions((current) => {
-      const next = new Map(current);
-      next.delete(cameraId);
-      return next;
-    });
+    if (!mountedRef.current || !selectedRef.current.has(cameraId)) return;
     setTileErrors((current) =>
       new Map(current).set(cameraId, {
         code: "media_failed",
@@ -337,13 +558,10 @@ export function LiveViewScreen() {
 
                 <div className="live-media-frame">
                   {canRenderVideo && session ? (
-                    <video
+                    <LiveMedia
                       key={`${session.session_id}-${backendStatus?.reconnect_attempt ?? 0}`}
-                      className="live-video"
-                      src={session.url}
-                      autoPlay
-                      muted
-                      playsInline
+                      session={session}
+                      reconnectAttempt={backendStatus?.reconnect_attempt ?? 0}
                       onError={() => void handleMediaError(cameraId)}
                     />
                   ) : (

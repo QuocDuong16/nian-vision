@@ -631,40 +631,60 @@ No hardware model is claimed validated by the M10 automated suite.
 
 ### Independent multi-camera live view (M11)
 
-`nian-application` live-controller tests use fake per-session runners and real loopback
-sockets. They prove the four-camera cap, same-camera duplicate refusal, admission/started
-RAII reservation release, opaque UUID-only frontend DTOs, explicit close/keepalive stale
-handles, per-camera status failure isolation and background expiry without any follow-up
-controller command. HTTP tests accept only the committed `/live/<uuid>` capability and
-reject wrong Host/Origin, non-GET/HEAD methods, malformed/arbitrary paths and closed
-sessions; no test endpoint accepts a camera URL or filesystem path. A short test-only
-session timeout proves the reaper stops the runner, removes the session directory and
-releases capacity after frontend abandonment.
+`nian-application` live-controller tests use deterministic fake runners plus real loopback
+sockets. The suite proves the four-camera cap, duplicate refusal, RAII reservation release,
+opaque/secret-safe DTOs, per-camera status isolation and background expiry without a
+follow-up command. The remediation suite additionally proves that 80 simulated finalized
+fragments collapse to the configured six-fragment rolling window, four sessions are bounded
+independently, reader-owned old fragments survive trimming until reader release, explicit
+close removes transient cache, and startup removes only canonical owned `session-<uuid>`
+directories while preserving lookalikes/unrelated files.
 
-Media-worker unit tests cover strict RTSP/absolute-output live parameters, the bounded
-five-attempt retry terminal state and lifecycle cancellation during backoff. The normal
-workspace media/worker integration suite remains green, so M11 does not weaken existing
-FFmpeg ABI, probe, playback or recording behavior.
+HTTP tests cover the session base capability, manifest and fixed fragment grammar plus
+wrong Host/Origin, non-GET/HEAD methods, malformed/arbitrary paths, stale sessions and reader
+limits. No request may supply an RTSP URL or arbitrary filesystem path. The configured
+resource contract under test is a 2-second fragment target, six retained-fragment target,
+eight-finalized-fragment hard ceiling, 16 MiB maximum per fragment, two readers per live
+session, eight concurrent live HTTP requests and four simultaneous live sessions.
 
-Desktop regressions open fake live sessions through the real `CameraService`/
-`LiveViewController` seam and prove Stop All Recording leaves live ownership untouched;
-close-to-tray clears live while preserving recording runtime and Desired intent; suspend
-invalidates live session ids while Resume restores Desired recording exactly once and only
-reopens live admission; update teardown clears live while preserving recording intent.
-These tests run without RTSP hardware.
+Lifecycle tests exercise the split runner stop/join contract. `close_all` records that all
+four stop signals exist before the first join observation and completes the fake slow-worker
+case within a deterministic bound. In-flight-open tests block runner startup after the
+worker has been installed in controller-owned `OpeningState`, cancel four openings together,
+prove lifecycle waits for cleanup/reap, reject late commit, preserve newer reservations and
+release capacity/cache. Keepalive tests prove a heartbeat does not synchronously reap an
+unrelated expired worker; the reaper owns expensive expiry cleanup.
 
-`LiveViewScreen` tests cover explicit camera selection, localhost-only opaque media URLs,
-one failed tile beside a healthy tile, recording Start/Stop without live close, media-error
-backend cleanup, unmount cleanup and `live → backoff → live` remount using a new reconnect
-attempt. The complete UI gate is TypeScript typecheck + ESLint + Vitest + Vite production
-build.
+Media-worker unit tests cover strict RTSP/absolute-owned-directory fragment parameters,
+fixed-width owned fragment names/partial cleanup, hard size/count policy bounds, counting only
+owned finalized regular files, cancellable backpressure at the finalized-fragment ceiling,
+the bounded five-attempt retry terminal state and lifecycle cancellation during backoff. Existing FFmpeg
+ABI/muxer, probe, playback and recording tests remain unchanged and pass in the workspace
+suite; M11 does not refactor recorder muxing.
+
+Desktop regressions use the real `CameraService`/`LiveViewController` seam with fake live
+runners. They prove Stop All Recording leaves live ownership untouched; close-to-tray
+preserves recording Desired/Runtime while live admission closes; suspend invalidates live
+sessions while Resume restores Desired recording and only reopens live admission; update
+teardown preserves recording intent. CSP tests require only self/loopback `connect-src` and
+self/`blob:`/loopback `media-src`. Blocking live open/close/status work is dispatched through
+Tauri's blocking runtime, while keepalive remains bounded bookkeeping.
+
+`LiveViewScreen` tests use manually controlled deferred Promises for the opening races. They
+cover remove while `live_open` is pending, unmount/navigation-equivalent cleanup with two
+pending opens, stale generation 1 resolving after generation 2 has been requested, immediate
+`live_close` of late results, exclusion of late sessions from the keepalive set and prevention
+of stale overwrite. Existing tests continue to cover per-tile failure isolation, recording
+Start/Stop independence, media-error cleanup and reconnect remount. Fragment consumption uses
+a single sequence watermark rather than retaining an unbounded historical sequence set. The complete UI gate is
+TypeScript typecheck + ESLint + Vitest + Vite production build.
 
 Physical live-camera validation remains optional/manual and is not claimed by CI. A real
-WebView smoke should select one then multiple configured H.264 cameras, verify playback
-from `http://127.0.0.1:<ephemeral>/live/<uuid>`, confirm the listener is loopback-only,
-exercise camera/network interruption and confirm one tile reconnect/failure does not stop
-other tiles or recording. H.265/transcoding/WebRTC/PTZ/events are not part of that M11
-claim.
+Tauri WebView smoke should select one then multiple configured H.264 cameras, verify the
+MediaSource path fetches only `http://127.0.0.1:<ephemeral>/live/<uuid>/...`, leave live view
+running long enough to confirm the cache stays near the rolling-window bound, interrupt a
+camera/network connection, and confirm one tile's failure/reconnect does not stop other live
+tiles or recording. H.265/transcoding/WebRTC/PTZ/events remain outside M11.
 
 ## Planned per milestone
 

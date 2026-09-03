@@ -11,7 +11,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak, mpsc};
+use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use nian_domain::CameraId;
@@ -24,9 +24,18 @@ pub const MAX_SIMULTANEOUS_LIVE_VIEWS: usize = 4;
 const LIVE_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const WORKER_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_HTTP_REQUESTS: usize = 8;
+pub const LIVE_FRAGMENT_TARGET: Duration = Duration::from_secs(2);
+pub const MAX_RETAINED_LIVE_FRAGMENTS: usize = 6;
+pub const MAX_LIVE_FRAGMENT_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_HTTP_REQUESTS: usize = 8;
+pub const MAX_HTTP_READERS_PER_SESSION: usize = 2;
+pub const MAX_LIVE_CACHE_FRAGMENTS: usize =
+    MAX_RETAINED_LIVE_FRAGMENTS + MAX_HTTP_READERS_PER_SESSION;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
-const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_LIVE_MANIFEST_BYTES: usize = 16 * 1024;
+const LIVE_HTTP_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(16);
+const LIVE_FRAGMENT_PREFIX: &str = "fragment-";
+const LIVE_FRAGMENT_SUFFIX: &str = ".mp4";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,40 +110,157 @@ pub struct PreparedLive {
     pub source_json: serde_json::Value,
 }
 
-pub struct LiveOpenAdmission {
+struct OpeningState {
     session_id: String,
     camera_id: CameraId,
-    source_json: serde_json::Value,
     temp_dir: PathBuf,
-    media_path: PathBuf,
+    cancel: Arc<AtomicBool>,
+    runner: Mutex<Option<Box<dyn LiveRunner>>>,
+    done: Mutex<bool>,
+    done_cv: Condvar,
+}
+
+impl OpeningState {
+    fn new(session_id: String, camera_id: CameraId, temp_dir: PathBuf) -> Self {
+        Self {
+            session_id,
+            camera_id,
+            temp_dir,
+            cancel: Arc::new(AtomicBool::new(false)),
+            runner: Mutex::new(None),
+            done: Mutex::new(false),
+            done_cv: Condvar::new(),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+    }
+
+    fn install_runner(&self, runner: Box<dyn LiveRunner>) -> Result<(), Box<dyn LiveRunner>> {
+        if self.is_cancelled() {
+            return Err(runner);
+        }
+        let Ok(mut slot) = self.runner.lock() else {
+            return Err(runner);
+        };
+        if self.is_cancelled() {
+            return Err(runner);
+        }
+        *slot = Some(runner);
+        self.done_cv.notify_all();
+        Ok(())
+    }
+
+    fn start_runner(&self, source_json: serde_json::Value) -> Result<(), LiveError> {
+        let mut slot = self
+            .runner
+            .lock()
+            .map_err(|_| LiveError::WorkerUnavailable)?;
+        let runner = slot.as_mut().ok_or(LiveError::WorkerUnavailable)?;
+        runner.start(source_json, &self.temp_dir, self.cancel.clone())
+    }
+
+    fn take_runner(&self) -> Option<Box<dyn LiveRunner>> {
+        self.runner.lock().ok()?.take()
+    }
+
+    fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+        if let Ok(mut slot) = self.runner.lock()
+            && let Some(runner) = slot.as_mut()
+        {
+            runner.request_stop();
+        }
+        self.done_cv.notify_all();
+    }
+
+    fn mark_done(&self) {
+        if let Ok(mut done) = self.done.lock() {
+            *done = true;
+            self.done_cv.notify_all();
+        }
+    }
+
+    fn cleanup_temp(&self) {
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
+    }
+
+    fn wait_and_reap(&self) {
+        self.cancel.store(true, Ordering::Release);
+        loop {
+            if let Some(mut runner) = self.take_runner() {
+                runner.request_stop();
+                runner.join_or_reap();
+                self.cleanup_temp();
+                self.mark_done();
+                return;
+            }
+
+            let Ok(done) = self.done.lock() else {
+                return;
+            };
+            if *done {
+                return;
+            }
+            let wait = self.done_cv.wait_timeout(done, Duration::from_millis(50));
+            match wait {
+                Ok((done, _)) if *done => return,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    }
+}
+
+pub struct LiveOpenAdmission {
+    source_json: serde_json::Value,
     factory: Arc<dyn LiveRunnerFactory>,
     registry: Weak<Mutex<LiveRegistry>>,
+    opening: Arc<OpeningState>,
     cleanup_on_drop: bool,
 }
 
 impl LiveOpenAdmission {
     pub fn start(mut self) -> Result<StartedLiveOpen, LiveOpenStartError> {
-        let result = self
-            .factory
-            .start(std::mem::take(&mut self.source_json), &self.media_path);
-        match result {
-            Ok(runner) => {
-                self.cleanup_on_drop = false;
-                Ok(StartedLiveOpen {
-                    session_id: self.session_id.clone(),
-                    camera_id: self.camera_id.clone(),
-                    temp_dir: self.temp_dir.clone(),
-                    media_path: self.media_path.clone(),
-                    runner: Some(runner),
-                    registry: self.registry.clone(),
-                    cleanup_on_drop: true,
-                })
-            }
-            Err(error) => Err(LiveOpenStartError {
-                session_id: self.session_id.clone(),
-                camera_id: self.camera_id.clone(),
-                error,
-            }),
+        if self.opening.is_cancelled() {
+            return Err(self.start_error(LiveError::LifecycleBlocked));
+        }
+        let runner = match self.factory.spawn() {
+            Ok(runner) => runner,
+            Err(error) => return Err(self.start_error(error)),
+        };
+        if let Err(mut runner) = self.opening.install_runner(runner) {
+            runner.request_stop();
+            runner.join_or_reap();
+            return Err(self.start_error(LiveError::LifecycleBlocked));
+        }
+
+        let source_json = std::mem::take(&mut self.source_json);
+        if let Err(error) = self.opening.start_runner(source_json) {
+            self.opening.request_cancel();
+            self.opening.wait_and_reap();
+            return Err(self.start_error(error));
+        }
+        if self.opening.is_cancelled() {
+            self.opening.request_cancel();
+            self.opening.wait_and_reap();
+            return Err(self.start_error(LiveError::LifecycleBlocked));
+        }
+
+        self.cleanup_on_drop = false;
+        Ok(StartedLiveOpen {
+            opening: self.opening.clone(),
+            registry: self.registry.clone(),
+            cleanup_on_drop: true,
+        })
+    }
+
+    fn start_error(&self, error: LiveError) -> LiveOpenStartError {
+        LiveOpenStartError {
+            session_id: self.opening.session_id.clone(),
+            camera_id: self.opening.camera_id.clone(),
+            error,
         }
     }
 }
@@ -142,13 +268,9 @@ impl LiveOpenAdmission {
 impl Drop for LiveOpenAdmission {
     fn drop(&mut self) {
         if self.cleanup_on_drop {
-            let _ = std::fs::remove_dir_all(&self.temp_dir);
-            if let Some(registry) = self.registry.upgrade()
-                && let Ok(mut registry) = registry.lock()
-                && registry.opening.get(&self.camera_id) == Some(&self.session_id)
-            {
-                registry.opening.remove(&self.camera_id);
-            }
+            remove_opening_reservation(&self.registry, &self.opening);
+            self.opening.cleanup_temp();
+            self.opening.mark_done();
         }
     }
 }
@@ -161,11 +283,7 @@ pub struct LiveOpenStartError {
 }
 
 pub struct StartedLiveOpen {
-    session_id: String,
-    camera_id: CameraId,
-    temp_dir: PathBuf,
-    media_path: PathBuf,
-    runner: Option<Box<dyn LiveRunner>>,
+    opening: Arc<OpeningState>,
     registry: Weak<Mutex<LiveRegistry>>,
     cleanup_on_drop: bool,
 }
@@ -173,31 +291,39 @@ pub struct StartedLiveOpen {
 impl Drop for StartedLiveOpen {
     fn drop(&mut self) {
         if self.cleanup_on_drop {
-            if let Some(registry) = self.registry.upgrade()
-                && let Ok(mut registry) = registry.lock()
-                && registry.opening.get(&self.camera_id) == Some(&self.session_id)
-            {
-                registry.opening.remove(&self.camera_id);
-            }
-            if let Some(mut runner) = self.runner.take() {
-                runner.stop();
-            }
-            let _ = std::fs::remove_dir_all(&self.temp_dir);
+            remove_opening_reservation(&self.registry, &self.opening);
+            self.opening.request_cancel();
+            self.opening.wait_and_reap();
         }
     }
 }
 
+fn remove_opening_reservation(registry: &Weak<Mutex<LiveRegistry>>, opening: &OpeningState) {
+    if let Some(registry) = registry.upgrade()
+        && let Ok(mut registry) = registry.lock()
+        && registry
+            .opening
+            .get(&opening.camera_id)
+            .is_some_and(|current| current.session_id == opening.session_id)
+    {
+        registry.opening.remove(&opening.camera_id);
+    }
+}
+
 pub trait LiveRunner: Send {
+    fn start(
+        &mut self,
+        source_json: serde_json::Value,
+        output_dir: &Path,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<(), LiveError>;
     fn status(&mut self) -> Result<LiveWorkerStatus, LiveError>;
-    fn stop(&mut self);
+    fn request_stop(&mut self);
+    fn join_or_reap(&mut self);
 }
 
 pub trait LiveRunnerFactory: Send + Sync {
-    fn start(
-        &self,
-        source_json: serde_json::Value,
-        output_path: &Path,
-    ) -> Result<Box<dyn LiveRunner>, LiveError>;
+    fn spawn(&self) -> Result<Box<dyn LiveRunner>, LiveError>;
 }
 
 #[derive(Debug, Clone)]
@@ -206,12 +332,8 @@ pub struct WorkerLiveRunnerFactory {
 }
 
 impl LiveRunnerFactory for WorkerLiveRunnerFactory {
-    fn start(
-        &self,
-        source_json: serde_json::Value,
-        output_path: &Path,
-    ) -> Result<Box<dyn LiveRunner>, LiveError> {
-        WorkerLiveRunner::start(&self.worker_program, source_json, output_path)
+    fn spawn(&self) -> Result<Box<dyn LiveRunner>, LiveError> {
+        WorkerLiveRunner::spawn(&self.worker_program)
             .map(|runner| Box::new(runner) as Box<dyn LiveRunner>)
     }
 }
@@ -220,15 +342,52 @@ struct LiveSession {
     camera_id: CameraId,
     temp_dir: PathBuf,
     last_keepalive: Mutex<Instant>,
-    runner: Mutex<Box<dyn LiveRunner>>,
+    runner: Mutex<Option<Box<dyn LiveRunner>>>,
+    http: Arc<HttpSession>,
+    cleaned: AtomicBool,
+}
+
+impl LiveSession {
+    fn request_stop(&self) {
+        if let Ok(mut runner) = self.runner.lock()
+            && let Some(runner) = runner.as_mut()
+        {
+            runner.request_stop();
+        }
+    }
+
+    fn join_and_cleanup(&self) {
+        if self.cleaned.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Ok(mut slot) = self.runner.lock()
+            && let Some(mut runner) = slot.take()
+        {
+            runner.request_stop();
+            runner.join_or_reap();
+        }
+        self.http.deactivate();
+        if self.http.wait_for_readers() {
+            let _ = std::fs::remove_dir_all(&self.temp_dir);
+        }
+    }
 }
 
 impl Drop for LiveSession {
     fn drop(&mut self) {
-        if let Ok(runner) = self.runner.get_mut() {
-            runner.stop();
+        if self.cleaned.swap(true, Ordering::AcqRel) {
+            return;
         }
-        let _ = std::fs::remove_dir_all(&self.temp_dir);
+        if let Ok(slot) = self.runner.get_mut()
+            && let Some(mut runner) = slot.take()
+        {
+            runner.request_stop();
+            runner.join_or_reap();
+        }
+        self.http.deactivate();
+        if self.http.wait_for_readers() {
+            let _ = std::fs::remove_dir_all(&self.temp_dir);
+        }
     }
 }
 
@@ -236,19 +395,123 @@ impl Drop for LiveSession {
 struct LiveRegistry {
     sessions: HashMap<String, Arc<LiveSession>>,
     camera_sessions: HashMap<CameraId, String>,
-    opening: HashMap<CameraId, String>,
+    opening: HashMap<CameraId, Arc<OpeningState>>,
     accepting: bool,
 }
 
-#[derive(Clone)]
+#[derive(Default)]
+struct HttpReaderState {
+    total: usize,
+    fragments: HashMap<String, usize>,
+}
+
 struct HttpSession {
-    media_path: PathBuf,
-    active: bool,
+    session_dir: PathBuf,
+    active: AtomicBool,
+    readers: Mutex<HttpReaderState>,
+    readers_cv: Condvar,
+}
+
+impl HttpSession {
+    fn new(session_dir: PathBuf) -> Self {
+        Self {
+            session_dir,
+            active: AtomicBool::new(true),
+            readers: Mutex::new(HttpReaderState::default()),
+            readers_cv: Condvar::new(),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+        self.readers_cv.notify_all();
+    }
+
+    fn try_acquire_fragment(self: &Arc<Self>, fragment: &str) -> Option<HttpFragmentReadGuard> {
+        if !self.is_active() {
+            return None;
+        }
+        let mut readers = self.readers.lock().ok()?;
+        if !self.is_active() || readers.total >= MAX_HTTP_READERS_PER_SESSION {
+            return None;
+        }
+        readers.total += 1;
+        *readers.fragments.entry(fragment.to_owned()).or_insert(0) += 1;
+        Some(HttpFragmentReadGuard {
+            session: self.clone(),
+            fragment: fragment.to_owned(),
+        })
+    }
+
+    fn fragment_has_reader(&self, fragment: &str) -> bool {
+        self.readers
+            .lock()
+            .ok()
+            .and_then(|readers| readers.fragments.get(fragment).copied())
+            .unwrap_or(0)
+            > 0
+    }
+
+    fn wait_for_readers(&self) -> bool {
+        let Ok(mut readers) = self.readers.lock() else {
+            return false;
+        };
+        let deadline = Instant::now() + LIVE_HTTP_READER_DRAIN_TIMEOUT;
+        while readers.total > 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match self
+                .readers_cv
+                .wait_timeout(readers, remaining.min(Duration::from_millis(50)))
+            {
+                Ok((next, _)) => readers = next,
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+}
+
+struct HttpFragmentReadGuard {
+    session: Arc<HttpSession>,
+    fragment: String,
+}
+
+impl Drop for HttpFragmentReadGuard {
+    fn drop(&mut self) {
+        if let Ok(mut readers) = self.session.readers.lock() {
+            readers.total = readers.total.saturating_sub(1);
+            if let Some(count) = readers.fragments.get_mut(&self.fragment) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    readers.fragments.remove(&self.fragment);
+                }
+            }
+            self.session.readers_cv.notify_all();
+        }
+        trim_session_fragments(&self.session);
+        if !self.session.is_active()
+            && self
+                .session
+                .readers
+                .lock()
+                .ok()
+                .is_some_and(|readers| readers.total == 0)
+        {
+            let _ = std::fs::remove_dir_all(&self.session.session_dir);
+        }
+    }
 }
 
 #[derive(Default)]
 struct LiveHttpRuntime {
-    sessions: HashMap<String, HttpSession>,
+    sessions: HashMap<String, Arc<HttpSession>>,
 }
 
 pub struct LiveViewController {
@@ -258,7 +521,6 @@ pub struct LiveViewController {
     server: Mutex<LiveHttpServer>,
     reaper: Mutex<LiveSessionReaper>,
     cache_root: PathBuf,
-    session_timeout: Duration,
 }
 
 impl std::fmt::Debug for LiveViewController {
@@ -297,6 +559,7 @@ impl LiveViewController {
         session_timeout: Duration,
     ) -> Result<Self, LiveError> {
         std::fs::create_dir_all(&cache_root).map_err(|_| LiveError::Internal)?;
+        cleanup_abandoned_live_cache(&cache_root)?;
         let registry = Arc::new(Mutex::new(LiveRegistry {
             accepting: true,
             ..LiveRegistry::default()
@@ -312,7 +575,6 @@ impl LiveViewController {
             server: Mutex::new(server),
             reaper: Mutex::new(reaper),
             cache_root,
-            session_timeout,
         })
     }
 
@@ -325,7 +587,6 @@ impl LiveViewController {
     }
 
     pub fn admit(&self, prepared: PreparedLive) -> Result<LiveOpenAdmission, LiveError> {
-        self.expire_sessions();
         let mut registry = self.registry.lock().map_err(|_| LiveError::Internal)?;
         if !registry.accepting {
             return Err(LiveError::LifecycleBlocked);
@@ -342,79 +603,83 @@ impl LiveViewController {
         let token = Uuid::new_v4().to_string();
         let temp_dir = self.cache_root.join(format!("session-{token}"));
         std::fs::create_dir(&temp_dir).map_err(|_| LiveError::Internal)?;
-        let media_path = temp_dir.join("live.mp4");
+        let opening = Arc::new(OpeningState::new(
+            token,
+            prepared.camera_id.clone(),
+            temp_dir,
+        ));
         registry
             .opening
-            .insert(prepared.camera_id.clone(), token.clone());
+            .insert(prepared.camera_id.clone(), opening.clone());
         Ok(LiveOpenAdmission {
-            session_id: token,
-            camera_id: prepared.camera_id,
             source_json: prepared.source_json,
-            temp_dir,
-            media_path,
             factory: self.factory.clone(),
             registry: Arc::downgrade(&self.registry),
+            opening,
             cleanup_on_drop: true,
         })
     }
 
     pub fn cancel_failed_open(&self, failed: LiveOpenStartError) -> LiveError {
-        if let Ok(mut registry) = self.registry.lock()
-            && registry.opening.get(&failed.camera_id) == Some(&failed.session_id)
-        {
-            registry.opening.remove(&failed.camera_id);
+        let opening = if let Ok(mut registry) = self.registry.lock() {
+            let matches = registry
+                .opening
+                .get(&failed.camera_id)
+                .is_some_and(|opening| opening.session_id == failed.session_id);
+            if matches {
+                registry.opening.remove(&failed.camera_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(opening) = opening {
+            opening.cleanup_temp();
+            opening.mark_done();
         }
         failed.error
     }
 
     pub fn commit_open(&self, mut started: StartedLiveOpen) -> Result<LiveOpenDto, LiveError> {
+        let opening = started.opening.clone();
+        let session_id = opening.session_id.clone();
+        let camera_id = opening.camera_id.clone();
+        let temp_dir = opening.temp_dir.clone();
+        let mut registry = self.registry.lock().map_err(|_| LiveError::Internal)?;
+        let reserved = registry
+            .opening
+            .get(&camera_id)
+            .is_some_and(|current| current.session_id == session_id);
+        if !registry.accepting
+            || !reserved
+            || opening.is_cancelled()
+            || registry.camera_sessions.contains_key(&camera_id)
         {
-            let registry = self.registry.lock().map_err(|_| LiveError::Internal)?;
-            let reserved = registry.opening.get(&started.camera_id) == Some(&started.session_id);
-            if !registry.accepting || !reserved {
-                return Err(LiveError::LifecycleBlocked);
-            }
+            return Err(LiveError::LifecycleBlocked);
         }
 
-        self.http_runtime
-            .lock()
-            .map_err(|_| LiveError::Internal)?
-            .sessions
-            .insert(
-                started.session_id.clone(),
-                HttpSession {
-                    media_path: started.media_path.clone(),
-                    active: true,
-                },
-            );
-        let session_id = started.session_id.clone();
-        let camera_id = started.camera_id.clone();
-        let temp_dir = started.temp_dir.clone();
-        let runner = started.runner.take().ok_or(LiveError::Internal)?;
-        started.cleanup_on_drop = false;
+        let mut runtime = self.http_runtime.lock().map_err(|_| LiveError::Internal)?;
+        let Some(runner) = opening.take_runner() else {
+            return Err(LiveError::LifecycleBlocked);
+        };
+        let http = Arc::new(HttpSession::new(temp_dir.clone()));
         let session = Arc::new(LiveSession {
             camera_id: camera_id.clone(),
             temp_dir,
             last_keepalive: Mutex::new(Instant::now()),
-            runner: Mutex::new(runner),
+            runner: Mutex::new(Some(runner)),
+            http: http.clone(),
+            cleaned: AtomicBool::new(false),
         });
-        let mut registry = self.registry.lock().map_err(|_| LiveError::Internal)?;
-        let reserved = registry.opening.get(&camera_id) == Some(&session_id);
-        if !registry.accepting || !reserved || registry.camera_sessions.contains_key(&camera_id) {
-            if reserved {
-                registry.opening.remove(&camera_id);
-            }
-            drop(registry);
-            if let Ok(mut runtime) = self.http_runtime.lock() {
-                runtime.sessions.remove(&session_id);
-            }
-            return Err(LiveError::LifecycleBlocked);
-        }
+        runtime.sessions.insert(session_id.clone(), http);
         registry.opening.remove(&camera_id);
         registry
             .camera_sessions
             .insert(camera_id.clone(), session_id.clone());
         registry.sessions.insert(session_id.clone(), session);
+        started.cleanup_on_drop = false;
+        opening.mark_done();
         let port = self.server.lock().map_err(|_| LiveError::Internal)?.port;
         Ok(LiveOpenDto {
             session_id: session_id.clone(),
@@ -425,7 +690,6 @@ impl LiveViewController {
     }
 
     pub fn close(&self, session_id: &str) -> Result<(), LiveError> {
-        self.expire_sessions();
         let session = {
             let mut registry = self.registry.lock().map_err(|_| LiveError::Internal)?;
             let session = registry
@@ -435,15 +699,16 @@ impl LiveViewController {
             registry.camera_sessions.remove(&session.camera_id);
             session
         };
-        if let Ok(mut runtime) = self.http_runtime.lock() {
-            runtime.sessions.remove(session_id);
+        if let Ok(mut runtime) = self.http_runtime.lock()
+            && let Some(http) = runtime.sessions.remove(session_id)
+        {
+            http.deactivate();
         }
-        drop(session);
+        teardown_live_owners(Vec::new(), vec![session]);
         Ok(())
     }
 
     pub fn keep_alive(&self, session_id: &str) -> Result<(), LiveError> {
-        self.expire_sessions();
         let session = self
             .registry
             .lock()
@@ -460,7 +725,6 @@ impl LiveViewController {
     }
 
     pub fn statuses(&self) -> Result<Vec<LiveStatus>, LiveError> {
-        self.expire_sessions();
         let sessions: Vec<(String, Arc<LiveSession>)> = self
             .registry
             .lock()
@@ -478,7 +742,9 @@ impl LiveViewController {
                             .runner
                             .lock()
                             .map_err(|_| LiveError::WorkerUnavailable)
-                            .and_then(|mut runner| runner.status())
+                            .and_then(|mut slot| {
+                                slot.as_mut().ok_or(LiveError::WorkerUnavailable)?.status()
+                            })
                             .unwrap_or_else(|error| LiveWorkerStatus {
                                 state: LiveState::Failed,
                                 failure_category: Some(failure_category_for_error(&error)),
@@ -504,23 +770,36 @@ impl LiveViewController {
     }
 
     pub fn close_all(&self) {
-        let sessions = if let Ok(mut registry) = self.registry.lock() {
+        let (openings, sessions) = if let Ok(mut registry) = self.registry.lock() {
             registry.camera_sessions.clear();
-            registry.opening.clear();
-            std::mem::take(&mut registry.sessions)
+            let openings = std::mem::take(&mut registry.opening)
+                .into_values()
+                .collect::<Vec<_>>();
+            let sessions = std::mem::take(&mut registry.sessions)
+                .into_values()
+                .collect::<Vec<_>>();
+            (openings, sessions)
         } else {
-            HashMap::new()
+            (Vec::new(), Vec::new())
         };
         if let Ok(mut runtime) = self.http_runtime.lock() {
+            for http in runtime.sessions.values() {
+                http.deactivate();
+            }
             runtime.sessions.clear();
         }
-        drop(sessions);
+        teardown_live_owners(openings, sessions);
     }
 
     pub fn stop_accepting(&self) {
-        if let Ok(mut registry) = self.registry.lock() {
+        let openings = if let Ok(mut registry) = self.registry.lock() {
             registry.accepting = false;
-            registry.opening.clear();
+            registry.opening.values().cloned().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for opening in openings {
+            opening.request_cancel();
         }
     }
 
@@ -540,9 +819,158 @@ impl LiveViewController {
             server.shutdown();
         }
     }
+}
 
-    fn expire_sessions(&self) {
-        expire_live_sessions(&self.registry, &self.http_runtime, self.session_timeout);
+fn teardown_live_owners(openings: Vec<Arc<OpeningState>>, sessions: Vec<Arc<LiveSession>>) {
+    for opening in &openings {
+        opening.cancel.store(true, Ordering::Release);
+        opening.done_cv.notify_all();
+    }
+
+    std::thread::scope(|scope| {
+        let mut signals = Vec::with_capacity(openings.len() + sessions.len());
+        for opening in &openings {
+            signals.push(scope.spawn(|| opening.request_cancel()));
+        }
+        for session in &sessions {
+            signals.push(scope.spawn(|| session.request_stop()));
+        }
+        for signal in signals {
+            let _ = signal.join();
+        }
+    });
+
+    std::thread::scope(|scope| {
+        let mut joins = Vec::with_capacity(openings.len() + sessions.len());
+        for opening in openings {
+            joins.push(scope.spawn(move || opening.wait_and_reap()));
+        }
+        for session in sessions {
+            joins.push(scope.spawn(move || session.join_and_cleanup()));
+        }
+        for join in joins {
+            let _ = join.join();
+        }
+    });
+}
+
+fn cleanup_abandoned_live_cache(cache_root: &Path) -> Result<(), LiveError> {
+    let entries = std::fs::read_dir(cache_root).map_err(|_| LiveError::Internal)?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(token) = name.strip_prefix("session-") else {
+            continue;
+        };
+        let Ok(uuid) = Uuid::parse_str(token) else {
+            continue;
+        };
+        if uuid.hyphenated().to_string() != token {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_dir_all(entry.path()) {
+            tracing::warn!(
+                error = %error,
+                "failed to remove abandoned live-cache session"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct LiveFragment {
+    sequence: u64,
+    name: String,
+    path: PathBuf,
+    bytes: u64,
+}
+
+fn parse_live_fragment_name(name: &str) -> Option<u64> {
+    let sequence = name
+        .strip_prefix(LIVE_FRAGMENT_PREFIX)?
+        .strip_suffix(LIVE_FRAGMENT_SUFFIX)?;
+    if sequence.is_empty()
+        || sequence.len() > 20
+        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    sequence.parse().ok()
+}
+
+fn list_live_fragments(session_dir: &Path) -> Vec<LiveFragment> {
+    let Ok(entries) = std::fs::read_dir(session_dir) else {
+        return Vec::new();
+    };
+    let mut fragments = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(sequence) = parse_live_fragment_name(&name) else {
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        fragments.push(LiveFragment {
+            sequence,
+            name,
+            path: entry.path(),
+            bytes: metadata.len(),
+        });
+    }
+    fragments.sort_by_key(|fragment| fragment.sequence);
+    fragments
+}
+
+fn trim_session_fragments(session: &HttpSession) {
+    let fragments = list_live_fragments(&session.session_dir);
+    if fragments.is_empty() {
+        return;
+    }
+    let retain_from = fragments.len().saturating_sub(MAX_RETAINED_LIVE_FRAGMENTS);
+    let mut remaining_bytes = fragments.iter().map(|fragment| fragment.bytes).sum::<u64>();
+    let target_bytes = MAX_RETAINED_LIVE_FRAGMENTS as u64 * MAX_LIVE_FRAGMENT_BYTES;
+
+    for (index, fragment) in fragments.into_iter().enumerate() {
+        let older_than_window = index < retain_from;
+        let over_bytes = remaining_bytes > target_bytes;
+        let oversized = fragment.bytes > MAX_LIVE_FRAGMENT_BYTES;
+        if !(older_than_window || over_bytes || oversized) {
+            continue;
+        }
+        if session.fragment_has_reader(&fragment.name) {
+            continue;
+        }
+        if std::fs::remove_file(&fragment.path).is_ok() {
+            remaining_bytes = remaining_bytes.saturating_sub(fragment.bytes);
+        }
+    }
+}
+
+fn maintain_live_fragments(http_runtime: &Arc<Mutex<LiveHttpRuntime>>) {
+    let sessions = http_runtime
+        .lock()
+        .map(|runtime| runtime.sessions.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for session in sessions {
+        trim_session_fragments(&session);
     }
 }
 
@@ -582,10 +1010,15 @@ fn expire_live_sessions(
     }
     if let Ok(mut runtime) = http_runtime.lock() {
         for (session_id, _) in &removed {
-            runtime.sessions.remove(session_id);
+            if let Some(http) = runtime.sessions.remove(session_id) {
+                http.deactivate();
+            }
         }
     }
-    drop(removed);
+    teardown_live_owners(
+        Vec::new(),
+        removed.into_iter().map(|(_, session)| session).collect(),
+    );
 }
 
 struct LiveSessionReaper {
@@ -600,7 +1033,7 @@ impl LiveSessionReaper {
         session_timeout: Duration,
     ) -> Result<Self, LiveError> {
         let (stop_tx, stop_rx) = mpsc::channel();
-        let interval = Duration::from_secs(1).min(session_timeout);
+        let interval = Duration::from_millis(500).min(session_timeout);
         let thread = std::thread::Builder::new()
             .name("live-session-reaper".to_owned())
             .spawn(move || {
@@ -608,6 +1041,7 @@ impl LiveSessionReaper {
                     match stop_rx.recv_timeout(interval) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
+                            maintain_live_fragments(&http_runtime);
                             expire_live_sessions(&registry, &http_runtime, session_timeout);
                         }
                     }
@@ -751,65 +1185,134 @@ fn serve_live_request(
     if !host_allowed(request.header("host"), port) || !origin_allowed(request.header("origin")) {
         return write_empty(stream, "403 Forbidden");
     }
-    let Some(token) = request.path.strip_prefix("/live/") else {
+
+    let Some(rest) = request.path.strip_prefix("/live/") else {
         return write_empty(stream, "404 Not Found");
     };
-    if token.is_empty() || token.contains('/') || Uuid::parse_str(token).is_err() {
+    let mut parts = rest.split('/');
+    let Some(token) = parts.next() else {
+        return write_empty(stream, "404 Not Found");
+    };
+    if token.is_empty() || Uuid::parse_str(token).is_err() {
         return write_empty(stream, "404 Not Found");
     }
-    let media_path = {
+    let session = {
         let runtime = runtime
             .lock()
             .map_err(|_| std::io::Error::other("live state unavailable"))?;
         let Some(session) = runtime.sessions.get(token) else {
             return write_empty(stream, "410 Gone");
         };
-        if !session.active {
+        if !session.is_active() {
             return write_empty(stream, "410 Gone");
         }
-        session.media_path.clone()
+        session.clone()
     };
 
-    let mut file = File::open(&media_path)?;
-    let origin_header = request
-        .header("origin")
+    trim_session_fragments(&session);
+    let tail = parts.collect::<Vec<_>>();
+    match tail.as_slice() {
+        [] => {
+            let fragments = list_live_fragments(&session.session_dir);
+            let Some(latest) = fragments.last() else {
+                return write_empty(stream, "425 Too Early");
+            };
+            serve_fragment(stream, &request, &session, &latest.name)
+        }
+        ["manifest"] => serve_manifest(stream, &request, token, &session),
+        ["fragment", name] if parse_live_fragment_name(name).is_some() => {
+            serve_fragment(stream, &request, &session, name)
+        }
+        _ => write_empty(stream, "404 Not Found"),
+    }
+}
+
+fn serve_manifest(
+    mut stream: TcpStream,
+    request: &HttpRequest,
+    token: &str,
+    session: &Arc<HttpSession>,
+) -> std::io::Result<()> {
+    let fragments = list_live_fragments(&session.session_dir);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "session_id": token,
+        "fragments": fragments
+            .iter()
+            .filter(|fragment| fragment.bytes <= MAX_LIVE_FRAGMENT_BYTES)
+            .map(|fragment| fragment.sequence)
+            .collect::<Vec<_>>(),
+    }))
+    .map_err(|_| std::io::Error::other("live manifest encode failed"))?;
+    if body.len() > MAX_LIVE_MANIFEST_BYTES {
+        return write_empty(stream, "500 Internal Server Error");
+    }
+    write_http_body(
+        &mut stream,
+        request,
+        "application/json",
+        &body,
+        request.header("origin"),
+    )
+}
+
+fn serve_fragment(
+    mut stream: TcpStream,
+    request: &HttpRequest,
+    session: &Arc<HttpSession>,
+    fragment_name: &str,
+) -> std::io::Result<()> {
+    if parse_live_fragment_name(fragment_name).is_none() {
+        return write_empty(stream, "404 Not Found");
+    }
+    let Some(_reader) = session.try_acquire_fragment(fragment_name) else {
+        return write_empty(stream, "503 Service Unavailable");
+    };
+    let path = session.session_dir.join(fragment_name);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            metadata
+        }
+        _ => return write_empty(stream, "404 Not Found"),
+    };
+    if metadata.len() > MAX_LIVE_FRAGMENT_BYTES {
+        return write_empty(stream, "413 Content Too Large");
+    }
+    let file = File::open(path)?;
+    let mut body = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_LIVE_FRAGMENT_BYTES + 1)
+        .read_to_end(&mut body)?;
+    if body.len() as u64 > MAX_LIVE_FRAGMENT_BYTES {
+        return write_empty(stream, "413 Content Too Large");
+    }
+    write_http_body(
+        &mut stream,
+        request,
+        "video/mp4",
+        &body,
+        request.header("origin"),
+    )
+}
+
+fn write_http_body(
+    stream: &mut TcpStream,
+    request: &HttpRequest,
+    content_type: &str,
+    body: &[u8],
+    origin: Option<&str>,
+) -> std::io::Result<()> {
+    let origin_header = origin
         .map(|origin| format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"))
         .unwrap_or_default();
     stream.write_all(
         format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nTransfer-Encoding: chunked\r\n{origin_header}Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{origin_header}Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+            body.len()
         )
         .as_bytes(),
     )?;
-    if request.method == "HEAD" {
-        stream.write_all(b"0\r\n\r\n")?;
-        return Ok(());
+    if request.method == "GET" {
+        stream.write_all(body)?;
     }
-
-    let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
-    loop {
-        let still_active = runtime
-            .lock()
-            .map(|runtime| {
-                runtime
-                    .sessions
-                    .get(token)
-                    .is_some_and(|session| session.active)
-            })
-            .unwrap_or(false);
-        if !still_active {
-            break;
-        }
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            std::thread::sleep(Duration::from_millis(40));
-            continue;
-        }
-        stream.write_all(format!("{read:X}\r\n").as_bytes())?;
-        stream.write_all(&buffer[..read])?;
-        stream.write_all(b"\r\n")?;
-    }
-    let _ = stream.write_all(b"0\r\n\r\n");
     Ok(())
 }
 
@@ -902,15 +1405,12 @@ struct WorkerLiveRunner {
     rx: mpsc::Receiver<WorkerMessage>,
     reader: Option<std::thread::JoinHandle<()>>,
     next_request_id: u64,
-    stopped: bool,
+    stop_signalled: bool,
+    reaped: bool,
 }
 
 impl WorkerLiveRunner {
-    fn start(
-        program: &str,
-        source_json: serde_json::Value,
-        output_path: &Path,
-    ) -> Result<Self, LiveError> {
+    fn spawn(program: &str) -> Result<Self, LiveError> {
         let child = Command::new(program)
             .arg("run")
             .stdin(Stdio::piped())
@@ -920,19 +1420,7 @@ impl WorkerLiveRunner {
             .map_err(|_| LiveError::WorkerUnavailable)?;
         let child = crate::worker_process::contain_spawned_worker(child)
             .map_err(|_| LiveError::WorkerUnavailable)?;
-        let mut runner = Self::from_child(child)?;
-        runner.wait_hello()?;
-        let result = runner.request(
-            "live.start",
-            serde_json::json!({
-                "source": source_json,
-                "output_path": output_path.to_string_lossy(),
-            }),
-        )?;
-        if result.get("started").and_then(serde_json::Value::as_bool) != Some(true) {
-            return Err(LiveError::WorkerUnavailable);
-        }
-        Ok(runner)
+        Self::from_child(child)
     }
 
     fn from_child(mut child: Child) -> Result<Self, LiveError> {
@@ -968,15 +1456,23 @@ impl WorkerLiveRunner {
             rx,
             reader: Some(reader),
             next_request_id: 1,
-            stopped: false,
+            stop_signalled: false,
+            reaped: false,
         })
     }
 
-    fn wait_hello(&mut self) -> Result<(), LiveError> {
+    fn wait_hello(&mut self, cancel: &AtomicBool) -> Result<(), LiveError> {
         let deadline = Instant::now() + WORKER_HELLO_TIMEOUT;
         loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err(LiveError::LifecycleBlocked);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match self.rx.recv_timeout(remaining) {
+            if remaining.is_zero() {
+                return Err(LiveError::WorkerUnavailable);
+            }
+            let slice = remaining.min(Duration::from_millis(50));
+            match self.rx.recv_timeout(slice) {
                 Ok(WorkerMessage::Frame(Envelope::Event { v, name, data }))
                     if v == PROTOCOL_VERSION
                         && name == event::HELLO
@@ -984,8 +1480,9 @@ impl WorkerLiveRunner {
                 {
                     return Ok(());
                 }
-                Ok(WorkerMessage::Frame(_)) => {}
-                Ok(WorkerMessage::Eof | WorkerMessage::Error) | Err(_) => {
+                Ok(WorkerMessage::Frame(_)) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(WorkerMessage::Eof | WorkerMessage::Error)
+                | Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(LiveError::WorkerUnavailable);
                 }
             }
@@ -997,6 +1494,18 @@ impl WorkerLiveRunner {
         method_name: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, LiveError> {
+        self.request_cancelable(method_name, params, None)
+    }
+
+    fn request_cancelable(
+        &mut self,
+        method_name: &str,
+        params: serde_json::Value,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<serde_json::Value, LiveError> {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+            return Err(LiveError::LifecycleBlocked);
+        }
         let id = self.next_request_id;
         self.next_request_id = self.next_request_id.saturating_add(1);
         let stdin = self.stdin.as_mut().ok_or(LiveError::WorkerUnavailable)?;
@@ -1010,8 +1519,15 @@ impl WorkerLiveRunner {
             .map_err(|_| LiveError::WorkerUnavailable)?;
         let deadline = Instant::now() + WORKER_REQUEST_TIMEOUT;
         loop {
+            if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+                return Err(LiveError::LifecycleBlocked);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match self.rx.recv_timeout(remaining) {
+            if remaining.is_zero() {
+                return Err(LiveError::WorkerUnavailable);
+            }
+            let slice = remaining.min(Duration::from_millis(50));
+            match self.rx.recv_timeout(slice) {
                 Ok(WorkerMessage::Frame(Envelope::Response {
                     v,
                     id: response_id,
@@ -1030,29 +1546,43 @@ impl WorkerLiveRunner {
                         error_code.as_deref().unwrap_or("internal"),
                     ));
                 }
-                Ok(WorkerMessage::Frame(_)) => {}
-                Ok(WorkerMessage::Eof | WorkerMessage::Error) | Err(_) => {
+                Ok(WorkerMessage::Frame(_)) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(WorkerMessage::Eof | WorkerMessage::Error)
+                | Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(LiveError::WorkerUnavailable);
                 }
             }
         }
     }
 
-    fn cleanup(&mut self) {
-        if self.stopped {
+    fn signal_request(&mut self, method_name: &str) {
+        let Some(stdin) = self.stdin.as_mut() else {
+            return;
+        };
+        let id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        let _ = FramedWriter::new(stdin).send(&Envelope::Request {
+            v: PROTOCOL_VERSION,
+            id,
+            method: method_name.to_owned(),
+            params: serde_json::json!({}),
+        });
+    }
+
+    fn signal_stop(&mut self) {
+        if self.stop_signalled {
             return;
         }
-        let _ = self.request("live.stop", serde_json::json!({}));
-        self.stopped = true;
-        if let Some(stdin) = self.stdin.as_mut() {
-            let id = self.next_request_id;
-            let _ = FramedWriter::new(stdin).send(&Envelope::Request {
-                v: PROTOCOL_VERSION,
-                id,
-                method: method::SHUTDOWN.to_owned(),
-                params: serde_json::json!({}),
-            });
+        self.stop_signalled = true;
+        self.signal_request("live.stop");
+        self.signal_request(method::SHUTDOWN);
+    }
+
+    fn reap(&mut self) {
+        if self.reaped {
+            return;
         }
+        self.signal_stop();
         self.stdin.take();
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut reaped = false;
@@ -1073,23 +1603,55 @@ impl WorkerLiveRunner {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
+        self.reaped = true;
     }
 }
 
 impl LiveRunner for WorkerLiveRunner {
+    fn start(
+        &mut self,
+        source_json: serde_json::Value,
+        output_dir: &Path,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<(), LiveError> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(LiveError::LifecycleBlocked);
+        }
+        self.wait_hello(&cancel)?;
+        let result = self.request_cancelable(
+            "live.start",
+            serde_json::json!({
+                "source": source_json,
+                "output_dir": output_dir.to_string_lossy(),
+                "fragment_target_ms": LIVE_FRAGMENT_TARGET.as_millis() as u64,
+                "max_fragment_bytes": MAX_LIVE_FRAGMENT_BYTES,
+                "max_fragment_count": MAX_LIVE_CACHE_FRAGMENTS,
+            }),
+            Some(&cancel),
+        )?;
+        if result.get("started").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(LiveError::WorkerUnavailable);
+        }
+        Ok(())
+    }
+
     fn status(&mut self) -> Result<LiveWorkerStatus, LiveError> {
         let value = self.request("live.status", serde_json::json!({}))?;
         serde_json::from_value(value).map_err(|_| LiveError::WorkerUnavailable)
     }
 
-    fn stop(&mut self) {
-        self.cleanup();
+    fn request_stop(&mut self) {
+        self.signal_stop();
+    }
+
+    fn join_or_reap(&mut self) {
+        self.reap();
     }
 }
 
 impl Drop for WorkerLiveRunner {
     fn drop(&mut self) {
-        self.cleanup();
+        self.reap();
     }
 }
 
@@ -1115,20 +1677,27 @@ mod tests {
     }
 
     impl LiveRunner for FakeRunner {
+        fn start(
+            &mut self,
+            _source_json: serde_json::Value,
+            output_dir: &Path,
+            _cancel: Arc<AtomicBool>,
+        ) -> Result<(), LiveError> {
+            std::fs::write(output_dir.join("fragment-000000000000.mp4"), b"fake-live")
+                .map_err(|_| LiveError::Internal)
+        }
+
         fn status(&mut self) -> Result<LiveWorkerStatus, LiveError> {
             self.status.clone()
         }
 
-        fn stop(&mut self) {}
+        fn request_stop(&mut self) {}
+
+        fn join_or_reap(&mut self) {}
     }
 
     impl LiveRunnerFactory for FakeFactory {
-        fn start(
-            &self,
-            _source_json: serde_json::Value,
-            output_path: &Path,
-        ) -> Result<Box<dyn LiveRunner>, LiveError> {
-            std::fs::write(output_path, b"fake-live").map_err(|_| LiveError::Internal)?;
+        fn spawn(&self) -> Result<Box<dyn LiveRunner>, LiveError> {
             Ok(Box::new(FakeRunner {
                 status: Ok(LiveWorkerStatus {
                     state: LiveState::Live,
@@ -1146,9 +1715,20 @@ mod tests {
 
     struct StopCountingRunner {
         stops: Arc<AtomicUsize>,
+        signalled: bool,
     }
 
     impl LiveRunner for StopCountingRunner {
+        fn start(
+            &mut self,
+            _source_json: serde_json::Value,
+            output_dir: &Path,
+            _cancel: Arc<AtomicBool>,
+        ) -> Result<(), LiveError> {
+            std::fs::write(output_dir.join("fragment-000000000000.mp4"), b"fake-live")
+                .map_err(|_| LiveError::Internal)
+        }
+
         fn status(&mut self) -> Result<LiveWorkerStatus, LiveError> {
             Ok(LiveWorkerStatus {
                 state: LiveState::Live,
@@ -1157,20 +1737,21 @@ mod tests {
             })
         }
 
-        fn stop(&mut self) {
-            self.stops.fetch_add(1, Ordering::AcqRel);
+        fn request_stop(&mut self) {
+            if !self.signalled {
+                self.signalled = true;
+                self.stops.fetch_add(1, Ordering::AcqRel);
+            }
         }
+
+        fn join_or_reap(&mut self) {}
     }
 
     impl LiveRunnerFactory for StopCountingFactory {
-        fn start(
-            &self,
-            _source_json: serde_json::Value,
-            output_path: &Path,
-        ) -> Result<Box<dyn LiveRunner>, LiveError> {
-            std::fs::write(output_path, b"fake-live").map_err(|_| LiveError::Internal)?;
+        fn spawn(&self) -> Result<Box<dyn LiveRunner>, LiveError> {
             Ok(Box::new(StopCountingRunner {
                 stops: self.stops.clone(),
+                signalled: false,
             }))
         }
     }
@@ -1180,12 +1761,7 @@ mod tests {
     }
 
     impl LiveRunnerFactory for IsolatingFactory {
-        fn start(
-            &self,
-            _source_json: serde_json::Value,
-            output_path: &Path,
-        ) -> Result<Box<dyn LiveRunner>, LiveError> {
-            std::fs::write(output_path, b"fake-live").map_err(|_| LiveError::Internal)?;
+        fn spawn(&self) -> Result<Box<dyn LiveRunner>, LiveError> {
             let status = if self.starts.fetch_add(1, Ordering::AcqRel) == 0 {
                 Err(LiveError::WorkerUnavailable)
             } else {
@@ -1471,6 +2047,420 @@ mod tests {
         assert_eq!(
             http_status(&controller, "HEAD", &path, &host, Some("tauri://localhost")),
             "HTTP/1.1 410 Gone"
+        );
+    }
+
+    fn write_test_fragment(dir: &Path, sequence: u64, bytes: usize) -> String {
+        let name = format!("fragment-{sequence:012}.mp4");
+        std::fs::write(dir.join(&name), vec![sequence as u8; bytes]).unwrap();
+        name
+    }
+
+    fn committed_session(controller: &LiveViewController, session_id: &str) -> Arc<LiveSession> {
+        controller
+            .registry
+            .lock()
+            .unwrap()
+            .sessions
+            .get(session_id)
+            .cloned()
+            .unwrap()
+    }
+
+    #[derive(Clone)]
+    struct OrderedTeardownFactory {
+        next: Arc<AtomicUsize>,
+        signals: Arc<AtomicUsize>,
+        join_signal_snapshots: Arc<Mutex<Vec<usize>>>,
+    }
+
+    struct OrderedTeardownRunner {
+        id: usize,
+        signalled: bool,
+        signals: Arc<AtomicUsize>,
+        join_signal_snapshots: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl LiveRunner for OrderedTeardownRunner {
+        fn start(
+            &mut self,
+            _source_json: serde_json::Value,
+            output_dir: &Path,
+            _cancel: Arc<AtomicBool>,
+        ) -> Result<(), LiveError> {
+            write_test_fragment(output_dir, 0, 32);
+            Ok(())
+        }
+
+        fn status(&mut self) -> Result<LiveWorkerStatus, LiveError> {
+            Ok(LiveWorkerStatus {
+                state: LiveState::Live,
+                failure_category: None,
+                reconnect_attempt: 0,
+            })
+        }
+
+        fn request_stop(&mut self) {
+            if !self.signalled {
+                self.signalled = true;
+                self.signals.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        fn join_or_reap(&mut self) {
+            self.join_signal_snapshots
+                .lock()
+                .unwrap()
+                .push(self.signals.load(Ordering::Acquire));
+            if self.id == 0 {
+                std::thread::sleep(Duration::from_millis(80));
+            }
+        }
+    }
+
+    impl LiveRunnerFactory for OrderedTeardownFactory {
+        fn spawn(&self) -> Result<Box<dyn LiveRunner>, LiveError> {
+            let id = self.next.fetch_add(1, Ordering::AcqRel);
+            Ok(Box::new(OrderedTeardownRunner {
+                id,
+                signalled: false,
+                signals: self.signals.clone(),
+                join_signal_snapshots: self.join_signal_snapshots.clone(),
+            }))
+        }
+    }
+
+    #[derive(Clone)]
+    struct CancelBlockingFactory {
+        entered: Arc<AtomicUsize>,
+        cancelled: Arc<AtomicUsize>,
+        return_runner_after_cancel: bool,
+        signals: Arc<AtomicUsize>,
+        joins: Arc<AtomicUsize>,
+    }
+
+    struct CancelAwareRunner {
+        entered: Arc<AtomicUsize>,
+        cancelled: Arc<AtomicUsize>,
+        succeed_after_cancel: bool,
+        signalled: bool,
+        signals: Arc<AtomicUsize>,
+        joins: Arc<AtomicUsize>,
+    }
+
+    impl LiveRunner for CancelAwareRunner {
+        fn start(
+            &mut self,
+            _source_json: serde_json::Value,
+            output_dir: &Path,
+            cancel: Arc<AtomicBool>,
+        ) -> Result<(), LiveError> {
+            self.entered.fetch_add(1, Ordering::AcqRel);
+            while !cancel.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            self.cancelled.fetch_add(1, Ordering::AcqRel);
+            if self.succeed_after_cancel {
+                write_test_fragment(output_dir, 0, 32);
+                Ok(())
+            } else {
+                Err(LiveError::LifecycleBlocked)
+            }
+        }
+
+        fn status(&mut self) -> Result<LiveWorkerStatus, LiveError> {
+            Ok(LiveWorkerStatus {
+                state: LiveState::Starting,
+                failure_category: None,
+                reconnect_attempt: 0,
+            })
+        }
+
+        fn request_stop(&mut self) {
+            if !self.signalled {
+                self.signalled = true;
+                self.signals.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        fn join_or_reap(&mut self) {
+            self.joins.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl LiveRunnerFactory for CancelBlockingFactory {
+        fn spawn(&self) -> Result<Box<dyn LiveRunner>, LiveError> {
+            Ok(Box::new(CancelAwareRunner {
+                entered: self.entered.clone(),
+                cancelled: self.cancelled.clone(),
+                succeed_after_cancel: self.return_runner_after_cancel,
+                signalled: false,
+                signals: self.signals.clone(),
+                joins: self.joins.clone(),
+            }))
+        }
+    }
+
+    #[test]
+    fn rolling_fragment_retention_reclaims_old_output_and_stays_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let controller =
+            LiveViewController::with_factory(Arc::new(FakeFactory), temp.path().to_path_buf())
+                .unwrap();
+        let opened = controller.open(prepared("front-door")).unwrap();
+        let session = committed_session(&controller, &opened.session_id);
+        for sequence in 1..=80 {
+            write_test_fragment(&session.temp_dir, sequence, 1024);
+        }
+
+        trim_session_fragments(&session.http);
+        let fragments = list_live_fragments(&session.temp_dir);
+        assert_eq!(fragments.len(), MAX_RETAINED_LIVE_FRAGMENTS);
+        assert_eq!(fragments.first().unwrap().sequence, 75);
+        assert!(
+            fragments.iter().map(|fragment| fragment.bytes).sum::<u64>()
+                <= MAX_RETAINED_LIVE_FRAGMENTS as u64 * MAX_LIVE_FRAGMENT_BYTES
+        );
+    }
+
+    #[test]
+    fn fragment_with_active_reader_is_reclaimed_only_after_reader_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let controller =
+            LiveViewController::with_factory(Arc::new(FakeFactory), temp.path().to_path_buf())
+                .unwrap();
+        let opened = controller.open(prepared("front-door")).unwrap();
+        let session = committed_session(&controller, &opened.session_id);
+        for sequence in 1..=10 {
+            write_test_fragment(&session.temp_dir, sequence, 1024);
+        }
+        let oldest = "fragment-000000000000.mp4";
+        let reader = session.http.try_acquire_fragment(oldest).unwrap();
+        trim_session_fragments(&session.http);
+        assert!(session.temp_dir.join(oldest).exists());
+        assert!(list_live_fragments(&session.temp_dir).len() <= MAX_RETAINED_LIVE_FRAGMENTS + 1);
+
+        drop(reader);
+        assert!(!session.temp_dir.join(oldest).exists());
+        assert_eq!(
+            list_live_fragments(&session.temp_dir).len(),
+            MAX_RETAINED_LIVE_FRAGMENTS
+        );
+    }
+
+    #[test]
+    fn closing_session_removes_transient_cache_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let controller =
+            LiveViewController::with_factory(Arc::new(FakeFactory), temp.path().to_path_buf())
+                .unwrap();
+        let opened = controller.open(prepared("front-door")).unwrap();
+        let session_dir = temp.path().join(format!("session-{}", opened.session_id));
+        assert!(session_dir.exists());
+        controller.close(&opened.session_id).unwrap();
+        assert!(!session_dir.exists());
+    }
+
+    #[test]
+    fn startup_cleans_only_provably_owned_abandoned_session_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale_id = Uuid::new_v4().to_string();
+        let stale = temp.path().join(format!("session-{stale_id}"));
+        let lookalike = temp.path().join("session-not-a-uuid");
+        let unrelated = temp.path().join("keep-me.txt");
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join("fragment-000000000001.mp4"), b"old").unwrap();
+        std::fs::create_dir(&lookalike).unwrap();
+        std::fs::write(&unrelated, b"foreign").unwrap();
+
+        let controller =
+            LiveViewController::with_factory(Arc::new(FakeFactory), temp.path().to_path_buf())
+                .unwrap();
+        assert!(!stale.exists());
+        assert!(lookalike.exists());
+        assert!(unrelated.exists());
+        drop(controller);
+        assert!(lookalike.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn four_sessions_are_independently_fragment_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let controller =
+            LiveViewController::with_factory(Arc::new(FakeFactory), temp.path().to_path_buf())
+                .unwrap();
+        let opened = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|camera| controller.open(prepared(camera)).unwrap())
+            .collect::<Vec<_>>();
+        for live in &opened {
+            let session = committed_session(&controller, &live.session_id);
+            for sequence in 1..=32 {
+                write_test_fragment(&session.temp_dir, sequence, 512);
+            }
+            trim_session_fragments(&session.http);
+            assert_eq!(
+                list_live_fragments(&session.temp_dir).len(),
+                MAX_RETAINED_LIVE_FRAGMENTS
+            );
+        }
+    }
+
+    #[test]
+    fn close_all_signals_every_worker_before_any_join_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        let signals = Arc::new(AtomicUsize::new(0));
+        let join_signal_snapshots = Arc::new(Mutex::new(Vec::new()));
+        let controller = LiveViewController::with_factory(
+            Arc::new(OrderedTeardownFactory {
+                next: Arc::new(AtomicUsize::new(0)),
+                signals: signals.clone(),
+                join_signal_snapshots: join_signal_snapshots.clone(),
+            }),
+            temp.path().to_path_buf(),
+        )
+        .unwrap();
+        for camera in ["a", "b", "c", "d"] {
+            controller.open(prepared(camera)).unwrap();
+        }
+
+        let started = Instant::now();
+        controller.close_all();
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(signals.load(Ordering::Acquire), 4);
+        let snapshots = join_signal_snapshots.lock().unwrap().clone();
+        assert_eq!(snapshots.len(), 4);
+        assert!(
+            snapshots
+                .into_iter()
+                .all(|signals_before_join| signals_before_join == 4)
+        );
+    }
+
+    #[test]
+    fn keepalive_does_not_synchronously_reap_an_unrelated_expired_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let stops = Arc::new(AtomicUsize::new(0));
+        let controller = LiveViewController::with_factory_and_timeout(
+            Arc::new(StopCountingFactory {
+                stops: stops.clone(),
+            }),
+            temp.path().to_path_buf(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let expired = controller.open(prepared("a")).unwrap();
+        let healthy = controller.open(prepared("b")).unwrap();
+        let expired_session = committed_session(&controller, &expired.session_id);
+        *expired_session.last_keepalive.lock().unwrap() = Instant::now() - Duration::from_secs(10);
+
+        controller.keep_alive(&healthy.session_id).unwrap();
+        assert_eq!(stops.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn lifecycle_cancels_and_waits_for_all_inflight_openings() {
+        let temp = tempfile::tempdir().unwrap();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let controller = Arc::new(
+            LiveViewController::with_factory(
+                Arc::new(CancelBlockingFactory {
+                    entered: entered.clone(),
+                    cancelled: cancelled.clone(),
+                    return_runner_after_cancel: false,
+                    signals: Arc::new(AtomicUsize::new(0)),
+                    joins: Arc::new(AtomicUsize::new(0)),
+                }),
+                temp.path().to_path_buf(),
+            )
+            .unwrap(),
+        );
+        let admissions = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|camera| controller.admit(prepared(camera)).unwrap())
+            .collect::<Vec<_>>();
+        let threads = admissions
+            .into_iter()
+            .map(|admission| std::thread::spawn(move || admission.start()))
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while entered.load(Ordering::Acquire) < 4 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(entered.load(Ordering::Acquire), 4);
+
+        controller.stop_accepting();
+        controller.close_all();
+        for thread in threads {
+            assert!(matches!(
+                thread.join().unwrap(),
+                Err(LiveOpenStartError {
+                    error: LiveError::LifecycleBlocked,
+                    ..
+                })
+            ));
+        }
+        assert_eq!(cancelled.load(Ordering::Acquire), 4);
+        assert!(controller.registry.lock().unwrap().opening.is_empty());
+        assert!(controller.registry.lock().unwrap().sessions.is_empty());
+        assert!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with("session-"))
+        );
+        controller.resume_accepting();
+        let fresh = controller.admit(prepared("e")).unwrap();
+        drop(fresh);
+    }
+
+    #[test]
+    fn late_runner_after_lifecycle_cancel_is_signalled_reaped_and_cannot_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let signals = Arc::new(AtomicUsize::new(0));
+        let joins = Arc::new(AtomicUsize::new(0));
+        let controller = Arc::new(
+            LiveViewController::with_factory(
+                Arc::new(CancelBlockingFactory {
+                    entered: entered.clone(),
+                    cancelled: cancelled.clone(),
+                    return_runner_after_cancel: true,
+                    signals: signals.clone(),
+                    joins: joins.clone(),
+                }),
+                temp.path().to_path_buf(),
+            )
+            .unwrap(),
+        );
+        let admission = controller.admit(prepared("a")).unwrap();
+        let thread = std::thread::spawn(move || admission.start());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while entered.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        controller.stop_accepting();
+        controller.close_all();
+        assert!(matches!(
+            thread.join().unwrap(),
+            Err(LiveOpenStartError {
+                error: LiveError::LifecycleBlocked,
+                ..
+            })
+        ));
+        assert_eq!(cancelled.load(Ordering::Acquire), 1);
+        assert_eq!(signals.load(Ordering::Acquire), 1);
+        assert_eq!(joins.load(Ordering::Acquire), 1);
+        assert!(controller.registry.lock().unwrap().sessions.is_empty());
+        assert!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with("session-"))
         );
     }
 
