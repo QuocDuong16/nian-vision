@@ -20,6 +20,7 @@ Testing is part of the definition of done for every milestone (master spec
 | `nian-application` / desktop (M7) | lifecycle admission (`Running`/`Suspending`/`Quitting`), persisted desired-recording restoration, lifecycle-owned recorder shutdown/join, probe cancellation/admission, playback suspend/resume/shutdown, single-instance activation policy, close-to-tray, autostart reconciliation/rollback, suspend/resume convergence and deterministic Quit ordering |
 | `nian-settings` / `nian-application` / desktop (M9) | schema v3 multi-desired migration + rollback, bounded per-camera recording slots, independent runner/supervisor ownership, camera-scoped Start/Stop/status, transactional Stop All, capacity ordering, failure isolation, multi-camera startup/suspend/resume/update restoration, concurrent admission races, tray/UI aggregation without synthetic global state |
 | `nian-onvif` / `nian-application` / desktop/UI (M10) | bounded/cancellable discovery aggregation, hostile XML and authority validation, Device/Media2/legacy Media fixtures, Digest/UsernameToken secret safety, H.264 profile selection, stream-URI sanitation, opaque session invalidation, per-device failure isolation, lifecycle cancellation and ONVIF/manual onboarding UI |
+| `nian-application` / media worker / desktop/UI (M11) | four-camera live capacity, duplicate/open reservation RAII, opaque loopback session capability, Host/Origin/path/method rejection, background keepalive expiry/reaper, per-camera worker-status isolation, bounded live retry/cancel, recording/live independence, suspend/hide/update cleanup and reconnect media remount |
 | `nian-storage` | recordings layout, partial/final naming round-trip, traversal rejection, exclusive claims (incl. sub-second clock regression), no-replace publication (success, collision refusal, recoverable abandoned partials) |
 | `nian-storage` (M3/M4) | partial-file classification plus deterministic exact-grammar filesystem inventory; normal + recovered first-class recordings; foreign/control artifacts excluded; recording-looking symlinks never followed; shared strict recovery-tombstone v2 validation; typed path-presence semantics where only `NotFound` proves absence; shared whole-second filesystem identity normalization |
 | `nian-ipc` | envelope round-trips, framing limits (1 MiB cap, CRLF, truncation), dispatch loop (ping/describe/shutdown/unknown), protocol version guard, handler event emission through the writer before replies (M3) |
@@ -628,10 +629,48 @@ recording concurrency/convergence tests remain unchanged.
 Physical ONVIF camera validation is optional/manual and never a Forgejo CI dependency.
 No hardware model is claimed validated by the M10 automated suite.
 
+### Independent multi-camera live view (M11)
+
+`nian-application` live-controller tests use fake per-session runners and real loopback
+sockets. They prove the four-camera cap, same-camera duplicate refusal, admission/started
+RAII reservation release, opaque UUID-only frontend DTOs, explicit close/keepalive stale
+handles, per-camera status failure isolation and background expiry without any follow-up
+controller command. HTTP tests accept only the committed `/live/<uuid>` capability and
+reject wrong Host/Origin, non-GET/HEAD methods, malformed/arbitrary paths and closed
+sessions; no test endpoint accepts a camera URL or filesystem path. A short test-only
+session timeout proves the reaper stops the runner, removes the session directory and
+releases capacity after frontend abandonment.
+
+Media-worker unit tests cover strict RTSP/absolute-output live parameters, the bounded
+five-attempt retry terminal state and lifecycle cancellation during backoff. The normal
+workspace media/worker integration suite remains green, so M11 does not weaken existing
+FFmpeg ABI, probe, playback or recording behavior.
+
+Desktop regressions open fake live sessions through the real `CameraService`/
+`LiveViewController` seam and prove Stop All Recording leaves live ownership untouched;
+close-to-tray clears live while preserving recording runtime and Desired intent; suspend
+invalidates live session ids while Resume restores Desired recording exactly once and only
+reopens live admission; update teardown clears live while preserving recording intent.
+These tests run without RTSP hardware.
+
+`LiveViewScreen` tests cover explicit camera selection, localhost-only opaque media URLs,
+one failed tile beside a healthy tile, recording Start/Stop without live close, media-error
+backend cleanup, unmount cleanup and `live → backoff → live` remount using a new reconnect
+attempt. The complete UI gate is TypeScript typecheck + ESLint + Vitest + Vite production
+build.
+
+Physical live-camera validation remains optional/manual and is not claimed by CI. A real
+WebView smoke should select one then multiple configured H.264 cameras, verify playback
+from `http://127.0.0.1:<ephemeral>/live/<uuid>`, confirm the listener is loopback-only,
+exercise camera/network interruption and confirm one tile reconnect/failure does not stop
+other tiles or recording. H.265/transcoding/WebRTC/PTZ/events are not part of that M11
+claim.
+
 ## Planned per milestone
 
-* **M11+**: PTZ/events/live-view expansion if separately specified. macOS distribution,
-  clip export, thumbnails/motion analysis and AI/cloud behavior remain outside M10.
+* **M12+**: PTZ/events or further live-view expansion only if separately specified. macOS
+  distribution, H.265/transcoding/WebRTC, clip export, thumbnails/motion analysis and
+  AI/cloud behavior remain outside M11.
 * **Hardware/manual** (never in CI): real Tapo C200 via
   `NIAN_VISION_RTSP_URL` with
   `nian-media-worker record --rtsp-from-env ...` and/or an IPC-driven

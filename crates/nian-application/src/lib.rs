@@ -14,6 +14,7 @@ pub mod camera_service;
 pub mod config;
 pub mod desktop_lifecycle;
 pub mod error;
+pub mod live_controller;
 pub mod onvif_controller;
 pub mod playback;
 pub mod probe_controller;
@@ -31,6 +32,11 @@ pub use camera_service::{
 pub use config::{AppConfig, SegmentTargetDuration};
 pub use desktop_lifecycle::{DesktopLifecycle, DesktopLifecycleError, DesktopLifecycleState};
 pub use error::ApplicationError;
+pub use live_controller::{
+    LiveError, LiveFailureCategory, LiveOpenDto, LiveRunner, LiveRunnerFactory, LiveState,
+    LiveStatus, LiveViewController, LiveWorkerStatus, MAX_SIMULTANEOUS_LIVE_VIEWS, PreparedLive,
+    WorkerLiveRunnerFactory,
+};
 pub use onvif_controller::{
     OnvifConnectionDto, OnvifController, OnvifControllerError, OnvifDiscoveredDeviceDto,
     OnvifDiscoveryDto, OnvifMediaProfileDto, OnvifPreparedProfileDto,

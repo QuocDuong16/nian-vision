@@ -60,7 +60,7 @@ Key properties:
 | Crate | Role | Notes |
 |---|---|---|
 | `nian-domain` | Camera/Recording/Media vocabulary | path-safe IDs, redacted credentials, backoff schedule |
-| `nian-application` | config validation and orchestration policies | `WorkerSupervisor` (M3), `StorageManager` (M4), camera/record/probe controllers, M6 `PlaybackController`, M7 lifecycle admission, M10 `OnvifController` session/authority boundary |
+| `nian-application` | config validation and orchestration policies | `WorkerSupervisor` (M3), `StorageManager` (M4), camera/record/probe controllers, M6 `PlaybackController`, M7 lifecycle admission, M10 `OnvifController`, M11 `LiveViewController` session/capacity/reaper boundary |
 | `nian-onvif` | ONVIF discovery/protocol infrastructure | bounded WS-Discovery, SOAP Device/Media2/Media client, XML/authority hardening; no Tauri, settings, keyring or FFmpeg |
 | `nian-index` | rebuildable SQLite recording catalog | bundled SQLite, schema v1 migrations, WAL, timeline queries; no camera settings or credentials (M4) |
 | `nian-settings` | authoritative non-secret desktop configuration | app-data `settings.sqlite3`, schema v2 camera/storage + desired-recording/autostart settings; no FFmpeg/Tauri/process logic |
@@ -71,8 +71,8 @@ Key properties:
 | `nian-recorder` | segmented recording engine + supervision | keyframe rotation, durable finalize/publish; camera reconnect supervisor, partial recovery (M3) |
 | `nian-ffmpeg-sys` | raw FFI (generated) | committed bindings from vendored 8.0.3 headers |
 | `nian-platform-windows` | isolated Win32 desktop boundary | M7 suspend/resume notifications and kill-on-close Job Object worker containment |
-| `apps/nian-desktop` | Tauri 2 host | managed M7 state, single-instance/tray/autostart/lifecycle owner, platform app-data + native credentials, playback HTTP owner, thin typed commands |
-| `apps/nian-media-worker` | media process | `probe` CLI, `run` IPC with `recording.*`, bounded `camera.probe`, M6 `playback.prepare`, manual `record` smoke command |
+| `apps/nian-desktop` | Tauri 2 host | single-instance/tray/autostart/lifecycle owner, platform app-data + native credentials, playback/live loopback HTTP owner, thin typed commands |
+| `apps/nian-media-worker` | media process | `probe` CLI, `run` IPC with `recording.*`, bounded `camera.probe`, M6 `playback.prepare`, M11 `live.*`, manual `record` smoke command |
 
 ## Recording data flow
 
@@ -271,8 +271,9 @@ M5 originally chose session-only desired recording state. M7 supersedes only tha
 lifetime rule: the single allowed desired camera is now persisted in authoritative
 settings and restored through the normal `RecordingController` path after desktop
 restart or resume. Runtime state remains separate and may legitimately be `Failed`
-while Desired stays On. M6 playback/timeline semantics are unchanged; live view
-and thumbnails remain out of scope. See ADR-0008 and ADR-0010.
+while Desired stays On. M6 playback/timeline semantics are unchanged. Live view was
+outside M7 and is added later as the separate transient M11 subsystem; thumbnails
+remain out of scope. See ADR-0008, ADR-0010 and ADR-0014.
 
 ## Recording timeline and playback (M6)
 
@@ -632,6 +633,56 @@ M10 explicitly excludes PTZ, presets, events/motion subscriptions, talkback, liv
 redesign, H.265 recording, transcoding, cloud/remote discovery and automatic camera
 adoption. See ADR-0013.
 
+## Independent multi-camera live view (M11)
+
+M11 adds live viewing as a transient subsystem beside recording rather than as another
+recording mode. `CameraService::prepare_live` resolves an existing camera plus native
+credential reference entirely inside Rust. The secret-bearing authenticated RTSP source
+is handed only to a dedicated live worker; React receives an opaque UUID session id,
+typed live status and an ephemeral `http://127.0.0.1:<port>/live/<uuid>` URL. No settings
+schema or persistent live-layout state is added.
+
+`LiveViewController` admits at most four simultaneous cameras and at most one opening or
+active live session per camera. Admission reserves camera/capacity under a short registry
+lock, worker spawn/hello/start happens outside that registry lock, then commit installs the
+session. Admission and started handles release reservations on drop, so cancellation or
+thread failure cannot strand capacity. Each committed session owns its runner behind a
+per-session mutex; aggregate status polling queries sessions independently and converts a
+failed worker status request into a failure for that camera rather than failing the whole
+status set. Recording slots and live slots are separate; the same camera may record and
+view live concurrently using independent RTSP connections.
+
+The worker accepts `live.start`, `live.status` and `live.stop`. It opens RTSP through the
+existing FFmpeg wrapper, requires H.264 video and packet-copies only that video stream into
+fragmented MP4. There is no decode/transcode path. Transient source/media loss retries at
+1/2/4/8/15 seconds with a five-attempt bound. Lifecycle cancellation interrupts active
+FFmpeg work and aborts backoff promptly.
+
+The live HTTP server binds only `127.0.0.1` on an ephemeral port. `/live/<uuid>` maps one
+opaque session to one application-created media file; the request cannot supply a camera
+URL or filesystem path. GET/HEAD only, loopback Host checks, expected desktop/development
+Origin checks, UUID grammar, bounded headers and bounded concurrent HTTP requests keep the
+endpoint a narrow capability rather than a LAN/file proxy. Closing or expiring a session
+removes the mapping and stale requests return a gone response. The existing desktop CSP
+continues to allow media only from self plus loopback HTTP.
+
+The frontend uses one aggregate one-second status poll and one 30-second keepalive loop.
+Keepalive is not the sole cleanup mechanism: sessions have a two-minute expiry and a
+background application reaper removes abandoned sessions even when the frontend crashes
+and sends no further command. Expiry stops the worker, removes the HTTP capability and
+releases live capacity. During worker backoff the tile unmounts its `<video>` element; on
+return to `live` with a new reconnect attempt it remounts the element against the same
+opaque session URL. A media-element error closes the backend session before Retry creates
+a fresh session.
+
+Close-to-tray releases live sessions but does not alter recording Desired/Runtime state.
+Suspend stops live admission and clears sessions; Resume only reopens live admission and
+never resurrects stale session ids. Quit and update stop admission and tear down live
+workers as part of deterministic desktop shutdown. Recording restoration continues through
+the M9 Desired path and is independent of live cleanup. PTZ/events, H.265 live view,
+transcoding, WebRTC, remote streaming and persisted live layouts remain outside M11. See
+ADR-0014.
+
 ## Failure model
 
 Camera and network failures are normal operation (master spec §11):
@@ -645,10 +696,11 @@ filesystem remains the source of survival; SQLite is a rebuildable index
 
 Sleep/wake is now explicit M7 lifecycle input on Windows. Native power
 notifications move the desktop to `Suspending`, close new work admission and
-request bounded recorder/probe/playback interruption. Resume returns admission to
-`Running`, independently resynchronizes playback storage, rejoins any stopping
-recording controller, restores persisted desired recording through the normal
-start path and reopens probe admission. One subsystem's resume failure is surfaced
+request bounded recorder/probe/playback interruption and clear transient live sessions.
+Resume returns admission to `Running`, independently resynchronizes playback storage,
+rejoins any stopping recording controller, restores persisted desired recording through
+the normal start path, reopens probe/live admission and does not resurrect old live
+session ids. One subsystem's resume failure is surfaced
 without preventing the remaining subsystems from converging.
 
 ## Documentation index

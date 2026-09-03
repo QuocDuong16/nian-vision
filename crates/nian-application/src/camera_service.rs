@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{AppConfig, DesiredRecording};
+use crate::{AppConfig, DesiredRecording, PreparedLive};
 
 const MAX_CREDENTIAL_REF_GENERATION_ATTEMPTS: usize = 8;
 
@@ -708,6 +708,25 @@ impl CameraService {
             }),
             segment_target_secs: config.segment_target_duration().get().as_secs(),
             copy_audio: camera.audio_policy() == AudioPolicy::CopyAll,
+        })
+    }
+
+    pub fn prepare_live(&self, camera_id: &str) -> Result<PreparedLive, CameraServiceError> {
+        let camera_id = parse_camera_id(camera_id)?;
+        let camera = self
+            .repository
+            .get_camera(&camera_id)
+            .map_err(map_repository_service_error)?
+            .ok_or(CameraServiceError::CameraNotFound)?;
+        let credentials = self.credentials.get(camera.credential_ref())?;
+        validate_credentials(&credentials)?;
+        let CameraSource::Rtsp(endpoint) = camera.source();
+        Ok(PreparedLive {
+            camera_id,
+            source_json: serde_json::json!({
+                "kind": "rtsp",
+                "url": endpoint.url_with(Some(&credentials)),
+            }),
         })
     }
 

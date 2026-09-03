@@ -23,6 +23,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod job;
+mod live;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -227,11 +228,13 @@ fn cmd_run() -> Result<(), String> {
     let mut handler = WorkerHandler {
         versions,
         jobs: job::RecordingJobManager::new(),
+        live: live::LiveJobManager::new(),
         media,
     };
     serve(std::io::stdin().lock(), stdout.lock(), &mut handler)
         .map_err(|error| error.to_string())?;
 
+    handler.live.stop();
     // M3 remediation §8: a REAL shutdown lifecycle replaces the old fixed
     // 5-second sleep. Graceful stop → bounded grace join (larger than any
     // normal bounded read + finalization headroom) → force-cancel only if
@@ -661,6 +664,7 @@ fn print_recording_event(event: &nian_recorder::RecordingEvent) {
 struct WorkerHandler {
     versions: RuntimeVersions,
     jobs: job::RecordingJobManager,
+    live: live::LiveJobManager,
     media: FfmpegBackend,
 }
 
@@ -734,6 +738,20 @@ impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
                 // this serves.
                 nian_ipc::Dispatch::Reply(Ok(self.jobs.status().to_json()))
             }
+            "live.start" => match live::LiveSpec::from_params(params) {
+                Err(reason) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(
+                    with_reason(live::code::INVALID_PARAMS, reason),
+                ))),
+                Ok(spec) => match self.live.start(spec) {
+                    Ok(()) => nian_ipc::Dispatch::Reply(Ok(json!({"started": true}))),
+                    Err(code) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(code))),
+                },
+            },
+            "live.status" => nian_ipc::Dispatch::Reply(Ok(self.live.status_json())),
+            "live.stop" => {
+                self.live.stop();
+                nian_ipc::Dispatch::Reply(Ok(json!({"stopped": true})))
+            }
             camera_method::PROBE => match probe_params(params) {
                 Ok((source, timeout)) => match self.media.probe_with_timeout(&source, timeout) {
                     Ok(report) => {
@@ -780,6 +798,7 @@ impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
                 // cmd_run does the waiting. The operator two-press counter
                 // is never consulted, so a shutdown can never escalate to a
                 // forced cancellation by itself.
+                self.live.stop();
                 self.jobs.request_graceful_stop();
                 nian_ipc::Dispatch::ShutdownReply(Ok(json!({"bye": true})))
             }

@@ -8,7 +8,7 @@ describe("App shell", () => {
   it("renders navigation and honest empty states", () => {
     render(<App />);
 
-    for (const label of ["Cameras", "Timeline", "Storage", "Settings"]) {
+    for (const label of ["Cameras", "Live View", "Timeline", "Storage", "Settings"]) {
       expect(screen.getByRole("button", { name: label })).toBeTruthy();
     }
 

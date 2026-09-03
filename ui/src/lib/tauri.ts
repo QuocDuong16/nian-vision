@@ -57,6 +57,36 @@ export interface RecordingStatus {
   finalized_segments: number;
 }
 
+export type LiveState =
+  | "starting"
+  | "connecting"
+  | "live"
+  | "backoff"
+  | "stopping"
+  | "failed";
+
+export type LiveFailureCategory =
+  | "source_open_failed"
+  | "unsupported_codec"
+  | "worker_unavailable"
+  | "media_failed"
+  | "lifecycle_cancelled";
+
+export interface LiveOpenDto {
+  session_id: string;
+  camera_id: string;
+  url: string;
+  state: LiveState;
+}
+
+export interface LiveStatus {
+  session_id: string;
+  camera_id: string;
+  state: LiveState;
+  failure_category: LiveFailureCategory | null;
+  reconnect_attempt: number;
+}
+
 export interface ProbeResult {
   reachable: boolean;
   video_stream_found: boolean;

@@ -4,6 +4,7 @@ import { useTauriCommand } from "./lib/tauri";
 import type { ScreenId } from "./navigation";
 import { Sidebar } from "./components/Sidebar";
 import { CamerasScreen } from "./screens/CamerasScreen";
+import { LiveViewScreen } from "./screens/LiveViewScreen";
 import { TimelineScreen } from "./screens/TimelineScreen";
 import { StorageScreen } from "./screens/StorageScreen";
 import { SettingsScreen } from "./screens/SettingsScreen";
@@ -26,6 +27,7 @@ export function App() {
           <span className="app-version">v{appInfo.version}</span>
         </header>
         {screen === "cameras" && <CamerasScreen />}
+        {screen === "live" && <LiveViewScreen />}
         {screen === "timeline" && <TimelineScreen />}
         {screen === "storage" && <StorageScreen />}
         {screen === "settings" && <SettingsScreen />}

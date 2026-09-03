@@ -523,9 +523,6 @@ export function CamerasScreen() {
                   </div>
                   <span className={`chip chip-${state}`}>{statusLabel(state)}</span>
                 </div>
-                <div className="camera-placeholder" aria-label="Live view unavailable">
-                  <span>No live view in M10</span>
-                </div>
                 <p className="camera-metrics muted">Desired: {desiredOn ? "On" : "Off"} · Runtime: {statusLabel(state)}</p>
                 {runtime && (
                   <p className="camera-metrics muted">

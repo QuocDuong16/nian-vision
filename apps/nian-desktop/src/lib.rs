@@ -16,11 +16,11 @@ use chrono::NaiveDateTime;
 use nian_application::{
     ApplicationSettingsDto, CameraDraft, CameraService, CameraServiceError, CameraSummary,
     CredentialStore, CredentialStoreError, DesktopLifecycle, DesktopLifecycleError,
-    DesktopLifecycleState, OnvifConnectionDto, OnvifController, OnvifControllerError,
-    OnvifDiscoveryDto, OnvifPreparedProfileDto, PlaybackController, PlaybackError, PlaybackOpenDto,
-    ProbeController, ProbeError, ProbeResult, RecordingController, RecordingControllerError,
-    RecordingDto, RecordingState, RecordingStatus, SupervisorRecordingRunnerFactory,
-    WorkerProbeRunner,
+    DesktopLifecycleState, LiveError, LiveOpenDto, LiveStatus, LiveViewController,
+    OnvifConnectionDto, OnvifController, OnvifControllerError, OnvifDiscoveryDto,
+    OnvifPreparedProfileDto, PlaybackController, PlaybackError, PlaybackOpenDto, ProbeController,
+    ProbeError, ProbeResult, RecordingController, RecordingControllerError, RecordingDto,
+    RecordingState, RecordingStatus, SupervisorRecordingRunnerFactory, WorkerProbeRunner,
 };
 use nian_domain::{
     AudioPolicy, CameraId, CredentialRef, Credentials, RetentionPolicy, StorageQuota,
@@ -222,6 +222,7 @@ impl CredentialStore for NativeCredentialStore {
 struct DesktopState {
     camera_service: Mutex<CameraService>,
     recording_controller: Mutex<RecordingController>,
+    live_controller: LiveViewController,
     playback_controller: Mutex<PlaybackController>,
     probe_controller: ProbeController,
     onvif_controller: OnvifController,
@@ -370,6 +371,10 @@ fn close_action(lifecycle: &DesktopLifecycle) -> Result<CloseAction, DesktopErro
     }
 }
 
+fn release_hidden_window_resources(state: &DesktopState) {
+    let _ = state.onvif_controller.cancel(None);
+    state.live_controller.close_all();
+}
 fn activate_window(
     lifecycle: &DesktopLifecycle,
     window: &impl WindowActions,
@@ -1010,6 +1015,68 @@ fn recording_intent(
     Ok(RecordingIntentDto { camera_ids })
 }
 
+fn open_live(state: &DesktopState, camera_id: &str) -> Result<LiveOpenDto, DesktopErrorDto> {
+    admit_running(state)?;
+    let prepared = lock(&state.camera_service)?
+        .prepare_live(camera_id)
+        .map_err(map_camera_error)?;
+    let admission = state
+        .live_controller
+        .admit(prepared)
+        .map_err(map_live_error)?;
+    let started = match admission.start() {
+        Ok(started) => started,
+        Err(failed) => {
+            let error = state.live_controller.cancel_failed_open(failed);
+            return Err(map_live_error(error));
+        }
+    };
+    state
+        .live_controller
+        .commit_open(started)
+        .map_err(map_live_error)
+}
+
+#[tauri::command]
+async fn live_open(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    camera_id: String,
+) -> Result<LiveOpenDto, DesktopErrorDto> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || open_live(&state, &camera_id))
+        .await
+        .map_err(|_| DesktopErrorDto::new("worker_unavailable", "live-view task failed"))?
+}
+
+#[tauri::command]
+fn live_close(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    session_id: String,
+) -> Result<(), DesktopErrorDto> {
+    state
+        .live_controller
+        .close(&session_id)
+        .map_err(map_live_error)
+}
+
+#[tauri::command]
+fn live_keepalive(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    session_id: String,
+) -> Result<(), DesktopErrorDto> {
+    state
+        .live_controller
+        .keep_alive(&session_id)
+        .map_err(map_live_error)
+}
+
+#[tauri::command]
+fn live_statuses(
+    state: tauri::State<'_, Arc<DesktopState>>,
+) -> Result<Vec<LiveStatus>, DesktopErrorDto> {
+    state.live_controller.statuses().map_err(map_live_error)
+}
+
 #[tauri::command]
 fn desktop_lifecycle_status(
     state: tauri::State<'_, Arc<DesktopState>>,
@@ -1306,6 +1373,38 @@ fn map_recording_error(error: RecordingControllerError) -> DesktopErrorDto {
         RecordingControllerError::Synchronization | RecordingControllerError::ThreadStart => {
             DesktopErrorDto::new("worker_unavailable", "recording controller is unavailable")
         }
+    }
+}
+
+fn map_live_error(error: LiveError) -> DesktopErrorDto {
+    match error {
+        LiveError::AlreadyOpen => {
+            DesktopErrorDto::new("live_already_open", "camera already has a live session")
+        }
+        LiveError::Capacity => DesktopErrorDto::new(
+            "live_capacity",
+            "simultaneous live-view capacity has been reached",
+        ),
+        LiveError::SessionExpired => {
+            DesktopErrorDto::new("session_expired", "live session expired; reopen the camera")
+        }
+        LiveError::WorkerUnavailable => {
+            DesktopErrorDto::new("worker_unavailable", "live media worker is unavailable")
+        }
+        LiveError::SourceOpenFailed => DesktopErrorDto::new(
+            "source_open_failed",
+            "camera live source could not be opened",
+        ),
+        LiveError::UnsupportedCodec => DesktopErrorDto::new(
+            "unsupported_codec",
+            "live view requires an H.264 camera stream",
+        ),
+        LiveError::MediaFailed => DesktopErrorDto::new("media_failed", "live media stream failed"),
+        LiveError::LifecycleBlocked => DesktopErrorDto::new(
+            "lifecycle_cancelled",
+            "live view is unavailable during lifecycle transition",
+        ),
+        LiveError::Internal => DesktopErrorDto::new("internal", "live-view operation failed"),
     }
 }
 
@@ -1874,6 +1973,7 @@ fn shutdown_runtime_resources(state: &DesktopState) -> Result<(), DesktopErrorDt
             DesktopErrorDto::new("lifecycle_failed", "recording shutdown failed"),
         ),
     }
+    state.live_controller.shutdown();
     match state.playback_controller.lock() {
         Ok(mut playback) => playback.shutdown(),
         Err(_) => capture_first_error(
@@ -1912,6 +2012,7 @@ fn begin_update_shutdown(state: &DesktopState) -> Result<(), DesktopErrorDto> {
             capture_first_error(&mut admission_error, map_onvif_error(error));
         }
         state.probe_controller.stop_accepting_and_cancel();
+        state.live_controller.stop_accepting();
         match state.playback_controller.lock() {
             Ok(mut playback) => playback.stop_accepting(),
             Err(_) => capture_first_error(
@@ -1954,6 +2055,7 @@ fn request_quit(app: &AppHandle) -> Result<(), DesktopErrorDto> {
         }
         // Admission closes before any potentially blocking teardown begins.
         state.probe_controller.stop_accepting_and_cancel();
+        state.live_controller.stop_accepting();
         match state.playback_controller.lock() {
             Ok(mut playback) => playback.stop_accepting(),
             Err(_) => capture_first_error(
@@ -2007,9 +2109,9 @@ fn handle_power_event(
     state: &DesktopState,
     event: nian_platform_windows::PowerEvent,
 ) -> Result<(), DesktopErrorDto> {
-    let _gate = lock(&state.control_gate)?;
     match event {
         nian_platform_windows::PowerEvent::Suspend => {
+            let gate = lock(&state.control_gate)?;
             if !state
                 .lifecycle
                 .begin_suspend()
@@ -2022,6 +2124,7 @@ fn handle_power_event(
                 capture_first_error(&mut first_error, map_onvif_error(error));
             }
             state.probe_controller.stop_accepting_and_cancel();
+            state.live_controller.stop_accepting();
             match state.playback_controller.lock() {
                 Ok(mut playback) => playback.stop_accepting(),
                 Err(_) => capture_first_error(
@@ -2040,11 +2143,14 @@ fn handle_power_event(
                     DesktopErrorDto::new("internal", "recording controller is unavailable"),
                 ),
             }
+            drop(gate);
+            state.live_controller.close_all();
             if let Some(error) = first_error {
                 return Err(error);
             }
         }
         nian_platform_windows::PowerEvent::Resume => {
+            let _gate = lock(&state.control_gate)?;
             if !state.lifecycle.resume().map_err(map_lifecycle_error)? {
                 return Ok(());
             }
@@ -2097,6 +2203,7 @@ fn handle_power_event(
             {
                 capture_first_error(&mut first_error, error);
             }
+            state.live_controller.resume_accepting();
             state.probe_controller.resume_accepting();
             state.onvif_controller.resume_accepting();
             if let Some(error) = first_error {
@@ -2263,7 +2370,7 @@ pub fn run() {
                     Ok(CloseAction::HideAndPrevent)
                 )
             {
-                let _ = state.onvif_controller.cancel(None);
+                release_hidden_window_resources(&state);
                 api.prevent_close();
                 let _ = WindowActions::hide(window);
             }
@@ -2306,6 +2413,9 @@ pub fn run() {
             }));
             let onvif_controller = OnvifController::production()
                 .map_err(|_| std::io::Error::other("ONVIF service could not start"))?;
+            let live_controller =
+                LiveViewController::new(worker_program.clone(), app_data.join("live-cache"))
+                    .map_err(|_| std::io::Error::other("live-view service could not start"))?;
             let mut playback_controller =
                 PlaybackController::new(worker_program, app_data.join("playback-cache"))
                     .map_err(|_| std::io::Error::other("playback service could not start"))?;
@@ -2327,6 +2437,7 @@ pub fn run() {
             let state = Arc::new(DesktopState {
                 camera_service: Mutex::new(camera_service),
                 recording_controller: Mutex::new(recording_controller),
+                live_controller,
                 playback_controller: Mutex::new(playback_controller),
                 probe_controller,
                 onvif_controller,
@@ -2433,6 +2544,10 @@ pub fn run() {
             recording_status,
             recording_statuses,
             recording_intent,
+            live_open,
+            live_close,
+            live_keepalive,
+            live_statuses,
             desktop_lifecycle_status,
             recordings_refresh,
             recording_days,
@@ -3028,6 +3143,35 @@ mod tests {
         );
     }
 
+    struct DesktopLiveRunner;
+
+    impl nian_application::LiveRunner for DesktopLiveRunner {
+        fn status(
+            &mut self,
+        ) -> Result<nian_application::LiveWorkerStatus, nian_application::LiveError> {
+            Ok(nian_application::LiveWorkerStatus {
+                state: nian_application::LiveState::Live,
+                failure_category: None,
+                reconnect_attempt: 0,
+            })
+        }
+
+        fn stop(&mut self) {}
+    }
+
+    struct DesktopLiveFactory;
+
+    impl nian_application::LiveRunnerFactory for DesktopLiveFactory {
+        fn start(
+            &self,
+            _source_json: serde_json::Value,
+            output_path: &std::path::Path,
+        ) -> Result<Box<dyn nian_application::LiveRunner>, nian_application::LiveError> {
+            std::fs::write(output_path, b"fake-live")
+                .map_err(|_| nian_application::LiveError::Internal)?;
+            Ok(Box::new(DesktopLiveRunner))
+        }
+    }
     fn lifecycle_state(
         root: &std::path::Path,
         configure_playback_storage: bool,
@@ -3044,6 +3188,11 @@ mod tests {
         let probe_runner = Arc::new(ImmediateProbeRunner::default());
         let probe_controller = ProbeController::new(probe_runner.clone());
         let cache_root = root.with_extension("playback-cache");
+        let live_controller = LiveViewController::with_factory(
+            Arc::new(DesktopLiveFactory),
+            root.with_extension("live-cache"),
+        )
+        .unwrap();
         let playback_controller = if configure_playback_storage {
             configured_playback(root, cache_root)
         } else {
@@ -3054,6 +3203,7 @@ mod tests {
             DesktopState {
                 camera_service: Mutex::new(service),
                 recording_controller: Mutex::new(recording_controller),
+                live_controller,
                 playback_controller: Mutex::new(playback_controller),
                 probe_controller,
                 onvif_controller: OnvifController::production().unwrap(),
@@ -3262,6 +3412,7 @@ mod tests {
         let root = temp.path().join("recordings");
         let (state, repository, _runner, _probe) = lifecycle_state(&root, false);
         restore_desired_recordings_locked(&state).unwrap();
+        let live_before_update = open_live(&state, "front-door").unwrap();
 
         state.update_installing.store(true, Ordering::Release);
         begin_update_shutdown(&state).unwrap();
@@ -3284,6 +3435,20 @@ mod tests {
                 .state,
             RecordingState::Stopped,
         );
+        assert!(state.live_controller.statuses().unwrap().is_empty());
+        assert_eq!(
+            state
+                .live_controller
+                .keep_alive(&live_before_update.session_id),
+            Err(LiveError::SessionExpired)
+        );
+        assert!(matches!(
+            open_live(&state, "front-door"),
+            Err(DesktopErrorDto {
+                code: "update_in_progress",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3585,6 +3750,64 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn stop_all_recordings_leaves_live_session_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
+        restore_desired_recordings_locked(&state).unwrap();
+        wait_for_starts(&runner.starts, 1);
+        let opened = open_live(&state, "front-door").unwrap();
+
+        stop_all_recordings(&state).unwrap();
+
+        let live = state.live_controller.statuses().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].session_id, opened.session_id);
+        assert!(repository.lock().unwrap().desired_camera.is_none());
+        state.live_controller.close_all();
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown_all()
+            .unwrap();
+    }
+
+    #[test]
+    fn hiding_main_window_closes_live_but_preserves_recording_ownership_and_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
+        restore_desired_recordings_locked(&state).unwrap();
+        wait_for_starts(&runner.starts, 1);
+        open_live(&state, "front-door").unwrap();
+
+        release_hidden_window_resources(&state);
+
+        assert!(state.live_controller.statuses().unwrap().is_empty());
+        assert_eq!(
+            state
+                .recording_controller
+                .lock()
+                .unwrap()
+                .active_camera()
+                .unwrap()
+                .as_ref()
+                .map(CameraId::as_str),
+            Some("front-door")
+        );
+        assert_eq!(
+            repository.lock().unwrap().desired_camera.as_deref(),
+            Some("front-door")
+        );
+        state
+            .recording_controller
+            .lock()
+            .unwrap()
+            .shutdown_all()
+            .unwrap();
+    }
     #[test]
     fn stop_all_persistence_failure_leaves_every_runtime_owned() {
         let temp = tempfile::tempdir().unwrap();
@@ -4343,11 +4566,19 @@ mod tests {
         repository.lock().unwrap().extra_desired_camera = Some("back-door".to_owned());
         restore_desired_recordings_locked(&state).unwrap();
         wait_for_starts(&runner.starts, 2);
+        let live_before_suspend = open_live(&state, "front-door").unwrap();
 
         handle_power_event(&state, nian_platform_windows::PowerEvent::Suspend).unwrap();
         assert_eq!(
             state.lifecycle.state().unwrap(),
             DesktopLifecycleState::Suspending
+        );
+        assert!(state.live_controller.statuses().unwrap().is_empty());
+        assert_eq!(
+            state
+                .live_controller
+                .keep_alive(&live_before_suspend.session_id),
+            Err(LiveError::SessionExpired)
         );
         handle_power_event(&state, nian_platform_windows::PowerEvent::Resume).unwrap();
         wait_for_starts(&runner.starts, 4);
@@ -4355,6 +4586,10 @@ mod tests {
             state.lifecycle.state().unwrap(),
             DesktopLifecycleState::Running
         );
+        assert!(state.live_controller.statuses().unwrap().is_empty());
+        let reopened = open_live(&state, "front-door").unwrap();
+        assert_ne!(reopened.session_id, live_before_suspend.session_id);
+        state.live_controller.close(&reopened.session_id).unwrap();
         assert_eq!(
             state
                 .recording_controller
