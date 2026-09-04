@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use nian_domain::{
     AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Credentials,
-    Host, RetentionPolicy, StorageQuota,
+    Host, PtzBinding, RetentionPolicy, StorageQuota,
 };
 use nian_settings::{ApplicationSettings, SettingsError, SettingsStore};
 use serde::{Deserialize, Serialize};
@@ -135,6 +135,10 @@ pub trait SettingsRepository: Send {
     fn insert_camera(&mut self, camera: &CameraConfig) -> Result<(), SettingsRepositoryError>;
     fn update_camera(&mut self, camera: &CameraConfig) -> Result<bool, SettingsRepositoryError>;
     fn delete_camera(&mut self, camera_id: &CameraId) -> Result<bool, SettingsRepositoryError>;
+    fn get_ptz_binding(
+        &self,
+        camera_id: &CameraId,
+    ) -> Result<Option<PtzBinding>, SettingsRepositoryError>;
     fn application_settings(&self) -> Result<ApplicationSettings, SettingsRepositoryError>;
     fn save_application_settings(
         &mut self,
@@ -171,6 +175,13 @@ impl SettingsRepository for SettingsStore {
 
     fn delete_camera(&mut self, camera_id: &CameraId) -> Result<bool, SettingsRepositoryError> {
         SettingsStore::delete_camera(self, camera_id).map_err(repository_error)
+    }
+
+    fn get_ptz_binding(
+        &self,
+        camera_id: &CameraId,
+    ) -> Result<Option<PtzBinding>, SettingsRepositoryError> {
+        SettingsStore::get_ptz_binding(self, camera_id).map_err(repository_error)
     }
 
     fn application_settings(&self) -> Result<ApplicationSettings, SettingsRepositoryError> {
@@ -260,6 +271,8 @@ pub enum CameraServiceError {
     DuplicateCamera,
     #[error("camera is actively recording")]
     CameraBusy,
+    #[error("camera identity or shared credentials cannot change while PTZ is paired")]
+    PtzBindingRequiresUnpair,
     #[error("credential store unavailable")]
     CredentialStore(#[from] CredentialStoreError),
     #[error("settings persistence failed")]
@@ -459,6 +472,20 @@ impl CameraService {
             return Err(CameraServiceError::CameraBusy);
         }
 
+        if let Some(binding) = self
+            .repository
+            .get_ptz_binding(&camera_id)
+            .map_err(map_repository_service_error)?
+        {
+            let CameraSource::Rtsp(previous_endpoint) = previous.source();
+            let host_changed = previous_endpoint.host() != endpoint.host();
+            let replacing_shared_credentials =
+                draft.replacement_credentials.is_some() && !binding.owns_credential();
+            if host_changed || replacing_shared_credentials {
+                return Err(CameraServiceError::PtzBindingRequiresUnpair);
+            }
+        }
+
         let replacing_credentials = draft.replacement_credentials.is_some();
         let credential_ref = if replacing_credentials {
             self.allocate_credential_ref(&camera_id, Some(previous.credential_ref()))?
@@ -537,6 +564,10 @@ impl CameraService {
             .get_camera(&camera_id)
             .map_err(map_repository_service_error)?
             .ok_or(CameraServiceError::CameraNotFound)?;
+        let ptz_binding = self
+            .repository
+            .get_ptz_binding(&camera_id)
+            .map_err(map_repository_service_error)?;
         if !self
             .repository
             .delete_camera(&camera_id)
@@ -544,11 +575,15 @@ impl CameraService {
         {
             return Err(CameraServiceError::CameraNotFound);
         }
-        let warning = self
-            .credentials
-            .delete(existing.credential_ref())
-            .err()
-            .map(|_| CameraWarning::OrphanCredentialCleanupFailed);
+        let mut cleanup_failed = self.credentials.delete(existing.credential_ref()).is_err();
+        if let Some(binding) = ptz_binding
+            && binding.owns_credential()
+            && binding.credential_ref() != existing.credential_ref()
+            && self.credentials.delete(binding.credential_ref()).is_err()
+        {
+            cleanup_failed = true;
+        }
+        let warning = cleanup_failed.then_some(CameraWarning::OrphanCredentialCleanupFailed);
         Ok(CameraMutation {
             value: CameraSummary::from(&existing),
             warning,

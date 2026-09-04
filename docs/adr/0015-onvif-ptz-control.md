@@ -30,7 +30,10 @@ The binding deliberately does not persist a password, PTZ service XAddr, profile
 PTZ configuration token, SOAP payload, Digest challenge or capability range. Those values
 are resolved and revalidated by the backend when a PTZ runtime session is established.
 Deleting a camera cascades its PTZ binding; unpairing PTZ does not alter the RTSP camera or
-recording Desired state.
+recording Desired state. Camera deletion first captures any PTZ-owned credential metadata,
+settles the camera's PTZ runtime ownership, commits the camera/settings deletion, and only
+then best-effort deletes external camera/PTZ credentials. A failed database deletion therefore
+leaves every still-authoritative native secret intact.
 
 ### Pairing is explicit and authority-bound
 
@@ -44,6 +47,14 @@ RTSP camera host. M12 intentionally requires exact host equality; model, manufac
 display name and other descriptive metadata are never treated as device identity. A
 service XAddr is separately validated by `nian-onvif` against the already trusted Device
 service authority before authenticated PTZ traffic is sent.
+
+`OnvifController` snapshots the authenticated connection identity before PTZ capability
+lookup and revalidates the same session, device endpoint reference and connection generation
+after the blocking network call. Refresh, cancel or reconnect therefore invalidates stale
+pairing work before a `PreparedPtzPairing` can escape. Pair/replace/unpair are serialized per
+CameraId, while different cameras remain independent. Pair persistence also uses a short
+lifecycle-generation commit gate, so Hide/Suspend/Quit/Update that wins after network work
+prevents a late binding commit and rolls back any newly written PTZ credential.
 
 If the ONVIF credentials equal the camera's existing credentials, the PTZ binding reuses
 the camera credential reference. Otherwise a collision-resistant PTZ-specific reference
@@ -70,17 +81,36 @@ Every `ContinuousMove` also carries an ONVIF camera-side timeout of one second. 
 second dead-man layer in addition to application ownership and protects against host loss
 after the camera accepts a move.
 
+### Camera mutation cannot silently retarget PTZ
+
+`CameraConfig` remains the physical RTSP authority even after PTZ pairing. If a camera has a
+PTZ binding, changing its RTSP host is rejected with a typed require-unpair error. If that
+binding reuses the camera credential reference, replacing camera credentials is also rejected
+until PTZ is explicitly unpaired. Port/path/display/audio edits remain governed by the normal
+camera policy because M12's physical-device proof is exact host equality. CameraId alone is
+never treated as proof that an edited row still represents the same physical camera.
+
+This command-side policy is defense in depth, not the runtime safety boundary. Before a PTZ
+session is reused or established, `PtzController` re-reads both current `CameraConfig` and
+`PtzBinding` and verifies exact host equality before loading credentials or sending
+authenticated ONVIF control traffic. A stale/corrupt binding returns `AuthorityMismatch` and
+the stale authority is not contacted.
+
 ### Runtime ownership is per camera and bounded
 
-`PtzController` owns at most 16 active PTZ runtime sessions. Each camera gets one worker
-thread and a bounded four-command sync queue. Network I/O is serialized only for that
-camera; no global PTZ/settings/lifecycle mutex is held through SOAP I/O. A slow or failed
-camera therefore cannot serialize unrelated PTZ cameras.
+`PtzController` owns one registry with three explicit states: `opening`, `active` and
+`draining`. Their combined count is capped at 16. A same-camera caller encountering an
+`opening` reservation receives typed Busy rather than starting duplicate ONVIF discovery or a
+temporary worker; other cameras may establish independently. Each committed camera has one
+worker thread and a bounded four-command sync queue. Credential access and SOAP/network work
+happen outside the registry lock, so a slow camera does not serialize unrelated cameras.
 
-Runtime session creation re-reads the persisted binding and native credentials, reconstructs
-the Device-service URL, re-discovers the current PTZ service/configuration and refuses a
-camera that no longer advertises compatible pan/tilt control. PTZ service/configuration
-tokens are transient worker-owned values rather than settings authority.
+Runtime session establishment reserves capacity first, then re-reads current camera/binding
+authority and native credentials, reconstructs the Device-service URL and re-discovers current
+PTZ service/configuration. Commit succeeds only if the same opening reservation and lifecycle
+generation still own the slot. Late network completion after lifecycle cancellation therefore
+cannot publish a worker. PTZ service/configuration tokens remain transient worker-owned values
+rather than settings authority.
 
 ### Movement uses generation ownership plus two dead-men
 
@@ -108,10 +138,18 @@ Hide, Suspend, Quit and updater handoff close PTZ admission and set an out-of-ba
 `stop_requested` flag on every session before blocking teardown. This flag is independent
 of the bounded command queue, so a full queue cannot preserve movement admission.
 Existing per-camera workers perform the network Stop; lifecycle joins worker ownership off
-the Tauri/window event thread. Hide freezes the worker handles that existed at capture time
-into a teardown batch. A later reactivation may admit a new PTZ session immediately, and the
-stale hide batch cannot drain or shut down that fresh ownership when its background join
-eventually completes.
+the Tauri/window event thread. In-flight `opening` reservations are marked cancelled but remain
+controller-owned until their bounded network establishment returns and signals completion. Hide
+moves then-active owners into controller-owned `draining` entries and returns a teardown batch
+with stable opening references plus drain identities; the batch is never the sole ownership
+representation. One caller becomes the Stop/join leader for each draining session, while any
+concurrent Hide/Quit/Update/Suspend/delete follower waits for the same opening/drain completion
+instead of double-joining or creating Stop storms. Full shutdown is complete only when
+`opening`, `active` and `draining` are all empty and every worker has joined.
+
+A later reactivation may admit a fresh same-camera session while the old session is still
+draining. Reap removal is keyed by stable session identity/Arc identity, not CameraId alone,
+so stale completion cannot stop or erase that fresh owner.
 
 Resume reopens admission only. It never restores a prior PTZ direction, generation or
 session movement. A later PTZ request creates/revalidates runtime ownership normally.

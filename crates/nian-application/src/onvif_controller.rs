@@ -173,6 +173,7 @@ impl std::fmt::Debug for PreparedPtzPairing {
 
 #[derive(Clone)]
 struct ConnectedDevice {
+    connection_id: Uuid,
     credentials: Credentials,
     device_service: String,
     interrogation: OnvifInterrogation,
@@ -379,6 +380,7 @@ impl OnvifController {
         session.connections.insert(
             device_id.to_owned(),
             ConnectedDevice {
+                connection_id: Uuid::new_v4(),
                 credentials,
                 device_service,
                 interrogation: interrogation.clone(),
@@ -506,6 +508,28 @@ impl OnvifController {
             .device
             .ptz_control(&connection.device_service, &credentials)?;
         self.require_accepting()?;
+        {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| OnvifControllerError::Internal)?;
+            let session = sessions
+                .get(session_id)
+                .ok_or(OnvifControllerError::SessionExpired)?;
+            let current_device = session
+                .devices
+                .get(device_id)
+                .ok_or(OnvifControllerError::DeviceExpired)?;
+            let current_connection = session
+                .connections
+                .get(device_id)
+                .ok_or(OnvifControllerError::DeviceExpired)?;
+            if current_device.endpoint_reference != device.endpoint_reference
+                || current_connection.connection_id != connection.connection_id
+            {
+                return Err(OnvifControllerError::DeviceExpired);
+            }
+        }
         Ok(PreparedPtzPairing {
             device_service: connection.device_service,
             endpoint_reference: device.endpoint_reference,
@@ -731,6 +755,76 @@ mod tests {
         }
     }
 
+    struct BlockingPtzDevice {
+        inner: FakeDevice,
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl DeviceBackend for BlockingPtzDevice {
+        fn interrogate(
+            &self,
+            device_service: &str,
+            credentials: &OnvifCredentials,
+        ) -> Result<OnvifInterrogation, OnvifError> {
+            self.inner.interrogate(device_service, credentials)
+        }
+
+        fn stream_endpoint(
+            &self,
+            device_service: &str,
+            media_service: &str,
+            credentials: &OnvifCredentials,
+            profile: &MediaProfile,
+        ) -> Result<StreamEndpoint, OnvifError> {
+            self.inner
+                .stream_endpoint(device_service, media_service, credentials, profile)
+        }
+
+        fn ptz_control(
+            &self,
+            _device_service: &str,
+            _credentials: &OnvifCredentials,
+        ) -> Result<PtzControl, OnvifError> {
+            self.entered.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            Ok(PtzControl::test_fixture(false))
+        }
+    }
+
+    fn blocking_ptz_controller(
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    ) -> OnvifController {
+        OnvifController::with_backends(
+            Arc::new(FakeDiscovery {
+                devices: vec![DiscoveredDevice {
+                    endpoint_reference: "urn:uuid:fixture".into(),
+                    xaddrs: vec!["http://192.168.1.8/onvif/device_service".into()],
+                    scopes: vec![],
+                    network_address: "192.168.1.8".into(),
+                }],
+            }),
+            Arc::new(BlockingPtzDevice {
+                inner: FakeDevice {
+                    auth_failure: false,
+                },
+                entered,
+                release,
+            }),
+        )
+    }
+
+    fn wait_for_atomic_true(flag: &AtomicBool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !flag.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
     fn controller(auth_failure: bool) -> OnvifController {
         OnvifController::with_backends(
             Arc::new(FakeDiscovery {
@@ -809,6 +903,74 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, OnvifControllerError::SessionExpired));
+    }
+
+    #[test]
+    fn cancelled_session_invalidates_blocked_ptz_pairing_prepare() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let controller = Arc::new(blocking_ptz_controller(entered.clone(), release.clone()));
+        let discovery = controller.discover().unwrap();
+        let device_id = discovery.devices[0].device_id.clone();
+        controller
+            .connect(
+                &discovery.session_id,
+                &device_id,
+                Credentials::new("admin", "secret"),
+            )
+            .unwrap();
+
+        let worker_controller = controller.clone();
+        let session_id = discovery.session_id.clone();
+        let worker_device_id = device_id.clone();
+        let worker = std::thread::spawn(move || {
+            worker_controller.prepare_ptz_pairing(&session_id, &worker_device_id)
+        });
+        wait_for_atomic_true(&entered);
+        controller.cancel_session(&discovery.session_id).unwrap();
+        release.store(true, Ordering::Release);
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(OnvifControllerError::SessionExpired)
+        ));
+    }
+
+    #[test]
+    fn reconnect_invalidates_blocked_ptz_pairing_prepare_connection_generation() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let controller = Arc::new(blocking_ptz_controller(entered.clone(), release.clone()));
+        let discovery = controller.discover().unwrap();
+        let device_id = discovery.devices[0].device_id.clone();
+        controller
+            .connect(
+                &discovery.session_id,
+                &device_id,
+                Credentials::new("admin", "first-secret"),
+            )
+            .unwrap();
+
+        let worker_controller = controller.clone();
+        let session_id = discovery.session_id.clone();
+        let worker_device_id = device_id.clone();
+        let worker = std::thread::spawn(move || {
+            worker_controller.prepare_ptz_pairing(&session_id, &worker_device_id)
+        });
+        wait_for_atomic_true(&entered);
+        controller
+            .connect(
+                &discovery.session_id,
+                &device_id,
+                Credentials::new("admin", "second-secret"),
+            )
+            .unwrap();
+        release.store(true, Ordering::Release);
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(OnvifControllerError::DeviceExpired)
+        ));
     }
 
     #[test]
@@ -1167,6 +1329,13 @@ mod tests {
             camera_id: &nian_domain::CameraId,
         ) -> Result<bool, crate::SettingsRepositoryError> {
             crate::SettingsRepository::delete_camera(&mut self.inner, camera_id)
+        }
+
+        fn get_ptz_binding(
+            &self,
+            camera_id: &nian_domain::CameraId,
+        ) -> Result<Option<nian_domain::PtzBinding>, crate::SettingsRepositoryError> {
+            crate::SettingsRepository::get_ptz_binding(&self.inner, camera_id)
         }
 
         fn application_settings(

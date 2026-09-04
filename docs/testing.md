@@ -713,13 +713,25 @@ spoofing and service-authority mismatch. The client tests also assert bounded
 hardening used by M10. No test creates a generic proxy or accepts an unrelated PTZ host.
 
 `PtzController` tests use deterministic fake settings, credentials and PTZ backends. They
-prove an unpaired RTSP camera remains valid; exact camera-authority pairing; credential reuse
-versus PTZ-specific credential ownership; pair/unpair independence from RTSP camera and
-recording Desired state; capability-gated zoom; one-camera failure isolation; stale Stop
-generation refusal; 400 ms renewal extending the one-second lease; automatic dead-man Stop;
-and lifecycle cancellation stopping motion without Resume resurrection. A frozen hide-teardown
-regression additionally proves that background completion of an old PTZ worker batch cannot
-retire a fresh same-camera session admitted after immediate reactivation.
+prove an unpaired RTSP camera remains valid; exact camera-authority pairing; runtime rejection
+of a manually stale host binding before `backend.control`; credential reuse versus PTZ-specific
+ownership; pair/unpair independence from RTSP camera and recording Desired state; capability-
+gated zoom; one-camera failure isolation; stale Stop generation refusal; 400 ms renewal extending
+the one-second lease; automatic dead-man Stop; and lifecycle cancellation without Resume
+resurrection. Opening-reservation tests prove same-camera single-flight/Busy behavior, the
+`opening + active + draining <= 16` capacity bound, lifecycle cancellation of blocked network
+establishment, full-shutdown waiting for that cancelled opening, and Busy/stale-opening refusal
+after reactivation. Draining tests block Stop/join to
+prove Hide -> immediate shutdown and camera-delete -> shutdown wait for one controller-owned
+leader, with no double Stop/join and no stale same-camera removal. Mutation tests force concurrent
+pair/pair and replace/unpair ordering and assert no orphan PTZ credential remains.
+
+`CameraService` fault-injection tests cover paired-camera host replacement rejection, shared-
+credential replacement rejection, delete with reused versus PTZ-owned credentials, failed DB
+delete preserving every secret/binding, and post-commit keyring cleanup failure returning a
+warning without database rollback. `OnvifController` blocks PTZ capability lookup and cancels
+the owning discovery session before release, proving stale authenticated session/device work
+cannot return a prepared PTZ pairing.
 
 Frontend `PtzControls` tests use deferred Promises and fake timers to cover press/release,
 release before `ptz_move` resolves, Left→Right stale response ordering, periodic renew,

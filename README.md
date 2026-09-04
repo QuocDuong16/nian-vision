@@ -67,11 +67,18 @@ cloud and remote streaming remain outside M12.
   `Test & Add` must pass the existing media-worker RTSP probe before the ordinary
   camera/credential transaction is committed.
 * Optional M12 PTZ pairing reuses explicit ONVIF discovery/authentication but persists a
-  separate non-secret control binding. The configured RTSP camera remains authoritative.
-  Continuous pan/tilt and advertised zoom are serialized per camera with a bounded queue;
-  stale frontend releases cannot stop a newer generation, lease expiry automatically sends
-  `Stop`, and every `ContinuousMove` also carries a camera-side one-second timeout. Hide,
-  suspend, quit and update cancel motion; resume never restores a previous direction.
+  separate non-secret control binding. The configured RTSP camera remains authoritative. A
+  paired camera cannot silently change RTSP host, and shared camera credentials cannot be
+  replaced, until PTZ is explicitly unpaired; runtime also revalidates current camera/binding
+  host equality before authenticated control traffic. Pair/replace/unpair are serialized per
+  camera and stale ONVIF/lifecycle work cannot commit. PTZ runtime capacity counts opening,
+  active and draining ownership together (maximum 16), with one same-camera opening reservation.
+  Continuous pan/tilt and advertised zoom are serialized per camera with a bounded queue; stale
+  frontend releases cannot stop a newer generation, lease expiry automatically sends `Stop`,
+  and every `ContinuousMove` also carries a camera-side one-second timeout. Hide, suspend, quit
+  and update cancel motion and wait for controller-owned draining workers; resume never restores
+  a previous direction. Camera deletion settles PTZ ownership before DB commit and cleans any
+  PTZ-owned native credential only after successful persistence deletion.
 * Playback sessions bind only an ephemeral `127.0.0.1` port. An unguessable
   per-session token maps to one already-validated finalized recording; HTTP Range
   requests provide browser seeking without a directory listing, arbitrary path
@@ -226,8 +233,11 @@ and does not depend on ONVIF.
 For an existing camera, use **Pair PTZ** on its camera card, explicitly choose the same
 physical ONVIF device, authenticate and confirm the pairing. Pairing requires the selected
 ONVIF Device-service host to match the configured RTSP host and requires advertised
-continuous pan/tilt capability. **Unpair PTZ** removes only the optional control binding;
-the RTSP camera, recordings and desired recording state are unchanged.
+continuous pan/tilt capability. While PTZ remains paired, changing the camera's RTSP host is
+rejected; replacing camera credentials is also rejected when PTZ reuses that same credential
+reference. **Unpair PTZ** first when intentionally replacing the physical camera or shared
+credentials. Unpair removes only the optional control binding; the RTSP camera, recordings
+and desired recording state are unchanged.
 
 Troubleshooting:
 

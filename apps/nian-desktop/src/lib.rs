@@ -696,55 +696,82 @@ fn camera_update(
     state: tauri::State<'_, Arc<DesktopState>>,
     input: CameraCommandInput,
 ) -> Result<nian_application::CameraMutation<CameraSummary>, DesktopErrorDto> {
-    let _gate = lock(&state.control_gate)?;
-    require_running(&state)?;
     let camera_id = CameraId::parse(&input.camera_id)
         .map_err(|error| DesktopErrorDto::new("validation", error.to_string()))?;
+    state
+        .ptz_controller
+        .coordinate_camera_update(&camera_id, || {
+            let _gate = lock(&state.control_gate)?;
+            require_running(&state)?;
+            let active = lock(&state.recording_controller)?
+                .is_owned(&camera_id)
+                .map_err(map_recording_error)?;
+            lock(&state.camera_service)?
+                .update_camera(input.into_draft()?, active.then_some(&camera_id))
+                .map_err(map_camera_error)
+        })
+        .map_err(map_ptz_error)?
+}
+
+fn ensure_camera_delete_allowed(
+    state: &DesktopState,
+    id: &CameraId,
+) -> Result<(), DesktopErrorDto> {
     let active = lock(&state.recording_controller)?
-        .is_owned(&camera_id)
+        .is_owned(id)
         .map_err(map_recording_error)?;
-    lock(&state.camera_service)?
-        .update_camera(input.into_draft()?, active.then_some(&camera_id))
-        .map_err(map_camera_error)
+    let desired = lock(&state.camera_service)?
+        .recording_enabled_cameras()
+        .map_err(map_desired_state_error)?
+        .iter()
+        .any(|desired| desired == id);
+    if active || desired {
+        return Err(DesktopErrorDto::new(
+            "camera_busy",
+            "camera must be stopped before deletion",
+        ));
+    }
+    Ok(())
 }
 
 fn delete_camera_config(
     state: &DesktopState,
     camera_id: &str,
 ) -> Result<nian_application::CameraMutation<CameraSummary>, DesktopErrorDto> {
-    let _gate = lock(&state.control_gate)?;
-    require_running(state)?;
     let id = CameraId::parse(camera_id)
         .map_err(|error| DesktopErrorDto::new("validation", error.to_string()))?;
-    let active = lock(&state.recording_controller)?
-        .is_owned(&id)
-        .map_err(map_recording_error)?;
-    let desired = lock(&state.camera_service)?
-        .recording_enabled_cameras()
-        .map_err(map_desired_state_error)?
-        .iter()
-        .any(|desired| desired == &id);
-    if desired {
-        return Err(DesktopErrorDto::new(
-            "camera_busy",
-            "camera must be stopped before deletion",
-        ));
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(state)?;
+        ensure_camera_delete_allowed(state, &id)?;
     }
-    let deleted = lock(&state.camera_service)?
-        .delete_camera(camera_id, active.then_some(&id))
-        .map_err(map_camera_error)?;
-    lock(&state.recording_controller)?
-        .forget_status(&id)
-        .map_err(map_recording_error)?;
-    Ok(deleted)
+
+    state
+        .ptz_controller
+        .coordinate_camera_delete(&id, || {
+            let _gate = lock(&state.control_gate)?;
+            require_running(state)?;
+            ensure_camera_delete_allowed(state, &id)?;
+            let deleted = lock(&state.camera_service)?
+                .delete_camera(camera_id, None)
+                .map_err(map_camera_error)?;
+            lock(&state.recording_controller)?
+                .forget_status(&id)
+                .map_err(map_recording_error)?;
+            Ok(deleted)
+        })
+        .map_err(map_ptz_error)?
 }
 
 #[tauri::command]
-fn camera_delete(
+async fn camera_delete(
     state: tauri::State<'_, Arc<DesktopState>>,
     camera_id: String,
 ) -> Result<nian_application::CameraMutation<CameraSummary>, DesktopErrorDto> {
-    delete_camera_config(&state, &camera_id)
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || delete_camera_config(&state, &camera_id))
+        .await
+        .map_err(|_| DesktopErrorDto::new("internal", "camera delete task failed"))?
 }
 
 #[tauri::command]
@@ -1513,6 +1540,10 @@ fn map_camera_error(error: CameraServiceError) -> DesktopErrorDto {
         CameraServiceError::CameraBusy => {
             DesktopErrorDto::new("camera_busy", "camera is actively recording")
         }
+        CameraServiceError::PtzBindingRequiresUnpair => DesktopErrorDto::new(
+            "ptz_requires_unpair",
+            "unpair PTZ before changing camera identity or shared credentials",
+        ),
         CameraServiceError::CredentialStore(_) => {
             DesktopErrorDto::new("credential_store", "credential store operation failed")
         }
@@ -1838,6 +1869,7 @@ fn classify_restoration_failure(error: &CameraServiceError) -> RestorationFailur
         CameraServiceError::Settings => RestorationFailure::Authoritative,
         CameraServiceError::DuplicateCamera
         | CameraServiceError::CameraBusy
+        | CameraServiceError::PtzBindingRequiresUnpair
         | CameraServiceError::CredentialRollbackCleanup { .. }
         | CameraServiceError::CredentialRefGeneration(_)
         | CameraServiceError::CredentialRefCollision => {
@@ -2903,6 +2935,14 @@ mod tests {
                 .iter()
                 .find(|camera| camera.camera_id() == camera_id)
                 .cloned())
+        }
+
+        fn get_ptz_binding(
+            &self,
+            _camera_id: &CameraId,
+        ) -> Result<Option<nian_domain::PtzBinding>, nian_application::SettingsRepositoryError>
+        {
+            Ok(None)
         }
 
         fn insert_camera(

@@ -14,7 +14,7 @@ use nian_application::{
 };
 use nian_domain::{
     AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Credentials,
-    Host, RetentionPolicy,
+    Host, OnvifScheme, PtzBinding, RetentionPolicy,
 };
 use nian_index::{RecordingIndex, RecordingKind, RecordingUpsert};
 use nian_settings::ApplicationSettings;
@@ -23,6 +23,7 @@ use tempfile::tempdir;
 #[derive(Default)]
 struct RepoState {
     cameras: HashMap<String, CameraConfig>,
+    ptz_bindings: HashMap<String, PtzBinding>,
     fail_insert: bool,
     fail_update: bool,
     fail_delete: bool,
@@ -86,7 +87,23 @@ impl SettingsRepository for FakeRepo {
         if state.fail_delete {
             return Err(SettingsRepositoryError::Persistence);
         }
-        Ok(state.cameras.remove(camera_id.as_str()).is_some())
+        let removed = state.cameras.remove(camera_id.as_str()).is_some();
+        if removed {
+            state.ptz_bindings.remove(camera_id.as_str());
+        }
+        Ok(removed)
+    }
+    fn get_ptz_binding(
+        &self,
+        camera_id: &CameraId,
+    ) -> Result<Option<PtzBinding>, SettingsRepositoryError> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .ptz_bindings
+            .get(camera_id.as_str())
+            .cloned())
     }
     fn application_settings(&self) -> Result<ApplicationSettings, SettingsRepositoryError> {
         Ok(ApplicationSettings {
@@ -268,6 +285,20 @@ fn existing(ref_text: &str) -> CameraConfig {
     .unwrap()
 }
 
+fn ptz_binding(ref_text: &str, owns_credential: bool) -> PtzBinding {
+    PtzBinding::new(
+        CameraId::parse("front-door").unwrap(),
+        OnvifScheme::Http,
+        Host::parse("192.168.1.50").unwrap(),
+        80,
+        "/onvif/device_service",
+        "urn:uuid:front-door",
+        CredentialRef::parse(ref_text).unwrap(),
+        owns_credential,
+    )
+    .unwrap()
+}
+
 fn seeded() -> (CameraService, Arc<Mutex<RepoState>>, Arc<FakeSecrets>) {
     let (repo, repo_state) = FakeRepo::new();
     let secrets = Arc::new(FakeSecrets::default());
@@ -414,6 +445,181 @@ fn active_camera_rejects_critical_edit_and_delete_but_allows_display_name_only()
             .as_str(),
         "front-door"
     );
+}
+
+#[test]
+fn paired_ptz_rejects_camera_host_replacement_without_mutating_camera_or_binding() {
+    let (mut service, repo, _secrets) = seeded();
+    repo.lock()
+        .unwrap()
+        .ptz_bindings
+        .insert("front-door".into(), ptz_binding("old-ref", false));
+    let before_camera = repo
+        .lock()
+        .unwrap()
+        .cameras
+        .get("front-door")
+        .cloned()
+        .unwrap();
+    let before_binding = repo
+        .lock()
+        .unwrap()
+        .ptz_bindings
+        .get("front-door")
+        .cloned()
+        .unwrap();
+
+    let mut changed = draft("Front door", None);
+    changed.host = "192.168.1.99".into();
+    assert!(matches!(
+        service.update_camera(changed, None),
+        Err(CameraServiceError::PtzBindingRequiresUnpair)
+    ));
+
+    let state = repo.lock().unwrap();
+    assert_eq!(state.cameras.get("front-door"), Some(&before_camera));
+    assert_eq!(state.ptz_bindings.get("front-door"), Some(&before_binding));
+}
+
+#[test]
+fn paired_ptz_reusing_camera_credential_rejects_credential_replacement() {
+    let (mut service, repo, secrets) = seeded();
+    repo.lock()
+        .unwrap()
+        .ptz_bindings
+        .insert("front-door".into(), ptz_binding("old-ref", false));
+
+    assert!(matches!(
+        service.update_camera(draft("Front door", Some("replacement")), None),
+        Err(CameraServiceError::PtzBindingRequiresUnpair)
+    ));
+    let state = repo.lock().unwrap();
+    assert_eq!(
+        state
+            .cameras
+            .get("front-door")
+            .unwrap()
+            .credential_ref()
+            .as_str(),
+        "old-ref"
+    );
+    assert_eq!(
+        state
+            .ptz_bindings
+            .get("front-door")
+            .unwrap()
+            .credential_ref()
+            .as_str(),
+        "old-ref"
+    );
+    drop(state);
+    let secrets = secrets.0.lock().unwrap();
+    assert!(secrets.entries.contains_key("old-ref"));
+    assert!(secrets.puts.is_empty());
+}
+
+#[test]
+fn delete_with_reused_ptz_credential_cleans_camera_secret_once_and_binding_cascades() {
+    let (mut service, repo, secrets) = seeded();
+    repo.lock()
+        .unwrap()
+        .ptz_bindings
+        .insert("front-door".into(), ptz_binding("old-ref", false));
+
+    let outcome = service.delete_camera("front-door", None).unwrap();
+    assert_eq!(outcome.warning, None);
+    let state = repo.lock().unwrap();
+    assert!(!state.cameras.contains_key("front-door"));
+    assert!(!state.ptz_bindings.contains_key("front-door"));
+    drop(state);
+    let secrets = secrets.0.lock().unwrap();
+    assert_eq!(secrets.deletes, vec!["old-ref"]);
+    assert!(!secrets.entries.contains_key("old-ref"));
+}
+
+#[test]
+fn delete_with_ptz_owned_credential_cleans_both_secrets_after_db_commit() {
+    let (mut service, repo, secrets) = seeded();
+    repo.lock()
+        .unwrap()
+        .ptz_bindings
+        .insert("front-door".into(), ptz_binding("ptz-ref", true));
+    secrets
+        .0
+        .lock()
+        .unwrap()
+        .entries
+        .insert("ptz-ref".into(), Credentials::new("ptz", "ptz-password"));
+
+    let outcome = service.delete_camera("front-door", None).unwrap();
+    assert_eq!(outcome.warning, None);
+    let state = repo.lock().unwrap();
+    assert!(!state.cameras.contains_key("front-door"));
+    assert!(!state.ptz_bindings.contains_key("front-door"));
+    drop(state);
+    let secrets = secrets.0.lock().unwrap();
+    assert_eq!(secrets.deletes, vec!["old-ref", "ptz-ref"]);
+    assert!(secrets.entries.is_empty());
+}
+
+#[test]
+fn failed_camera_delete_preserves_camera_ptz_binding_and_all_credentials() {
+    let (mut service, repo, secrets) = seeded();
+    {
+        let mut state = repo.lock().unwrap();
+        state.fail_delete = true;
+        state
+            .ptz_bindings
+            .insert("front-door".into(), ptz_binding("ptz-ref", true));
+    }
+    secrets
+        .0
+        .lock()
+        .unwrap()
+        .entries
+        .insert("ptz-ref".into(), Credentials::new("ptz", "ptz-password"));
+
+    assert!(matches!(
+        service.delete_camera("front-door", None),
+        Err(CameraServiceError::Settings)
+    ));
+    let state = repo.lock().unwrap();
+    assert!(state.cameras.contains_key("front-door"));
+    assert!(state.ptz_bindings.contains_key("front-door"));
+    drop(state);
+    let secrets = secrets.0.lock().unwrap();
+    assert!(secrets.entries.contains_key("old-ref"));
+    assert!(secrets.entries.contains_key("ptz-ref"));
+    assert!(secrets.deletes.is_empty());
+}
+
+#[test]
+fn ptz_secret_cleanup_failure_after_delete_surfaces_warning_without_db_rollback() {
+    let (mut service, repo, secrets) = seeded();
+    repo.lock()
+        .unwrap()
+        .ptz_bindings
+        .insert("front-door".into(), ptz_binding("ptz-ref", true));
+    {
+        let mut state = secrets.0.lock().unwrap();
+        state
+            .entries
+            .insert("ptz-ref".into(), Credentials::new("ptz", "ptz-password"));
+        state.fail_delete_refs.push("ptz-ref".into());
+    }
+
+    let outcome = service.delete_camera("front-door", None).unwrap();
+    assert_eq!(
+        outcome.warning,
+        Some(CameraWarning::OrphanCredentialCleanupFailed)
+    );
+    let state = repo.lock().unwrap();
+    assert!(!state.cameras.contains_key("front-door"));
+    assert!(!state.ptz_bindings.contains_key("front-door"));
+    drop(state);
+    let secrets = secrets.0.lock().unwrap();
+    assert!(!secrets.entries.contains_key("old-ref"));
+    assert!(secrets.entries.contains_key("ptz-ref"));
 }
 
 #[test]
