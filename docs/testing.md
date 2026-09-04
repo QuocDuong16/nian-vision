@@ -718,20 +718,34 @@ of a manually stale host binding before `backend.control`; credential reuse vers
 ownership; pair/unpair independence from RTSP camera and recording Desired state; capability-
 gated zoom; one-camera failure isolation; stale Stop generation refusal; 400 ms renewal extending
 the one-second lease; automatic dead-man Stop; and lifecycle cancellation without Resume
-resurrection. Opening-reservation tests prove same-camera single-flight/Busy behavior, the
-`opening + active + draining <= 16` capacity bound, lifecycle cancellation of blocked network
-establishment, full-shutdown waiting for that cancelled opening, and Busy/stale-opening refusal
-after reactivation. Draining tests block Stop/join to
-prove Hide -> immediate shutdown and camera-delete -> shutdown wait for one controller-owned
-leader, with no double Stop/join and no stale same-camera removal. Mutation tests force concurrent
-pair/pair and replace/unpair ordering and assert no orphan PTZ credential remains.
+resurrection.
+
+Opening-reservation tests prove same-camera single-flight/Busy behavior, the
+`opening + active + draining <= 16` worker-capacity bound, lifecycle cancellation of blocked
+network establishment, full-shutdown waiting for that cancelled opening, and Busy/stale-opening
+refusal after reactivation. Mutation tests now exercise registry-owned `mutating` state directly:
+delete and unpair reject fresh same-camera session admission before any new `backend.control`, an
+opening prepared against B1 is cancelled before a B2 replacement becomes authoritative, many
+same-camera mutation contenders all fail fast Busy without a waiter queue or extra credentials,
+and a mutation on camera A does not block camera B.
+
+Draining tests block Stop/join to prove Hide -> immediate shutdown and camera-delete -> shutdown
+share one controller-owned leader, with no double Stop/join and no stale same-camera removal.
+Lifecycle side-effect tests block after a PTZ credential write, during unpair credential cleanup,
+and during coordinated camera-delete completion. Suspend/Quit/Update's shared PTZ teardown path
+must remain blocked until the mutation drops only after rollback/cleanup settles; Resume then
+proves no stale pairing or motion is restored. Test-only ownership introspection asserts
+`(opening, active, draining, mutating) == (0, 0, 0, 0)` after terminal settlement.
 
 `CameraService` fault-injection tests cover paired-camera host replacement rejection, shared-
 credential replacement rejection, delete with reused versus PTZ-owned credentials, failed DB
 delete preserving every secret/binding, and post-commit keyring cleanup failure returning a
-warning without database rollback. `OnvifController` blocks PTZ capability lookup and cancels
-the owning discovery session before release, proving stale authenticated session/device work
-cannot return a prepared PTZ pairing.
+warning without database rollback. Desktop coverage also holds a same-camera PTZ mutation while
+invoking the camera-update helper and proves typed `ptz_busy` returns before the owner is released;
+the production Tauri command dispatches that helper through `spawn_blocking` rather than running
+mutation coordination on the main thread. `OnvifController` blocks PTZ capability lookup and
+cancels/reconnects the owning discovery session before release, proving stale authenticated
+session/device/connection-generation work cannot return a prepared PTZ pairing.
 
 Frontend `PtzControls` tests use deferred Promises and fake timers to cover press/release,
 release before `ptz_move` resolves, Left→Right stale response ordering, periodic renew,

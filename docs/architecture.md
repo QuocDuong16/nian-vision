@@ -754,7 +754,8 @@ connection generation after blocking network work, so refresh/cancel/reconnect c
 a stale prepared pairing. If ONVIF and RTSP credentials are identical the existing camera
 credential reference is reused; otherwise a PTZ-specific credential is stored in the same
 native `CredentialStore`, with rollback on settings or lifecycle commit failure and best-effort
-obsolete-secret cleanup on replace/unpair. Pair/replace/unpair are serialized per camera.
+obsolete-secret cleanup on replace/unpair. Same-camera PTZ mutations share one registry owner and
+concurrent mutation attempts fail fast Busy rather than forming an unbounded waiter queue.
 
 `nian-onvif` extends the existing hardened SOAP transport rather than introducing a second
 HTTP stack. PTZ service discovery, profile/configuration association and continuous velocity
@@ -771,13 +772,21 @@ under the existing M12 exact-host identity rule. Independently, runtime admissio
 current `CameraConfig` and `PtzBinding` and rejects host mismatch before credential loading or
 ONVIF control traffic, protecting against corrupt settings and future mutation regressions.
 
-`PtzController` owns a bounded registry of `opening`, `active` and `draining` runtime owners.
-The combined count is capped at 16. Same-camera concurrent establishment is single-flight by
-reservation and returns Busy instead of duplicating ONVIF work; different cameras remain
-independent. Each active session has one camera-local worker and a four-command bounded sync
-queue. Settings/registry locks are released before credential or network I/O. Opening commit
-requires the same reservation identity plus unchanged lifecycle generation, so late network
-completion after Hide/Suspend/Quit/Update cannot publish a worker.
+`PtzController` owns one bounded authoritative registry with `opening`, `active`, `draining`
+and `mutating` ownership. Worker capacity is still strictly
+`opening + active + draining <= 16`; a mutation is a same-camera coordination owner, not a worker
+slot. Same-camera opening or mutation contention returns Busy instead of duplicating ONVIF work or
+creating an unbounded waiter queue, while different cameras remain independent. Pair/replace/
+unpair/coordinated update/delete publish `mutating[camera]` before cancelling an opening or
+retiring an active session, so fresh same-camera runtime admission cannot slip between retirement
+and persistence commit.
+
+Each active session has one camera-local worker and a four-command bounded sync queue. Settings/
+registry locks are released before credential or network I/O. Opening admission snapshots an
+internal binding epoch. After ONVIF establishment the current camera/binding is re-read, and commit
+requires the same reservation, unchanged lifecycle generation and binding epoch, no current
+same-camera mutation, and the same persisted `PtzBinding`. A worker prepared against B1 therefore
+cannot commit after B2 becomes authoritative.
 
 Movement ownership is generation-based. `ptz_move` returns a monotonic generation, a
 one-second backend lease and a 400 ms renew hint. Renew and Stop affect only that generation;
@@ -787,26 +796,35 @@ camera-side ONVIF timeout. The React control pad also handles pointer/keyboard r
 pending move responses, stale generations and unmount, but frontend behavior is not the
 safety boundary.
 
-Hide, Suspend, Quit and updater handoff close PTZ admission, advance the lifecycle generation
-and set an out-of-band stop flag for every owned worker before blocking teardown. The flag is
-independent of the bounded queue, so a full queue cannot preserve movement and no helper-thread
-fan-out is needed. Current opening reservations are marked cancelled but remain tracked until
-their bounded backend establishment returns. Hide moves active sessions into controller-owned
-`draining` state and returns stable opening/drain identities to the background task. One leader
-performs each Stop/join while concurrent lifecycle/delete followers wait for the same completion.
-Full shutdown therefore cannot report complete while either an old opening or hide worker is
-still owned. A cancelled same-camera opening returns Busy after reactivation until the stale
-reservation resolves; an already-draining old session may coexist with a fresh active session,
-whose distinct identity cannot be removed by stale drain completion. Resume reopens admission
-only and never recreates a previous movement generation or direction. PTZ degradation remains
-isolated from recording/live Desired/Runtime ownership. See ADR-0015.
+Hide, Suspend, Quit and updater handoff close PTZ admission, advance the lifecycle generation,
+mark current opening/mutation owners cancelled and set an out-of-band stop flag for every worker
+before blocking teardown. The flag is independent of the bounded queue, so a full queue cannot
+preserve movement and no helper-thread fan-out is needed. Current opening reservations remain
+tracked until bounded backend establishment returns. Active sessions move into controller-owned
+`draining` state. Mutation states remain tracked until their operation scope exits only after DB/
+keyring commit, rollback or cleanup has settled.
 
-Camera deletion coordinates through the same per-camera mutation owner: PTZ runtime is retired
-before the camera deletion closure commits. `CameraService` captures PTZ credential ownership
-metadata, commits the database deletion/cascade first, then best-effort deletes the ordinary
-camera credential and any distinct PTZ-owned credential. Persistence failure leaves all still-
-needed external secrets intact; post-commit keyring cleanup failure surfaces the existing orphan
-credential warning without resurrecting the deleted camera/binding.
+Lifecycle teardown batches therefore carry stable opening, drain and mutation identities. One
+leader performs each Stop/join while concurrent lifecycle/delete followers wait for the same
+completion. Terminal Suspend/Quit/Update shutdown cannot report complete while any opening,
+active, draining or mutating PTZ ownership remains, including a pair secret rollback or unpair/
+delete credential cleanup. Hide may finish visual hiding while its background batch continues, but
+that ownership remains visible to a later terminal shutdown. A cancelled same-camera opening
+returns Busy after reactivation until the stale reservation resolves; an already-draining old
+session may coexist with a fresh active session whose distinct identity cannot be removed by stale
+drain completion. Resume reopens admission only and never recreates a previous movement generation
+or direction. PTZ degradation remains isolated from recording/live Desired/Runtime ownership.
+See ADR-0015.
+
+Camera deletion coordinates through the same registry-owned per-camera mutation state. The
+mutation becomes visible before PTZ retirement and blocks fresh same-camera openings throughout
+the delete. `CameraService` captures PTZ credential ownership metadata, commits the database
+deletion/cascade first, then best-effort deletes the ordinary camera credential and any distinct
+PTZ-owned credential. The mutation lease remains owned through that cleanup outcome, so terminal
+lifecycle waits it. Persistence failure leaves all still-needed external secrets intact;
+post-commit keyring cleanup failure surfaces the existing orphan credential warning without
+resurrecting the deleted camera/binding. `camera_update` uses the same bounded mutation admission
+but its Tauri command runs via `spawn_blocking`, keeping this coordination off the main thread.
 
 ## Failure model
 

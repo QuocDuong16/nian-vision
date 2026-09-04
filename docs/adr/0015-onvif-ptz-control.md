@@ -51,8 +51,9 @@ service authority before authenticated PTZ traffic is sent.
 `OnvifController` snapshots the authenticated connection identity before PTZ capability
 lookup and revalidates the same session, device endpoint reference and connection generation
 after the blocking network call. Refresh, cancel or reconnect therefore invalidates stale
-pairing work before a `PreparedPtzPairing` can escape. Pair/replace/unpair are serialized per
-CameraId, while different cameras remain independent. Pair persistence also uses a short
+pairing work before a `PreparedPtzPairing` can escape. Pair/replace/unpair and coordinated camera
+mutation share one per-CameraId registry owner; concurrent same-camera mutation fails fast Busy
+instead of queuing, while different cameras remain independent. Pair persistence also uses a short
 lifecycle-generation commit gate, so Hide/Suspend/Quit/Update that wins after network work
 prevents a late binding commit and rolls back any newly written PTZ credential.
 
@@ -98,19 +99,29 @@ the stale authority is not contacted.
 
 ### Runtime ownership is per camera and bounded
 
-`PtzController` owns one registry with three explicit states: `opening`, `active` and
-`draining`. Their combined count is capped at 16. A same-camera caller encountering an
-`opening` reservation receives typed Busy rather than starting duplicate ONVIF discovery or a
-temporary worker; other cameras may establish independently. Each committed camera has one
-worker thread and a bounded four-command sync queue. Credential access and SOAP/network work
-happen outside the registry lock, so a slow camera does not serialize unrelated cameras.
+`PtzController` owns one authoritative registry with four explicit ownership domains:
+`opening`, `active`, `draining` and `mutating`. Worker capacity remains
+`opening + active + draining <= 16`; mutation ownership does not consume a worker slot. A
+same-camera caller encountering either an `opening` reservation or an active mutation receives
+typed Busy rather than starting duplicate ONVIF work or becoming an unbounded waiter. Different
+cameras remain independent. Each committed camera has one worker thread and a bounded four-command
+sync queue. Credential access and SOAP/network work happen outside the registry lock, so a slow
+camera does not serialize unrelated cameras.
 
-Runtime session establishment reserves capacity first, then re-reads current camera/binding
-authority and native credentials, reconstructs the Device-service URL and re-discovers current
-PTZ service/configuration. Commit succeeds only if the same opening reservation and lifecycle
-generation still own the slot. Late network completion after lifecycle cancellation therefore
-cannot publish a worker. PTZ service/configuration tokens remain transient worker-owned values
-rather than settings authority.
+Pair, replace, unpair, coordinated camera update and camera delete publish `mutating[camera]`
+inside the registry before cancelling an opening or retiring an active PTZ session. Once visible,
+that mutation excludes fresh same-camera session admission until its commit/rollback/cleanup has
+settled. Mutation contention is intentionally fail-fast Busy; there is no arbitrary Condvar waiter
+queue.
+
+Runtime session establishment reserves capacity first and snapshots an internal per-camera binding
+epoch, then re-reads current camera/binding authority and native credentials, reconstructs the
+Device-service URL and re-discovers current PTZ service/configuration. After network work it
+re-reads the persisted binding again. Opening -> active commit requires the same reservation,
+unchanged lifecycle generation, unchanged binding epoch, no current same-camera mutation and the
+same persisted `PtzBinding` identity. Late network completion after lifecycle cancellation or a
+B1 -> B2 binding replacement therefore cannot publish a stale worker. PTZ service/configuration
+tokens remain transient worker-owned values rather than settings authority.
 
 ### Movement uses generation ownership plus two dead-men
 
@@ -134,18 +145,23 @@ useful for responsiveness but is not the safety boundary; backend and camera dea
 
 ### Lifecycle always cancels motion and never restores it
 
-Hide, Suspend, Quit and updater handoff close PTZ admission and set an out-of-band
-`stop_requested` flag on every session before blocking teardown. This flag is independent
-of the bounded command queue, so a full queue cannot preserve movement admission.
-Existing per-camera workers perform the network Stop; lifecycle joins worker ownership off
-the Tauri/window event thread. In-flight `opening` reservations are marked cancelled but remain
-controller-owned until their bounded network establishment returns and signals completion. Hide
-moves then-active owners into controller-owned `draining` entries and returns a teardown batch
-with stable opening references plus drain identities; the batch is never the sole ownership
+Hide, Suspend, Quit and updater handoff close PTZ admission, advance lifecycle generation,
+mark in-flight openings/mutations cancelled and set an out-of-band `stop_requested` flag on every
+session before blocking teardown. This flag is independent of the bounded command queue, so a full
+queue cannot preserve movement admission. Existing per-camera workers perform the network Stop;
+lifecycle joins worker ownership off the Tauri/window event thread. In-flight `opening`
+reservations remain controller-owned until their bounded network establishment returns and signals
+completion. In-flight mutations remain registry-owned until their database/keyring outcome is
+settled, including rollback of a newly written PTZ secret or cleanup after unpair/delete.
+
+Hide moves then-active owners into controller-owned `draining` entries and returns a teardown batch
+with stable opening, drain and mutation identities; the batch is never the sole ownership
 representation. One caller becomes the Stop/join leader for each draining session, while any
-concurrent Hide/Quit/Update/Suspend/delete follower waits for the same opening/drain completion
-instead of double-joining or creating Stop storms. Full shutdown is complete only when
-`opening`, `active` and `draining` are all empty and every worker has joined.
+concurrent Hide/Quit/Update/Suspend/delete follower waits for the same tracked completion instead
+of double-joining or creating Stop storms. Hide may finish visual hiding before background
+settlement completes, but it does not forget the ownership. Suspend, Quit and updater handoff do
+not report PTZ teardown complete until `opening`, `active`, `draining` and `mutating` are all empty,
+every worker has joined and admitted PTZ credential side effects have settled.
 
 A later reactivation may admit a fresh same-camera session while the old session is still
 draining. Reap removal is keyed by stable session identity/Arc identity, not CameraId alone,
@@ -157,9 +173,11 @@ session movement. A later PTZ request creates/revalidates runtime ownership norm
 ### The Tauri surface remains narrow
 
 React receives safe capability/runtime DTOs and opaque movement generations only. The
-desktop exposes pairing/unpairing, configured/capability reads, move/renew/stop commands;
-raw SOAP, PTZ service URLs, profile/configuration tokens and passwords do not cross the
-frontend boundary. Blocking PTZ work is dispatched through Tauri's blocking runtime.
+desktop exposes pairing/unpairing, configured/capability reads, move/renew/stop commands; raw SOAP,
+PTZ service URLs, profile/configuration tokens and passwords do not cross the frontend boundary.
+Blocking PTZ work is dispatched through Tauri's blocking runtime. `camera_update` is also async at
+the Tauri boundary and executes its PTZ mutation coordination through `spawn_blocking`, so a
+same-camera ownership wait/retirement path can never run on the Tauri main thread.
 
 ## Consequences
 

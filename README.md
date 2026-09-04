@@ -70,15 +70,20 @@ cloud and remote streaming remain outside M12.
   separate non-secret control binding. The configured RTSP camera remains authoritative. A
   paired camera cannot silently change RTSP host, and shared camera credentials cannot be
   replaced, until PTZ is explicitly unpaired; runtime also revalidates current camera/binding
-  host equality before authenticated control traffic. Pair/replace/unpair are serialized per
-  camera and stale ONVIF/lifecycle work cannot commit. PTZ runtime capacity counts opening,
-  active and draining ownership together (maximum 16), with one same-camera opening reservation.
-  Continuous pan/tilt and advertised zoom are serialized per camera with a bounded queue; stale
-  frontend releases cannot stop a newer generation, lease expiry automatically sends `Stop`,
-  and every `ContinuousMove` also carries a camera-side one-second timeout. Hide, suspend, quit
-  and update cancel motion and wait for controller-owned draining workers; resume never restores
-  a previous direction. Camera deletion settles PTZ ownership before DB commit and cleans any
-  PTZ-owned native credential only after successful persistence deletion.
+  host equality before authenticated control traffic. PTZ owns one per-camera registry across
+  opening, active, draining and mutation state. Same-camera pair/replace/unpair/update/delete
+  mutation contention fails fast Busy, blocks fresh PTZ opening admission, and never grows an
+  arbitrary waiter queue; other cameras remain independent. Worker capacity still counts only
+  opening + active + draining ownership together (maximum 16). Opening commit revalidates the
+  current binding identity/epoch so a worker prepared against a replaced binding cannot publish.
+  Continuous pan/tilt and advertised zoom remain serialized per camera with a bounded queue;
+  stale frontend releases cannot stop a newer generation, lease expiry automatically sends
+  `Stop`, and every `ContinuousMove` also carries a camera-side one-second timeout. Hide,
+  suspend, quit and update cancel motion while retaining controller ownership of in-flight
+  openings, drains and mutations; terminal teardown waits credential rollback/cleanup before
+  completion and resume never restores a previous direction. Camera deletion keeps mutation
+  ownership through DB outcome and post-commit credential cleanup. Camera update runs through
+  Tauri `spawn_blocking` so PTZ coordination never blocks the main thread.
 * Playback sessions bind only an ephemeral `127.0.0.1` port. An unguessable
   per-session token maps to one already-validated finalized recording; HTTP Range
   requests provide browser seeking without a directory listing, arbitrary path

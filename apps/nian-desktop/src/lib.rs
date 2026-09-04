@@ -691,9 +691,8 @@ fn camera_create(
         .map_err(map_camera_error)
 }
 
-#[tauri::command]
-fn camera_update(
-    state: tauri::State<'_, Arc<DesktopState>>,
+fn update_camera_config(
+    state: &DesktopState,
     input: CameraCommandInput,
 ) -> Result<nian_application::CameraMutation<CameraSummary>, DesktopErrorDto> {
     let camera_id = CameraId::parse(&input.camera_id)
@@ -702,7 +701,7 @@ fn camera_update(
         .ptz_controller
         .coordinate_camera_update(&camera_id, || {
             let _gate = lock(&state.control_gate)?;
-            require_running(&state)?;
+            require_running(state)?;
             let active = lock(&state.recording_controller)?
                 .is_owned(&camera_id)
                 .map_err(map_recording_error)?;
@@ -711,6 +710,17 @@ fn camera_update(
                 .map_err(map_camera_error)
         })
         .map_err(map_ptz_error)?
+}
+
+#[tauri::command]
+async fn camera_update(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    input: CameraCommandInput,
+) -> Result<nian_application::CameraMutation<CameraSummary>, DesktopErrorDto> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || update_camera_config(&state, input))
+        .await
+        .map_err(|_| DesktopErrorDto::new("internal", "camera update task failed"))?
 }
 
 fn ensure_camera_delete_allowed(
@@ -1656,7 +1666,7 @@ fn map_ptz_error(error: PtzError) -> DesktopErrorDto {
         PtzError::Capacity => {
             DesktopErrorDto::new("ptz_capacity", "PTZ session capacity has been reached")
         }
-        PtzError::Busy => DesktopErrorDto::new("ptz_busy", "PTZ command queue is busy"),
+        PtzError::Busy => DesktopErrorDto::new("ptz_busy", "PTZ operation is busy"),
         PtzError::Settings => DesktopErrorDto::new("ptz_settings", "PTZ settings are unavailable"),
         PtzError::CredentialStore(_) => {
             DesktopErrorDto::new("credential_store", "PTZ credential store is unavailable")
@@ -5457,6 +5467,56 @@ mod tests {
             .unwrap()
             .shutdown_all()
             .unwrap();
+    }
+
+    #[test]
+    fn camera_update_helper_returns_busy_while_same_camera_ptz_mutation_is_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let (state, _repository, _runner, _probe) = lifecycle_state(&root, true);
+        let state = Arc::new(state);
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let owner_state = state.clone();
+        let owner_camera_id = camera_id.clone();
+        let owner = std::thread::spawn(move || {
+            owner_state
+                .ptz_controller
+                .coordinate_camera_update(&owner_camera_id, || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let input = CameraCommandInput {
+            camera_id: "front-door".to_owned(),
+            display_name: "Front door renamed".to_owned(),
+            host: "192.168.1.50".to_owned(),
+            port: 554,
+            path: "/stream1".to_owned(),
+            audio_policy: AudioPolicy::CopyAll,
+            username: String::new(),
+            password: String::new(),
+        };
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let update_state = state.clone();
+        let update = std::thread::spawn(move || {
+            result_tx
+                .send(update_camera_config(&update_state, input))
+                .unwrap();
+        });
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, "ptz_busy");
+
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+        update.join().unwrap();
     }
 
     #[test]

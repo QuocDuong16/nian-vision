@@ -1,6 +1,6 @@
 //! Optional ONVIF PTZ control-plane ownership.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
@@ -246,16 +246,49 @@ struct OpeningState {
     camera_id: CameraId,
     reservation_id: u64,
     lifecycle_generation: u64,
+    binding_epoch: u64,
     cancelled: AtomicBool,
     done: Mutex<bool>,
     done_cv: Condvar,
 }
 
 impl OpeningState {
-    fn new(camera_id: CameraId, reservation_id: u64, lifecycle_generation: u64) -> Self {
+    fn new(
+        camera_id: CameraId,
+        reservation_id: u64,
+        lifecycle_generation: u64,
+        binding_epoch: u64,
+    ) -> Self {
         Self {
             camera_id,
             reservation_id,
+            lifecycle_generation,
+            binding_epoch,
+            cancelled: AtomicBool::new(false),
+            done: Mutex::new(false),
+            done_cv: Condvar::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+struct MutationState {
+    camera_id: CameraId,
+    mutation_id: u64,
+    lifecycle_generation: u64,
+    cancelled: AtomicBool,
+    done: Mutex<bool>,
+    done_cv: Condvar,
+}
+
+impl MutationState {
+    fn new(camera_id: CameraId, mutation_id: u64, lifecycle_generation: u64) -> Self {
+        Self {
+            camera_id,
+            mutation_id,
             lifecycle_generation,
             cancelled: AtomicBool::new(false),
             done: Mutex::new(false),
@@ -293,6 +326,8 @@ struct PtzRegistry {
     opening: HashMap<CameraId, Arc<OpeningState>>,
     active: HashMap<CameraId, SessionHandle>,
     draining: HashMap<u64, Arc<DrainState>>,
+    mutating: HashMap<CameraId, Arc<MutationState>>,
+    binding_epochs: HashMap<CameraId, u64>,
 }
 
 impl PtzRegistry {
@@ -323,6 +358,7 @@ enum PtzCommand {
 pub struct PtzTeardownBatch {
     openings: Vec<Arc<OpeningState>>,
     drain_ids: Vec<u64>,
+    mutations: Vec<Arc<MutationState>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -341,23 +377,25 @@ pub struct PtzController {
     generation: AtomicU64,
     session_ids: AtomicU64,
     reservation_ids: AtomicU64,
+    mutation_ids: AtomicU64,
     registry: Mutex<PtzRegistry>,
-    mutation_owners: Mutex<HashSet<CameraId>>,
-    mutation_cv: Condvar,
     commit_gate: Mutex<()>,
 }
 
 struct CameraMutationLease<'a> {
     controller: &'a PtzController,
-    camera_id: CameraId,
+    state: Arc<MutationState>,
+}
+
+impl CameraMutationLease<'_> {
+    fn lifecycle_generation(&self) -> u64 {
+        self.state.lifecycle_generation
+    }
 }
 
 impl Drop for CameraMutationLease<'_> {
     fn drop(&mut self) {
-        if let Ok(mut owners) = self.controller.mutation_owners.lock() {
-            owners.remove(&self.camera_id);
-            self.controller.mutation_cv.notify_all();
-        }
+        self.controller.finish_mutation(&self.state);
     }
 }
 
@@ -390,9 +428,8 @@ impl PtzController {
             generation: AtomicU64::new(0),
             session_ids: AtomicU64::new(0),
             reservation_ids: AtomicU64::new(0),
+            mutation_ids: AtomicU64::new(0),
             registry: Mutex::new(PtzRegistry::default()),
-            mutation_owners: Mutex::new(HashSet::new()),
-            mutation_cv: Condvar::new(),
             commit_gate: Mutex::new(()),
         }
     }
@@ -403,8 +440,8 @@ impl PtzController {
         prepared: PreparedPtzPairing,
     ) -> Result<PtzMutation<PtzCapabilitiesDto>, PtzError> {
         let camera_id = CameraId::parse(camera_id).map_err(|_| PtzError::CameraNotFound)?;
-        let _mutation = self.acquire_camera_mutation(&camera_id)?;
-        let lifecycle_generation = self.lifecycle_snapshot()?;
+        let mutation = self.acquire_camera_mutation(&camera_id, true)?;
+        let lifecycle_generation = mutation.lifecycle_generation();
         let camera = self
             .repository
             .lock()
@@ -426,7 +463,6 @@ impl PtzController {
             return Err(PtzError::Unsupported);
         }
 
-        self.retire_session(&camera_id);
         let old_binding = self
             .repository
             .lock()
@@ -458,6 +494,7 @@ impl PtzController {
         let commit_result = (|| {
             let _commit = self.commit_gate.lock().map_err(|_| PtzError::Internal)?;
             self.require_generation(lifecycle_generation)?;
+            self.require_mutation_registered(&mutation.state)?;
             self.repository
                 .lock()
                 .map_err(|_| PtzError::Internal)?
@@ -494,9 +531,8 @@ impl PtzController {
 
     pub fn unpair(&self, camera_id: &str) -> Result<PtzMutation<PtzCapabilitiesDto>, PtzError> {
         let camera_id = CameraId::parse(camera_id).map_err(|_| PtzError::CameraNotFound)?;
-        let _mutation = self.acquire_camera_mutation(&camera_id)?;
-        let lifecycle_generation = self.lifecycle_snapshot()?;
-        self.retire_session(&camera_id);
+        let mutation = self.acquire_camera_mutation(&camera_id, true)?;
+        let lifecycle_generation = mutation.lifecycle_generation();
         let binding = self
             .repository
             .lock()
@@ -512,6 +548,7 @@ impl PtzController {
         let deleted = {
             let _commit = self.commit_gate.lock().map_err(|_| PtzError::Internal)?;
             self.require_generation(lifecycle_generation)?;
+            self.require_mutation_registered(&mutation.state)?;
             self.repository
                 .lock()
                 .map_err(|_| PtzError::Internal)?
@@ -542,7 +579,7 @@ impl PtzController {
     where
         F: FnOnce() -> T,
     {
-        let _mutation = self.acquire_camera_mutation(camera_id)?;
+        let _mutation = self.acquire_camera_mutation(camera_id, false)?;
         Ok(operation())
     }
 
@@ -554,8 +591,7 @@ impl PtzController {
     where
         F: FnOnce() -> T,
     {
-        let _mutation = self.acquire_camera_mutation(camera_id)?;
-        self.retire_session(camera_id);
+        let _mutation = self.acquire_camera_mutation(camera_id, true)?;
         Ok(operation())
     }
 
@@ -689,6 +725,9 @@ impl PtzController {
         for opening in registry.opening.values() {
             opening.cancel();
         }
+        for mutation in registry.mutating.values() {
+            mutation.cancel();
+        }
         for handle in registry.active.values() {
             signal_lifecycle_stop(&handle.session);
         }
@@ -724,6 +763,7 @@ impl PtzController {
         PtzTeardownBatch {
             openings,
             drain_ids: registry.draining.keys().copied().collect(),
+            mutations: registry.mutating.values().cloned().collect(),
         }
     }
 
@@ -734,6 +774,9 @@ impl PtzController {
         }
         for session_id in batch.drain_ids {
             self.finish_drain(session_id);
+        }
+        for mutation in batch.mutations {
+            self.wait_mutation(&mutation);
         }
     }
 
@@ -767,6 +810,9 @@ impl PtzController {
             self.require_accepting()?;
             let lifecycle_generation = self.lifecycle_generation.load(Ordering::Acquire);
             let mut registry = self.registry.lock().map_err(|_| PtzError::Internal)?;
+            if registry.mutating.contains_key(camera_id) {
+                return Err(PtzError::Busy);
+            }
             if let Some(existing) = registry
                 .active
                 .get(camera_id)
@@ -780,10 +826,12 @@ impl PtzController {
                 if registry.owned_count() >= MAX_ACTIVE_PTZ_SESSIONS {
                     return Err(PtzError::Capacity);
                 }
+                let binding_epoch = registry.binding_epochs.get(camera_id).copied().unwrap_or(0);
                 let opening = Arc::new(OpeningState::new(
                     camera_id.clone(),
                     reservation_id,
                     lifecycle_generation,
+                    binding_epoch,
                 ));
                 registry.opening.insert(camera_id.clone(), opening.clone());
                 (None, Some(opening))
@@ -828,6 +876,13 @@ impl PtzController {
             return Err(PtzError::Unsupported);
         }
 
+        // Network work was performed against this exact binding. Re-read persistence before
+        // commit so an out-of-band/stale replacement cannot silently become an active worker.
+        let current_binding = self.validate_current_authority(camera_id)?;
+        if current_binding != binding {
+            return Err(PtzError::LifecycleCancelled);
+        }
+
         let _commit = self.commit_gate.lock().map_err(|_| PtzError::Internal)?;
         self.require_generation(opening.lifecycle_generation)?;
         if opening.cancelled.load(Ordering::Acquire) {
@@ -838,8 +893,11 @@ impl PtzController {
             Arc::ptr_eq(current, opening)
                 && current.reservation_id == opening.reservation_id
                 && current.lifecycle_generation == opening.lifecycle_generation
+                && current.binding_epoch == opening.binding_epoch
         });
-        if !reservation_matches {
+        let epoch_matches =
+            registry.binding_epochs.get(camera_id).copied().unwrap_or(0) == opening.binding_epoch;
+        if !reservation_matches || !epoch_matches || registry.mutating.contains_key(camera_id) {
             return Err(PtzError::LifecycleCancelled);
         }
 
@@ -1030,26 +1088,128 @@ impl PtzController {
     fn acquire_camera_mutation(
         &self,
         camera_id: &CameraId,
+        retire_active: bool,
     ) -> Result<CameraMutationLease<'_>, PtzError> {
-        let mut owners = self
-            .mutation_owners
-            .lock()
-            .map_err(|_| PtzError::Internal)?;
-        while owners.contains(camera_id) {
-            owners = self
-                .mutation_cv
-                .wait(owners)
-                .map_err(|_| PtzError::Internal)?;
-        }
-        owners.insert(camera_id.clone());
-        Ok(CameraMutationLease {
+        let mutation_id = self
+            .mutation_ids
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let (state, opening, drain_ids) = {
+            let _commit = self.commit_gate.lock().map_err(|_| PtzError::Internal)?;
+            self.require_accepting()?;
+            let lifecycle_generation = self.lifecycle_generation.load(Ordering::Acquire);
+            let mut registry = self.registry.lock().map_err(|_| PtzError::Internal)?;
+            if registry.mutating.contains_key(camera_id) {
+                return Err(PtzError::Busy);
+            }
+
+            // Mutation visibility is published before any existing PTZ owner is retired.
+            // This closes the gap in which a fresh opening could otherwise slip in.
+            let epoch = registry
+                .binding_epochs
+                .entry(camera_id.clone())
+                .or_insert(0);
+            *epoch = epoch.wrapping_add(1);
+            let state = Arc::new(MutationState::new(
+                camera_id.clone(),
+                mutation_id,
+                lifecycle_generation,
+            ));
+            registry.mutating.insert(camera_id.clone(), state.clone());
+
+            let opening = registry.opening.get(camera_id).cloned();
+            if let Some(opening) = &opening {
+                opening.cancel();
+            }
+            if retire_active && let Some(handle) = registry.active.remove(camera_id) {
+                signal_lifecycle_stop(&handle.session);
+                let session_id = handle.session.session_id;
+                registry
+                    .draining
+                    .entry(session_id)
+                    .or_insert_with(|| Arc::new(DrainState::new(handle)));
+            }
+            let drain_ids = registry
+                .draining
+                .iter()
+                .filter_map(|(session_id, drain)| {
+                    (drain.camera_id == *camera_id).then_some(*session_id)
+                })
+                .collect::<Vec<_>>();
+            (state, opening, drain_ids)
+        };
+
+        let lease = CameraMutationLease {
             controller: self,
-            camera_id: camera_id.clone(),
-        })
+            state,
+        };
+        if let Some(opening) = opening {
+            self.wait_opening(&opening);
+        }
+        for session_id in drain_ids {
+            self.finish_drain(session_id);
+        }
+        self.require_mutation_current(&lease.state)?;
+        Ok(lease)
+    }
+
+    fn require_mutation_current(&self, mutation: &Arc<MutationState>) -> Result<(), PtzError> {
+        let _commit = self.commit_gate.lock().map_err(|_| PtzError::Internal)?;
+        self.require_generation(mutation.lifecycle_generation)?;
+        self.require_mutation_registered(mutation)
+    }
+
+    fn require_mutation_registered(&self, mutation: &Arc<MutationState>) -> Result<(), PtzError> {
+        if mutation.cancelled.load(Ordering::Acquire) {
+            return Err(PtzError::LifecycleCancelled);
+        }
+        let registry = self.registry.lock().map_err(|_| PtzError::Internal)?;
+        let current = registry
+            .mutating
+            .get(&mutation.camera_id)
+            .is_some_and(|state| {
+                Arc::ptr_eq(state, mutation) && state.mutation_id == mutation.mutation_id
+            });
+        current.then_some(()).ok_or(PtzError::LifecycleCancelled)
+    }
+
+    fn finish_mutation(&self, mutation: &Arc<MutationState>) {
+        if let Ok(mut registry) = self.registry.lock()
+            && registry
+                .mutating
+                .get(&mutation.camera_id)
+                .is_some_and(|current| Arc::ptr_eq(current, mutation))
+        {
+            if let Ok(mut done) = mutation.done.lock()
+                && !*done
+            {
+                *done = true;
+                mutation.done_cv.notify_all();
+            }
+            registry.mutating.remove(&mutation.camera_id);
+            return;
+        }
+        if let Ok(mut done) = mutation.done.lock()
+            && !*done
+        {
+            *done = true;
+            mutation.done_cv.notify_all();
+        }
+    }
+
+    fn wait_mutation(&self, mutation: &Arc<MutationState>) {
+        if let Ok(mut done) = mutation.done.lock() {
+            while !*done {
+                match mutation.done_cv.wait(done) {
+                    Ok(next) => done = next,
+                    Err(_) => break,
+                }
+            }
+        }
     }
 
     #[cfg(test)]
-    fn ownership_counts(&self) -> (usize, usize, usize) {
+    fn ownership_counts(&self) -> (usize, usize, usize, usize) {
         self.registry
             .lock()
             .map(|registry| {
@@ -1057,9 +1217,10 @@ impl PtzController {
                     registry.opening.len(),
                     registry.active.len(),
                     registry.draining.len(),
+                    registry.mutating.len(),
                 )
             })
-            .unwrap_or((usize::MAX, usize::MAX, usize::MAX))
+            .unwrap_or((usize::MAX, usize::MAX, usize::MAX, usize::MAX))
     }
 
     fn allocate_ptz_credential_ref(&self, camera_id: &CameraId) -> Result<CredentialRef, PtzError> {
@@ -1075,12 +1236,6 @@ impl PtzController {
             }
         }
         Err(PtzError::Internal)
-    }
-
-    fn lifecycle_snapshot(&self) -> Result<u64, PtzError> {
-        let _commit = self.commit_gate.lock().map_err(|_| PtzError::Internal)?;
-        self.require_accepting()?;
-        Ok(self.lifecycle_generation.load(Ordering::Acquire))
     }
 
     fn require_generation(&self, generation: u64) -> Result<(), PtzError> {
@@ -1104,7 +1259,7 @@ impl PtzController {
 
 impl Drop for PtzController {
     fn drop(&mut self) {
-        self.accepting.store(false, Ordering::Release);
+        let _ = self.stop_accepting_and_stop_all();
         self.shutdown_sessions();
     }
 }
@@ -1614,6 +1769,8 @@ mod tests {
         entries: Mutex<std::collections::HashMap<String, Credentials>>,
         block_ptz_put: AtomicBool,
         put_gate: BlockingGate,
+        block_ptz_delete: AtomicBool,
+        delete_gate: BlockingGate,
     }
 
     impl CredentialStore for TrackingCredentialStore {
@@ -1630,13 +1787,13 @@ mod tests {
             reference: &CredentialRef,
             credentials: &Credentials,
         ) -> Result<(), CredentialStoreError> {
-            if self.block_ptz_put.load(Ordering::Acquire) && reference.as_str().contains("/ptz/") {
-                self.put_gate.enter();
-            }
             self.entries
                 .lock()
                 .unwrap()
                 .insert(reference.as_str().to_owned(), credentials.clone());
+            if self.block_ptz_put.load(Ordering::Acquire) && reference.as_str().contains("/ptz/") {
+                self.put_gate.enter();
+            }
             Ok(())
         }
 
@@ -1650,6 +1807,10 @@ mod tests {
         }
 
         fn delete(&self, reference: &CredentialRef) -> Result<(), CredentialStoreError> {
+            if self.block_ptz_delete.load(Ordering::Acquire) && reference.as_str().contains("/ptz/")
+            {
+                self.delete_gate.enter();
+            }
             self.entries.lock().unwrap().remove(reference.as_str());
             Ok(())
         }
@@ -1711,7 +1872,7 @@ mod tests {
             Err(PtzError::AuthorityMismatch)
         ));
         assert!(fixture.backend.events().is_empty());
-        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0));
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0, 0));
     }
 
     #[test]
@@ -1738,7 +1899,7 @@ mod tests {
 
         fixture.backend.control_gate.release();
         assert!(first.join().unwrap().is_ok());
-        assert_eq!(fixture.controller.ownership_counts(), (0, 1, 0));
+        assert_eq!(fixture.controller.ownership_counts(), (0, 1, 0, 0));
     }
 
     #[test]
@@ -1748,16 +1909,16 @@ mod tests {
         let controller = fixture.controller.clone();
         let opening = thread::spawn(move || controller.capabilities("front-door"));
         fixture.backend.control_gate.wait_for(1);
-        assert_eq!(fixture.controller.ownership_counts(), (1, 0, 0));
+        assert_eq!(fixture.controller.ownership_counts(), (1, 0, 0, 0));
 
         fixture.controller.stop_accepting_and_stop_all().unwrap();
-        assert_eq!(fixture.controller.ownership_counts(), (1, 0, 0));
+        assert_eq!(fixture.controller.ownership_counts(), (1, 0, 0, 0));
         fixture.backend.control_gate.release();
         assert!(matches!(
             opening.join().unwrap(),
             Err(PtzError::LifecycleCancelled)
         ));
-        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0));
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0, 0));
     }
 
     #[test]
@@ -1777,7 +1938,7 @@ mod tests {
             done_tx.send(()).unwrap();
         });
         assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
-        assert_eq!(fixture.controller.ownership_counts(), (1, 0, 0));
+        assert_eq!(fixture.controller.ownership_counts(), (1, 0, 0, 0));
 
         fixture.backend.control_gate.release();
         assert!(matches!(
@@ -1786,7 +1947,7 @@ mod tests {
         ));
         done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         shutdown.join().unwrap();
-        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0));
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0, 0));
     }
 
     #[test]
@@ -1803,18 +1964,18 @@ mod tests {
             fixture.controller.capabilities("front-door"),
             Err(PtzError::Busy)
         ));
-        assert_eq!(fixture.controller.ownership_counts(), (1, 0, 0));
+        assert_eq!(fixture.controller.ownership_counts(), (1, 0, 0, 0));
 
         fixture.backend.control_gate.release();
         assert!(matches!(
             old.join().unwrap(),
             Err(PtzError::LifecycleCancelled)
         ));
-        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0));
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0, 0));
 
         let fresh = fixture.controller.capabilities("front-door").unwrap();
         assert!(fresh.configured);
-        assert_eq!(fixture.controller.ownership_counts(), (0, 1, 0));
+        assert_eq!(fixture.controller.ownership_counts(), (0, 1, 0, 0));
         assert_eq!(
             fixture
                 .backend
@@ -1875,7 +2036,7 @@ mod tests {
         backend.control_gate.wait_for(MAX_ACTIVE_PTZ_SESSIONS);
         assert_eq!(
             controller.ownership_counts(),
-            (MAX_ACTIVE_PTZ_SESSIONS, 0, 0)
+            (MAX_ACTIVE_PTZ_SESSIONS, 0, 0, 0)
         );
         assert!(matches!(
             controller.capabilities(&format!("camera-{}", MAX_ACTIVE_PTZ_SESSIONS)),
@@ -1895,10 +2056,10 @@ mod tests {
         }
         assert_eq!(
             controller.ownership_counts(),
-            (0, MAX_ACTIVE_PTZ_SESSIONS, 0)
+            (0, MAX_ACTIVE_PTZ_SESSIONS, 0, 0)
         );
         controller.shutdown_sessions();
-        assert_eq!(controller.ownership_counts(), (0, 0, 0));
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 0));
     }
 
     #[test]
@@ -2050,7 +2211,7 @@ mod tests {
         fixture.backend.stop_gate.block();
         fixture.controller.stop_accepting_and_stop_all().unwrap();
         let batch = fixture.controller.begin_shutdown_sessions();
-        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 1));
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 1, 0));
 
         let hide_controller = fixture.controller.clone();
         let hide = thread::spawn(move || hide_controller.finish_shutdown_sessions(batch));
@@ -2067,7 +2228,7 @@ mod tests {
         fixture.backend.stop_gate.release();
         hide.join().unwrap();
         quit.join().unwrap();
-        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0));
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0, 0));
         assert_eq!(
             fixture
                 .backend
@@ -2089,13 +2250,10 @@ mod tests {
         fixture.backend.stop_gate.block();
         let camera_id = CameraId::parse("front-door").unwrap();
         let delete_controller = fixture.controller.clone();
-        let delete = thread::spawn(move || {
-            delete_controller
-                .coordinate_camera_delete(&camera_id, || ())
-                .unwrap();
-        });
+        let delete =
+            thread::spawn(move || delete_controller.coordinate_camera_delete(&camera_id, || ()));
         fixture.backend.stop_gate.wait_for(1);
-        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 1));
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 1, 1));
 
         let (done_tx, done_rx) = mpsc::channel();
         let quit_controller = fixture.controller.clone();
@@ -2107,9 +2265,12 @@ mod tests {
         assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
 
         fixture.backend.stop_gate.release();
-        delete.join().unwrap();
+        assert!(matches!(
+            delete.join().unwrap(),
+            Err(PtzError::LifecycleCancelled)
+        ));
         quit.join().unwrap();
-        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0));
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0, 0));
         assert_eq!(
             fixture
                 .backend
@@ -2119,6 +2280,119 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn camera_delete_mutation_blocks_fresh_session_admission() {
+        let fixture = fixture(true, false);
+        let gate = Arc::new(BlockingGate::default());
+        gate.block();
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let delete_camera_id = camera_id.clone();
+        let delete_controller = fixture.controller.clone();
+        let delete_gate = gate.clone();
+        let db_path = fixture.db_path.clone();
+        let delete = thread::spawn(move || {
+            delete_controller
+                .coordinate_camera_delete(&camera_id, || {
+                    delete_gate.enter();
+                    let mut store = SettingsStore::open(db_path).unwrap();
+                    assert!(store.delete_camera(&delete_camera_id).unwrap());
+                })
+                .unwrap();
+        });
+        gate.wait_for(1);
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0, 1));
+        assert!(matches!(
+            fixture.controller.capabilities("front-door"),
+            Err(PtzError::Busy)
+        ));
+        assert!(fixture.backend.events().is_empty());
+
+        gate.release();
+        delete.join().unwrap();
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0, 0));
+        assert!(!fixture.controller.is_configured("front-door").unwrap());
+    }
+
+    #[test]
+    fn unpair_mutation_blocks_fresh_session_admission() {
+        let fixture = fixture(true, false);
+        fixture
+            .controller
+            .move_camera("front-door", PtzDirection::Left)
+            .unwrap();
+        fixture.backend.stop_gate.block();
+        let unpair_controller = fixture.controller.clone();
+        let unpair = thread::spawn(move || unpair_controller.unpair("front-door"));
+        fixture.backend.stop_gate.wait_for(1);
+
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 1, 1));
+        assert!(matches!(
+            fixture.controller.capabilities("front-door"),
+            Err(PtzError::Busy)
+        ));
+        assert_eq!(
+            fixture
+                .backend
+                .events()
+                .iter()
+                .filter(|event| event.as_str() == "control")
+                .count(),
+            1
+        );
+
+        fixture.backend.stop_gate.release();
+        unpair.join().unwrap().unwrap();
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0, 0));
+        assert!(!fixture.controller.is_configured("front-door").unwrap());
+    }
+
+    #[test]
+    fn replace_mutation_cancels_opening_prepared_against_old_binding() {
+        let fixture = fixture(true, false);
+        fixture.backend.control_gate.block();
+        let opening_controller = fixture.controller.clone();
+        let opening = thread::spawn(move || opening_controller.capabilities("front-door"));
+        fixture.backend.control_gate.wait_for(1);
+        assert_eq!(fixture.controller.ownership_counts(), (1, 0, 0, 0));
+
+        let replace_controller = fixture.controller.clone();
+        let (replace_done_tx, replace_done_rx) = mpsc::channel();
+        let replace = thread::spawn(move || {
+            let result = replace_controller.pair(
+                "front-door",
+                prepared("192.168.1.50", "replacement-user", "replacement-value"),
+            );
+            replace_done_tx.send(()).unwrap();
+            result
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while fixture.controller.ownership_counts().3 != 1 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(fixture.controller.ownership_counts(), (1, 0, 0, 1));
+        assert!(
+            replace_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+
+        fixture.backend.control_gate.release();
+        assert!(matches!(
+            opening.join().unwrap(),
+            Err(PtzError::LifecycleCancelled)
+        ));
+        replace.join().unwrap().unwrap();
+
+        let store = SettingsStore::open(fixture.db_path.clone()).unwrap();
+        let binding = store
+            .get_ptz_binding(&CameraId::parse("front-door").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.endpoint_reference(), "urn:uuid:192.168.1.50");
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0, 0));
     }
 
     #[test]
@@ -2239,7 +2513,256 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_same_camera_pairs_are_serialized_without_orphan_credentials() {
+    fn terminal_shutdown_waits_for_pair_credential_rollback() {
+        let (_temp, db_path, credentials, _backend, controller) = tracking_fixture();
+        credentials.block_ptz_put.store(true, Ordering::Release);
+        credentials.put_gate.block();
+
+        let pair_controller = controller.clone();
+        let pair = thread::spawn(move || {
+            pair_controller.pair(
+                "front-door",
+                prepared("192.168.1.50", "ptz-user", "ptz-value"),
+            )
+        });
+        credentials.put_gate.wait_for(1);
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 1));
+        assert_eq!(
+            credentials
+                .entries
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|reference| reference.contains("/ptz/"))
+                .count(),
+            1,
+            "the PTZ secret is already externally visible while pair is blocked"
+        );
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let shutdown_controller = controller.clone();
+        let shutdown = thread::spawn(move || {
+            shutdown_controller.stop_accepting_and_stop_all().unwrap();
+            shutdown_controller.shutdown_sessions();
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        credentials.put_gate.release();
+        assert!(matches!(
+            pair.join().unwrap(),
+            Err(PtzError::LifecycleCancelled)
+        ));
+        done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        shutdown.join().unwrap();
+
+        let store = SettingsStore::open(db_path).unwrap();
+        assert!(
+            store
+                .get_ptz_binding(&CameraId::parse("front-door").unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let entries = credentials.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries.contains_key("nian-vision/front-door/camera"));
+        drop(entries);
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn terminal_shutdown_waits_for_unpair_credential_cleanup() {
+        let (_temp, db_path, credentials, _backend, controller) = tracking_fixture();
+        controller
+            .pair(
+                "front-door",
+                prepared("192.168.1.50", "ptz-user", "ptz-value"),
+            )
+            .unwrap();
+        credentials.block_ptz_delete.store(true, Ordering::Release);
+        credentials.delete_gate.block();
+
+        let unpair_controller = controller.clone();
+        let unpair = thread::spawn(move || unpair_controller.unpair("front-door"));
+        credentials.delete_gate.wait_for(1);
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 1));
+        let store = SettingsStore::open(db_path.clone()).unwrap();
+        assert!(
+            store
+                .get_ptz_binding(&CameraId::parse("front-door").unwrap())
+                .unwrap()
+                .is_none(),
+            "binding deletion commits before external credential cleanup"
+        );
+        assert_eq!(credentials.entries.lock().unwrap().len(), 2);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let shutdown_controller = controller.clone();
+        let shutdown = thread::spawn(move || {
+            shutdown_controller.stop_accepting_and_stop_all().unwrap();
+            shutdown_controller.shutdown_sessions();
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        credentials.delete_gate.release();
+        unpair.join().unwrap().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        shutdown.join().unwrap();
+        let entries = credentials.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries.contains_key("nian-vision/front-door/camera"));
+        drop(entries);
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn suspend_shutdown_waits_for_pair_rollback_and_resume_does_not_restore() {
+        let (_temp, db_path, credentials, _backend, controller) = tracking_fixture();
+        credentials.block_ptz_put.store(true, Ordering::Release);
+        credentials.put_gate.block();
+        let pair_controller = controller.clone();
+        let pair = thread::spawn(move || {
+            pair_controller.pair(
+                "front-door",
+                prepared("192.168.1.50", "suspend-user", "suspend-value"),
+            )
+        });
+        credentials.put_gate.wait_for(1);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let suspend_controller = controller.clone();
+        let suspend = thread::spawn(move || {
+            suspend_controller.stop_accepting_and_stop_all().unwrap();
+            suspend_controller.shutdown_sessions();
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        credentials.put_gate.release();
+        assert!(matches!(
+            pair.join().unwrap(),
+            Err(PtzError::LifecycleCancelled)
+        ));
+        done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        suspend.join().unwrap();
+        controller.resume_accepting();
+
+        let store = SettingsStore::open(db_path).unwrap();
+        assert!(
+            store
+                .get_ptz_binding(&CameraId::parse("front-door").unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(credentials.entries.lock().unwrap().len(), 1);
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 0));
+        let capabilities = controller.capabilities("front-door").unwrap();
+        assert!(!capabilities.configured);
+    }
+
+    #[test]
+    fn terminal_shutdown_waits_for_camera_delete_coordination_to_finish() {
+        let fixture = fixture(true, false);
+        let cleanup_gate = Arc::new(BlockingGate::default());
+        cleanup_gate.block();
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let delete_camera_id = camera_id.clone();
+        let delete_controller = fixture.controller.clone();
+        let delete_gate = cleanup_gate.clone();
+        let db_path = fixture.db_path.clone();
+        let delete = thread::spawn(move || {
+            delete_controller.coordinate_camera_delete(&camera_id, || {
+                let mut store = SettingsStore::open(db_path).unwrap();
+                assert!(store.delete_camera(&delete_camera_id).unwrap());
+                delete_gate.enter();
+            })
+        });
+        cleanup_gate.wait_for(1);
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0, 1));
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let shutdown_controller = fixture.controller.clone();
+        let shutdown = thread::spawn(move || {
+            shutdown_controller.stop_accepting_and_stop_all().unwrap();
+            shutdown_controller.shutdown_sessions();
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        cleanup_gate.release();
+        delete.join().unwrap().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        shutdown.join().unwrap();
+        assert_eq!(fixture.controller.ownership_counts(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn camera_a_mutation_does_not_block_camera_b_session_opening() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore::open(temp.path().join("settings.sqlite3")).unwrap();
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        for (camera_id, host) in [("camera-a", "192.168.1.50"), ("camera-b", "192.168.1.51")] {
+            let reference =
+                CredentialRef::parse(format!("nian-vision/{camera_id}/camera")).unwrap();
+            store
+                .insert_camera(&camera(camera_id, host, reference.clone()))
+                .unwrap();
+            store
+                .save_ptz_binding(
+                    &PtzBinding::new(
+                        CameraId::parse(camera_id).unwrap(),
+                        OnvifScheme::Http,
+                        Host::parse(host).unwrap(),
+                        80,
+                        "/onvif/device_service",
+                        format!("urn:uuid:{camera_id}"),
+                        reference.clone(),
+                        false,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            credentials
+                .put(&reference, &Credentials::new("admin", "pw"))
+                .unwrap();
+        }
+        let backend = Arc::new(FakeBackend::with_zoom(false));
+        let controller = Arc::new(PtzController::with_backend(
+            Box::new(store),
+            credentials,
+            backend.clone(),
+        ));
+        let gate = Arc::new(BlockingGate::default());
+        gate.block();
+        let owner_controller = controller.clone();
+        let owner_gate = gate.clone();
+        let camera_a = CameraId::parse("camera-a").unwrap();
+        let owner = thread::spawn(move || {
+            owner_controller
+                .coordinate_camera_update(&camera_a, || owner_gate.enter())
+                .unwrap();
+        });
+        gate.wait_for(1);
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 1));
+
+        let capabilities = controller.capabilities("camera-b").unwrap();
+        assert!(capabilities.configured);
+        assert_eq!(
+            backend
+                .events()
+                .iter()
+                .filter(|event| event.as_str() == "control")
+                .count(),
+            1
+        );
+        gate.release();
+        owner.join().unwrap();
+        controller.stop_accepting_and_stop_all().unwrap();
+        controller.shutdown_sessions();
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn concurrent_same_camera_pair_is_busy_without_orphan_credentials() {
         let (_temp, db_path, credentials, _backend, controller) = tracking_fixture();
         credentials.block_ptz_put.store(true, Ordering::Release);
         credentials.put_gate.block();
@@ -2249,16 +2772,15 @@ mod tests {
             first_controller.pair("front-door", prepared("192.168.1.50", "ptz-a", "secret-a"))
         });
         credentials.put_gate.wait_for(1);
-
-        let second_controller = controller.clone();
-        let second = thread::spawn(move || {
-            second_controller.pair("front-door", prepared("192.168.1.50", "ptz-b", "secret-b"))
-        });
-        thread::sleep(Duration::from_millis(50));
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 1));
+        assert!(matches!(
+            controller.pair("front-door", prepared("192.168.1.50", "ptz-b", "secret-b")),
+            Err(PtzError::Busy)
+        ));
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 1));
         credentials.put_gate.release();
 
         first.join().unwrap().unwrap();
-        second.join().unwrap().unwrap();
 
         let store = SettingsStore::open(db_path).unwrap();
         let binding = store
@@ -2268,7 +2790,7 @@ mod tests {
         assert!(binding.owns_credential());
         assert_eq!(
             credentials.get(binding.credential_ref()).unwrap(),
-            Credentials::new("ptz-b", "secret-b")
+            Credentials::new("ptz-a", "secret-a")
         );
         let entries = credentials.entries.lock().unwrap();
         assert_eq!(
@@ -2279,7 +2801,47 @@ mod tests {
     }
 
     #[test]
-    fn replace_then_concurrent_unpair_obeys_same_camera_mutation_order() {
+    fn many_same_camera_mutation_contenders_are_busy_and_do_not_queue() {
+        let (_temp, _db_path, credentials, _backend, controller) = tracking_fixture();
+        credentials.block_ptz_put.store(true, Ordering::Release);
+        credentials.put_gate.block();
+        let owner_controller = controller.clone();
+        let owner = thread::spawn(move || {
+            owner_controller.pair(
+                "front-door",
+                prepared("192.168.1.50", "owner-user", "owner-value"),
+            )
+        });
+        credentials.put_gate.wait_for(1);
+
+        let mut contenders = Vec::new();
+        for index in 0..12 {
+            let contender = controller.clone();
+            contenders.push(thread::spawn(move || {
+                contender.pair(
+                    "front-door",
+                    prepared(
+                        "192.168.1.50",
+                        &format!("contender-{index}"),
+                        &format!("value-{index}"),
+                    ),
+                )
+            }));
+        }
+        for contender in contenders {
+            assert!(matches!(contender.join().unwrap(), Err(PtzError::Busy)));
+        }
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 1));
+        assert_eq!(credentials.entries.lock().unwrap().len(), 2);
+
+        credentials.put_gate.release();
+        owner.join().unwrap().unwrap();
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 0));
+        assert_eq!(credentials.entries.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn replace_owns_camera_mutation_and_concurrent_unpair_is_busy() {
         let (_temp, db_path, credentials, _backend, controller) = tracking_fixture();
         controller
             .pair(
@@ -2299,13 +2861,15 @@ mod tests {
         });
         credentials.put_gate.wait_for(1);
 
-        let unpair_controller = controller.clone();
-        let unpair = thread::spawn(move || unpair_controller.unpair("front-door"));
-        thread::sleep(Duration::from_millis(50));
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 1));
+        assert!(matches!(
+            controller.unpair("front-door"),
+            Err(PtzError::Busy)
+        ));
         credentials.put_gate.release();
 
         replace.join().unwrap().unwrap();
-        unpair.join().unwrap().unwrap();
+        controller.unpair("front-door").unwrap();
 
         let store = SettingsStore::open(db_path).unwrap();
         assert!(
@@ -2317,6 +2881,7 @@ mod tests {
         let entries = credentials.entries.lock().unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries.contains_key("nian-vision/front-door/camera"));
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 0));
     }
 
     #[test]
