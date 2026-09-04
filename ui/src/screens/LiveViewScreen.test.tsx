@@ -57,6 +57,13 @@ function installDesktop(
     if (command === "recording_statuses") return recording;
     if (command === "recording_intent") return intent;
     if (command === "live_keepalive") return undefined;
+    if (command === "ptz_capabilities") {
+      const cameraId = (args as { cameraId: string }).cameraId;
+      return {
+        camera_id: cameraId, configured: false, ptz_supported: false,
+        pan_tilt_supported: false, zoom_supported: false, state: null, error: null,
+      };
+    }
     if (command === "live_open") {
       const cameraId = (args as { cameraId: string }).cameraId;
       const opened = openOverride

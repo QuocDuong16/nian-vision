@@ -4,7 +4,7 @@ Local-first desktop NVR (network video recorder) for IP cameras. The first
 supported camera is the TP-Link Tapo C200 over RTSP, with a camera-agnostic
 domain so other RTSP/ONVIF cameras can follow.
 
-**Status**: milestones **M0–M11** are implemented. M10 adds local ONVIF discovery
+**Status**: milestones **M0–M12** are implemented. M10 adds local ONVIF discovery
 and provisioning without changing the accepted RTSP recording architecture. M11 adds
 a separate user-selected Live View surface for up to four H.264 cameras. Each live
 camera owns an independent worker/session and opaque loopback capability; live capacity,
@@ -12,7 +12,11 @@ lifecycle and failures remain separate from M9 recording Desired/Runtime ownersh
 media is a bounded rolling fragmented-MP4 window (2-second target, six retained fragments,
 16 MiB hard fragment limit) rather than an ever-growing session file. Explicit keepalive
 plus a background reaper cleans abandoned sessions/cache, and controller-owned in-flight
-openings make hide/suspend/quit/update cancellation deterministic. The desktop persists
+openings make hide/suspend/quit/update cancellation deterministic. M12 adds an optional
+ONVIF PTZ control plane for explicitly paired cameras: continuous pan/tilt plus
+capability-gated zoom use per-camera bounded workers, movement generations and backend +
+camera-side dead-man timeouts. PTZ binding/failure stays independent of RTSP recording/live
+ownership. The desktop persists
 camera definitions, recorder/storage
 settings, launch-at-login preference and independent per-camera desired recording intent
 in authoritative platform app-data `settings.sqlite3`, while camera passwords remain in
@@ -32,12 +36,13 @@ same pinned LGPL FFmpeg 8.0.3 source authority and signed Tauri updater trust ro
 owns independent per-camera recording slots with a conservative eight-recording safety
 cap and separate Desired/Runtime state. M10 keeps ONVIF observational until explicit
 provisioning and never makes ONVIF availability a prerequisite for an already configured
-RTSP camera. macOS distribution, PTZ/events, H.265 recording/live view, transcoding,
-motion analysis, AI, cloud and remote streaming remain outside M11.
+RTSP camera. M12 keeps PTZ optional and explicitly paired. macOS distribution, ONVIF
+events/presets/talkback, H.265 recording/live view, transcoding, motion analysis, AI,
+cloud and remote streaming remain outside M12.
 
 ## What it does today
 
-* Tauri 2 desktop application (React/TypeScript/Vite UI) with managed M11 state:
+* Tauri 2 desktop application (React/TypeScript/Vite UI) with managed M12 state:
   camera CRUD, manual RTSP plus ONVIF onboarding, pre-save connection testing,
   per-camera Start/Stop controls, typed recording status, delete confirmation, persisted
   storage/retention settings, recording-day navigation, a gap-aware timeline, native
@@ -61,6 +66,12 @@ motion analysis, AI, cloud and remote streaming remain outside M11.
   Media fallback, and H.264 profiles remain the M10 compatibility boundary. Final
   `Test & Add` must pass the existing media-worker RTSP probe before the ordinary
   camera/credential transaction is committed.
+* Optional M12 PTZ pairing reuses explicit ONVIF discovery/authentication but persists a
+  separate non-secret control binding. The configured RTSP camera remains authoritative.
+  Continuous pan/tilt and advertised zoom are serialized per camera with a bounded queue;
+  stale frontend releases cannot stop a newer generation, lease expiry automatically sends
+  `Stop`, and every `ContinuousMove` also carries a camera-side one-second timeout. Hide,
+  suspend, quit and update cancel motion; resume never restores a previous direction.
 * Playback sessions bind only an ephemeral `127.0.0.1` port. An unguessable
   per-session token maps to one already-validated finalized recording; HTTP Range
   requests provide browser seeking without a directory listing, arbitrary path
@@ -140,7 +151,7 @@ layout (process isolation, FFmpeg strategy, container choice, storage
 model, authoritative-settings/native-secret split, M6 playback transport, M7
 desktop lifecycle/worker containment, M8 distribution/updater design, M9
 per-camera recording coordination, M10 ONVIF discovery/provisioning and M11
-independent multi-camera live view).
+independent multi-camera live view, and M12 optional ONVIF PTZ control).
 
 ## Requirements
 
@@ -195,11 +206,12 @@ ADR-0011. macOS packaging remains deferred.
 * RTSP (H.264) — implemented at the media layer for recording and M11 live view;
   manual smoke test via `NIAN_VISION_RTSP_URL` (credentials never go on the command
   line). Live view packet-copies video into fragmented MP4 and does not transcode.
-* ONVIF — implemented for local discovery and provisioning. Device Management plus
+* ONVIF — implemented for local discovery/provisioning and optional M12 PTZ. Device Management plus
   Media2/legacy Media profile discovery resolves a selected H.264 profile to a
   sanitized RTSP endpoint; recording itself still uses RTSP through the existing
-  media worker. M11 live view reuses the resulting configured RTSP camera; PTZ/events,
-  H.265 recording/live view and transcoding remain out of scope.
+  media worker. M11 live view reuses the resulting configured RTSP camera. M12 adds
+  explicitly paired continuous pan/tilt and capability-gated zoom; events, presets,
+  talkback, H.265 recording/live view and transcoding remain out of scope.
 
 ## ONVIF camera setup
 
@@ -210,6 +222,12 @@ authentication the wizard operates with opaque session/device/profile handles. T
 resolved stream is probed through the same media worker used by manual RTSP setup
 before credentials/settings are persisted. **Add RTSP manually** remains available
 and does not depend on ONVIF.
+
+For an existing camera, use **Pair PTZ** on its camera card, explicitly choose the same
+physical ONVIF device, authenticate and confirm the pairing. Pairing requires the selected
+ONVIF Device-service host to match the configured RTSP host and requires advertised
+continuous pan/tilt capability. **Unpair PTZ** removes only the optional control binding;
+the RTSP camera, recordings and desired recording state are unchanged.
 
 Troubleshooting:
 
@@ -229,7 +247,7 @@ Automated Forgejo tests use deterministic fixtures/local servers and do not requ
 physical ONVIF camera or LAN multicast access. Physical-camera interoperability is
 therefore a manual validation boundary, not a CI guarantee.
 
-**Milestone status:** M0–M11 complete; M12 has not been started.
+**Milestone status:** M0–M12 implemented; physical PTZ interoperability remains a manual validation boundary.
 
 ## License notes
 

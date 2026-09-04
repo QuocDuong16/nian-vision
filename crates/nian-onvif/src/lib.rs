@@ -19,7 +19,7 @@ pub use discovery::{DiscoveryConfig, DiscoveryScanner};
 pub use error::OnvifError;
 pub use types::{
     DeviceInformation, DiscoveredDevice, MediaProfile, MediaServiceKind, OnvifCredentials,
-    OnvifInterrogation, StreamEndpoint,
+    OnvifInterrogation, PtzControl, PtzVelocityRange, StreamEndpoint,
 };
 
 pub const DEFAULT_DISCOVERY_TIMEOUT_MS: u64 = 3_000;
@@ -36,4 +36,6 @@ pub const MAX_XML_TEXT_BYTES: usize = 16 * 1024;
 pub const MAX_PROFILES: usize = 128;
 pub const MAX_PROFILE_TOKEN_BYTES: usize = 256;
 pub const MAX_PROFILE_NAME_BYTES: usize = 512;
+pub const MAX_PTZ_CONFIGURATION_TOKEN_BYTES: usize = 256;
+pub const PTZ_MOVE_TIMEOUT_MS: u64 = 1_000;
 pub const HTTP_TIMEOUT_MS: u64 = 5_000;

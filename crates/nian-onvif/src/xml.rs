@@ -3,12 +3,13 @@ use quick_xml::name::ResolveResult;
 use quick_xml::{NsReader, Reader, XmlVersion};
 
 use crate::types::{
-    DeviceInformation, MediaProfile, MediaServiceKind, ProbeMatch, ServiceEndpoint,
+    DeviceInformation, MediaProfile, MediaServiceKind, ProbeMatch, PtzConfigurationOptions,
+    PtzProfileAssociation, PtzVelocityRange, ServiceEndpoint,
 };
 use crate::{
     MAX_ENDPOINT_REFERENCE_BYTES, MAX_PROFILE_NAME_BYTES, MAX_PROFILE_TOKEN_BYTES, MAX_PROFILES,
-    MAX_SCOPE_BYTES, MAX_SCOPES_PER_DEVICE, MAX_SOAP_RESPONSE_BYTES, MAX_XADDRS_PER_DEVICE,
-    MAX_XML_DEPTH, MAX_XML_TEXT_BYTES, OnvifError,
+    MAX_PTZ_CONFIGURATION_TOKEN_BYTES, MAX_SCOPE_BYTES, MAX_SCOPES_PER_DEVICE,
+    MAX_SOAP_RESPONSE_BYTES, MAX_XADDRS_PER_DEVICE, MAX_XML_DEPTH, MAX_XML_TEXT_BYTES, OnvifError,
 };
 
 fn local_name(raw: &str) -> String {
@@ -80,6 +81,7 @@ const ALLOWED_ONVIF_NAMESPACES: &[&str] = &[
     "http://www.onvif.org/ver10/device/wsdl",
     "http://www.onvif.org/ver10/media/wsdl",
     "http://www.onvif.org/ver20/media/wsdl",
+    "http://www.onvif.org/ver20/ptz/wsdl",
     "http://www.onvif.org/ver10/schema",
 ];
 
@@ -115,6 +117,16 @@ fn recognized_onvif_field(name: &str) -> bool {
             | "FrameRateLimit"
             | "BitrateLimit"
             | "Uri"
+            | "PTZConfiguration"
+            | "Configurations"
+            | "PTZ"
+            | "Spaces"
+            | "ContinuousPanTiltVelocitySpace"
+            | "ContinuousZoomVelocitySpace"
+            | "XRange"
+            | "YRange"
+            | "Min"
+            | "Max"
     )
 }
 
@@ -469,6 +481,149 @@ pub(crate) fn parse_profiles(
     Ok(profiles)
 }
 
+pub(crate) fn parse_ptz_profile_associations(
+    xml: &[u8],
+) -> Result<Vec<PtzProfileAssociation>, OnvifError> {
+    validate_recognized_namespaces(xml)?;
+    let mut reader = reader(xml)?;
+    let mut stack = Vec::new();
+    let mut current: Option<(String, Option<String>)> = None;
+    let mut associations = Vec::new();
+    loop {
+        let event = reader.read_event().map_err(|_| OnvifError::Protocol)?;
+        if prohibited(&event) {
+            return Err(OnvifError::Protocol);
+        }
+        match event {
+            Event::Start(start) => {
+                let name = local_name(start.name().as_ref());
+                if matches!(name.as_str(), "Profiles" | "Profile") && current.is_none() {
+                    let token = attribute(&start, "token")?.ok_or(OnvifError::Protocol)?;
+                    if token.len() > MAX_PROFILE_TOKEN_BYTES {
+                        return Err(OnvifError::ResponseTooLarge);
+                    }
+                    current = Some((token, None));
+                } else if name == "PTZConfiguration"
+                    || (name == "PTZ" && stack.iter().any(|item| item == "Configurations"))
+                {
+                    capture_ptz_configuration_token(&start, &mut current)?;
+                }
+                push_start(&mut stack, name)?;
+            }
+            Event::Empty(start) => {
+                let name = local_name(start.name().as_ref());
+                if name == "PTZConfiguration"
+                    || (name == "PTZ" && stack.iter().any(|item| item == "Configurations"))
+                {
+                    capture_ptz_configuration_token(&start, &mut current)?;
+                }
+            }
+            Event::End(end) => {
+                let name = local_name(end.name().as_ref());
+                if matches!(name.as_str(), "Profiles" | "Profile")
+                    && let Some((profile_token, Some(configuration_token))) = current.take()
+                {
+                    if associations.len() >= MAX_PROFILES {
+                        return Err(OnvifError::ResponseTooLarge);
+                    }
+                    associations.push(PtzProfileAssociation {
+                        profile_token,
+                        configuration_token,
+                    });
+                }
+                stack.pop().ok_or(OnvifError::Protocol)?;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(associations)
+}
+
+fn capture_ptz_configuration_token(
+    start: &BytesStart<'_>,
+    current: &mut Option<(String, Option<String>)>,
+) -> Result<(), OnvifError> {
+    let Some((_, configuration)) = current.as_mut() else {
+        return Ok(());
+    };
+    if configuration.is_some() {
+        return Ok(());
+    }
+    if let Some(token) = attribute(start, "token")? {
+        if token.len() > MAX_PTZ_CONFIGURATION_TOKEN_BYTES {
+            return Err(OnvifError::ResponseTooLarge);
+        }
+        *configuration = Some(token);
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_ptz_configuration_options(
+    xml: &[u8],
+) -> Result<PtzConfigurationOptions, OnvifError> {
+    validate_recognized_namespaces(xml)?;
+    let mut reader = reader(xml)?;
+    let mut stack = Vec::new();
+    let (mut pan_min, mut pan_max) = (None, None);
+    let (mut tilt_min, mut tilt_max) = (None, None);
+    let (mut zoom_min, mut zoom_max) = (None, None);
+    loop {
+        let event = reader.read_event().map_err(|_| OnvifError::Protocol)?;
+        if prohibited(&event) {
+            return Err(OnvifError::Protocol);
+        }
+        match event {
+            Event::Start(start) => push_start(&mut stack, local_name(start.name().as_ref()))?,
+            Event::Text(text)
+                if matches!(stack.last().map(String::as_str), Some("Min" | "Max")) =>
+            {
+                let value = decode_text(text)?
+                    .parse::<f64>()
+                    .map_err(|_| OnvifError::Protocol)?;
+                if !value.is_finite() {
+                    return Err(OnvifError::Protocol);
+                }
+                let is_min = stack.last().is_some_and(|name| name == "Min");
+                let pan_tilt = stack
+                    .iter()
+                    .any(|name| name == "ContinuousPanTiltVelocitySpace");
+                let zoom = stack
+                    .iter()
+                    .any(|name| name == "ContinuousZoomVelocitySpace");
+                let x = stack.iter().any(|name| name == "XRange");
+                let y = stack.iter().any(|name| name == "YRange");
+                match (pan_tilt, zoom, x, y, is_min) {
+                    (true, false, true, false, true) => pan_min = Some(value),
+                    (true, false, true, false, false) => pan_max = Some(value),
+                    (true, false, false, true, true) => tilt_min = Some(value),
+                    (true, false, false, true, false) => tilt_max = Some(value),
+                    (false, true, true, false, true) => zoom_min = Some(value),
+                    (false, true, true, false, false) => zoom_max = Some(value),
+                    _ => {}
+                }
+            }
+            Event::End(_) => {
+                stack.pop().ok_or(OnvifError::Protocol)?;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    fn range(min: Option<f64>, max: Option<f64>) -> Result<Option<PtzVelocityRange>, OnvifError> {
+        match (min, max) {
+            (Some(min), Some(max)) => Ok(Some(PtzVelocityRange { min, max }.validate()?)),
+            (None, None) => Ok(None),
+            _ => Err(OnvifError::Protocol),
+        }
+    }
+    Ok(PtzConfigurationOptions {
+        pan: range(pan_min, pan_max)?,
+        tilt: range(tilt_min, tilt_max)?,
+        zoom: range(zoom_min, zoom_max)?,
+    })
+}
+
 pub(crate) fn parse_stream_uri(xml: &[u8]) -> Result<String, OnvifError> {
     validate_recognized_namespaces(xml)?;
     let mut reader = reader(xml)?;
@@ -578,6 +733,54 @@ mod tests {
         assert_eq!(profiles[0].width, Some(1920));
         assert_eq!(profiles[0].audio_codec.as_deref(), Some("AAC"));
         assert!(!profiles[1].is_h264_compatible());
+    }
+
+    #[test]
+    fn parses_media_profile_ptz_association_and_bounded_velocity_spaces() {
+        let profiles = br#"<trt:GetProfilesResponse xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><trt:Profiles token="main"><tt:PTZConfiguration token="ptz-config-1"/></trt:Profiles></trt:GetProfilesResponse>"#;
+        let associations = parse_ptz_profile_associations(profiles).unwrap();
+        assert_eq!(associations.len(), 1);
+        assert_eq!(associations[0].profile_token, "main");
+        assert_eq!(associations[0].configuration_token, "ptz-config-1");
+
+        let options = br#"<tptz:GetConfigurationOptionsResponse xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><tptz:PTZConfigurationOptions><tt:Spaces><tt:ContinuousPanTiltVelocitySpace><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange><tt:YRange><tt:Min>-0.5</tt:Min><tt:Max>0.75</tt:Max></tt:YRange></tt:ContinuousPanTiltVelocitySpace><tt:ContinuousZoomVelocitySpace><tt:XRange><tt:Min>-0.25</tt:Min><tt:Max>0.5</tt:Max></tt:XRange></tt:ContinuousZoomVelocitySpace></tt:Spaces></tptz:PTZConfigurationOptions></tptz:GetConfigurationOptionsResponse>"#;
+        let options = parse_ptz_configuration_options(options).unwrap();
+        assert_eq!(
+            options.pan,
+            Some(PtzVelocityRange {
+                min: -1.0,
+                max: 1.0
+            })
+        );
+        assert_eq!(
+            options.tilt,
+            Some(PtzVelocityRange {
+                min: -0.5,
+                max: 0.75
+            })
+        );
+        assert_eq!(
+            options.zoom,
+            Some(PtzVelocityRange {
+                min: -0.25,
+                max: 0.5
+            })
+        );
+    }
+
+    #[test]
+    fn ptz_parser_rejects_namespace_spoofing_and_invalid_ranges() {
+        let spoofed = br#"<root xmlns:evil="urn:evil"><evil:Profiles token="main"><evil:PTZConfiguration token="ptz"/></evil:Profiles></root>"#;
+        assert_eq!(
+            parse_ptz_profile_associations(spoofed),
+            Err(OnvifError::Protocol)
+        );
+
+        let invalid = br#"<root><Spaces><ContinuousPanTiltVelocitySpace><XRange><Min>1</Min><Max>-1</Max></XRange><YRange><Min>-1</Min><Max>1</Max></YRange></ContinuousPanTiltVelocitySpace></Spaces></root>"#;
+        assert_eq!(
+            parse_ptz_configuration_options(invalid),
+            Err(OnvifError::Protocol)
+        );
     }
 
     #[test]

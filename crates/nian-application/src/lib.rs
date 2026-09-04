@@ -18,6 +18,7 @@ pub mod live_controller;
 pub mod onvif_controller;
 pub mod playback;
 pub mod probe_controller;
+pub mod ptz_controller;
 pub mod recording_controller;
 pub mod storage_manager;
 pub mod supervisor;
@@ -39,7 +40,7 @@ pub use live_controller::{
 };
 pub use onvif_controller::{
     OnvifConnectionDto, OnvifController, OnvifControllerError, OnvifDiscoveredDeviceDto,
-    OnvifDiscoveryDto, OnvifMediaProfileDto, OnvifPreparedProfileDto,
+    OnvifDiscoveryDto, OnvifMediaProfileDto, OnvifPreparedProfileDto, PreparedPtzPairing,
 };
 pub use playback::{
     AdjacentRecordingsDto, PlaybackBackend, PlaybackController, PlaybackError, PlaybackErrorCode,
@@ -48,6 +49,12 @@ pub use playback::{
 };
 pub use probe_controller::{
     ProbeController, ProbeError, ProbeResult, ProbeRunner, WorkerProbeRunner,
+};
+pub use ptz_controller::{
+    MAX_ACTIVE_PTZ_SESSIONS, PTZ_COMMAND_QUEUE_CAPACITY, PTZ_MOVEMENT_LEASE_MS,
+    PTZ_RENEW_INTERVAL_MS, PtzBackend, PtzCapabilitiesDto, PtzController, PtzDirection, PtzError,
+    PtzMovementDto, PtzMutation, PtzRuntimeState, PtzSettingsRepository, PtzTeardownBatch,
+    PtzWarning,
 };
 pub use recording_controller::{
     MAX_SIMULTANEOUS_RECORDINGS, RecordingController, RecordingControllerError,

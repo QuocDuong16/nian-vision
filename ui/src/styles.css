@@ -568,3 +568,33 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 }
+
+.ptz-panel {
+  display: grid;
+  gap: 0.45rem;
+  justify-items: center;
+  padding: 0.55rem;
+  border-top: 1px solid var(--border);
+}
+.ptz-pad {
+  display: grid;
+  grid-template-columns: repeat(3, 2.4rem);
+  grid-template-rows: repeat(3, 2.25rem);
+  gap: 0.3rem;
+  align-items: center;
+  justify-items: center;
+}
+.ptz-pad button, .ptz-zoom button {
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+  user-select: none;
+}
+.ptz-center { opacity: 0.55; pointer-events: none; }
+.ptz-zoom {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(5.5rem, 1fr));
+  gap: 0.4rem;
+}
+.ptz-status, .ptz-error { font-size: 0.78rem; text-align: center; }
+.ptz-error { color: var(--danger); }

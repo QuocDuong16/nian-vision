@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use nian_domain::{AudioPolicy, Credentials};
 use nian_onvif::{
     DiscoveredDevice, DiscoveryConfig, DiscoveryScanner, MediaProfile, OnvifClient,
-    OnvifCredentials, OnvifError, OnvifInterrogation, StreamEndpoint,
+    OnvifCredentials, OnvifError, OnvifInterrogation, PtzControl, StreamEndpoint,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -46,6 +46,14 @@ trait DeviceBackend: Send + Sync {
         credentials: &OnvifCredentials,
         profile: &MediaProfile,
     ) -> Result<StreamEndpoint, OnvifError>;
+
+    fn ptz_control(
+        &self,
+        _device_service: &str,
+        _credentials: &OnvifCredentials,
+    ) -> Result<PtzControl, OnvifError> {
+        Err(OnvifError::Unsupported)
+    }
 }
 
 impl DeviceBackend for OnvifClient {
@@ -65,6 +73,14 @@ impl DeviceBackend for OnvifClient {
         profile: &MediaProfile,
     ) -> Result<StreamEndpoint, OnvifError> {
         OnvifClient::stream_endpoint(self, device_service, media_service, credentials, profile)
+    }
+
+    fn ptz_control(
+        &self,
+        device_service: &str,
+        credentials: &OnvifCredentials,
+    ) -> Result<PtzControl, OnvifError> {
+        OnvifClient::ptz_control(self, device_service, credentials)
     }
 }
 
@@ -137,6 +153,22 @@ pub enum OnvifControllerError {
     Protocol(#[from] OnvifError),
     #[error("ONVIF internal state is unavailable")]
     Internal,
+}
+
+pub struct PreparedPtzPairing {
+    pub(crate) device_service: String,
+    pub(crate) endpoint_reference: String,
+    pub(crate) credentials: Credentials,
+    pub(crate) control: PtzControl,
+}
+
+impl std::fmt::Debug for PreparedPtzPairing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedPtzPairing")
+            .field("pan_tilt_supported", &self.control.pan_tilt_supported())
+            .field("zoom_supported", &self.control.zoom_supported())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]
@@ -437,6 +469,48 @@ impl OnvifController {
             port: endpoint.port,
             path: endpoint.path,
             host_mismatch: endpoint.host_mismatch,
+        })
+    }
+
+    pub fn prepare_ptz_pairing(
+        &self,
+        session_id: &str,
+        device_id: &str,
+    ) -> Result<PreparedPtzPairing, OnvifControllerError> {
+        self.require_accepting()?;
+        let (device, connection) = {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| OnvifControllerError::Internal)?;
+            let session = sessions
+                .get(session_id)
+                .ok_or(OnvifControllerError::SessionExpired)?;
+            let device = session
+                .devices
+                .get(device_id)
+                .cloned()
+                .ok_or(OnvifControllerError::DeviceExpired)?;
+            let connection = session
+                .connections
+                .get(device_id)
+                .cloned()
+                .ok_or(OnvifControllerError::DeviceExpired)?;
+            (device, connection)
+        };
+        let credentials = OnvifCredentials {
+            username: connection.credentials.username.clone(),
+            password: connection.credentials.password().to_owned(),
+        };
+        let control = self
+            .device
+            .ptz_control(&connection.device_service, &credentials)?;
+        self.require_accepting()?;
+        Ok(PreparedPtzPairing {
+            device_service: connection.device_service,
+            endpoint_reference: device.endpoint_reference,
+            credentials: connection.credentials,
+            control,
         })
     }
 

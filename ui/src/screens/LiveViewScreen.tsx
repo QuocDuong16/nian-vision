@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EmptyState } from "../components/EmptyState";
+import { PtzControls } from "../components/PtzControls";
 import { desktopError, invokeDesktop, isTauri } from "../lib/tauri";
 import type {
   CameraSummary,
@@ -7,6 +8,7 @@ import type {
   LiveOpenDto,
   LiveState,
   LiveStatus,
+  PtzCapabilities,
   RecordingIntent,
   RecordingState,
   RecordingStatus,
@@ -215,6 +217,8 @@ export function LiveViewScreen() {
   const [intent, setIntent] = useState<RecordingIntent>({ camera_ids: [] });
   const [opening, setOpening] = useState<Set<string>>(() => new Set());
   const [tileErrors, setTileErrors] = useState<Map<string, DesktopError>>(() => new Map());
+  const [ptzCapabilities, setPtzCapabilities] = useState<Map<string, PtzCapabilities>>(() => new Map());
+  const [ptzErrors, setPtzErrors] = useState<Map<string, DesktopError>>(() => new Map());
   const [recordingBusy, setRecordingBusy] = useState<Set<string>>(() => new Set());
   const [loading, setLoading] = useState(isTauri());
   const [error, setError] = useState<DesktopError | null>(null);
@@ -317,6 +321,29 @@ export function LiveViewScreen() {
       window.clearInterval(timer);
     };
   }, [refreshStatuses]);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    for (const cameraId of selected) {
+      if (ptzCapabilities.has(cameraId)) continue;
+      void invokeDesktop<PtzCapabilities>("ptz_capabilities", { cameraId })
+        .then((capabilities) => {
+          if (disposed || !selectedRef.current.has(cameraId)) return;
+          setPtzCapabilities((current) => new Map(current).set(cameraId, capabilities));
+          setPtzErrors((current) => {
+            const next = new Map(current);
+            next.delete(cameraId);
+            return next;
+          });
+        })
+        .catch((cause) => {
+          if (disposed || !selectedRef.current.has(cameraId)) return;
+          setPtzErrors((current) => new Map(current).set(cameraId, desktopError(cause)));
+        });
+    }
+    return () => { disposed = true; };
+  }, [selected, ptzCapabilities]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -439,6 +466,16 @@ export function LiveViewScreen() {
     setSelected([...nextSelected]);
     setSessionForCamera(cameraId, null);
     setTileErrors((current) => {
+      const next = new Map(current);
+      next.delete(cameraId);
+      return next;
+    });
+    setPtzCapabilities((current) => {
+      const next = new Map(current);
+      next.delete(cameraId);
+      return next;
+    });
+    setPtzErrors((current) => {
       const next = new Map(current);
       next.delete(cameraId);
       return next;
@@ -580,6 +617,18 @@ export function LiveViewScreen() {
                     </div>
                   )}
                 </div>
+
+                <PtzControls
+                  cameraId={cameraId}
+                  capabilities={ptzCapabilities.get(cameraId) ?? null}
+                  error={ptzErrors.get(cameraId) ?? null}
+                  onError={(nextError) => setPtzErrors((current) => {
+                    const next = new Map(current);
+                    if (nextError) next.set(cameraId, nextError);
+                    else next.delete(cameraId);
+                    return next;
+                  })}
+                />
 
                 <div className="live-tile-meta">
                   <span>Recording desired: <strong>{desiredOn ? "On" : "Off"}</strong></span>

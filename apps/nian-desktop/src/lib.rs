@@ -19,9 +19,10 @@ use nian_application::{
     DesktopLifecycleState, LiveError, LiveOpenDto, LiveStatus, LiveTeardownBatch,
     LiveViewController, OnvifConnectionDto, OnvifController, OnvifControllerError,
     OnvifDiscoveryDto, OnvifPreparedProfileDto, PlaybackController, PlaybackError, PlaybackOpenDto,
-    ProbeController, ProbeError, ProbeResult, RecordingController, RecordingControllerError,
-    RecordingDto, RecordingState, RecordingStatus, SupervisorRecordingRunnerFactory,
-    WorkerProbeRunner,
+    ProbeController, ProbeError, ProbeResult, PtzCapabilitiesDto, PtzController, PtzDirection,
+    PtzError, PtzMovementDto, PtzMutation, PtzTeardownBatch, RecordingController,
+    RecordingControllerError, RecordingDto, RecordingState, RecordingStatus,
+    SupervisorRecordingRunnerFactory, WorkerProbeRunner,
 };
 use nian_domain::{
     AudioPolicy, CameraId, CredentialRef, Credentials, RetentionPolicy, StorageQuota,
@@ -160,6 +161,25 @@ struct OnvifAddInput {
     audio_policy: AudioPolicy,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct PtzPairInput {
+    camera_id: String,
+    session_id: String,
+    device_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PtzMoveInput {
+    camera_id: String,
+    direction: PtzDirection,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PtzGenerationInput {
+    camera_id: String,
+    generation: u64,
+}
+
 const fn default_probe_timeout_ms() -> u64 {
     10_000
 }
@@ -227,6 +247,7 @@ struct DesktopState {
     playback_controller: Mutex<PlaybackController>,
     probe_controller: ProbeController,
     onvif_controller: OnvifController,
+    ptz_controller: PtzController,
     lifecycle: DesktopLifecycle,
     power_subscription: Mutex<Option<Box<dyn PowerEventSubscription>>>,
     power_dispatch_tx: Mutex<Option<mpsc::Sender<PowerDispatchMessage>>>,
@@ -372,16 +393,25 @@ fn close_action(lifecycle: &DesktopLifecycle) -> Result<CloseAction, DesktopErro
     }
 }
 
-fn begin_hidden_window_resource_release(state: &DesktopState) -> LiveTeardownBatch {
+struct HiddenWindowTeardownBatch {
+    ptz: PtzTeardownBatch,
+    live: LiveTeardownBatch,
+}
+
+fn begin_hidden_window_resource_release(state: &DesktopState) -> HiddenWindowTeardownBatch {
     let _ = state.onvif_controller.cancel(None);
+    let _ = state.ptz_controller.stop_accepting_and_stop_all();
+    let ptz = state.ptz_controller.begin_shutdown_sessions();
     state.live_controller.stop_accepting();
-    state.live_controller.begin_close_all()
+    let live = state.live_controller.begin_close_all();
+    HiddenWindowTeardownBatch { ptz, live }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn release_hidden_window_resources(state: &DesktopState) {
     let batch = begin_hidden_window_resource_release(state);
-    state.live_controller.finish_close_all(batch);
+    state.ptz_controller.finish_shutdown_sessions(batch.ptz);
+    state.live_controller.finish_close_all(batch.live);
 }
 fn activate_window(
     lifecycle: &DesktopLifecycle,
@@ -402,6 +432,7 @@ fn activate_main_window(app: &AppHandle) -> Result<(), DesktopErrorDto> {
         .ok_or_else(|| DesktopErrorDto::new("lifecycle_failed", "main window is unavailable"))?;
     activate_window(&state.lifecycle, &window)?;
     state.live_controller.resume_accepting();
+    state.ptz_controller.resume_accepting();
     Ok(())
 }
 
@@ -894,6 +925,136 @@ async fn onvif_add_camera(
     tauri::async_runtime::spawn_blocking(move || add_onvif_camera(&state, input))
         .await
         .map_err(|_| DesktopErrorDto::new("onvif_internal", "ONVIF provisioning task failed"))?
+}
+
+#[tauri::command]
+async fn ptz_pair(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    input: PtzPairInput,
+) -> Result<PtzMutation<PtzCapabilitiesDto>, DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let prepared = state
+            .onvif_controller
+            .prepare_ptz_pairing(&input.session_id, &input.device_id)
+            .map_err(map_onvif_error)?;
+        let result = state
+            .ptz_controller
+            .pair(&input.camera_id, prepared)
+            .map_err(map_ptz_error)?;
+        let _ = state.onvif_controller.cancel_session(&input.session_id);
+        Ok(result)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("ptz_internal", "PTZ pairing task failed"))?
+}
+
+#[tauri::command]
+async fn ptz_unpair(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    camera_id: String,
+) -> Result<PtzMutation<PtzCapabilitiesDto>, DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .ptz_controller
+            .unpair(&camera_id)
+            .map_err(map_ptz_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("ptz_internal", "PTZ unpair task failed"))?
+}
+
+#[tauri::command]
+fn ptz_configured(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    camera_id: String,
+) -> Result<bool, DesktopErrorDto> {
+    admit_running(&state)?;
+    state
+        .ptz_controller
+        .is_configured(&camera_id)
+        .map_err(map_ptz_error)
+}
+
+#[tauri::command]
+async fn ptz_capabilities(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    camera_id: String,
+) -> Result<PtzCapabilitiesDto, DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .ptz_controller
+            .capabilities(&camera_id)
+            .map_err(map_ptz_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("ptz_internal", "PTZ capability task failed"))?
+}
+
+#[tauri::command]
+async fn ptz_move(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    input: PtzMoveInput,
+) -> Result<PtzMovementDto, DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .ptz_controller
+            .move_camera(&input.camera_id, input.direction)
+            .map_err(map_ptz_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("ptz_internal", "PTZ move task failed"))?
+}
+
+#[tauri::command]
+async fn ptz_renew(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    input: PtzGenerationInput,
+) -> Result<(), DesktopErrorDto> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .ptz_controller
+            .renew(&input.camera_id, input.generation)
+            .map_err(map_ptz_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("ptz_internal", "PTZ renew task failed"))?
+}
+
+#[tauri::command]
+async fn ptz_stop(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    input: PtzGenerationInput,
+) -> Result<(), DesktopErrorDto> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .ptz_controller
+            .stop(&input.camera_id, input.generation)
+            .map_err(map_ptz_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("ptz_internal", "PTZ stop task failed"))?
 }
 
 fn start_recording(
@@ -1425,6 +1586,55 @@ fn map_live_error(error: LiveError) -> DesktopErrorDto {
             "live view is unavailable during lifecycle transition",
         ),
         LiveError::Internal => DesktopErrorDto::new("internal", "live-view operation failed"),
+    }
+}
+
+fn map_ptz_error(error: PtzError) -> DesktopErrorDto {
+    match error {
+        PtzError::CameraNotFound => {
+            DesktopErrorDto::new("camera_not_found", "camera was not found")
+        }
+        PtzError::NotConfigured => DesktopErrorDto::new(
+            "not_configured",
+            "ONVIF PTZ is not configured for this camera",
+        ),
+        PtzError::Unsupported => DesktopErrorDto::new(
+            "unsupported",
+            "camera does not advertise compatible ONVIF PTZ control",
+        ),
+        PtzError::AuthFailed => {
+            DesktopErrorDto::new("auth_failed", "ONVIF PTZ authentication failed")
+        }
+        PtzError::DeviceUnreachable => {
+            DesktopErrorDto::new("device_unreachable", "ONVIF PTZ device is unreachable")
+        }
+        PtzError::ControlTimeout => {
+            DesktopErrorDto::new("control_timeout", "ONVIF PTZ request timed out")
+        }
+        PtzError::ControlFailed => {
+            DesktopErrorDto::new("control_failed", "ONVIF PTZ request failed")
+        }
+        PtzError::LifecycleCancelled => DesktopErrorDto::new(
+            "lifecycle_cancelled",
+            "PTZ control is unavailable during lifecycle transition",
+        ),
+        PtzError::AuthorityMismatch => DesktopErrorDto::new(
+            "authority_mismatch",
+            "selected ONVIF device does not match the configured camera authority",
+        ),
+        PtzError::Capacity => {
+            DesktopErrorDto::new("ptz_capacity", "PTZ session capacity has been reached")
+        }
+        PtzError::Busy => DesktopErrorDto::new("ptz_busy", "PTZ command queue is busy"),
+        PtzError::Settings => DesktopErrorDto::new("ptz_settings", "PTZ settings are unavailable"),
+        PtzError::CredentialStore(_) => {
+            DesktopErrorDto::new("credential_store", "PTZ credential store is unavailable")
+        }
+        PtzError::CredentialRollbackCleanup => DesktopErrorDto::new(
+            "credential_rollback_cleanup",
+            "PTZ credential rollback cleanup failed",
+        ),
+        PtzError::Internal => DesktopErrorDto::new("ptz_internal", "PTZ controller is unavailable"),
     }
 }
 
@@ -1982,6 +2192,10 @@ fn shutdown_runtime_resources(state: &DesktopState) -> Result<(), DesktopErrorDt
     if let Err(error) = state.onvif_controller.stop_accepting_and_cancel() {
         capture_first_error(&mut first_error, map_onvif_error(error));
     }
+    if let Err(error) = state.ptz_controller.stop_accepting_and_stop_all() {
+        capture_first_error(&mut first_error, map_ptz_error(error));
+    }
+    state.ptz_controller.shutdown_sessions();
     match state.recording_controller.lock() {
         Ok(mut controller) => {
             if let Err(error) = controller.shutdown_all() {
@@ -2031,6 +2245,9 @@ fn begin_update_shutdown(state: &DesktopState) -> Result<(), DesktopErrorDto> {
         if let Err(error) = state.onvif_controller.stop_accepting_and_cancel() {
             capture_first_error(&mut admission_error, map_onvif_error(error));
         }
+        if let Err(error) = state.ptz_controller.stop_accepting_and_stop_all() {
+            capture_first_error(&mut admission_error, map_ptz_error(error));
+        }
         state.probe_controller.stop_accepting_and_cancel();
         state.live_controller.stop_accepting();
         match state.playback_controller.lock() {
@@ -2074,6 +2291,9 @@ fn request_quit(app: &AppHandle) -> Result<(), DesktopErrorDto> {
             return Ok(());
         }
         // Admission closes before any potentially blocking teardown begins.
+        if let Err(error) = state.ptz_controller.stop_accepting_and_stop_all() {
+            capture_first_error(&mut admission_error, map_ptz_error(error));
+        }
         state.probe_controller.stop_accepting_and_cancel();
         state.live_controller.stop_accepting();
         match state.playback_controller.lock() {
@@ -2143,6 +2363,9 @@ fn handle_power_event(
             if let Err(error) = state.onvif_controller.stop_accepting_and_cancel() {
                 capture_first_error(&mut first_error, map_onvif_error(error));
             }
+            if let Err(error) = state.ptz_controller.stop_accepting_and_stop_all() {
+                capture_first_error(&mut first_error, map_ptz_error(error));
+            }
             state.probe_controller.stop_accepting_and_cancel();
             state.live_controller.stop_accepting();
             match state.playback_controller.lock() {
@@ -2164,6 +2387,7 @@ fn handle_power_event(
                 ),
             }
             drop(gate);
+            state.ptz_controller.shutdown_sessions();
             state.live_controller.close_all();
             if let Some(error) = first_error {
                 return Err(error);
@@ -2226,6 +2450,7 @@ fn handle_power_event(
             state.live_controller.resume_accepting();
             state.probe_controller.resume_accepting();
             state.onvif_controller.resume_accepting();
+            state.ptz_controller.resume_accepting();
             if let Some(error) = first_error {
                 return Err(error);
             }
@@ -2395,7 +2620,8 @@ pub fn run() {
                 let _ = WindowActions::hide(window);
                 let state = state.inner().clone();
                 tauri::async_runtime::spawn_blocking(move || {
-                    state.live_controller.finish_close_all(batch);
+                    state.ptz_controller.finish_shutdown_sessions(batch.ptz);
+                    state.live_controller.finish_close_all(batch.live);
                 });
             }
         })
@@ -2405,9 +2631,13 @@ pub fn run() {
             })?;
             let app_data = app.path().app_data_dir()?;
             let settings_path = app_data.join("settings.sqlite3");
-            let settings = SettingsStore::open(settings_path)?;
+            let settings = SettingsStore::open(settings_path.clone())?;
+            let ptz_settings = SettingsStore::open(settings_path)?;
             let credentials: Arc<dyn CredentialStore> = Arc::new(NativeCredentialStore);
-            let camera_service = CameraService::new(Box::new(settings), credentials);
+            let camera_service = CameraService::new(Box::new(settings), credentials.clone());
+            let ptz_controller =
+                PtzController::production(Box::new(ptz_settings), credentials.clone())
+                    .map_err(|_| std::io::Error::other("PTZ service could not start"))?;
             let initial_settings = camera_service
                 .application_settings()
                 .map_err(|_| std::io::Error::other("application settings are unavailable"))?;
@@ -2465,6 +2695,7 @@ pub fn run() {
                 playback_controller: Mutex::new(playback_controller),
                 probe_controller,
                 onvif_controller,
+                ptz_controller,
                 lifecycle: DesktopLifecycle::new(),
                 power_subscription: Mutex::new(None),
                 power_dispatch_tx: Mutex::new(None),
@@ -2562,6 +2793,13 @@ pub fn run() {
             onvif_connect,
             onvif_prepare_profile,
             onvif_add_camera,
+            ptz_pair,
+            ptz_unpair,
+            ptz_configured,
+            ptz_capabilities,
+            ptz_move,
+            ptz_renew,
+            ptz_stop,
             recording_start,
             recording_stop,
             recording_stop_all,
@@ -3322,6 +3560,10 @@ mod tests {
         let recording_controller = RecordingController::new(recording_runner.clone());
         let probe_runner = Arc::new(ImmediateProbeRunner::default());
         let probe_controller = ProbeController::new(probe_runner.clone());
+        let ptz_settings =
+            SettingsStore::open(root.with_extension("ptz-settings.sqlite3")).unwrap();
+        let ptz_controller =
+            PtzController::production(Box::new(ptz_settings), credentials.clone()).unwrap();
         let cache_root = root.with_extension("playback-cache");
         let live_controller =
             LiveViewController::with_factory(live_factory, root.with_extension("live-cache"))
@@ -3340,6 +3582,7 @@ mod tests {
                 playback_controller: Mutex::new(playback_controller),
                 probe_controller,
                 onvif_controller: OnvifController::production().unwrap(),
+                ptz_controller,
                 lifecycle: DesktopLifecycle::new(),
                 power_subscription: Mutex::new(None),
                 power_dispatch_tx: Mutex::new(None),
@@ -3967,7 +4210,10 @@ mod tests {
 
         let hide_state = state.clone();
         let hide_thread = std::thread::spawn(move || {
-            hide_state.live_controller.finish_close_all(batch);
+            hide_state
+                .ptz_controller
+                .finish_shutdown_sessions(batch.ptz);
+            hide_state.live_controller.finish_close_all(batch.live);
         });
         control.wait_for_join_start();
         let live = state.live_controller.statuses().unwrap();
@@ -4002,7 +4248,10 @@ mod tests {
         let batch = begin_hidden_window_resource_release(&state);
         let hide_state = state.clone();
         let hide_thread = std::thread::spawn(move || {
-            hide_state.live_controller.finish_close_all(batch);
+            hide_state
+                .ptz_controller
+                .finish_shutdown_sessions(batch.ptz);
+            hide_state.live_controller.finish_close_all(batch.live);
         });
         control.wait_for_join_start();
         assert!(state.live_controller.statuses().unwrap().is_empty());

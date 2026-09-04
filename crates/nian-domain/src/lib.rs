@@ -25,6 +25,7 @@ pub mod camera;
 pub mod error;
 pub mod ids;
 pub mod media;
+pub mod ptz;
 pub mod recording;
 pub mod retention;
 pub mod secret;
@@ -38,6 +39,9 @@ pub use camera::{
 pub use error::DomainError;
 pub use ids::{CameraId, RecordingId};
 pub use media::{MediaPacketMetadata, MediaProbeReport, MediaRational, MediaStreamInfo, MediaType};
+pub use ptz::{
+    MAX_ONVIF_DEVICE_PATH_LEN, MAX_ONVIF_ENDPOINT_REFERENCE_LEN, OnvifScheme, PtzBinding,
+};
 pub use recording::{FailureCategory, RecordingState};
 pub use retention::{RetentionPolicy, StorageQuota};
 pub use secret::Secret;

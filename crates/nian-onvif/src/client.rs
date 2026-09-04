@@ -16,16 +16,21 @@ use uuid::Uuid;
 
 use crate::authority::{parse_stream_uri as normalize_stream_uri, validate_service_xaddr};
 use crate::types::{
-    MediaProfile, MediaServiceKind, OnvifCredentials, OnvifInterrogation, ServiceEndpoint,
+    MediaProfile, MediaServiceKind, OnvifCredentials, OnvifInterrogation, PtzControl,
+    PtzProfileAssociation, ServiceEndpoint,
 };
 use crate::xml::{
-    parse_device_information, parse_hostname, parse_profiles, parse_services, parse_stream_uri,
+    parse_device_information, parse_hostname, parse_profiles, parse_ptz_configuration_options,
+    parse_ptz_profile_associations, parse_services, parse_stream_uri,
 };
-use crate::{HTTP_TIMEOUT_MS, MAX_SOAP_RESPONSE_BYTES, OnvifError, StreamEndpoint};
+use crate::{
+    HTTP_TIMEOUT_MS, MAX_SOAP_RESPONSE_BYTES, OnvifError, PTZ_MOVE_TIMEOUT_MS, StreamEndpoint,
+};
 
 const DEVICE_NS: &str = "http://www.onvif.org/ver10/device/wsdl";
 const MEDIA1_NS: &str = "http://www.onvif.org/ver10/media/wsdl";
 const MEDIA2_NS: &str = "http://www.onvif.org/ver20/media/wsdl";
+const PTZ_NS: &str = "http://www.onvif.org/ver20/ptz/wsdl";
 
 #[derive(Clone)]
 pub struct OnvifClient {
@@ -141,6 +146,180 @@ impl OnvifClient {
         let xml = self.soap(media_service, credentials, &action, &body)?;
         let raw = parse_stream_uri(&xml)?;
         normalize_stream_uri(&raw, device_service)
+    }
+
+    pub fn ptz_control(
+        &self,
+        device_service: &str,
+        credentials: &OnvifCredentials,
+    ) -> Result<PtzControl, OnvifError> {
+        let services_xml = self.soap(
+            device_service,
+            credentials,
+            &format!("{DEVICE_NS}/GetServices"),
+            "<tds:GetServices><tds:IncludeCapability>false</tds:IncludeCapability></tds:GetServices>",
+        )?;
+        let services = parse_services(&services_xml)?;
+        let (ptz_services, rejected_ptz) =
+            validated_service_xaddrs(&services, "/ver20/ptz/wsdl", device_service);
+        if ptz_services.is_empty() {
+            return Err(if rejected_ptz {
+                OnvifError::AuthorityRejected
+            } else {
+                OnvifError::Unsupported
+            });
+        }
+        let (media2, rejected_media2) =
+            validated_service_xaddrs(&services, "/ver20/media/wsdl", device_service);
+        let (media1, rejected_media1) =
+            validated_service_xaddrs(&services, "/ver10/media/wsdl", device_service);
+        if media2.is_empty() && media1.is_empty() {
+            return Err(if rejected_media2 || rejected_media1 {
+                OnvifError::AuthorityRejected
+            } else {
+                OnvifError::Unsupported
+            });
+        }
+
+        let mut associations = Vec::new();
+        let mut last_error = OnvifError::Unsupported;
+        for (kind, candidates) in [
+            (MediaServiceKind::Media2, &media2),
+            (MediaServiceKind::LegacyMedia, &media1),
+        ] {
+            for media in candidates {
+                match self.get_ptz_associations(media, credentials, kind) {
+                    Ok(found) => associations.extend(found),
+                    Err(OnvifError::AuthFailed) => return Err(OnvifError::AuthFailed),
+                    Err(error) => last_error = error,
+                }
+            }
+            if !associations.is_empty() {
+                break;
+            }
+        }
+        if associations.is_empty() {
+            return Err(last_error);
+        }
+
+        for service in ptz_services {
+            for association in &associations {
+                let token = xml_escape(&association.configuration_token);
+                let body = format!(
+                    "<tptz:GetConfigurationOptions><tptz:ConfigurationToken>{token}</tptz:ConfigurationToken></tptz:GetConfigurationOptions>"
+                );
+                match self.soap(
+                    &service,
+                    credentials,
+                    &format!("{PTZ_NS}/GetConfigurationOptions"),
+                    &body,
+                ) {
+                    Ok(xml) => {
+                        let options = parse_ptz_configuration_options(&xml)?;
+                        if options.pan.is_some() && options.tilt.is_some() {
+                            return Ok(PtzControl {
+                                service,
+                                profile_token: association.profile_token.clone(),
+                                pan: options.pan,
+                                tilt: options.tilt,
+                                zoom: options.zoom,
+                            });
+                        }
+                        last_error = OnvifError::Unsupported;
+                    }
+                    Err(OnvifError::AuthFailed) => return Err(OnvifError::AuthFailed),
+                    Err(error) => last_error = error,
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    pub fn continuous_move(
+        &self,
+        control: &PtzControl,
+        credentials: &OnvifCredentials,
+        pan_tilt: Option<(f64, f64)>,
+        zoom: Option<f64>,
+    ) -> Result<(), OnvifError> {
+        if pan_tilt.is_none() && zoom.is_none() {
+            return Err(OnvifError::Protocol);
+        }
+        let mut velocity = String::new();
+        if let Some((pan, tilt)) = pan_tilt {
+            let (pan_range, tilt_range) = control
+                .pan
+                .zip(control.tilt)
+                .ok_or(OnvifError::Unsupported)?;
+            let pan = pan_range.map_normalized(pan)?;
+            let tilt = tilt_range.map_normalized(tilt)?;
+            velocity.push_str(&format!("<tt:PanTilt x=\"{pan:.6}\" y=\"{tilt:.6}\"/>"));
+        }
+        if let Some(zoom) = zoom {
+            let zoom_range = control.zoom.ok_or(OnvifError::Unsupported)?;
+            let zoom = zoom_range.map_normalized(zoom)?;
+            velocity.push_str(&format!("<tt:Zoom x=\"{zoom:.6}\"/>"));
+        }
+        let profile = xml_escape(&control.profile_token);
+        let timeout_seconds = PTZ_MOVE_TIMEOUT_MS as f64 / 1000.0;
+        let body = format!(
+            "<tptz:ContinuousMove><tptz:ProfileToken>{profile}</tptz:ProfileToken><tptz:Velocity>{velocity}</tptz:Velocity><tptz:Timeout>PT{timeout_seconds:.3}S</tptz:Timeout></tptz:ContinuousMove>"
+        );
+        self.soap(
+            &control.service,
+            credentials,
+            &format!("{PTZ_NS}/ContinuousMove"),
+            &body,
+        )?;
+        Ok(())
+    }
+
+    pub fn stop(
+        &self,
+        control: &PtzControl,
+        credentials: &OnvifCredentials,
+        pan_tilt: bool,
+        zoom: bool,
+    ) -> Result<(), OnvifError> {
+        if !pan_tilt && !zoom {
+            return Ok(());
+        }
+        if pan_tilt && !control.pan_tilt_supported() {
+            return Err(OnvifError::Unsupported);
+        }
+        if zoom && !control.zoom_supported() {
+            return Err(OnvifError::Unsupported);
+        }
+        let profile = xml_escape(&control.profile_token);
+        let body = format!(
+            "<tptz:Stop><tptz:ProfileToken>{profile}</tptz:ProfileToken><tptz:PanTilt>{pan_tilt}</tptz:PanTilt><tptz:Zoom>{zoom}</tptz:Zoom></tptz:Stop>"
+        );
+        self.soap(
+            &control.service,
+            credentials,
+            &format!("{PTZ_NS}/Stop"),
+            &body,
+        )?;
+        Ok(())
+    }
+
+    fn get_ptz_associations(
+        &self,
+        service: &str,
+        credentials: &OnvifCredentials,
+        kind: MediaServiceKind,
+    ) -> Result<Vec<PtzProfileAssociation>, OnvifError> {
+        let (action, body) = match kind {
+            MediaServiceKind::Media2 => (
+                format!("{MEDIA2_NS}/GetProfiles"),
+                "<tr2:GetProfiles><tr2:Type>All</tr2:Type></tr2:GetProfiles>",
+            ),
+            MediaServiceKind::LegacyMedia => {
+                (format!("{MEDIA1_NS}/GetProfiles"), "<trt:GetProfiles/>")
+            }
+        };
+        let xml = self.soap(service, credentials, &action, body)?;
+        parse_ptz_profile_associations(&xml)
     }
 
     fn select_media_profiles(
@@ -407,7 +586,7 @@ fn read_response(mut response: Response) -> Result<Vec<u8>, OnvifError> {
 fn anonymous_soap_envelope(body: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tr2="http://www.onvif.org/ver20/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tr2="http://www.onvif.org/ver20/media/wsdl" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
 <s:Body>{body}</s:Body></s:Envelope>"#
     )
 }
@@ -424,7 +603,7 @@ fn soap_envelope(credentials: &OnvifCredentials, body: &str) -> String {
     let username = xml_escape(&credentials.username);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tr2="http://www.onvif.org/ver20/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tr2="http://www.onvif.org/ver20/media/wsdl" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
 <s:Header><wsse:Security s:mustUnderstand="1"><wsse:UsernameToken><wsse:Username>{username}</wsse:Username><wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{digest}</wsse:Password><wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{nonce}</wsse:Nonce><wsu:Created>{created}</wsu:Created></wsse:UsernameToken></wsse:Security></s:Header>
 <s:Body>{body}</s:Body></s:Envelope>"#
     )
@@ -1266,6 +1445,105 @@ mod tests {
             Err(OnvifError::AuthFailed)
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn ptz_control_discovers_service_profile_association_and_zoom_capability() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let body = if request.contains("GetServices") {
+                    format!(
+                        "<Envelope><Service><Namespace>{MEDIA1_NS}</Namespace><XAddr>http://{address}/media</XAddr></Service><Service><Namespace>{PTZ_NS}</Namespace><XAddr>http://{address}/ptz</XAddr></Service></Envelope>"
+                    )
+                } else if request.contains("GetProfiles") {
+                    "<Envelope><Profiles token=\"main\"><PTZConfiguration token=\"ptz-config\"/></Profiles></Envelope>".to_owned()
+                } else if request.contains("GetConfigurationOptions") {
+                    "<Envelope><Spaces><ContinuousPanTiltVelocitySpace><XRange><Min>-1</Min><Max>1</Max></XRange><YRange><Min>-1</Min><Max>1</Max></YRange></ContinuousPanTiltVelocitySpace><ContinuousZoomVelocitySpace><XRange><Min>-0.5</Min><Max>0.5</Max></XRange></ContinuousZoomVelocitySpace></Spaces></Envelope>".to_owned()
+                } else {
+                    panic!("unexpected PTZ fixture request: {request}")
+                };
+                write_http_response(&mut stream, "200 OK", &[], &body);
+                requests.push(request);
+            }
+            requests
+        });
+        let client = OnvifClient::with_timeout(Duration::from_secs(1)).unwrap();
+        let credentials = OnvifCredentials {
+            username: "admin".into(),
+            password: "secret".into(),
+        };
+        let control = client
+            .ptz_control(&format!("http://{address}/device"), &credentials)
+            .unwrap();
+        assert!(control.pan_tilt_supported());
+        assert!(control.zoom_supported());
+        assert_eq!(control.service, format!("http://{address}/ptz"));
+        assert_eq!(control.profile_token, "main");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| !request.contains("secret")));
+    }
+
+    #[test]
+    fn continuous_move_and_stop_are_bounded_and_axis_specific() {
+        use crate::PtzVelocityRange;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                write_http_response(&mut stream, "200 OK", &[], "<Envelope/>");
+                requests.push(request);
+            }
+            requests
+        });
+        let unit = PtzVelocityRange {
+            min: -1.0,
+            max: 1.0,
+        };
+        let control = PtzControl {
+            service: format!("http://{address}/ptz"),
+            profile_token: "main".to_owned(),
+            pan: Some(unit),
+            tilt: Some(unit),
+            zoom: Some(unit),
+        };
+        let client = OnvifClient::with_timeout(Duration::from_secs(1)).unwrap();
+        let credentials = OnvifCredentials {
+            username: "admin".into(),
+            password: "secret".into(),
+        };
+        client
+            .continuous_move(&control, &credentials, Some((-0.5, 0.25)), None)
+            .unwrap();
+        client.stop(&control, &credentials, true, false).unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[0].contains("ContinuousMove"));
+        assert!(requests[0].contains("x=\"-0.500000\""));
+        assert!(requests[0].contains("y=\"0.250000\""));
+        assert!(requests[0].contains("PT1.000S"));
+        assert!(requests[1].contains("<tptz:PanTilt>true</tptz:PanTilt>"));
+        assert!(requests[1].contains("<tptz:Zoom>false</tptz:Zoom>"));
+    }
+
+    #[test]
+    fn ptz_service_authority_mismatch_is_rejected_before_credentials_are_sent() {
+        let services = vec![ServiceEndpoint {
+            namespace: PTZ_NS.to_owned(),
+            xaddr: "http://127.0.0.2/ptz".to_owned(),
+        }];
+        let (candidates, rejected) =
+            validated_service_xaddrs(&services, "/ver20/ptz/wsdl", "http://127.0.0.1/device");
+        assert!(candidates.is_empty());
+        assert!(rejected);
     }
 
     #[test]

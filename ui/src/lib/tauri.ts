@@ -87,6 +87,32 @@ export interface LiveStatus {
   reconnect_attempt: number;
 }
 
+export type PtzDirection = "up" | "down" | "left" | "right" | "zoom_in" | "zoom_out";
+
+export type PtzRuntimeState = "ready" | "moving" | "degraded";
+
+export interface PtzCapabilities {
+  camera_id: string;
+  configured: boolean;
+  ptz_supported: boolean;
+  pan_tilt_supported: boolean;
+  zoom_supported: boolean;
+  state: PtzRuntimeState | null;
+  error: string | null;
+}
+
+export interface PtzMovement {
+  camera_id: string;
+  generation: number;
+  lease_ms: number;
+  renew_after_ms: number;
+}
+
+export interface PtzMutation<T> {
+  value: T;
+  warning: "orphan_credential_cleanup_failed" | null;
+}
+
 export interface ProbeResult {
   reachable: boolean;
   video_stream_found: boolean;

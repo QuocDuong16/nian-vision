@@ -60,10 +60,10 @@ Key properties:
 | Crate | Role | Notes |
 |---|---|---|
 | `nian-domain` | Camera/Recording/Media vocabulary | path-safe IDs, redacted credentials, backoff schedule |
-| `nian-application` | config validation and orchestration policies | `WorkerSupervisor` (M3), `StorageManager` (M4), camera/record/probe controllers, M6 `PlaybackController`, M7 lifecycle admission, M10 `OnvifController`, M11 `LiveViewController` session/capacity/reaper boundary |
-| `nian-onvif` | ONVIF discovery/protocol infrastructure | bounded WS-Discovery, SOAP Device/Media2/Media client, XML/authority hardening; no Tauri, settings, keyring or FFmpeg |
+| `nian-application` | config validation and orchestration policies | `WorkerSupervisor` (M3), `StorageManager` (M4), camera/record/probe controllers, M6 `PlaybackController`, M7 lifecycle admission, M10 `OnvifController`, M11 `LiveViewController`, M12 `PtzController` per-camera control ownership |
+| `nian-onvif` | ONVIF discovery/protocol infrastructure | bounded WS-Discovery, SOAP Device/Media2/Media/PTZ client, XML/authority hardening; no Tauri, settings, keyring or FFmpeg |
 | `nian-index` | rebuildable SQLite recording catalog | bundled SQLite, schema v1 migrations, WAL, timeline queries; no camera settings or credentials (M4) |
-| `nian-settings` | authoritative non-secret desktop configuration | app-data `settings.sqlite3`, schema v2 camera/storage + desired-recording/autostart settings; no FFmpeg/Tauri/process logic |
+| `nian-settings` | authoritative non-secret desktop configuration | app-data `settings.sqlite3`, schema v4 camera/storage/desired/autostart + optional PTZ binding; no passwords, FFmpeg/Tauri/process logic |
 | `nian-storage` | recordings layout, claiming, publication, inventory/transaction facts | traversal-proof paths, race-safe `claim_segment`, atomic no-replace publish, lease-aware partial primitives, symlink-safe deterministic inventory (M4) |
 | `nian-ipc` | NDJSON protocol + serve loop | versioned envelopes, size-capped framing; handlers may emit events mid-request (M3) |
 | `nian-media` | backend-agnostic facade | `Probe`, `MediaSource`; errors distinguish cancellation vs timeout (M3); packets travel as backend-owned types |
@@ -733,8 +733,56 @@ never joins the keepalive set. A newer generation queued behind a pending open c
 replaced by the stale result.
 
 Recording slots and live slots remain separate; the same camera may record and view live
-using independent RTSP workers. PTZ/events, H.265 live view, transcoding, WebRTC, remote
-streaming, motion/AI and persisted live layouts remain outside M11. See ADR-0014.
+using independent RTSP workers. PTZ was outside M11 and is added separately by M12; events,
+H.265 live view, transcoding, WebRTC, remote streaming, motion/AI and persisted live layouts
+remain outside M11. See ADR-0014.
+
+## Optional ONVIF PTZ control (M12)
+
+M12 adds PTZ as an optional control plane beside the accepted RTSP camera model. A camera
+without a PTZ binding remains fully valid for recording and live view. Schema v4 stores a
+separate `ptz_bindings` row keyed by `camera_id`; the row contains only bounded non-secret
+Device-service identity plus an opaque credential reference. PTZ service XAddr, profile/
+configuration tokens, SOAP payloads and passwords are never persisted.
+
+Pairing reuses the explicit M10 discovery/authentication session. The user selects a device,
+`OnvifController` resolves its PTZ service/profile/configuration and `PtzController` accepts
+the association only when the ONVIF Device-service host exactly matches the configured RTSP
+host. Service XAddrs are independently authority-validated inside `nian-onvif`. If ONVIF and
+RTSP credentials are identical the existing camera credential reference is reused; otherwise
+a PTZ-specific credential is stored in the same native `CredentialStore`, with rollback on
+settings failure and best-effort obsolete-secret cleanup on replace/unpair.
+
+`nian-onvif` extends the existing hardened SOAP transport rather than introducing a second
+HTTP stack. PTZ service discovery, profile/configuration association and continuous velocity
+ranges use the same no-proxy client, redirect refusal, bounded response/parser limits,
+namespace/DTD/entity hardening and authentication negotiation as M10. Pan/tilt is required;
+zoom is surfaced only when the device advertises a continuous zoom velocity space. UI
+directions map to a fixed normalized magnitude and are clamped/mapped into advertised device
+ranges. Each `ContinuousMove` carries a one-second ONVIF camera-side timeout.
+
+`PtzController` owns at most 16 active runtime sessions, each with one camera-local worker
+and a four-command bounded sync queue. Settings/registry locks are released before network
+I/O, so a slow camera does not serialize PTZ for another camera. Runtime creation re-reads
+the persisted binding and native credential then re-discovers current PTZ capability; the
+persisted binding is not treated as a cached service token.
+
+Movement ownership is generation-based. `ptz_move` returns a monotonic generation, a
+one-second backend lease and a 400 ms renew hint. Renew and Stop affect only that generation;
+an older release cannot stop a newer move. If renew disappears, the camera worker sends
+axis-scoped Stop at lease expiry. This application dead-man is independent of the one-second
+camera-side ONVIF timeout. The React control pad also handles pointer/keyboard release,
+pending move responses, stale generations and unmount, but frontend behavior is not the
+safety boundary.
+
+Hide, Suspend, Quit and updater handoff close PTZ admission and set an out-of-band stop flag
+for every camera before blocking teardown. The flag is independent of the bounded queue, so
+a full queue cannot preserve movement. Hide also freezes the then-current PTZ worker handles
+into a teardown batch before the window can reactivate; background completion joins only that
+captured ownership and therefore cannot retire a fresh PTZ session admitted after reactivation.
+Existing per-camera workers issue Stop and are joined off the Tauri/window event path. Resume
+reopens admission only and never recreates a previous movement generation or direction. PTZ
+degradation remains isolated from recording/live Desired/Runtime ownership. See ADR-0015.
 
 ## Failure model
 

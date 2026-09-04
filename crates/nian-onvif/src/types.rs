@@ -77,6 +77,90 @@ pub struct StreamEndpoint {
     pub host_mismatch: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PtzVelocityRange {
+    pub min: f64,
+    pub max: f64,
+}
+
+impl PtzVelocityRange {
+    pub(crate) fn validate(self) -> Result<Self, crate::OnvifError> {
+        if !self.min.is_finite() || !self.max.is_finite() || self.min > 0.0 || self.max < 0.0 {
+            return Err(crate::OnvifError::Protocol);
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn map_normalized(self, value: f64) -> Result<f64, crate::OnvifError> {
+        if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+            return Err(crate::OnvifError::Protocol);
+        }
+        let mapped = if value >= 0.0 {
+            value * self.max.max(0.0)
+        } else {
+            (-value) * self.min.min(0.0)
+        };
+        Ok(mapped.clamp(self.min, self.max))
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub struct PtzControl {
+    pub(crate) service: String,
+    pub(crate) profile_token: String,
+    pub(crate) pan: Option<PtzVelocityRange>,
+    pub(crate) tilt: Option<PtzVelocityRange>,
+    pub(crate) zoom: Option<PtzVelocityRange>,
+}
+
+impl std::fmt::Debug for PtzControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtzControl")
+            .field("pan_tilt_supported", &self.pan_tilt_supported())
+            .field("zoom_supported", &self.zoom_supported())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PtzControl {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_fixture(zoom_supported: bool) -> Self {
+        let unit = PtzVelocityRange {
+            min: -1.0,
+            max: 1.0,
+        };
+        Self {
+            service: "http://127.0.0.1/ptz-fixture".to_owned(),
+            profile_token: "ptz-fixture-profile".to_owned(),
+            pan: Some(unit),
+            tilt: Some(unit),
+            zoom: zoom_supported.then_some(unit),
+        }
+    }
+
+    pub fn pan_tilt_supported(&self) -> bool {
+        self.pan.is_some() && self.tilt.is_some()
+    }
+
+    pub fn zoom_supported(&self) -> bool {
+        self.zoom.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PtzProfileAssociation {
+    pub profile_token: String,
+    pub configuration_token: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct PtzConfigurationOptions {
+    pub pan: Option<PtzVelocityRange>,
+    pub tilt: Option<PtzVelocityRange>,
+    pub zoom: Option<PtzVelocityRange>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServiceEndpoint {
     pub namespace: String,

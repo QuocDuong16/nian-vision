@@ -14,6 +14,8 @@ import type {
   OnvifMediaProfile,
   OnvifPreparedProfile,
   ProbeResult,
+  PtzCapabilities,
+  PtzMutation,
   RecordingState,
   RecordingIntent,
   RecordingStatus,
@@ -102,6 +104,8 @@ export function CamerasScreen() {
   const [probeResult, setProbeResult] = useState<ProbeResult | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<CameraSummary | null>(null);
   const [busyCamera, setBusyCamera] = useState<string | null>(null);
+  const [ptzConfigured, setPtzConfigured] = useState<Map<string, boolean>>(() => new Map());
+  const [ptzTarget, setPtzTarget] = useState<CameraSummary | null>(null);
   const recordingBusyRef = useRef<Set<string>>(new Set());
   const [recordingBusyCameras, setRecordingBusyCameras] = useState<Set<string>>(() => new Set());
 
@@ -125,7 +129,15 @@ export function CamerasScreen() {
       return;
     }
     try {
-      setCameras(await invokeDesktop<CameraSummary[]>("camera_list"));
+      const rows = await invokeDesktop<CameraSummary[]>("camera_list");
+      setCameras(rows);
+      const configured = await Promise.all(
+        rows.map(async (camera) => [
+          camera.camera_id,
+          await invokeDesktop<boolean>("ptz_configured", { cameraId: camera.camera_id }).catch(() => false),
+        ] as const),
+      );
+      setPtzConfigured(new Map(configured));
       setError(null);
     } catch (cause) {
       setError(desktopError(cause));
@@ -214,6 +226,7 @@ export function CamerasScreen() {
     setOnvifCameraId("");
     setOnvifDisplayName("");
     setOnvifAudioPolicy("exclude");
+    setPtzTarget(null);
   }
 
   async function closeOnvif() {
@@ -255,8 +268,9 @@ export function CamerasScreen() {
     setError(null);
   }
 
-  async function startOnvifDiscovery() {
+  async function startOnvifDiscovery(target?: CameraSummary | null) {
     if (!isTauri() || onvifBusy) return;
+    if (target !== undefined) setPtzTarget(target);
     setShowAddChoice(false);
     setForm(null);
     setError(null);
@@ -311,6 +325,22 @@ export function CamerasScreen() {
           password,
         },
       });
+      if (ptzTarget) {
+        const paired = await invokeDesktop<PtzMutation<PtzCapabilities>>("ptz_pair", {
+          input: {
+            camera_id: ptzTarget.camera_id,
+            session_id: onvifSessionId,
+            device_id: onvifDevice.device_id,
+          },
+        });
+        const warning = paired.warning;
+        resetOnvifLocal();
+        await loadCameras();
+        if (warning) {
+          setError({ code: "credential_store", message: "PTZ was paired, but an obsolete PTZ credential could not be removed." });
+        }
+        return;
+      }
       setOnvifConnection(connection);
       const supported = connection.profiles.filter((profile) => profile.supported);
       setOnvifProfileToken(supported.length === 1 ? (supported[0]?.token ?? null) : null);
@@ -380,6 +410,23 @@ export function CamerasScreen() {
   function patchForm<K extends keyof CameraFormState>(key: K, value: CameraFormState[K]) {
     setForm((current) => (current ? { ...current, [key]: value } : current));
     setProbeResult(null);
+  }
+
+  async function unpairPtz(camera: CameraSummary) {
+    if (!isTauri() || busyCamera) return;
+    setBusyCamera(camera.camera_id);
+    setError(null);
+    try {
+      const result = await invokeDesktop<PtzMutation<PtzCapabilities>>("ptz_unpair", { cameraId: camera.camera_id });
+      await loadCameras();
+      if (result.warning) {
+        setError({ code: "credential_store", message: "PTZ was unpaired, but its obsolete credential could not be removed." });
+      }
+    } catch (cause) {
+      setError(desktopError(cause));
+    } finally {
+      setBusyCamera(null);
+    }
   }
 
   async function submitCamera(event: FormEvent) {
@@ -540,6 +587,13 @@ export function CamerasScreen() {
                   </button>
                   <button onClick={() => openEdit(camera)} disabled={busyCamera !== null || rowBusy}>Edit</button>
                   <button
+                    onClick={() => void startOnvifDiscovery(camera)}
+                    disabled={busyCamera !== null || rowBusy || onvifBusy}
+                  >{ptzConfigured.get(camera.camera_id) ? "Replace PTZ" : "Pair PTZ"}</button>
+                  {ptzConfigured.get(camera.camera_id) && (
+                    <button onClick={() => void unpairPtz(camera)} disabled={busyCamera !== null || rowBusy}>Unpair PTZ</button>
+                  )}
+                  <button
                     onClick={() => setDeleteTarget(camera)}
                     disabled={busyCamera !== null || rowBusy || ownActive || desiredOn}
                     title={ownActive || desiredOn ? "Turn off recording intent before deleting this camera" : undefined}
@@ -561,14 +615,14 @@ export function CamerasScreen() {
             <button onClick={() => setShowAddChoice(false)}>Close</button>
           </div>
           <div className="button-row">
-            <button className="primary-button" onClick={() => void startOnvifDiscovery()}>Discover ONVIF cameras</button>
+            <button className="primary-button" onClick={() => void startOnvifDiscovery(null)}>Discover ONVIF cameras</button>
             <button onClick={openManualCreate}>Add RTSP manually</button>
           </div>
         </div>
       )}
 
       {onvifStep !== "idle" && (
-        <div className="panel form-grid" role="dialog" aria-label="ONVIF camera onboarding">
+        <div className="panel form-grid" role="dialog" aria-label={ptzTarget ? "ONVIF PTZ pairing" : "ONVIF camera onboarding"}>
           <div className="panel-heading">
             <div>
               <h3>Discover ONVIF camera</h3>
@@ -621,7 +675,7 @@ export function CamerasScreen() {
               </label>
               <div className="button-row">
                 <button type="button" onClick={() => setOnvifStep("devices")} disabled={onvifBusy}>Back</button>
-                <button className="primary-button" type="submit" disabled={onvifBusy}>{onvifBusy ? "Connecting…" : "Connect"}</button>
+                <button className="primary-button" type="submit" disabled={onvifBusy}>{onvifBusy ? (ptzTarget ? "Validating PTZ…" : "Connecting…") : (ptzTarget ? "Authenticate & Pair" : "Connect")}</button>
               </div>
             </form>
           )}

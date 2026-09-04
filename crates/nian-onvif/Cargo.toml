@@ -6,6 +6,10 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+test-hooks = []
+
 [lints]
 workspace = true
 

@@ -21,6 +21,7 @@ Testing is part of the definition of done for every milestone (master spec
 | `nian-settings` / `nian-application` / desktop (M9) | schema v3 multi-desired migration + rollback, bounded per-camera recording slots, independent runner/supervisor ownership, camera-scoped Start/Stop/status, transactional Stop All, capacity ordering, failure isolation, multi-camera startup/suspend/resume/update restoration, concurrent admission races, tray/UI aggregation without synthetic global state |
 | `nian-onvif` / `nian-application` / desktop/UI (M10) | bounded/cancellable discovery aggregation, hostile XML and authority validation, Device/Media2/legacy Media fixtures, Digest/UsernameToken secret safety, H.264 profile selection, stream-URI sanitation, opaque session invalidation, per-device failure isolation, lifecycle cancellation and ONVIF/manual onboarding UI |
 | `nian-application` / media worker / desktop/UI (M11) | four-camera live capacity, duplicate/open reservation RAII, opaque loopback session capability, Host/Origin/path/method rejection, background keepalive expiry/reaper, per-camera worker-status isolation, bounded live retry/cancel, recording/live independence, suspend/hide/update cleanup and reconnect media remount |
+| `nian-domain` / `nian-settings` / `nian-onvif` / `nian-application` / desktop/UI (M12) | schema-v4 optional PTZ binding, secret-safe credential reuse/separation/rollback, PTZ service/profile/configuration parsing and authority hardening, capability-gated pan/tilt/zoom, per-camera bounded workers, movement generations, renew/dead-man Stop, lifecycle cancellation/no resume resurrection, pairing/unpairing and frontend pending/stale-generation races |
 | `nian-storage` | recordings layout, partial/final naming round-trip, traversal rejection, exclusive claims (incl. sub-second clock regression), no-replace publication (success, collision refusal, recoverable abandoned partials) |
 | `nian-storage` (M3/M4) | partial-file classification plus deterministic exact-grammar filesystem inventory; normal + recovered first-class recordings; foreign/control artifacts excluded; recording-looking symlinks never followed; shared strict recovery-tombstone v2 validation; typed path-presence semantics where only `NotFound` proves absence; shared whole-second filesystem identity normalization |
 | `nian-ipc` | envelope round-trips, framing limits (1 MiB cap, CRLF, truncation), dispatch loop (ping/describe/shutdown/unknown), protocol version guard, handler event emission through the writer before replies (M3) |
@@ -698,11 +699,45 @@ running long enough to confirm the cache stays near the rolling-window bound, in
 camera/network connection, and confirm one tile's failure/reconnect does not stop other live
 tiles or recording. H.265/transcoding/WebRTC/PTZ/events remain outside M11.
 
+### Optional ONVIF PTZ control (M12)
+
+`nian-settings` migration tests cover fresh schema v4, v1/v2/v3 upgrade paths, preservation
+of existing camera/desired rows, PTZ-binding round-trip and camera-delete cascade. Persisted
+PTZ rows contain only non-secret Device-service identity and credential references; camera
+passwords remain behind the existing native credential boundary.
+
+`nian-onvif` PTZ fixtures cover PTZ service discovery, media-profile/configuration
+association, continuous pan/tilt and zoom velocity-space parsing, invalid ranges, namespace
+spoofing and service-authority mismatch. The client tests also assert bounded
+`ContinuousMove`/`Stop` request construction and the same redirect/authentication/response
+hardening used by M10. No test creates a generic proxy or accepts an unrelated PTZ host.
+
+`PtzController` tests use deterministic fake settings, credentials and PTZ backends. They
+prove an unpaired RTSP camera remains valid; exact camera-authority pairing; credential reuse
+versus PTZ-specific credential ownership; pair/unpair independence from RTSP camera and
+recording Desired state; capability-gated zoom; one-camera failure isolation; stale Stop
+generation refusal; 400 ms renewal extending the one-second lease; automatic dead-man Stop;
+and lifecycle cancellation stopping motion without Resume resurrection. A frozen hide-teardown
+regression additionally proves that background completion of an old PTZ worker batch cannot
+retire a fresh same-camera session admitted after immediate reactivation.
+
+Frontend `PtzControls` tests use deferred Promises and fake timers to cover press/release,
+release before `ptz_move` resolves, Left→Right stale response ordering, periodic renew,
+unmount cleanup and per-camera failure isolation. `LiveViewScreen` regressions keep
+recording/live ownership independent while a tile mounts the PTZ pad. Camera-management
+coverage exercises explicit Pair/Replace/Unpair workflow through the existing ONVIF
+discovery/authentication surface; raw service/token values are never rendered.
+
+Physical PTZ validation is manual and never required by Forgejo CI. On a Tapo C200 or other
+candidate camera, verify every advertised direction, hold-to-renew behavior, navigation/hide
+while moving, suspend/resume with no movement restoration, and continued recording/live
+ownership during PTZ failure or unpair. Unsupported zoom is recorded as capability absence.
+
 ## Planned per milestone
 
-* **M12+**: PTZ/events or further live-view expansion only if separately specified. macOS
-  distribution, H.265/transcoding/WebRTC, clip export, thumbnails/motion analysis and
-  AI/cloud behavior remain outside M11.
+* **M13+**: ONVIF events/presets or further control/live-view expansion only if separately
+  specified. macOS distribution, H.265/transcoding/WebRTC, clip export, thumbnails/motion
+  analysis and AI/cloud behavior remain outside M12.
 * **Hardware/manual** (never in CI): real Tapo C200 via
   `NIAN_VISION_RTSP_URL` with
   `nian-media-worker record --rtsp-from-env ...` and/or an IPC-driven

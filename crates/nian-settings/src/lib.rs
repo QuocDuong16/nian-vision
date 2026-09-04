@@ -12,12 +12,12 @@ use std::time::Duration;
 
 use nian_domain::{
     AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Host,
-    RetentionPolicy, StorageQuota,
+    OnvifScheme, PtzBinding, RetentionPolicy, StorageQuota,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
@@ -182,6 +182,58 @@ impl SettingsStore {
     pub fn delete_camera(&mut self, camera_id: &CameraId) -> Result<bool, SettingsError> {
         Ok(self.connection.execute(
             "DELETE FROM cameras WHERE camera_id=?1",
+            [camera_id.as_str()],
+        )? > 0)
+    }
+
+    /// Returns the optional ONVIF PTZ control-plane binding for a camera.
+    pub fn get_ptz_binding(
+        &self,
+        camera_id: &CameraId,
+    ) -> Result<Option<PtzBinding>, SettingsError> {
+        let raw = self.connection.query_row(
+            "SELECT camera_id, scheme, host, port, device_path, endpoint_reference, credential_ref, owns_credential \
+             FROM ptz_bindings WHERE camera_id=?1",
+            [camera_id.as_str()],
+            |row| {
+                Ok(RawPtzBinding {
+                    camera_id: row.get(0)?,
+                    scheme: row.get(1)?,
+                    host: row.get(2)?,
+                    port: row.get(3)?,
+                    device_path: row.get(4)?,
+                    endpoint_reference: row.get(5)?,
+                    credential_ref: row.get(6)?,
+                    owns_credential: row.get(7)?,
+                })
+            },
+        ).optional()?;
+        raw.map(raw_to_ptz_binding).transpose()
+    }
+
+    /// Persists or atomically replaces only PTZ control metadata. Camera RTSP
+    /// fields and recording intent are deliberately untouched.
+    pub fn save_ptz_binding(&mut self, binding: &PtzBinding) -> Result<(), SettingsError> {
+        let row = ptz_binding_row(binding);
+        self.connection.execute(
+            "INSERT INTO ptz_bindings \
+             (camera_id, scheme, host, port, device_path, endpoint_reference, credential_ref, owns_credential) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(camera_id) DO UPDATE SET \
+             scheme=excluded.scheme, host=excluded.host, port=excluded.port, \
+             device_path=excluded.device_path, endpoint_reference=excluded.endpoint_reference, \
+             credential_ref=excluded.credential_ref, owns_credential=excluded.owns_credential",
+            params![
+                row.camera_id, row.scheme, row.host, row.port, row.device_path,
+                row.endpoint_reference, row.credential_ref, row.owns_credential,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_ptz_binding(&mut self, camera_id: &CameraId) -> Result<bool, SettingsError> {
+        Ok(self.connection.execute(
+            "DELETE FROM ptz_bindings WHERE camera_id=?1",
             [camera_id.as_str()],
         )? > 0)
     }
@@ -423,8 +475,38 @@ fn migrate(connection: &mut Connection) -> Result<(), SettingsError> {
              PRAGMA user_version=3;",
         )?;
         transaction.commit()?;
+        version = 3;
+    }
+    if version == 3 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE ptz_bindings (\
+                camera_id TEXT PRIMARY KEY NOT NULL REFERENCES cameras(camera_id) ON DELETE CASCADE,\
+                scheme TEXT NOT NULL CHECK(scheme IN ('http','https')),\
+                host TEXT NOT NULL,\
+                port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),\
+                device_path TEXT NOT NULL,\
+                endpoint_reference TEXT NOT NULL,\
+                credential_ref TEXT NOT NULL,\
+                owns_credential INTEGER NOT NULL CHECK(owns_credential IN (0,1))\
+             );\
+             PRAGMA user_version=4;",
+        )?;
+        transaction.commit()?;
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct RawPtzBinding {
+    camera_id: String,
+    scheme: String,
+    host: String,
+    port: i64,
+    device_path: String,
+    endpoint_reference: String,
+    credential_ref: String,
+    owns_credential: i64,
 }
 
 #[derive(Debug)]
@@ -468,6 +550,41 @@ fn camera_row(camera: &CameraConfig) -> Result<RawCamera, SettingsError> {
         audio_policy: camera.audio_policy().as_str().to_owned(),
         credential_ref: camera.credential_ref().as_str().to_owned(),
     })
+}
+
+fn raw_to_ptz_binding(raw: RawPtzBinding) -> Result<PtzBinding, SettingsError> {
+    let camera_id = CameraId::parse(raw.camera_id).map_err(invalid_domain)?;
+    let scheme = OnvifScheme::from_wire(&raw.scheme)
+        .ok_or_else(|| SettingsError::InvalidData("invalid PTZ ONVIF scheme".to_owned()))?;
+    let host = Host::parse(raw.host).map_err(invalid_domain)?;
+    let port = u16::try_from(raw.port)
+        .map_err(|_| SettingsError::InvalidData("invalid PTZ ONVIF port".to_owned()))?;
+    let credential_ref = CredentialRef::parse(raw.credential_ref).map_err(invalid_domain)?;
+    let owns_credential = parse_bool(raw.owns_credential, "ptz owns_credential")?;
+    PtzBinding::new(
+        camera_id,
+        scheme,
+        host,
+        port,
+        raw.device_path,
+        raw.endpoint_reference,
+        credential_ref,
+        owns_credential,
+    )
+    .map_err(invalid_domain)
+}
+
+fn ptz_binding_row(binding: &PtzBinding) -> RawPtzBinding {
+    RawPtzBinding {
+        camera_id: binding.camera_id().as_str().to_owned(),
+        scheme: binding.scheme().as_str().to_owned(),
+        host: binding.host().as_str().to_owned(),
+        port: i64::from(binding.port()),
+        device_path: binding.device_path().to_owned(),
+        endpoint_reference: binding.endpoint_reference().to_owned(),
+        credential_ref: binding.credential_ref().as_str().to_owned(),
+        owns_credential: if binding.owns_credential() { 1 } else { 0 },
+    }
 }
 
 fn invalid_domain(error: nian_domain::DomainError) -> SettingsError {

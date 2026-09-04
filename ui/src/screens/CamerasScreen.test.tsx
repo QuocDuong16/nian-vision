@@ -620,4 +620,95 @@ describe("CamerasScreen", () => {
     expect(screen.queryByText("Front ONVIF")).toBeNull();
   });
 
+  it("pairs PTZ through explicit ONVIF selection without forwarding credentials to ptz_pair", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    let paired = false;
+    let pairArgs: unknown;
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "camera_list") return [camera];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "ptz_configured") return paired;
+      if (command === "onvif_discover") return onvifDiscovery;
+      if (command === "onvif_connect") return onvifConnection;
+      if (command === "ptz_pair") {
+        pairArgs = args;
+        paired = true;
+        return {
+          value: {
+            camera_id: camera.camera_id,
+            configured: true,
+            ptz_supported: true,
+            pan_tilt_supported: true,
+            zoom_supported: true,
+            state: "ready",
+            error: null,
+          },
+          warning: null,
+        };
+      }
+      if (command === "onvif_cancel") return undefined;
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<CamerasScreen />);
+    await screen.findByText("Front door");
+    fireEvent.click(screen.getByRole("button", { name: "Pair PTZ" }));
+    expect(await screen.findByRole("dialog", { name: "ONVIF PTZ pairing" })).toBeTruthy();
+    await screen.findByText("Front ONVIF");
+    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    fireEvent.change(screen.getByLabelText("ONVIF username"), { target: { value: "admin" } });
+    fireEvent.change(screen.getByLabelText("ONVIF password"), {
+      target: { value: "SENTINEL-ptz-password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Authenticate & Pair" }));
+
+    expect(await screen.findByRole("button", { name: "Replace PTZ" })).toBeTruthy();
+    const serialized = JSON.stringify(pairArgs);
+    expect(serialized).toContain(camera.camera_id);
+    expect(serialized).toContain("session-1");
+    expect(serialized).toContain("device-1");
+    expect(serialized).not.toContain("username");
+    expect(serialized).not.toContain("password");
+    expect(serialized).not.toContain("SENTINEL-ptz-password");
+    expect(document.body.textContent).not.toContain("SENTINEL-ptz-password");
+  });
+
+  it("unpairs PTZ without deleting or mutating the RTSP camera row", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    let paired = true;
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "camera_list") return [camera];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "ptz_configured") return paired;
+      if (command === "ptz_unpair") {
+        expect(args).toEqual({ cameraId: camera.camera_id });
+        paired = false;
+        return {
+          value: {
+            camera_id: camera.camera_id,
+            configured: false,
+            ptz_supported: false,
+            pan_tilt_supported: false,
+            zoom_supported: false,
+            state: null,
+            error: null,
+          },
+          warning: null,
+        };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<CamerasScreen />);
+    await screen.findByText("Front door");
+    expect(await screen.findByRole("button", { name: "Unpair PTZ" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Unpair PTZ" }));
+    expect(await screen.findByRole("button", { name: "Pair PTZ" })).toBeTruthy();
+    expect(screen.getByText("192.168.1.50:554/stream1")).toBeTruthy();
+    expect(vi.mocked(invoke).mock.calls.some(([name]) => name === "camera_delete")).toBe(false);
+    expect(vi.mocked(invoke).mock.calls.some(([name]) => name === "camera_update")).toBe(false);
+  });
+
 });
