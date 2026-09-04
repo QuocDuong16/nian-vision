@@ -338,13 +338,20 @@ impl LiveRunnerFactory for WorkerLiveRunnerFactory {
     }
 }
 
+#[derive(Default)]
+struct SessionTeardownState {
+    started: bool,
+    done: bool,
+}
+
 struct LiveSession {
     camera_id: CameraId,
     temp_dir: PathBuf,
     last_keepalive: Mutex<Instant>,
     runner: Mutex<Option<Box<dyn LiveRunner>>>,
     http: Arc<HttpSession>,
-    cleaned: AtomicBool,
+    teardown: Mutex<SessionTeardownState>,
+    teardown_cv: Condvar,
 }
 
 impl LiveSession {
@@ -357,9 +364,29 @@ impl LiveSession {
     }
 
     fn join_and_cleanup(&self) {
-        if self.cleaned.swap(true, Ordering::AcqRel) {
+        let leader = {
+            let Ok(mut teardown) = self.teardown.lock() else {
+                return;
+            };
+            if teardown.done {
+                return;
+            }
+            if teardown.started {
+                while !teardown.done {
+                    match self.teardown_cv.wait(teardown) {
+                        Ok(next) => teardown = next,
+                        Err(_) => return,
+                    }
+                }
+                return;
+            }
+            teardown.started = true;
+            true
+        };
+        if !leader {
             return;
         }
+
         if let Ok(mut slot) = self.runner.lock()
             && let Some(mut runner) = slot.take()
         {
@@ -370,24 +397,16 @@ impl LiveSession {
         if self.http.wait_for_readers() {
             let _ = std::fs::remove_dir_all(&self.temp_dir);
         }
+        if let Ok(mut teardown) = self.teardown.lock() {
+            teardown.done = true;
+            self.teardown_cv.notify_all();
+        }
     }
 }
 
 impl Drop for LiveSession {
     fn drop(&mut self) {
-        if self.cleaned.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if let Ok(slot) = self.runner.get_mut()
-            && let Some(mut runner) = slot.take()
-        {
-            runner.request_stop();
-            runner.join_or_reap();
-        }
-        self.http.deactivate();
-        if self.http.wait_for_readers() {
-            let _ = std::fs::remove_dir_all(&self.temp_dir);
-        }
+        self.join_and_cleanup();
     }
 }
 
@@ -396,6 +415,8 @@ struct LiveRegistry {
     sessions: HashMap<String, Arc<LiveSession>>,
     camera_sessions: HashMap<CameraId, String>,
     opening: HashMap<CameraId, Arc<OpeningState>>,
+    draining_sessions: HashMap<String, Arc<LiveSession>>,
+    draining_openings: HashMap<String, Arc<OpeningState>>,
     accepting: bool,
 }
 
@@ -596,7 +617,11 @@ impl LiveViewController {
         {
             return Err(LiveError::AlreadyOpen);
         }
-        if registry.sessions.len() + registry.opening.len() >= MAX_SIMULTANEOUS_LIVE_VIEWS {
+        let owned_workers = registry.sessions.len()
+            + registry.opening.len()
+            + registry.draining_sessions.len()
+            + registry.draining_openings.len();
+        if owned_workers >= MAX_SIMULTANEOUS_LIVE_VIEWS {
             return Err(LiveError::Capacity);
         }
 
@@ -670,7 +695,8 @@ impl LiveViewController {
             last_keepalive: Mutex::new(Instant::now()),
             runner: Mutex::new(Some(runner)),
             http: http.clone(),
-            cleaned: AtomicBool::new(false),
+            teardown: Mutex::new(SessionTeardownState::default()),
+            teardown_cv: Condvar::new(),
         });
         runtime.sessions.insert(session_id.clone(), http);
         registry.opening.remove(&camera_id);
@@ -696,7 +722,16 @@ impl LiveViewController {
                 .sessions
                 .remove(session_id)
                 .ok_or(LiveError::SessionExpired)?;
-            registry.camera_sessions.remove(&session.camera_id);
+            if registry
+                .camera_sessions
+                .get(&session.camera_id)
+                .is_some_and(|current| current == session_id)
+            {
+                registry.camera_sessions.remove(&session.camera_id);
+            }
+            registry
+                .draining_sessions
+                .insert(session_id.to_owned(), session.clone());
             session
         };
         if let Ok(mut runtime) = self.http_runtime.lock()
@@ -704,7 +739,11 @@ impl LiveViewController {
         {
             http.deactivate();
         }
-        teardown_live_owners(Vec::new(), vec![session]);
+        teardown_live_owners(
+            &self.registry,
+            Vec::new(),
+            vec![(session_id.to_owned(), session)],
+        );
         Ok(())
     }
 
@@ -772,11 +811,31 @@ impl LiveViewController {
     pub fn close_all(&self) {
         let (openings, sessions) = if let Ok(mut registry) = self.registry.lock() {
             registry.camera_sessions.clear();
-            let openings = std::mem::take(&mut registry.opening)
-                .into_values()
+
+            let active_openings = std::mem::take(&mut registry.opening);
+            for opening in active_openings.into_values() {
+                registry
+                    .draining_openings
+                    .entry(opening.session_id.clone())
+                    .or_insert(opening);
+            }
+            let active_sessions = std::mem::take(&mut registry.sessions);
+            for (session_id, session) in active_sessions {
+                registry
+                    .draining_sessions
+                    .entry(session_id)
+                    .or_insert(session);
+            }
+
+            let openings = registry
+                .draining_openings
+                .iter()
+                .map(|(session_id, opening)| (session_id.clone(), opening.clone()))
                 .collect::<Vec<_>>();
-            let sessions = std::mem::take(&mut registry.sessions)
-                .into_values()
+            let sessions = registry
+                .draining_sessions
+                .iter()
+                .map(|(session_id, session)| (session_id.clone(), session.clone()))
                 .collect::<Vec<_>>();
             (openings, sessions)
         } else {
@@ -788,13 +847,18 @@ impl LiveViewController {
             }
             runtime.sessions.clear();
         }
-        teardown_live_owners(openings, sessions);
+        teardown_live_owners(&self.registry, openings, sessions);
     }
 
     pub fn stop_accepting(&self) {
         let openings = if let Ok(mut registry) = self.registry.lock() {
             registry.accepting = false;
-            registry.opening.values().cloned().collect::<Vec<_>>()
+            registry
+                .opening
+                .values()
+                .chain(registry.draining_openings.values())
+                .cloned()
+                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
@@ -821,18 +885,22 @@ impl LiveViewController {
     }
 }
 
-fn teardown_live_owners(openings: Vec<Arc<OpeningState>>, sessions: Vec<Arc<LiveSession>>) {
-    for opening in &openings {
+fn teardown_live_owners(
+    registry: &Arc<Mutex<LiveRegistry>>,
+    openings: Vec<(String, Arc<OpeningState>)>,
+    sessions: Vec<(String, Arc<LiveSession>)>,
+) {
+    for (_, opening) in &openings {
         opening.cancel.store(true, Ordering::Release);
         opening.done_cv.notify_all();
     }
 
     std::thread::scope(|scope| {
         let mut signals = Vec::with_capacity(openings.len() + sessions.len());
-        for opening in &openings {
+        for (_, opening) in &openings {
             signals.push(scope.spawn(|| opening.request_cancel()));
         }
-        for session in &sessions {
+        for (_, session) in &sessions {
             signals.push(scope.spawn(|| session.request_stop()));
         }
         for signal in signals {
@@ -842,11 +910,33 @@ fn teardown_live_owners(openings: Vec<Arc<OpeningState>>, sessions: Vec<Arc<Live
 
     std::thread::scope(|scope| {
         let mut joins = Vec::with_capacity(openings.len() + sessions.len());
-        for opening in openings {
-            joins.push(scope.spawn(move || opening.wait_and_reap()));
+        for (session_id, opening) in openings {
+            let registry = registry.clone();
+            joins.push(scope.spawn(move || {
+                opening.wait_and_reap();
+                if let Ok(mut registry) = registry.lock()
+                    && registry
+                        .draining_openings
+                        .get(&session_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &opening))
+                {
+                    registry.draining_openings.remove(&session_id);
+                }
+            }));
         }
-        for session in sessions {
-            joins.push(scope.spawn(move || session.join_and_cleanup()));
+        for (session_id, session) in sessions {
+            let registry = registry.clone();
+            joins.push(scope.spawn(move || {
+                session.join_and_cleanup();
+                if let Ok(mut registry) = registry.lock()
+                    && registry
+                        .draining_sessions
+                        .get(&session_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &session))
+                {
+                    registry.draining_sessions.remove(&session_id);
+                }
+            }));
         }
         for join in joins {
             let _ = join.join();
@@ -999,7 +1089,16 @@ fn expire_live_sessions(
         let mut removed = Vec::with_capacity(expired.len());
         for session_id in expired {
             if let Some(session) = registry.sessions.remove(&session_id) {
-                registry.camera_sessions.remove(&session.camera_id);
+                if registry
+                    .camera_sessions
+                    .get(&session.camera_id)
+                    .is_some_and(|current| current == &session_id)
+                {
+                    registry.camera_sessions.remove(&session.camera_id);
+                }
+                registry
+                    .draining_sessions
+                    .insert(session_id.clone(), session.clone());
                 removed.push((session_id, session));
             }
         }
@@ -1015,10 +1114,7 @@ fn expire_live_sessions(
             }
         }
     }
-    teardown_live_owners(
-        Vec::new(),
-        removed.into_iter().map(|(_, session)| session).collect(),
-    );
+    teardown_live_owners(registry, Vec::new(), removed);
 }
 
 struct LiveSessionReaper {
@@ -2130,6 +2226,89 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BlockingTeardownControl {
+        signals: AtomicUsize,
+        completed: AtomicUsize,
+        join_started: Mutex<usize>,
+        join_started_cv: Condvar,
+        released: Mutex<bool>,
+        released_cv: Condvar,
+    }
+
+    impl BlockingTeardownControl {
+        fn wait_for_join_starts(&self, expected: usize) {
+            let mut started = self.join_started.lock().unwrap();
+            while *started < expected {
+                started = self.join_started_cv.wait(started).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.released_cv.notify_all();
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingTeardownFactory {
+        control: Arc<BlockingTeardownControl>,
+    }
+
+    struct BlockingTeardownRunner {
+        control: Arc<BlockingTeardownControl>,
+        signalled: bool,
+    }
+
+    impl LiveRunner for BlockingTeardownRunner {
+        fn start(
+            &mut self,
+            _source_json: serde_json::Value,
+            output_dir: &Path,
+            _cancel: Arc<AtomicBool>,
+        ) -> Result<(), LiveError> {
+            write_test_fragment(output_dir, 0, 32);
+            Ok(())
+        }
+
+        fn status(&mut self) -> Result<LiveWorkerStatus, LiveError> {
+            Ok(LiveWorkerStatus {
+                state: LiveState::Live,
+                failure_category: None,
+                reconnect_attempt: 0,
+            })
+        }
+
+        fn request_stop(&mut self) {
+            if !self.signalled {
+                self.signalled = true;
+                self.control.signals.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        fn join_or_reap(&mut self) {
+            {
+                let mut started = self.control.join_started.lock().unwrap();
+                *started += 1;
+                self.control.join_started_cv.notify_all();
+            }
+            let mut released = self.control.released.lock().unwrap();
+            while !*released {
+                released = self.control.released_cv.wait(released).unwrap();
+            }
+            self.control.completed.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl LiveRunnerFactory for BlockingTeardownFactory {
+        fn spawn(&self) -> Result<Box<dyn LiveRunner>, LiveError> {
+            Ok(Box::new(BlockingTeardownRunner {
+                control: self.control.clone(),
+                signalled: false,
+            }))
+        }
+    }
+
     #[derive(Clone)]
     struct CancelBlockingFactory {
         entered: Arc<AtomicUsize>,
@@ -2336,6 +2515,141 @@ mod tests {
                 .into_iter()
                 .all(|signals_before_join| signals_before_join == 4)
         );
+    }
+
+    #[test]
+    fn close_draining_owner_remains_tracked_and_shutdown_waits_for_reap() {
+        let temp = tempfile::tempdir().unwrap();
+        let control = Arc::new(BlockingTeardownControl::default());
+        let controller = Arc::new(
+            LiveViewController::with_factory(
+                Arc::new(BlockingTeardownFactory {
+                    control: control.clone(),
+                }),
+                temp.path().to_path_buf(),
+            )
+            .unwrap(),
+        );
+        let opened = controller.open(prepared("a")).unwrap();
+        let close_controller = controller.clone();
+        let session_id = opened.session_id.clone();
+        let close_thread = std::thread::spawn(move || close_controller.close(&session_id));
+        control.wait_for_join_starts(1);
+
+        {
+            let registry = controller.registry.lock().unwrap();
+            assert!(registry.sessions.is_empty());
+            assert!(registry.draining_sessions.contains_key(&opened.session_id));
+        }
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let shutdown_controller = controller.clone();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_controller.shutdown();
+            let _ = done_tx.send(());
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        control.release();
+        assert_eq!(close_thread.join().unwrap(), Ok(()));
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        shutdown_thread.join().unwrap();
+        let registry = controller.registry.lock().unwrap();
+        assert!(registry.sessions.is_empty());
+        assert!(registry.opening.is_empty());
+        assert!(registry.draining_sessions.is_empty());
+        assert!(registry.draining_openings.is_empty());
+        assert_eq!(control.signals.load(Ordering::Acquire), 1);
+        assert_eq!(control.completed.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn close_all_keeps_all_workers_draining_until_parallel_reap_and_shutdown_waits() {
+        let temp = tempfile::tempdir().unwrap();
+        let control = Arc::new(BlockingTeardownControl::default());
+        let controller = Arc::new(
+            LiveViewController::with_factory(
+                Arc::new(BlockingTeardownFactory {
+                    control: control.clone(),
+                }),
+                temp.path().to_path_buf(),
+            )
+            .unwrap(),
+        );
+        for camera in ["a", "b", "c", "d"] {
+            controller.open(prepared(camera)).unwrap();
+        }
+
+        let close_controller = controller.clone();
+        let close_thread = std::thread::spawn(move || close_controller.close_all());
+        control.wait_for_join_starts(4);
+        assert_eq!(control.signals.load(Ordering::Acquire), 4);
+        {
+            let registry = controller.registry.lock().unwrap();
+            assert!(registry.sessions.is_empty());
+            assert_eq!(registry.draining_sessions.len(), 4);
+        }
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let shutdown_controller = controller.clone();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_controller.shutdown();
+            let _ = done_tx.send(());
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        control.release();
+        close_thread.join().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        shutdown_thread.join().unwrap();
+        let registry = controller.registry.lock().unwrap();
+        assert!(registry.opening.is_empty());
+        assert!(registry.sessions.is_empty());
+        assert!(registry.draining_openings.is_empty());
+        assert!(registry.draining_sessions.is_empty());
+        assert_eq!(control.signals.load(Ordering::Acquire), 4);
+        assert_eq!(control.completed.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn stale_draining_completion_does_not_remove_newer_same_camera_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let control = Arc::new(BlockingTeardownControl::default());
+        let controller = Arc::new(
+            LiveViewController::with_factory(
+                Arc::new(BlockingTeardownFactory {
+                    control: control.clone(),
+                }),
+                temp.path().to_path_buf(),
+            )
+            .unwrap(),
+        );
+        let old = controller.open(prepared("a")).unwrap();
+        let close_controller = controller.clone();
+        let old_session_id = old.session_id.clone();
+        let close_thread = std::thread::spawn(move || close_controller.close(&old_session_id));
+        control.wait_for_join_starts(1);
+
+        let fresh = controller.open(prepared("a")).unwrap();
+        assert_ne!(fresh.session_id, old.session_id);
+        {
+            let registry = controller.registry.lock().unwrap();
+            assert!(registry.draining_sessions.contains_key(&old.session_id));
+            assert!(registry.sessions.contains_key(&fresh.session_id));
+            assert_eq!(
+                registry.camera_sessions.get(&CameraId::parse("a").unwrap()),
+                Some(&fresh.session_id)
+            );
+        }
+
+        control.release();
+        assert_eq!(close_thread.join().unwrap(), Ok(()));
+        let statuses = controller.statuses().unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].session_id, fresh.session_id);
+        let registry = controller.registry.lock().unwrap();
+        assert!(!registry.draining_sessions.contains_key(&old.session_id));
+        assert!(registry.sessions.contains_key(&fresh.session_id));
     }
 
     #[test]

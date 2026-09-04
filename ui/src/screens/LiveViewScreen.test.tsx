@@ -43,6 +43,7 @@ function stopped(cameraId: string): RecordingStatus {
 function installDesktop(
   stateForCamera?: (cameraId: string, sessionId: string) => LiveStatus,
   openOverride?: (cameraId: string) => Promise<LiveOpenDto>,
+  liveStatusesOverride?: () => Promise<LiveStatus[]>,
 ) {
   Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
   let live: LiveStatus[] = [];
@@ -52,7 +53,7 @@ function installDesktop(
 
   vi.mocked(invoke).mockImplementation(async (command, args) => {
     if (command === "camera_list") return [front, garage];
-    if (command === "live_statuses") return live;
+    if (command === "live_statuses") return liveStatusesOverride ? await liveStatusesOverride() : live;
     if (command === "recording_statuses") return recording;
     if (command === "recording_intent") return intent;
     if (command === "live_keepalive") return undefined;
@@ -372,6 +373,56 @@ describe("LiveViewScreen", () => {
       expect(video?.src).toContain(fresh.session_id);
       expect(video?.src).not.toContain(stale.session_id);
     });
+  });
+
+
+  it("keeps aggregate status polling single-flight and recovers after resolve or reject", async () => {
+    const first = deferred<LiveStatus[]>();
+    const second = deferred<LiveStatus[]>();
+    const third = deferred<LiveStatus[]>();
+    const responses = [first, second, third];
+    let calls = 0;
+    let statusTick: (() => void) | undefined;
+    const realSetInterval = window.setInterval.bind(window);
+    vi.spyOn(window, "setInterval").mockImplementation((handler, timeout, ...args) => {
+      if (timeout === 1_000 && typeof handler === "function") {
+        statusTick = () => handler(...args);
+      }
+      return realSetInterval(handler, timeout, ...args);
+    });
+    installDesktop(undefined, undefined, async () => {
+      const response = responses[calls];
+      calls += 1;
+      if (!response) return [];
+      return response.promise;
+    });
+    const view = render(<LiveViewScreen />);
+
+    await waitFor(() => expect(calls).toBe(1));
+    expect(statusTick).toBeTruthy();
+    statusTick?.();
+    statusTick?.();
+    statusTick?.();
+    await Promise.resolve();
+    expect(calls).toBe(1);
+
+    first.resolve([]);
+    await waitFor(() => expect(screen.queryByText("Loading live view…")).toBeNull());
+    statusTick?.();
+    await waitFor(() => expect(calls).toBe(2));
+
+    second.reject(new Error("status failed"));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("Desktop operation failed."));
+    statusTick?.();
+    await waitFor(() => expect(calls).toBe(3));
+
+    view.unmount();
+    third.resolve([]);
+    await Promise.resolve();
+    await Promise.resolve();
+    statusTick?.();
+    await Promise.resolve();
+    expect(calls).toBe(3);
   });
 
   it("closes the backend session on media failure and unmount", async () => {

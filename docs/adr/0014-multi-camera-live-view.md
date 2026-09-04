@@ -44,6 +44,29 @@ normal five-second IPC deadline. A cancelled opening cannot commit. Lifecycle te
 waits until each opening has either been reaped or has completed its failure cleanup.
 Stale RAII cleanup is generation/session-id checked and cannot erase a newer reservation.
 
+### Controller ownership continues through draining teardown
+
+The live registry distinguishes opening, frontend-visible active sessions and draining
+owners. `live_close` removes an active session from frontend-visible ownership and invalidates
+its HTTP capability promptly, then moves the same session identity into controller-owned
+draining state before any worker join/reap begins. `close_all` performs the same transition
+for every opening and active owner. Draining owners count against the four-worker live
+capacity bound until process ownership is gone.
+
+Teardown is single-owner and waitable. The first caller that starts a session reap owns the
+runner join; concurrent lifecycle callers observe the same draining session and wait on its
+completion condition rather than starting a second join. A later Quit/Update/Suspend can
+therefore observe a close-to-tray teardown already running on Tauri's blocking runtime and
+cannot report lifecycle completion before that worker is reaped. Draining retirement is
+session-id plus Arc-identity checked, so completion of an older same-camera session cannot
+remove a newer active/opening/draining generation.
+
+Worker/process ownership and deferred reader file cleanup are deliberately distinct. Once
+the worker is reaped, draining worker ownership may retire even if an already-admitted HTTP
+reader still pins a fragment. The capability remains invalid, the file is not deleted under
+the reader, and the last reader deterministically performs deferred session-directory
+cleanup.
+
 ### Live media uses a bounded rolling fragmented-MP4 window
 
 The media worker opens RTSP through the existing FFmpeg wrapper, requires H.264 video and
@@ -69,6 +92,11 @@ failed rather than allowed to consume disk indefinitely. The application reaper 
 finalized fragments continuously. If finalized files reach the hard ceiling, the worker
 backpressures at the next keyframe boundary until retention or reader release creates room;
 lifecycle cancellation interrupts that wait. Four sessions are bounded independently.
+
+Every fragment finalization path owns exact cleanup of its `.partial.mp4`. Finalize, metadata/
+validation and rename failures all return the original media failure while best-effort
+removing only that worker-owned partial path. A successful rename preserves the finalized
+`.mp4`; unrelated cache files and finalized fragments are never cleanup targets.
 
 ### Fragment readers own deletion safety
 
@@ -116,6 +144,12 @@ an active opaque session and updates only its timestamp. It does not expire anot
 perform worker IPC or wait for teardown. The background reaper owns expiry, fragment
 retention and abandoned-session teardown.
 
+
+The one-second aggregate status refresh is also single-flight. One mounted Live View screen
+may have at most one `live_statuses` + `recording_statuses` + `recording_intent` refresh in
+flight; interval ticks are skipped while it is pending. Resolve or rejection releases the
+guard, and unmount ignores late results. M11 does not create per-camera polling loops.
+
 ### Teardown is signal-all-before-join and blocking work stays off Tauri's main path
 
 `LiveRunner` separates `request_stop` from `join_or_reap`. Teardown first invalidates HTTP
@@ -128,8 +162,8 @@ maximum of four live owners, this avoids both unbounded thread creation and the 
 `spawn_blocking`. `live_keepalive` stays synchronous because it is bounded bookkeeping only.
 Close-to-tray stops admission and hides the window immediately, then performs live teardown
 on the blocking runtime rather than the window event thread. Suspend, quit and update wait
-for live opening/active ownership to be fully reaped before their required lifecycle
-completion point.
+for live opening/active/draining worker ownership to be fully reaped before their required
+lifecycle completion point.
 
 ### Frontend ownership uses per-camera generations
 

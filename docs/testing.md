@@ -647,25 +647,31 @@ resource contract under test is a 2-second fragment target, six retained-fragmen
 eight-finalized-fragment hard ceiling, 16 MiB maximum per fragment, two readers per live
 session, eight concurrent live HTTP requests and four simultaneous live sessions.
 
-Lifecycle tests exercise the split runner stop/join contract. `close_all` records that all
-four stop signals exist before the first join observation and completes the fake slow-worker
-case within a deterministic bound. In-flight-open tests block runner startup after the
-worker has been installed in controller-owned `OpeningState`, cancel four openings together,
-prove lifecycle waits for cleanup/reap, reject late commit, preserve newer reservations and
-release capacity/cache. Keepalive tests prove a heartbeat does not synchronously reap an
-unrelated expired worker; the reaper owns expensive expiry cleanup.
+Lifecycle tests exercise the split runner stop/join contract and tracked draining phase. A
+Condvar-blocked fake proves `close(A)` removes A from frontend-visible active state but keeps
+it controller-owned as draining; concurrent shutdown cannot complete until A reap is
+released. A four-worker case proves all stop signals exist before join, all four remain
+observable as draining while blocked, concurrent shutdown waits, and each runner completes
+exactly one join. A stale-draining test opens session-2 for the same camera while session-1
+is draining and proves session-1 retirement cannot remove session-2. In-flight-open tests
+continue to prove lifecycle owns/cancels startup work. Keepalive remains cheap and the reaper
+owns expensive expiry cleanup.
 
 Media-worker unit tests cover strict RTSP/absolute-owned-directory fragment parameters,
 fixed-width owned fragment names/partial cleanup, hard size/count policy bounds, counting only
 owned finalized regular files, cancellable backpressure at the finalized-fragment ceiling,
-the bounded five-attempt retry terminal state and lifecycle cancellation during backoff. Existing FFmpeg
-ABI/muxer, probe, playback and recording tests remain unchanged and pass in the workspace
-suite; M11 does not refactor recorder muxing.
+and unified finalization-failure cleanup for finalize error, oversize validation and
+destination collision while preserving a successful finalized `.mp4`. The bounded
+five-attempt retry terminal state and lifecycle cancellation during backoff remain covered.
+Existing FFmpeg ABI/muxer, probe, playback and recording tests remain unchanged and pass in
+the workspace suite; M11 does not refactor recorder muxing.
 
 Desktop regressions use the real `CameraService`/`LiveViewController` seam with fake live
 runners. They prove Stop All Recording leaves live ownership untouched; close-to-tray
-preserves recording Desired/Runtime while live admission closes; suspend invalidates live
-sessions while Resume restores Desired recording and only reopens live admission; update
+preserves recording Desired/Runtime while live admission closes; a Condvar-blocked hide
+teardown remains visible to an immediate quit shutdown and is not double-joined; suspend
+invalidates live sessions while Resume restores Desired recording and only reopens live
+admission; update
 teardown preserves recording intent. CSP tests require only self/loopback `connect-src` and
 self/`blob:`/loopback `media-src`. Blocking live open/close/status work is dispatched through
 Tauri's blocking runtime, while keepalive remains bounded bookkeeping.
@@ -674,10 +680,12 @@ Tauri's blocking runtime, while keepalive remains bounded bookkeeping.
 cover remove while `live_open` is pending, unmount/navigation-equivalent cleanup with two
 pending opens, stale generation 1 resolving after generation 2 has been requested, immediate
 `live_close` of late results, exclusion of late sessions from the keepalive set and prevention
-of stale overwrite. Existing tests continue to cover per-tile failure isolation, recording
+of stale overwrite. A deferred `live_statuses` test proves repeated one-second ticks cannot
+overlap one aggregate refresh, resolve/reject both release polling ownership, and unmount
+ignores a late result. Existing tests continue to cover per-tile failure isolation, recording
 Start/Stop independence, media-error cleanup and reconnect remount. Fragment consumption uses
-a single sequence watermark rather than retaining an unbounded historical sequence set. The complete UI gate is
-TypeScript typecheck + ESLint + Vitest + Vite production build.
+a single sequence watermark rather than retaining an unbounded historical sequence set. The
+complete UI gate is TypeScript typecheck + ESLint + Vitest + Vite production build.
 
 Physical live-camera validation remains optional/manual and is not claimed by CI. A real
 Tauri WebView smoke should select one then multiple configured H.264 cameras, verify the

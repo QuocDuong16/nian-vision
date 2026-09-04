@@ -3202,9 +3202,112 @@ mod tests {
             Ok(Box::new(DesktopLiveRunner))
         }
     }
+
+    #[derive(Default)]
+    struct DesktopBlockingLiveControl {
+        signals: AtomicUsize,
+        completed: AtomicUsize,
+        join_started: Mutex<bool>,
+        join_started_cv: std::sync::Condvar,
+        released: Mutex<bool>,
+        released_cv: std::sync::Condvar,
+    }
+
+    impl DesktopBlockingLiveControl {
+        fn wait_for_join_start(&self) {
+            let mut started = self.join_started.lock().unwrap();
+            while !*started {
+                started = self.join_started_cv.wait(started).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.released_cv.notify_all();
+        }
+    }
+
+    struct DesktopBlockingLiveRunner {
+        control: Arc<DesktopBlockingLiveControl>,
+        signalled: bool,
+    }
+
+    impl nian_application::LiveRunner for DesktopBlockingLiveRunner {
+        fn start(
+            &mut self,
+            _source_json: serde_json::Value,
+            output_dir: &std::path::Path,
+            _cancel: Arc<AtomicBool>,
+        ) -> Result<(), nian_application::LiveError> {
+            std::fs::write(output_dir.join("fragment-000000000000.mp4"), b"fake-live")
+                .map_err(|_| nian_application::LiveError::Internal)
+        }
+
+        fn status(
+            &mut self,
+        ) -> Result<nian_application::LiveWorkerStatus, nian_application::LiveError> {
+            Ok(nian_application::LiveWorkerStatus {
+                state: nian_application::LiveState::Live,
+                failure_category: None,
+                reconnect_attempt: 0,
+            })
+        }
+
+        fn request_stop(&mut self) {
+            if !self.signalled {
+                self.signalled = true;
+                self.control.signals.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        fn join_or_reap(&mut self) {
+            {
+                let mut started = self.control.join_started.lock().unwrap();
+                *started = true;
+                self.control.join_started_cv.notify_all();
+            }
+            let mut released = self.control.released.lock().unwrap();
+            while !*released {
+                released = self.control.released_cv.wait(released).unwrap();
+            }
+            self.control.completed.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct DesktopBlockingLiveFactory {
+        control: Arc<DesktopBlockingLiveControl>,
+    }
+
+    impl nian_application::LiveRunnerFactory for DesktopBlockingLiveFactory {
+        fn spawn(
+            &self,
+        ) -> Result<Box<dyn nian_application::LiveRunner>, nian_application::LiveError> {
+            Ok(Box::new(DesktopBlockingLiveRunner {
+                control: self.control.clone(),
+                signalled: false,
+            }))
+        }
+    }
     fn lifecycle_state(
         root: &std::path::Path,
         configure_playback_storage: bool,
+    ) -> (
+        DesktopState,
+        Arc<Mutex<TestRepositoryState>>,
+        Arc<CountingRecordingRunner>,
+        Arc<ImmediateProbeRunner>,
+    ) {
+        lifecycle_state_with_live_factory(
+            root,
+            configure_playback_storage,
+            Arc::new(DesktopLiveFactory),
+        )
+    }
+
+    fn lifecycle_state_with_live_factory(
+        root: &std::path::Path,
+        configure_playback_storage: bool,
+        live_factory: Arc<dyn nian_application::LiveRunnerFactory>,
     ) -> (
         DesktopState,
         Arc<Mutex<TestRepositoryState>>,
@@ -3218,11 +3321,9 @@ mod tests {
         let probe_runner = Arc::new(ImmediateProbeRunner::default());
         let probe_controller = ProbeController::new(probe_runner.clone());
         let cache_root = root.with_extension("playback-cache");
-        let live_controller = LiveViewController::with_factory(
-            Arc::new(DesktopLiveFactory),
-            root.with_extension("live-cache"),
-        )
-        .unwrap();
+        let live_controller =
+            LiveViewController::with_factory(live_factory, root.with_extension("live-cache"))
+                .unwrap();
         let playback_controller = if configure_playback_storage {
             configured_playback(root, cache_root)
         } else {
@@ -3838,6 +3939,44 @@ mod tests {
             .shutdown_all()
             .unwrap();
     }
+    #[test]
+    fn hide_background_teardown_remains_visible_to_immediate_quit_shutdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let control = Arc::new(DesktopBlockingLiveControl::default());
+        let (state, _repository, _runner, _probe) = lifecycle_state_with_live_factory(
+            &root,
+            true,
+            Arc::new(DesktopBlockingLiveFactory {
+                control: control.clone(),
+            }),
+        );
+        let state = Arc::new(state);
+        open_live(&state, "front-door").unwrap();
+
+        begin_hidden_window_resource_release(&state);
+        let hide_state = state.clone();
+        let hide_thread = std::thread::spawn(move || hide_state.live_controller.close_all());
+        control.wait_for_join_start();
+        assert!(state.live_controller.statuses().unwrap().is_empty());
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let quit_state = state.clone();
+        let quit_thread = std::thread::spawn(move || {
+            quit_state.lifecycle.begin_quit().unwrap();
+            shutdown_runtime_resources(&quit_state).unwrap();
+            let _ = done_tx.send(());
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        control.release();
+        hide_thread.join().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        quit_thread.join().unwrap();
+        assert_eq!(control.signals.load(Ordering::Acquire), 1);
+        assert_eq!(control.completed.load(Ordering::Acquire), 1);
+    }
+
     #[test]
     fn stop_all_persistence_failure_leaves_every_runtime_owned() {
         let temp = tempfile::tempdir().unwrap();

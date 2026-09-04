@@ -652,6 +652,15 @@ handshake is blocked. Admission/started RAII handles remain the fallback that re
 reservations and temporary resources on task failure. A cancelled/stale opening cannot
 commit or erase a newer reservation.
 
+The controller registry also owns a draining phase. Active close removes the session from
+frontend-visible maps and invalidates its loopback capability, but the session remains in
+`draining_sessions` until worker stop + join/reap completes. Opening cancellation similarly
+remains in tracked draining ownership during teardown. Session teardown has one leader and
+a completion Condvar, so close-to-tray background cleanup and a later Quit/Update/Suspend
+wait on the same owner instead of double-joining it. Capacity counts opening + active +
+draining workers, and stale draining retirement is session/owner-identity checked so an old
+same-camera completion cannot erase a newer session.
+
 The worker accepts `live.start`, `live.status` and `live.stop`, requires H.264 and
 packet-copies video only. Instead of one growing MP4, it writes independently finalized
 fragmented-MP4 files beginning on keyframes. Production limits are: four live sessions, a
@@ -663,6 +672,8 @@ the hard fragment-count ceiling is full, uses byte pressure as a second rotation
 and fails pathological media that cannot stay within the hard fragment-size bound; no
 decode/transcode path is introduced. Transient source/media loss retains the bounded
 1/2/4/8/15-second, five-attempt reconnect policy.
+Every failed live-fragment finalization best-effort removes only its exact worker-owned
+`.partial.mp4`; successful rename leaves the finalized `.mp4` intact.
 
 The application reaper continuously trims finalized fragments. Every fragment HTTP request
 acquires explicit reader ownership, and trimming skips reader-owned files. Reader release
@@ -695,12 +706,17 @@ and committed runner receives cancellation/stop. Only after all stop signals hav
 issued does bounded fan-out join/reap workers and remove session resources. A slow camera
 therefore cannot delay cancellation delivery to the other cameras. Close-to-tray stops live
 admission, hides the window promptly, and performs teardown on the blocking runtime.
-Suspend/quit/update do not report required lifecycle completion until in-flight and active
-live workers have been reaped. Recording Desired/Runtime ownership remains untouched by
-window-hide live cleanup and Resume only reopens live admission.
+Suspend/quit/update do not report required lifecycle completion until in-flight, active and
+already-draining live workers have been reaped. Deferred file deletion under an active HTTP
+reader is separate from worker/process ownership and remains reader-guard owned. Recording
+Desired/Runtime ownership remains untouched by window-hide live cleanup and Resume only
+reopens live admission.
 
-The Live View UI uses per-camera generations plus mounted/selected/session refs as
-authoritative ownership across `await` boundaries. Remove, unmount, retry and media error
+The Live View UI keeps the one-second aggregate status refresh single-flight: while one
+`live_statuses` + `recording_statuses` + `recording_intent` request set is pending, later
+timer ticks skip rather than overlap. Resolve or rejection releases polling ownership and
+unmount ignores late results. Per-camera generations plus mounted/selected/session refs stay
+authoritative across `await` boundaries. Remove, unmount, retry and media error
 invalidate the generation first. A late `live_open` result that no longer matches current
 ownership is immediately `live_close`d, never enters React session state and therefore
 never joins the keepalive set. A newer generation queued behind a pending open cannot be

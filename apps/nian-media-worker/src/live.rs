@@ -484,14 +484,30 @@ fn create_fragment(
 fn finish_fragment(fragment: ActiveFragment, max_fragment_bytes: u64) -> Result<(), ()> {
     let partial_path = fragment.partial_path.clone();
     let final_path = fragment.final_path.clone();
-    fragment.muxer.finalize().map_err(|_| ())?;
-    let bytes = std::fs::metadata(&partial_path).map_err(|_| ())?.len();
-    if bytes == 0 || bytes > max_fragment_bytes || final_path.exists() {
-        let _ = std::fs::remove_file(&partial_path);
-        return Err(());
+    finish_owned_partial(&partial_path, &final_path, max_fragment_bytes, || {
+        fragment.muxer.finalize().map(|_| ()).map_err(|_| ())
+    })
+}
+
+fn finish_owned_partial(
+    partial_path: &Path,
+    final_path: &Path,
+    max_fragment_bytes: u64,
+    finalize: impl FnOnce() -> Result<(), ()>,
+) -> Result<(), ()> {
+    let result = (|| {
+        finalize()?;
+        let bytes = std::fs::metadata(partial_path).map_err(|_| ())?.len();
+        if bytes == 0 || bytes > max_fragment_bytes || final_path.exists() {
+            return Err(());
+        }
+        std::fs::rename(partial_path, final_path).map_err(|_| ())?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(partial_path);
     }
-    std::fs::rename(&partial_path, &final_path).map_err(|_| ())?;
-    Ok(())
+    result
 }
 
 fn discard_fragment(fragment: Option<ActiveFragment>) {
@@ -761,6 +777,42 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         stop.store(true, Ordering::Release);
         assert_eq!(waiter.join().unwrap(), Ok(false));
+    }
+
+    #[test]
+    fn failed_fragment_finalization_always_removes_owned_partial() {
+        let temp = tempfile::tempdir().unwrap();
+        let partial = temp.path().join("fragment-000000000001.partial.mp4");
+        let final_path = temp.path().join("fragment-000000000001.mp4");
+
+        std::fs::write(&partial, b"partial").unwrap();
+        assert!(finish_owned_partial(&partial, &final_path, 1024, || Err(())).is_err());
+        assert!(!partial.exists());
+        assert!(!final_path.exists());
+
+        std::fs::write(&partial, vec![1_u8; 2048]).unwrap();
+        assert!(finish_owned_partial(&partial, &final_path, 1024, || Ok(())).is_err());
+        assert!(!partial.exists());
+        assert!(!final_path.exists());
+
+        std::fs::write(&partial, b"new").unwrap();
+        std::fs::write(&final_path, b"existing-final").unwrap();
+        assert!(finish_owned_partial(&partial, &final_path, 1024, || Ok(())).is_err());
+        assert!(!partial.exists());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"existing-final");
+    }
+
+    #[test]
+    fn successful_fragment_finalization_preserves_final_and_removes_partial_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let partial = temp.path().join("fragment-000000000002.partial.mp4");
+        let final_path = temp.path().join("fragment-000000000002.mp4");
+        std::fs::write(&partial, b"complete-fragment").unwrap();
+
+        finish_owned_partial(&partial, &final_path, 1024, || Ok(())).unwrap();
+
+        assert!(!partial.exists());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"complete-fragment");
     }
 
     #[test]

@@ -223,6 +223,7 @@ export function LiveViewScreen() {
   const mountedRef = useRef(true);
   const generationRef = useRef<Map<string, number>>(new Map());
   const pendingOpenRef = useRef<Map<string, number>>(new Map());
+  const refreshInFlightRef = useRef(false);
 
   const setSessionForCamera = useCallback((cameraId: string, session: LiveOpenDto | null) => {
     const next = new Map(sessionsRef.current);
@@ -246,7 +247,8 @@ export function LiveViewScreen() {
   }, []);
 
   const refreshStatuses = useCallback(async () => {
-    if (!isTauri() || !mountedRef.current) return;
+    if (!isTauri() || !mountedRef.current || refreshInFlightRef.current) return;
+    refreshInFlightRef.current = true;
     try {
       const [live, runtime, desired] = await Promise.all([
         invokeDesktop<LiveStatus[]>("live_statuses"),
@@ -283,6 +285,8 @@ export function LiveViewScreen() {
       }
     } catch (cause) {
       if (mountedRef.current) setError(desktopError(cause));
+    } finally {
+      refreshInFlightRef.current = false;
     }
   }, []);
 
