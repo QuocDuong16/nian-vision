@@ -652,10 +652,13 @@ Condvar-blocked fake proves `close(A)` removes A from frontend-visible active st
 it controller-owned as draining; concurrent shutdown cannot complete until A reap is
 released. A four-worker case proves all stop signals exist before join, all four remain
 observable as draining while blocked, concurrent shutdown waits, and each runner completes
-exactly one join. A stale-draining test opens session-2 for the same camera while session-1
-is draining and proves session-1 retirement cannot remove session-2. In-flight-open tests
-continue to prove lifecycle owns/cancels startup work. Keepalive remains cheap and the reaper
-owns expensive expiry cleanup.
+exactly one join. Rapid-reactivation regressions synchronously capture a hide batch, resume
+admission before that batch starts or while its join is blocked, open a fresh same-camera
+session and prove old teardown cannot remove the new session or its HTTP capability. A
+four-session hide capture also proves all draining workers continue consuming capacity until
+reap. The stale-draining identity regression remains covered. In-flight-open tests continue
+to prove lifecycle owns/cancels startup work. Keepalive remains cheap and the reaper owns
+expensive expiry cleanup.
 
 Media-worker unit tests cover strict RTSP/absolute-owned-directory fragment parameters,
 fixed-width owned fragment names/partial cleanup, hard size/count policy bounds, counting only
@@ -668,13 +671,14 @@ the workspace suite; M11 does not refactor recorder muxing.
 
 Desktop regressions use the real `CameraService`/`LiveViewController` seam with fake live
 runners. They prove Stop All Recording leaves live ownership untouched; close-to-tray
-preserves recording Desired/Runtime while live admission closes; a Condvar-blocked hide
-teardown remains visible to an immediate quit shutdown and is not double-joined; suspend
-invalidates live sessions while Resume restores Desired recording and only reopens live
-admission; update
-teardown preserves recording intent. CSP tests require only self/loopback `connect-src` and
-self/`blob:`/loopback `media-src`. Blocking live open/close/status work is dispatched through
-Tauri's blocking runtime, while keepalive remains bounded bookkeeping.
+preserves recording Desired/Runtime while live admission closes; hide capture occurs before
+reactivation and an old blocked teardown cannot close a fresh same-camera live session; a
+Condvar-blocked hide teardown remains visible to an immediate quit shutdown and is not
+double-joined; suspend invalidates live sessions while Resume restores Desired recording and
+only reopens live admission; update teardown preserves recording intent. CSP tests require
+only self/loopback `connect-src` and self/`blob:`/loopback `media-src`. Blocking live
+open/close/status work is dispatched through Tauri's blocking runtime, while keepalive
+remains bounded bookkeeping.
 
 `LiveViewScreen` tests use manually controlled deferred Promises for the opening races. They
 cover remove while `live_open` is pending, unmount/navigation-equivalent cleanup with two

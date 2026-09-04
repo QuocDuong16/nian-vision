@@ -655,11 +655,17 @@ commit or erase a newer reservation.
 The controller registry also owns a draining phase. Active close removes the session from
 frontend-visible maps and invalidates its loopback capability, but the session remains in
 `draining_sessions` until worker stop + join/reap completes. Opening cancellation similarly
-remains in tracked draining ownership during teardown. Session teardown has one leader and
-a completion Condvar, so close-to-tray background cleanup and a later Quit/Update/Suspend
-wait on the same owner instead of double-joining it. Capacity counts opening + active +
-draining workers, and stale draining retirement is session/owner-identity checked so an old
-same-camera completion cannot erase a newer session.
+remains in tracked draining ownership during teardown. Bulk close separates a synchronous,
+bounded ownership capture (`begin_close_all`) from blocking teardown (`finish_close_all`).
+The capture moves only the currently active/opening owners to draining and removes only
+identity-matched HTTP capabilities; it never clears capabilities belonging to sessions
+created later. Close-to-tray performs this capture before hiding, then runs only the frozen
+batch's signal/join/cleanup on the blocking runtime. Reactivation can therefore admit a
+fresh same-camera session while the old one drains, subject to the same four-worker total
+capacity. Session teardown has one leader and a completion Condvar, so a later
+Quit/Update/Suspend waits on the same owner instead of double-joining it. Stale draining
+retirement is session/owner-identity checked so an old completion cannot erase a newer
+session.
 
 The worker accepts `live.start`, `live.status` and `live.stop`, requires H.264 and
 packet-copies video only. Instead of one growing MP4, it writes independently finalized
@@ -705,7 +711,11 @@ Teardown is two-phase. First, HTTP capabilities are invalidated and every in-fli
 and committed runner receives cancellation/stop. Only after all stop signals have been
 issued does bounded fan-out join/reap workers and remove session resources. A slow camera
 therefore cannot delay cancellation delivery to the other cameras. Close-to-tray stops live
-admission, hides the window promptly, and performs teardown on the blocking runtime.
+admission, synchronously captures current opening/active owners into draining and invalidates
+those captured capabilities, then hides the window promptly. The
+expensive teardown of that exact frozen batch runs on the blocking runtime. A rapid tray or
+single-instance reactivation may resume live admission without waiting for the old batch;
+new sessions are outside the stale batch and keep independent HTTP capabilities.
 Suspend/quit/update do not report required lifecycle completion until in-flight, active and
 already-draining live workers have been reaped. Deferred file deletion under an active HTTP
 reader is separate from worker/process ownership and remains reader-guard owned. Recording

@@ -49,17 +49,23 @@ Stale RAII cleanup is generation/session-id checked and cannot erase a newer res
 The live registry distinguishes opening, frontend-visible active sessions and draining
 owners. `live_close` removes an active session from frontend-visible ownership and invalidates
 its HTTP capability promptly, then moves the same session identity into controller-owned
-draining state before any worker join/reap begins. `close_all` performs the same transition
-for every opening and active owner. Draining owners count against the four-worker live
-capacity bound until process ownership is gone.
+draining state before any worker join/reap begins. Bulk close is split into a bounded
+`begin_close_all` ownership transition and a potentially blocking `finish_close_all` teardown.
+The begin phase freezes only the opening/active owners present at that instant, moves them to
+draining and removes only their identity-matched HTTP capabilities. Draining owners count
+against the four-worker live capacity bound until process ownership is gone.
 
 Teardown is single-owner and waitable. The first caller that starts a session reap owns the
 runner join; concurrent lifecycle callers observe the same draining session and wait on its
-completion condition rather than starting a second join. A later Quit/Update/Suspend can
-therefore observe a close-to-tray teardown already running on Tauri's blocking runtime and
-cannot report lifecycle completion before that worker is reaped. Draining retirement is
-session-id plus Arc-identity checked, so completion of an older same-camera session cannot
-remove a newer active/opening/draining generation.
+completion condition rather than starting a second join. Close-to-tray stops admission and
+synchronously executes the begin phase before hiding the window; only the captured batch's
+signal/join/cleanup runs later on Tauri's blocking runtime. Reactivation may resume admission
+while that old batch drains. A fresh same-camera session receives a new opaque capability and
+is outside the old batch, so stale hide teardown cannot stop it or remove its HTTP runtime
+entry. A later Quit/Update/Suspend still observes existing draining owners and cannot report
+lifecycle completion before they are reaped. Draining retirement is session-id plus
+Arc-identity checked, so completion of an older same-camera session cannot remove a newer
+active/opening/draining generation.
 
 Worker/process ownership and deferred reader file cleanup are deliberately distinct. Once
 the worker is reaped, draining worker ownership may retire even if an already-admitted HTTP

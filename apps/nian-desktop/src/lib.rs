@@ -16,11 +16,12 @@ use chrono::NaiveDateTime;
 use nian_application::{
     ApplicationSettingsDto, CameraDraft, CameraService, CameraServiceError, CameraSummary,
     CredentialStore, CredentialStoreError, DesktopLifecycle, DesktopLifecycleError,
-    DesktopLifecycleState, LiveError, LiveOpenDto, LiveStatus, LiveViewController,
-    OnvifConnectionDto, OnvifController, OnvifControllerError, OnvifDiscoveryDto,
-    OnvifPreparedProfileDto, PlaybackController, PlaybackError, PlaybackOpenDto, ProbeController,
-    ProbeError, ProbeResult, RecordingController, RecordingControllerError, RecordingDto,
-    RecordingState, RecordingStatus, SupervisorRecordingRunnerFactory, WorkerProbeRunner,
+    DesktopLifecycleState, LiveError, LiveOpenDto, LiveStatus, LiveTeardownBatch,
+    LiveViewController, OnvifConnectionDto, OnvifController, OnvifControllerError,
+    OnvifDiscoveryDto, OnvifPreparedProfileDto, PlaybackController, PlaybackError, PlaybackOpenDto,
+    ProbeController, ProbeError, ProbeResult, RecordingController, RecordingControllerError,
+    RecordingDto, RecordingState, RecordingStatus, SupervisorRecordingRunnerFactory,
+    WorkerProbeRunner,
 };
 use nian_domain::{
     AudioPolicy, CameraId, CredentialRef, Credentials, RetentionPolicy, StorageQuota,
@@ -371,15 +372,16 @@ fn close_action(lifecycle: &DesktopLifecycle) -> Result<CloseAction, DesktopErro
     }
 }
 
-fn begin_hidden_window_resource_release(state: &DesktopState) {
+fn begin_hidden_window_resource_release(state: &DesktopState) -> LiveTeardownBatch {
     let _ = state.onvif_controller.cancel(None);
     state.live_controller.stop_accepting();
+    state.live_controller.begin_close_all()
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn release_hidden_window_resources(state: &DesktopState) {
-    begin_hidden_window_resource_release(state);
-    state.live_controller.close_all();
+    let batch = begin_hidden_window_resource_release(state);
+    state.live_controller.finish_close_all(batch);
 }
 fn activate_window(
     lifecycle: &DesktopLifecycle,
@@ -2388,12 +2390,12 @@ pub fn run() {
                     Ok(CloseAction::HideAndPrevent)
                 )
             {
-                begin_hidden_window_resource_release(&state);
                 api.prevent_close();
+                let batch = begin_hidden_window_resource_release(&state);
                 let _ = WindowActions::hide(window);
                 let state = state.inner().clone();
                 tauri::async_runtime::spawn_blocking(move || {
-                    state.live_controller.close_all();
+                    state.live_controller.finish_close_all(batch);
                 });
             }
         })
@@ -3940,6 +3942,49 @@ mod tests {
             .unwrap();
     }
     #[test]
+    fn hide_capture_precedes_reactivation_and_old_batch_cannot_close_fresh_live() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let control = Arc::new(DesktopBlockingLiveControl::default());
+        let (state, _repository, _runner, _probe) = lifecycle_state_with_live_factory(
+            &root,
+            true,
+            Arc::new(DesktopBlockingLiveFactory {
+                control: control.clone(),
+            }),
+        );
+        let state = Arc::new(state);
+        let old = open_live(&state, "front-door").unwrap();
+
+        let batch = begin_hidden_window_resource_release(&state);
+        assert!(state.live_controller.statuses().unwrap().is_empty());
+
+        let window = FakeWindow::default();
+        activate_window(&state.lifecycle, &window).unwrap();
+        state.live_controller.resume_accepting();
+        let fresh = open_live(&state, "front-door").unwrap();
+        assert_ne!(fresh.session_id, old.session_id);
+
+        let hide_state = state.clone();
+        let hide_thread = std::thread::spawn(move || {
+            hide_state.live_controller.finish_close_all(batch);
+        });
+        control.wait_for_join_start();
+        let live = state.live_controller.statuses().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].session_id, fresh.session_id);
+
+        control.release();
+        hide_thread.join().unwrap();
+        let live = state.live_controller.statuses().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].session_id, fresh.session_id);
+        assert_eq!(control.signals.load(Ordering::Acquire), 1);
+        assert_eq!(control.completed.load(Ordering::Acquire), 1);
+        state.live_controller.close_all();
+    }
+
+    #[test]
     fn hide_background_teardown_remains_visible_to_immediate_quit_shutdown() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("recordings");
@@ -3954,9 +3999,11 @@ mod tests {
         let state = Arc::new(state);
         open_live(&state, "front-door").unwrap();
 
-        begin_hidden_window_resource_release(&state);
+        let batch = begin_hidden_window_resource_release(&state);
         let hide_state = state.clone();
-        let hide_thread = std::thread::spawn(move || hide_state.live_controller.close_all());
+        let hide_thread = std::thread::spawn(move || {
+            hide_state.live_controller.finish_close_all(batch);
+        });
         control.wait_for_join_start();
         assert!(state.live_controller.statuses().unwrap().is_empty());
 

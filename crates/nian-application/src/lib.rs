@@ -34,8 +34,8 @@ pub use desktop_lifecycle::{DesktopLifecycle, DesktopLifecycleError, DesktopLife
 pub use error::ApplicationError;
 pub use live_controller::{
     LiveError, LiveFailureCategory, LiveOpenDto, LiveRunner, LiveRunnerFactory, LiveState,
-    LiveStatus, LiveViewController, LiveWorkerStatus, MAX_SIMULTANEOUS_LIVE_VIEWS, PreparedLive,
-    WorkerLiveRunnerFactory,
+    LiveStatus, LiveTeardownBatch, LiveViewController, LiveWorkerStatus,
+    MAX_SIMULTANEOUS_LIVE_VIEWS, PreparedLive, WorkerLiveRunnerFactory,
 };
 pub use onvif_controller::{
     OnvifConnectionDto, OnvifController, OnvifControllerError, OnvifDiscoveredDeviceDto,

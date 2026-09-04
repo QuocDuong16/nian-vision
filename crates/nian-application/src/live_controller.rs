@@ -535,6 +535,18 @@ struct LiveHttpRuntime {
     sessions: HashMap<String, Arc<HttpSession>>,
 }
 
+#[must_use = "captured live owners remain draining until this batch is finished"]
+pub struct LiveTeardownBatch {
+    openings: Vec<(String, Arc<OpeningState>)>,
+    sessions: Vec<(String, Arc<LiveSession>)>,
+}
+
+impl LiveTeardownBatch {
+    fn is_empty(&self) -> bool {
+        self.openings.is_empty() && self.sessions.is_empty()
+    }
+}
+
 pub struct LiveViewController {
     factory: Arc<dyn LiveRunnerFactory>,
     registry: Arc<Mutex<LiveRegistry>>,
@@ -808,46 +820,89 @@ impl LiveViewController {
         Ok(statuses)
     }
 
-    pub fn close_all(&self) {
-        let (openings, sessions) = if let Ok(mut registry) = self.registry.lock() {
+    pub fn begin_close_all(&self) -> LiveTeardownBatch {
+        let mut captured_sessions = Vec::new();
+        let mut captured_openings = Vec::new();
+        if let Ok(mut registry) = self.registry.lock() {
             registry.camera_sessions.clear();
 
             let active_openings = std::mem::take(&mut registry.opening);
             for opening in active_openings.into_values() {
+                let session_id = opening.session_id.clone();
                 registry
                     .draining_openings
-                    .entry(opening.session_id.clone())
-                    .or_insert(opening);
+                    .entry(session_id.clone())
+                    .or_insert_with(|| opening.clone());
+                captured_openings.push((session_id, opening));
             }
             let active_sessions = std::mem::take(&mut registry.sessions);
             for (session_id, session) in active_sessions {
                 registry
                     .draining_sessions
-                    .entry(session_id)
-                    .or_insert(session);
+                    .entry(session_id.clone())
+                    .or_insert_with(|| session.clone());
+                captured_sessions.push((session_id, session));
             }
-
-            let openings = registry
-                .draining_openings
-                .iter()
-                .map(|(session_id, opening)| (session_id.clone(), opening.clone()))
-                .collect::<Vec<_>>();
-            let sessions = registry
-                .draining_sessions
-                .iter()
-                .map(|(session_id, session)| (session_id.clone(), session.clone()))
-                .collect::<Vec<_>>();
-            (openings, sessions)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        if let Ok(mut runtime) = self.http_runtime.lock() {
-            for http in runtime.sessions.values() {
-                http.deactivate();
-            }
-            runtime.sessions.clear();
         }
-        teardown_live_owners(&self.registry, openings, sessions);
+
+        for (_, session) in &captured_sessions {
+            session.http.deactivate();
+        }
+        if let Ok(mut runtime) = self.http_runtime.lock() {
+            for (session_id, session) in &captured_sessions {
+                if runtime
+                    .sessions
+                    .get(session_id)
+                    .is_some_and(|http| Arc::ptr_eq(http, &session.http))
+                {
+                    runtime.sessions.remove(session_id);
+                }
+            }
+        }
+
+        LiveTeardownBatch {
+            openings: captured_openings,
+            sessions: captured_sessions,
+        }
+    }
+
+    pub fn finish_close_all(&self, batch: LiveTeardownBatch) {
+        if !batch.is_empty() {
+            teardown_live_owners(&self.registry, batch.openings, batch.sessions);
+        }
+    }
+
+    fn snapshot_draining(&self) -> LiveTeardownBatch {
+        if let Ok(registry) = self.registry.lock() {
+            return LiveTeardownBatch {
+                openings: registry
+                    .draining_openings
+                    .iter()
+                    .map(|(session_id, opening)| (session_id.clone(), opening.clone()))
+                    .collect(),
+                sessions: registry
+                    .draining_sessions
+                    .iter()
+                    .map(|(session_id, session)| (session_id.clone(), session.clone()))
+                    .collect(),
+            };
+        }
+        LiveTeardownBatch {
+            openings: Vec::new(),
+            sessions: Vec::new(),
+        }
+    }
+
+    pub fn close_all(&self) {
+        let batch = self.begin_close_all();
+        self.finish_close_all(batch);
+        loop {
+            let draining = self.snapshot_draining();
+            if draining.is_empty() {
+                break;
+            }
+            self.finish_close_all(draining);
+        }
     }
 
     pub fn stop_accepting(&self) {
@@ -2650,6 +2705,155 @@ mod tests {
         let registry = controller.registry.lock().unwrap();
         assert!(!registry.draining_sessions.contains_key(&old.session_id));
         assert!(registry.sessions.contains_key(&fresh.session_id));
+    }
+
+    #[test]
+    fn hide_capture_freezes_ownership_before_reactivation_and_preserves_fresh_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let controller =
+            LiveViewController::with_factory(Arc::new(FakeFactory), temp.path().to_path_buf())
+                .unwrap();
+        let old = controller.open(prepared("a")).unwrap();
+        let port = controller.server.lock().unwrap().port;
+        let host = format!("127.0.0.1:{port}");
+        let old_path = format!("/live/{}", old.session_id);
+        assert_eq!(
+            http_status(
+                &controller,
+                "HEAD",
+                &old_path,
+                &host,
+                Some("tauri://localhost")
+            ),
+            "HTTP/1.1 200 OK"
+        );
+
+        controller.stop_accepting();
+        let hide_batch = controller.begin_close_all();
+        assert!(controller.statuses().unwrap().is_empty());
+        assert_eq!(
+            http_status(
+                &controller,
+                "HEAD",
+                &old_path,
+                &host,
+                Some("tauri://localhost")
+            ),
+            "HTTP/1.1 410 Gone"
+        );
+
+        // Deliberately reactivate before the old teardown batch is even started.
+        controller.resume_accepting();
+        let fresh = controller.open(prepared("a")).unwrap();
+        let fresh_path = format!("/live/{}", fresh.session_id);
+        assert_ne!(fresh.session_id, old.session_id);
+        assert_eq!(
+            http_status(
+                &controller,
+                "HEAD",
+                &fresh_path,
+                &host,
+                Some("tauri://localhost"),
+            ),
+            "HTTP/1.1 200 OK"
+        );
+
+        controller.finish_close_all(hide_batch);
+
+        let statuses = controller.statuses().unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].session_id, fresh.session_id);
+        assert_eq!(
+            http_status(
+                &controller,
+                "HEAD",
+                &fresh_path,
+                &host,
+                Some("tauri://localhost"),
+            ),
+            "HTTP/1.1 200 OK"
+        );
+        assert_eq!(
+            http_status(
+                &controller,
+                "HEAD",
+                &old_path,
+                &host,
+                Some("tauri://localhost")
+            ),
+            "HTTP/1.1 410 Gone"
+        );
+        let registry = controller.registry.lock().unwrap();
+        assert_eq!(
+            registry.camera_sessions.get(&CameraId::parse("a").unwrap()),
+            Some(&fresh.session_id)
+        );
+        assert!(registry.sessions.contains_key(&fresh.session_id));
+    }
+
+    #[test]
+    fn asynchronous_hide_teardown_cannot_stop_fresh_same_camera_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let control = Arc::new(BlockingTeardownControl::default());
+        let controller = Arc::new(
+            LiveViewController::with_factory(
+                Arc::new(BlockingTeardownFactory {
+                    control: control.clone(),
+                }),
+                temp.path().to_path_buf(),
+            )
+            .unwrap(),
+        );
+        let old = controller.open(prepared("a")).unwrap();
+        controller.stop_accepting();
+        let hide_batch = controller.begin_close_all();
+
+        let hide_controller = controller.clone();
+        let hide_thread = std::thread::spawn(move || hide_controller.finish_close_all(hide_batch));
+        control.wait_for_join_starts(1);
+
+        controller.resume_accepting();
+        let fresh = controller.open(prepared("a")).unwrap();
+        assert_ne!(fresh.session_id, old.session_id);
+        assert_eq!(
+            controller.statuses().unwrap()[0].session_id,
+            fresh.session_id
+        );
+
+        control.release();
+        hide_thread.join().unwrap();
+
+        let statuses = controller.statuses().unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].session_id, fresh.session_id);
+        let registry = controller.registry.lock().unwrap();
+        assert!(!registry.draining_sessions.contains_key(&old.session_id));
+        assert!(registry.sessions.contains_key(&fresh.session_id));
+        assert_eq!(control.signals.load(Ordering::Acquire), 1);
+        assert_eq!(control.completed.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn draining_hide_batch_continues_to_count_against_live_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let controller =
+            LiveViewController::with_factory(Arc::new(FakeFactory), temp.path().to_path_buf())
+                .unwrap();
+        for camera in ["a", "b", "c", "d"] {
+            controller.open(prepared(camera)).unwrap();
+        }
+
+        controller.stop_accepting();
+        let hide_batch = controller.begin_close_all();
+        controller.resume_accepting();
+        assert!(matches!(
+            controller.open(prepared("e")),
+            Err(LiveError::Capacity)
+        ));
+
+        controller.finish_close_all(hide_batch);
+        let fresh = controller.open(prepared("e")).unwrap();
+        assert_eq!(fresh.camera_id, "e");
     }
 
     #[test]
