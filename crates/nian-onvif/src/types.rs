@@ -229,10 +229,10 @@ impl PullPointSubscription {
             return Err(OnvifError::Protocol);
         }
         let seconds = u64::try_from(seconds).map_err(|_| OnvifError::Protocol)?;
-        Ok(Some(seconds.clamp(
-            MIN_EVENT_SUBSCRIPTION_LIFETIME_SECS,
-            MAX_EVENT_SUBSCRIPTION_LIFETIME_SECS,
-        )))
+        if seconds < MIN_EVENT_SUBSCRIPTION_LIFETIME_SECS {
+            return Err(OnvifError::Protocol);
+        }
+        Ok(Some(seconds.min(MAX_EVENT_SUBSCRIPTION_LIFETIME_SECS)))
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -306,7 +306,7 @@ mod event_subscription_tests {
     use super::*;
 
     #[test]
-    fn subscription_lifetime_is_positive_bounded_and_optional() {
+    fn subscription_lifetime_respects_remote_minimum_and_local_maximum() {
         assert_eq!(
             PullPointSubscription::test_fixture(60)
                 .bounded_lifetime_secs()
@@ -314,10 +314,19 @@ mod event_subscription_tests {
             Some(60)
         );
         assert_eq!(
-            PullPointSubscription::test_fixture(1)
+            PullPointSubscription::test_fixture(MIN_EVENT_SUBSCRIPTION_LIFETIME_SECS as i64)
                 .bounded_lifetime_secs()
                 .unwrap(),
             Some(MIN_EVENT_SUBSCRIPTION_LIFETIME_SECS)
+        );
+        assert_eq!(
+            PullPointSubscription::test_fixture(MIN_EVENT_SUBSCRIPTION_LIFETIME_SECS as i64 - 1)
+                .bounded_lifetime_secs(),
+            Err(OnvifError::Protocol)
+        );
+        assert_eq!(
+            PullPointSubscription::test_fixture(1).bounded_lifetime_secs(),
+            Err(OnvifError::Protocol)
         );
         assert_eq!(
             PullPointSubscription::test_fixture(10 * 24 * 60 * 60)

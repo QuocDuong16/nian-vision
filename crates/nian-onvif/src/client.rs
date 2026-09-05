@@ -435,11 +435,12 @@ impl OnvifClient {
             &body,
         )?;
         let (current, termination) = parse_renew_times(&xml)?;
-        if let (Some(current), Some(termination)) = (current, termination)
-            && termination <= current
-        {
-            return Err(OnvifError::Protocol);
-        }
+        let candidate = PullPointSubscription {
+            endpoint: subscription.endpoint.clone(),
+            current_time_utc: current,
+            termination_time_utc: termination,
+        };
+        candidate.bounded_lifetime_secs()?;
         subscription.current_time_utc = current;
         subscription.termination_time_utc = termination;
         Ok(())
@@ -1801,6 +1802,46 @@ mod tests {
                 .iter()
                 .all(|request| !request.contains("SENTINEL-event-password"))
         );
+    }
+
+    #[test]
+    fn renew_response_below_minimum_is_rejected_without_mutating_subscription() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert!(request.contains("<wsnt:Renew>"));
+            let body = "<Envelope><Body><RenewResponse><CurrentTime>2026-09-05T03:00:20Z</CurrentTime><TerminationTime>2026-09-05T03:00:21Z</TerminationTime></RenewResponse></Body></Envelope>";
+            write_http_response(&mut stream, "200 OK", &[], body);
+        });
+
+        let original_current = chrono::DateTime::parse_from_rfc3339("2026-09-05T03:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let original_termination = chrono::DateTime::parse_from_rfc3339("2026-09-05T03:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut subscription = PullPointSubscription {
+            endpoint: format!("http://{address}/pullpoint"),
+            current_time_utc: Some(original_current),
+            termination_time_utc: Some(original_termination),
+        };
+        let client = OnvifClient::new().unwrap();
+        let credentials = OnvifCredentials {
+            username: "admin".into(),
+            password: "SENTINEL-renew-password".into(),
+        };
+        assert_eq!(
+            client.renew_subscription(&mut subscription, &credentials),
+            Err(OnvifError::Protocol)
+        );
+        assert_eq!(subscription.current_time_utc(), Some(original_current));
+        assert_eq!(
+            subscription.termination_time_utc(),
+            Some(original_termination)
+        );
+        server.join().unwrap();
     }
 
     #[test]

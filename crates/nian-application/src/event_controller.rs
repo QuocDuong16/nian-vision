@@ -1414,6 +1414,14 @@ enum MotionState {
     Active,
 }
 
+struct MotionDecision {
+    source_key: Option<String>,
+    next: MotionState,
+    transition: Option<EventInsert>,
+    track_source: bool,
+    overflowed: bool,
+}
+
 #[derive(Default)]
 struct MotionNormalizer {
     sources: HashMap<Option<String>, MotionState>,
@@ -1421,12 +1429,12 @@ struct MotionNormalizer {
 }
 
 impl MotionNormalizer {
-    fn ingest(
-        &mut self,
+    fn prepare(
+        &self,
         camera_id: &CameraId,
         notification: &MotionNotification,
         received_time_utc: DateTime<Utc>,
-    ) -> Option<EventInsert> {
+    ) -> MotionDecision {
         let key = notification.source_key.clone();
         let current = self
             .sources
@@ -1438,38 +1446,62 @@ impl MotionNormalizer {
         } else {
             MotionState::Idle
         };
+        let source_is_known = self.sources.contains_key(&key);
         if current == MotionState::Unknown
-            && !self.sources.contains_key(&key)
+            && !source_is_known
             && self.sources.len() >= MAX_EVENT_SOURCES_PER_SESSION
         {
-            self.overflowed = true;
-            return None;
+            return MotionDecision {
+                source_key: key,
+                next,
+                transition: None,
+                track_source: false,
+                overflowed: true,
+            };
         }
-        self.sources.insert(key.clone(), next);
-        if notification.synchronization_baseline {
-            return None;
-        }
-        let kind = match (current, next) {
-            (MotionState::Unknown, MotionState::Active)
-            | (MotionState::Idle, MotionState::Active) => EventKind::MotionStarted,
-            (MotionState::Active, MotionState::Idle) => EventKind::MotionEnded,
-            (MotionState::Unknown, MotionState::Idle)
-            | (MotionState::Idle, MotionState::Idle)
-            | (MotionState::Active, MotionState::Active) => return None,
-            (MotionState::Unknown, MotionState::Unknown)
-            | (MotionState::Idle, MotionState::Unknown)
-            | (MotionState::Active, MotionState::Unknown) => return None,
+
+        let transition = if notification.synchronization_baseline {
+            None
+        } else {
+            let kind = match (current, next) {
+                (MotionState::Unknown, MotionState::Active)
+                | (MotionState::Idle, MotionState::Active) => Some(EventKind::MotionStarted),
+                (MotionState::Active, MotionState::Idle) => Some(EventKind::MotionEnded),
+                (MotionState::Unknown, MotionState::Idle)
+                | (MotionState::Idle, MotionState::Idle)
+                | (MotionState::Active, MotionState::Active)
+                | (MotionState::Unknown, MotionState::Unknown)
+                | (MotionState::Idle, MotionState::Unknown)
+                | (MotionState::Active, MotionState::Unknown) => None,
+            };
+            kind.map(|kind| EventInsert {
+                camera_id: camera_id.clone(),
+                kind,
+                source_key: key.clone(),
+                device_time_utc: notification.device_time_utc,
+                received_time_utc,
+                fingerprint: notification.device_time_utc.map(|device_time| {
+                    event_fingerprint(camera_id, kind, key.as_deref(), device_time)
+                }),
+            })
         };
-        Some(EventInsert {
-            camera_id: camera_id.clone(),
-            kind,
-            source_key: key.clone(),
-            device_time_utc: notification.device_time_utc,
-            received_time_utc,
-            fingerprint: notification
-                .device_time_utc
-                .map(|device_time| event_fingerprint(camera_id, kind, key.as_deref(), device_time)),
-        })
+
+        MotionDecision {
+            source_key: key,
+            next,
+            transition,
+            track_source: true,
+            overflowed: false,
+        }
+    }
+
+    fn commit(&mut self, decision: MotionDecision) {
+        if decision.overflowed {
+            self.overflowed = true;
+        }
+        if decision.track_source {
+            self.sources.insert(decision.source_key, decision.next);
+        }
     }
 
     fn aggregate_motion(&self) -> Option<bool> {
@@ -1492,6 +1524,35 @@ impl MotionNormalizer {
             None
         }
     }
+}
+
+fn persist_motion_transition(
+    event_index: &Mutex<Option<EventIndex>>,
+    insert: &EventInsert,
+    retention_days: Option<u32>,
+) -> Result<(), ()> {
+    let mut index = event_index.lock().map_err(|_| ())?;
+    let index = index.as_mut().ok_or(())?;
+    let _ = index
+        .insert_and_cleanup(insert, Utc::now(), retention_days)
+        .map_err(|_| ())?;
+    Ok(())
+}
+
+fn apply_motion_notification(
+    normalizer: &mut MotionNormalizer,
+    camera_id: &CameraId,
+    notification: &MotionNotification,
+    received_time_utc: DateTime<Utc>,
+    event_index: &Mutex<Option<EventIndex>>,
+    retention_days: Option<u32>,
+) -> Result<(), ()> {
+    let decision = normalizer.prepare(camera_id, notification, received_time_utc);
+    if let Some(insert) = decision.transition.as_ref() {
+        persist_motion_transition(event_index, insert, retention_days)?;
+    }
+    normalizer.commit(decision);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1608,25 +1669,28 @@ fn event_worker(
                     let mut persistence_failed = false;
                     for notification in notifications {
                         let received = Utc::now();
-                        let insert = normalizer.ingest(&camera_id, &notification, received);
+                        if apply_motion_notification(
+                            &mut normalizer,
+                            &camera_id,
+                            &notification,
+                            received,
+                            &event_index,
+                            retention_days,
+                        )
+                        .is_err()
+                        {
+                            persistence_failed = true;
+                            if let Ok(mut runtime) = status.lock() {
+                                runtime.motion_active = None;
+                                runtime.last_error_code = Some("persistence_failed".to_owned());
+                            }
+                            break;
+                        }
                         if let Ok(mut runtime) = status.lock() {
                             runtime.motion_active = normalizer.aggregate_motion();
                             runtime.last_event_at = Some(received);
                             runtime.last_error_code = None;
                             runtime.state = EventRuntimeState::Polling;
-                        }
-                        let Some(insert) = insert else {
-                            continue;
-                        };
-                        let persisted = event_index.lock().map_err(|_| ()).and_then(|mut index| {
-                            let index = index.as_mut().ok_or(())?;
-                            index.insert(&insert).map_err(|_| ())?;
-                            index.cleanup(Utc::now(), retention_days).map_err(|_| ())?;
-                            Ok(())
-                        });
-                        if persisted.is_err() {
-                            persistence_failed = true;
-                            break;
                         }
                     }
                     if persistence_failed {
@@ -2063,6 +2127,18 @@ mod tests {
         }
     }
 
+    fn commit_motion(
+        normalizer: &mut MotionNormalizer,
+        camera_id: &CameraId,
+        notification: &MotionNotification,
+        received: DateTime<Utc>,
+    ) -> Option<EventInsert> {
+        let decision = normalizer.prepare(camera_id, notification, received);
+        let transition = decision.transition.clone();
+        normalizer.commit(decision);
+        transition
+    }
+
     fn controller_fixture(
         backend: Arc<FakeBackend>,
         camera_host: &str,
@@ -2130,24 +2206,24 @@ mod tests {
             source_key: Some("source-a".to_owned()),
             synchronization_baseline: true,
         };
-        assert!(normalizer.ingest(&camera_id, &baseline, now).is_none());
+        assert!(commit_motion(&mut normalizer, &camera_id, &baseline, now).is_none());
         assert_eq!(normalizer.aggregate_motion(), Some(true));
 
         let repeated = MotionNotification {
             synchronization_baseline: false,
             ..baseline.clone()
         };
-        assert!(normalizer.ingest(&camera_id, &repeated, now).is_none());
+        assert!(commit_motion(&mut normalizer, &camera_id, &repeated, now).is_none());
 
         let ended = MotionNotification {
             active: false,
             synchronization_baseline: false,
             ..baseline
         };
-        let transition = normalizer.ingest(&camera_id, &ended, now).unwrap();
+        let transition = commit_motion(&mut normalizer, &camera_id, &ended, now).unwrap();
         assert_eq!(transition.kind, EventKind::MotionEnded);
         assert_eq!(normalizer.aggregate_motion(), Some(false));
-        assert!(normalizer.ingest(&camera_id, &ended, now).is_none());
+        assert!(commit_motion(&mut normalizer, &camera_id, &ended, now).is_none());
     }
 
     #[test]
@@ -2161,14 +2237,224 @@ mod tests {
             source_key: None,
             synchronization_baseline: false,
         };
-        assert!(normalizer.ingest(&camera_id, &idle, now).is_none());
+        assert!(commit_motion(&mut normalizer, &camera_id, &idle, now).is_none());
         let active = MotionNotification {
             active: true,
             ..idle.clone()
         };
-        let transition = normalizer.ingest(&camera_id, &active, now).unwrap();
+        let transition = commit_motion(&mut normalizer, &camera_id, &active, now).unwrap();
         assert_eq!(transition.kind, EventKind::MotionStarted);
-        assert!(normalizer.ingest(&camera_id, &active, now).is_none());
+        assert!(commit_motion(&mut normalizer, &camera_id, &active, now).is_none());
+    }
+
+    #[test]
+    fn failed_motion_started_persistence_does_not_advance_and_replay_retries_once() {
+        let temp = tempdir().unwrap();
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let now = Utc::now();
+        let mut normalizer = MotionNormalizer::default();
+        let event_index = Mutex::new(None);
+        let idle = MotionNotification {
+            active: false,
+            device_time_utc: None,
+            source_key: Some("source-a".to_owned()),
+            synchronization_baseline: false,
+        };
+        apply_motion_notification(
+            &mut normalizer,
+            &camera_id,
+            &idle,
+            now,
+            &event_index,
+            Some(30),
+        )
+        .unwrap();
+        assert_eq!(normalizer.aggregate_motion(), Some(false));
+
+        let started = MotionNotification {
+            active: true,
+            ..idle.clone()
+        };
+        assert_eq!(
+            apply_motion_notification(
+                &mut normalizer,
+                &camera_id,
+                &started,
+                now,
+                &event_index,
+                Some(30),
+            ),
+            Err(())
+        );
+        assert_eq!(normalizer.aggregate_motion(), Some(false));
+
+        *event_index.lock().unwrap() =
+            Some(EventIndex::open(temp.path().join("events.sqlite3")).unwrap());
+        apply_motion_notification(
+            &mut normalizer,
+            &camera_id,
+            &started,
+            now,
+            &event_index,
+            Some(30),
+        )
+        .unwrap();
+        assert_eq!(normalizer.aggregate_motion(), Some(true));
+        let rows = event_index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .recent(&camera_id, 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, EventKind::MotionStarted);
+
+        apply_motion_notification(
+            &mut normalizer,
+            &camera_id,
+            &started,
+            now,
+            &event_index,
+            Some(30),
+        )
+        .unwrap();
+        let rows = event_index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .recent(&camera_id, 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn failed_motion_ended_persistence_does_not_advance_and_replay_retries_once() {
+        let temp = tempdir().unwrap();
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let now = Utc::now();
+        let mut normalizer = MotionNormalizer::default();
+        let event_index = Mutex::new(None);
+        let baseline = MotionNotification {
+            active: true,
+            device_time_utc: None,
+            source_key: Some("source-a".to_owned()),
+            synchronization_baseline: true,
+        };
+        apply_motion_notification(
+            &mut normalizer,
+            &camera_id,
+            &baseline,
+            now,
+            &event_index,
+            Some(30),
+        )
+        .unwrap();
+        assert_eq!(normalizer.aggregate_motion(), Some(true));
+
+        let ended = MotionNotification {
+            active: false,
+            synchronization_baseline: false,
+            ..baseline
+        };
+        assert_eq!(
+            apply_motion_notification(
+                &mut normalizer,
+                &camera_id,
+                &ended,
+                now,
+                &event_index,
+                Some(30),
+            ),
+            Err(())
+        );
+        assert_eq!(normalizer.aggregate_motion(), Some(true));
+
+        *event_index.lock().unwrap() =
+            Some(EventIndex::open(temp.path().join("events.sqlite3")).unwrap());
+        apply_motion_notification(
+            &mut normalizer,
+            &camera_id,
+            &ended,
+            now,
+            &event_index,
+            Some(30),
+        )
+        .unwrap();
+        assert_eq!(normalizer.aggregate_motion(), Some(false));
+        let rows = event_index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .recent(&camera_id, 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, EventKind::MotionEnded);
+    }
+
+    #[test]
+    fn duplicate_persisted_transition_commits_runtime_state_without_extra_row() {
+        let temp = tempdir().unwrap();
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let now = Utc::now();
+        let mut normalizer = MotionNormalizer::default();
+        let event_index = Mutex::new(Some(
+            EventIndex::open(temp.path().join("events.sqlite3")).unwrap(),
+        ));
+        let idle = MotionNotification {
+            active: false,
+            device_time_utc: Some(now),
+            source_key: Some("source-a".to_owned()),
+            synchronization_baseline: false,
+        };
+        apply_motion_notification(
+            &mut normalizer,
+            &camera_id,
+            &idle,
+            now,
+            &event_index,
+            Some(30),
+        )
+        .unwrap();
+        let started = MotionNotification {
+            active: true,
+            ..idle
+        };
+        let prepared = normalizer.prepare(&camera_id, &started, now);
+        let insert = prepared.transition.as_ref().unwrap().clone();
+        assert!(
+            event_index
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .insert(&insert)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(normalizer.aggregate_motion(), Some(false));
+
+        apply_motion_notification(
+            &mut normalizer,
+            &camera_id,
+            &started,
+            now,
+            &event_index,
+            Some(30),
+        )
+        .unwrap();
+        assert_eq!(normalizer.aggregate_motion(), Some(true));
+        let rows = event_index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .recent(&camera_id, 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, EventKind::MotionStarted);
     }
 
     #[test]
@@ -2240,7 +2526,7 @@ mod tests {
                 source_key: Some(format!("source-{index}")),
                 synchronization_baseline: false,
             };
-            let _ = normalizer.ingest(&camera_id, &notification, now);
+            let _ = commit_motion(&mut normalizer, &camera_id, &notification, now);
         }
         assert_eq!(normalizer.sources.len(), MAX_EVENT_SOURCES_PER_SESSION);
         assert!(normalizer.overflowed);
@@ -2252,7 +2538,7 @@ mod tests {
             source_key: Some("source-0".to_owned()),
             synchronization_baseline: false,
         };
-        assert!(normalizer.ingest(&camera_id, &known_end, now).is_some());
+        assert!(commit_motion(&mut normalizer, &camera_id, &known_end, now).is_some());
         assert_eq!(normalizer.sources.len(), MAX_EVENT_SOURCES_PER_SESSION);
         assert_eq!(normalizer.aggregate_motion(), None);
     }
@@ -2269,37 +2555,52 @@ mod tests {
             synchronization_baseline: false,
         };
         assert_eq!(
-            normalizer.ingest(&camera_id, &started, now).unwrap().kind,
+            commit_motion(&mut normalizer, &camera_id, &started, now)
+                .unwrap()
+                .kind,
             EventKind::MotionStarted
         );
         // Subscription recreation deliberately preserves the bounded normalizer.
-        assert!(normalizer.ingest(&camera_id, &started, now).is_none());
+        assert!(commit_motion(&mut normalizer, &camera_id, &started, now).is_none());
 
         let ended = MotionNotification {
             active: false,
             ..started.clone()
         };
         assert_eq!(
-            normalizer.ingest(&camera_id, &ended, now).unwrap().kind,
+            commit_motion(&mut normalizer, &camera_id, &ended, now)
+                .unwrap()
+                .kind,
             EventKind::MotionEnded
         );
         assert_eq!(
-            normalizer.ingest(&camera_id, &started, now).unwrap().kind,
+            commit_motion(&mut normalizer, &camera_id, &started, now)
+                .unwrap()
+                .kind,
             EventKind::MotionStarted
         );
     }
 
     #[test]
-    fn subscription_renew_deadline_clamps_remote_lifetime_and_rejects_nonpositive() {
+    fn subscription_renew_deadline_rejects_short_remote_lifetime_and_bounds_long_lifetime() {
         let before = Instant::now();
         let normal = subscription_renew_deadline(&PullPointSubscription::test_fixture(60)).unwrap();
         let normal_delay = normal.saturating_duration_since(before).as_secs();
         assert!((39..=40).contains(&normal_delay));
 
-        let before = Instant::now();
-        let short = subscription_renew_deadline(&PullPointSubscription::test_fixture(1)).unwrap();
-        let short_delay = short.saturating_duration_since(before).as_secs();
-        assert!((2..=3).contains(&short_delay));
+        let minimum = nian_onvif::MIN_EVENT_SUBSCRIPTION_LIFETIME_SECS;
+        assert!(
+            subscription_renew_deadline(&PullPointSubscription::test_fixture(minimum as i64))
+                .is_ok()
+        );
+        assert_eq!(
+            subscription_renew_deadline(&PullPointSubscription::test_fixture(minimum as i64 - 1)),
+            Err(OnvifError::Protocol)
+        );
+        assert_eq!(
+            subscription_renew_deadline(&PullPointSubscription::test_fixture(1)),
+            Err(OnvifError::Protocol)
+        );
 
         let before = Instant::now();
         let long =
@@ -2311,6 +2612,10 @@ mod tests {
 
         assert_eq!(
             subscription_renew_deadline(&PullPointSubscription::test_fixture(0)),
+            Err(OnvifError::Protocol)
+        );
+        assert_eq!(
+            subscription_renew_deadline(&PullPointSubscription::test_fixture(-1)),
             Err(OnvifError::Protocol)
         );
         let fallback = PullPointSubscription::test_fixture_times(None, None);

@@ -171,6 +171,80 @@ impl EventIndex {
         Ok(Some(id))
     }
 
+    pub fn insert_and_cleanup(
+        &mut self,
+        event: &EventInsert,
+        now: DateTime<Utc>,
+        retention_days: Option<u32>,
+    ) -> Result<Option<u64>, IndexError> {
+        if event
+            .source_key
+            .as_ref()
+            .is_some_and(|key| key.len() > MAX_SOURCE_KEY_BYTES || !key.is_ascii())
+        {
+            return Err(IndexError::InvalidData(
+                "invalid event source key".to_owned(),
+            ));
+        }
+        let days = retention_days
+            .unwrap_or(DEFAULT_EVENT_RETENTION_DAYS)
+            .max(1);
+        let cutoff = now
+            .checked_sub_signed(Duration::days(i64::from(days)))
+            .ok_or_else(|| IndexError::InvalidData("invalid event retention cutoff".to_owned()))?
+            .timestamp_millis();
+        let device_ms = event.device_time_utc.map(|value| value.timestamp_millis());
+        let received_ms = event.received_time_utc.timestamp_millis();
+        let fingerprint = event.fingerprint.map(|value| value.to_vec());
+
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "INSERT OR IGNORE INTO events \
+             (camera_id, kind, source_key, device_time_utc_ms, received_time_utc_ms, fingerprint) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                event.camera_id.as_str(),
+                event.kind.as_str(),
+                event.source_key,
+                device_ms,
+                received_ms,
+                fingerprint,
+            ],
+        )?;
+        let inserted_id = if changed == 0 {
+            None
+        } else {
+            Some(
+                u64::try_from(transaction.last_insert_rowid())
+                    .map_err(|_| IndexError::InvalidData("invalid event id".to_owned()))?,
+            )
+        };
+        transaction.execute(
+            "DELETE FROM events WHERE event_id IN (\
+                 SELECT event_id FROM events WHERE received_time_utc_ms < ?1 \
+                 ORDER BY received_time_utc_ms, event_id LIMIT ?2\
+             )",
+            params![cutoff, i64::from(EVENT_CLEANUP_BATCH)],
+        )?;
+        let count: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        let excess = u64::try_from(count)
+            .map_err(|_| IndexError::InvalidData("invalid event count".to_owned()))?
+            .saturating_sub(MAX_EVENT_ROWS);
+        let cap_batch = excess.min(u64::from(EVENT_CLEANUP_BATCH));
+        if cap_batch != 0 {
+            transaction.execute(
+                "DELETE FROM events WHERE event_id IN (\
+                     SELECT event_id FROM events ORDER BY received_time_utc_ms, event_id LIMIT ?1\
+                 )",
+                [i64::try_from(cap_batch)
+                    .map_err(|_| IndexError::InvalidData("invalid cleanup batch".to_owned()))?],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(inserted_id)
+    }
+
     pub fn recent(&self, camera_id: &CameraId, limit: u32) -> Result<Vec<EventRecord>, IndexError> {
         let limit = limit.clamp(1, MAX_RECENT_EVENTS);
         let mut statement = self.connection.prepare(
@@ -369,6 +443,27 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, EventKind::MotionStarted);
+    }
+
+    #[test]
+    fn insert_and_cleanup_reports_duplicate_without_extra_row() {
+        let temp = tempdir().unwrap();
+        let mut index = EventIndex::open(temp.path().join("event-index.sqlite3")).unwrap();
+        let row = event("front-door", true, 10);
+        let now = DateTime::from_timestamp(20, 0).unwrap();
+        assert!(
+            index
+                .insert_and_cleanup(&row, now, Some(30))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            index
+                .insert_and_cleanup(&row, now, Some(30))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(index.count().unwrap(), 1);
     }
 
     #[test]
