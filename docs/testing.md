@@ -768,9 +768,7 @@ shared Event credentials block camera credential replacement, Event-owned creden
 independent camera credential replacement, and camera deletion cleans camera/PTZ/Event-owned
 credentials once and only after the database commit.
 
-`nian-onvif` parser fixtures cover the exact `RuleEngine/CellMotionDetector/Motion` TopicSet path,
-boolean `IsMotion`, synchronization `Initialized`, malformed/lookalike messages, bounded PullPoint
-metadata and SHA-256 source-token normalization. A local HTTP fixture executes the complete
+`nian-onvif` parser fixtures cover the namespace-qualified `RuleEngine/CellMotionDetector/Motion` TopicSet path, QName-prefix resolution for notification Topic text, rejection/ignore of identical local names under vendor namespaces, boolean `IsMotion`, synchronization `Initialized`, malformed/lookalike messages, 5-second to 24-hour PullPoint lifetime clamping, invalid/extreme timestamp handling and SHA-256 source-token normalization. A local HTTP fixture executes the complete
 GetServices/GetEventProperties/CreatePullPointSubscription/SetSynchronizationPoint/PullMessages/
 Renew/Unsubscribe sequence using the production client. It checks the four-second bounded poll,
 32-message cap, secret redaction and normalized source digest. A separate fixture advertises a
@@ -780,12 +778,7 @@ cross-host Event service and proves rejection occurs before follow-up authentica
 reconnected. Both paths must reject the stale `PreparedEventPairing`, including connection-generation
 replacement after credentials change.
 
-`EventController` fake-backend tests cover synchronization baseline semantics, transition-only
-persistence, repeated-state suppression, Desired-On survival after runtime startup failure, runtime
-exact-host rejection before authenticated Event traffic, and shutdown waiting for a blocked pull plus
-Unsubscribe. Worker ownership uses opening/active/draining/mutating state and terminal lifecycle waits
-mutation cleanup as well as workers. Per-camera failure/reconnect remains isolated and no test relies
-on a thread-per-poll implementation.
+`EventController` fake-backend tests cover synchronization baseline semantics, transition-only persistence, repeated-state suppression, Desired-On survival after runtime startup failure, runtime exact-host rejection before authenticated Event traffic, and shutdown waiting for a blocked pull plus Unsubscribe. Drain tests hold Pull blocked while two shutdown callers race and assert both observe one controller-owned DrainState until the single worker join completes. Terminal Unsupported behavior remains an owned live `Failed` worker until intentional cancellation, so no terminated JoinHandle can remain active. Source-state tests feed more than the 64-source bound and assert no growth plus conservative `motion_active=None` overflow behavior. Scripted reconnect tests assert repeated Pull failures request `2, 5, 10, 30, 60` seconds and a successful Pull resets the next failure to two seconds. Timestamp-less replay tests preserve bounded source state across subscription recreation, suppress duplicate MotionStarted, then prove MotionEnded followed by a new MotionStarted still persists.
 
 The dedicated Event index tests cover stable insert/query, fingerprint dedupe, bounded cleanup, corrupt
 DB quarantine/recreation, WAL/SHM evidence preservation and future-schema refusal without replacement.
@@ -795,11 +788,7 @@ root authoritative and reopens Event admission. Existing close-to-tray regressio
 admission remains available while transient live/PTZ ownership is released. Suspend/Resume/Quit/Update
 continue through the terminal Event settlement path rather than the Hide path.
 
-Frontend coverage pairs Events through explicit ONVIF selection without forwarding username/password
-to `event_pair`, verifies Pair leaves Desired Off until Enable, and exercises Unpair. Live View polls
-Event status at low frequency and verifies a motion/error indicator does not close or replace a healthy
-video tile. Event failures therefore remain presentation-local rather than becoming live/recording
-failures.
+Frontend coverage pairs Events through explicit ONVIF selection without forwarding username/password to `event_pair`, verifies Pair leaves Desired Off until Enable, and exercises Unpair. Cameras loads the aggregate `event_statuses` result instead of issuing N per-camera Event status calls. Live View polls the same aggregate at five-second cadence with an explicit single-flight guard; a deferred-request test fires multiple timer ticks and proves only one backend request remains active until resolution, after which one new poll may start. Motion/error projection still does not close or replace a healthy video tile. Desktop has a thread-identity regression proving aggregate Event status collection executes through `spawn_blocking`, not on the caller/main thread.
 
 Physical Event validation is manual and never claimed by CI. On a compatible camera, verify standard
 CellMotion start/end transitions, reconnect replay suppression, camera reboot, network interruption,

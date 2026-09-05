@@ -231,6 +231,7 @@ export function LiveViewScreen() {
   const generationRef = useRef<Map<string, number>>(new Map());
   const pendingOpenRef = useRef<Map<string, number>>(new Map());
   const refreshInFlightRef = useRef(false);
+  const eventStatusInFlightRef = useRef(false);
 
   const setSessionForCamera = useCallback((cameraId: string, session: LiveOpenDto | null) => {
     const next = new Map(sessionsRef.current);
@@ -355,14 +356,24 @@ export function LiveViewScreen() {
     }
     let disposed = false;
     const poll = async () => {
-      const rows = await Promise.all(
-        selected.map(async (cameraId) => {
-          const status = await invokeDesktop<EventStatus>("event_status", { cameraId }).catch(() => null);
-          return [cameraId, status] as const;
-        }),
-      );
-      if (disposed) return;
-      setEventStatuses(new Map(rows.filter((row): row is readonly [string, EventStatus] => row[1] !== null)));
+      if (eventStatusInFlightRef.current) return;
+      eventStatusInFlightRef.current = true;
+      try {
+        const rows = await invokeDesktop<EventStatus[]>("event_statuses");
+        if (disposed) return;
+        const selectedIds = selectedRef.current;
+        setEventStatuses(
+          new Map(
+            rows
+              .filter((status) => selectedIds.has(status.camera_id))
+              .map((status) => [status.camera_id, status]),
+          ),
+        );
+      } catch {
+        if (!disposed) setEventStatuses(new Map());
+      } finally {
+        eventStatusInFlightRef.current = false;
+      }
     };
     void poll();
     const timer = window.setInterval(() => void poll(), EVENT_STATUS_POLL_MS);

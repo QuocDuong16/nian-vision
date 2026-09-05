@@ -1216,27 +1216,57 @@ async fn event_disable(
 }
 
 #[tauri::command]
-fn event_configured(
+async fn event_configured(
     state: tauri::State<'_, Arc<DesktopState>>,
     camera_id: String,
 ) -> Result<bool, DesktopErrorDto> {
     admit_running(&state)?;
-    state
-        .event_controller
-        .configured(&camera_id)
-        .map_err(map_event_error)
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .event_controller
+            .configured(&camera_id)
+            .map_err(map_event_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("event_internal", "event status task failed"))?
 }
 
 #[tauri::command]
-fn event_status(
+async fn event_status(
     state: tauri::State<'_, Arc<DesktopState>>,
     camera_id: String,
 ) -> Result<EventStatusDto, DesktopErrorDto> {
     admit_running(&state)?;
-    state
-        .event_controller
-        .status(&camera_id)
-        .map_err(map_event_error)
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .event_controller
+            .status(&camera_id)
+            .map_err(map_event_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("event_internal", "event status task failed"))?
+}
+
+async fn run_event_statuses_blocking<F, T>(operation: F) -> Result<T, DesktopErrorDto>
+where
+    F: FnOnce() -> Result<T, DesktopErrorDto> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|_| DesktopErrorDto::new("event_internal", "event statuses task failed"))?
+}
+
+#[tauri::command]
+async fn event_statuses(
+    state: tauri::State<'_, Arc<DesktopState>>,
+) -> Result<Vec<EventStatusDto>, DesktopErrorDto> {
+    admit_running(&state)?;
+    let state = state.inner().clone();
+    run_event_statuses_blocking(move || state.event_controller.statuses().map_err(map_event_error))
+        .await
 }
 
 #[tauri::command]
@@ -3226,6 +3256,7 @@ pub fn run() {
             event_disable,
             event_configured,
             event_status,
+            event_statuses,
             event_recent,
             recording_start,
             recording_stop,
@@ -6229,6 +6260,16 @@ mod tests {
             root_b,
             "recording and playback must converge on the committed root",
         );
+    }
+
+    #[test]
+    fn event_statuses_blocking_helper_runs_repository_work_off_the_caller_thread() {
+        let caller = std::thread::current().id();
+        let worker = tauri::async_runtime::block_on(run_event_statuses_blocking(move || {
+            Ok::<_, DesktopErrorDto>(std::thread::current().id())
+        }))
+        .unwrap();
+        assert_ne!(caller, worker);
     }
 
     #[test]

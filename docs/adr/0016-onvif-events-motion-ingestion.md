@@ -1,6 +1,6 @@
 # ADR-0016: ONVIF PullPoint motion-event ingestion
 
-- Status: Accepted
+- Status: Proposed (implementation complete; final remediation review pending)
 - Milestone: M13
 
 ## Context
@@ -27,21 +27,21 @@ React reuses the existing ONVIF wizard and submits only `camera_id`, authenticat
 
 ### `nian-onvif` owns PullPoint protocol handling
 
-The protocol layer resolves the Event service through authenticated `GetServices`, inspects `GetEventProperties`, creates a PullPoint subscription, requests a synchronization point, long-polls `PullMessages`, renews the subscription at roughly two-thirds of its advertised lifetime, and unsubscribes on teardown. Pull timeout, message limit, response size, XML depth/text, namespace count and URL size remain bounded. DTD/custom entities remain rejected.
+The protocol layer resolves the Event service through authenticated `GetServices`, inspects `GetEventProperties`, creates a PullPoint subscription, requests a synchronization point, long-polls `PullMessages`, renews the subscription at roughly two-thirds of a validated lifetime, and unsubscribes on teardown. Advertised subscription lifetime is required to be positive when both timestamps exist, then clamped to 5 seconds through 24 hours; missing timestamp metadata uses the finite 40-second fallback. Renewal uses checked `Instant` arithmetic. Pull timeout, message limit, response size, XML depth/text, namespace count and URL size remain bounded. DTD/custom entities remain rejected.
 
-Only the exact standard motion topic is normalized. `IsMotion` accepts the XML boolean forms `true`, `false`, `1`, and `0`; malformed values are protocol errors and lookalike topics are ignored. Source `SimpleItem` tuples are sorted and SHA-256 hashed before leaving `nian-onvif`; raw source tokens are never persisted or rendered. Malformed optional device timestamps degrade to `None` rather than poisoning the worker.
+Only the namespace-qualified standard motion topic is normalized. `TopicSet` nodes must resolve to `http://www.onvif.org/ver10/topics`, and a notification such as `tns1:RuleEngine/CellMotionDetector/Motion` is accepted only when the in-scope `tns1` binding resolves to that same namespace. Vendor/evil namespaces with identical local names and unqualified ambiguous Topic text are ignored or rejected conservatively. `IsMotion` accepts the XML boolean forms `true`, `false`, `1`, and `0`; malformed values are protocol errors. Source `SimpleItem` tuples are sorted and SHA-256 hashed before leaving `nian-onvif`; raw source tokens are never persisted or rendered. Malformed optional device timestamps degrade to `None` rather than poisoning the worker.
 
 ### Runtime ownership is bounded per camera
 
-`EventController` owns a registry of `opening`, `active`, `draining`, and `mutating` state. Worker capacity is `opening + active + draining <= 16`; `mutating` does not consume a worker slot but excludes fresh same-camera admission. Same-camera mutation contention fails fast `Busy` instead of creating an unbounded waiter queue. Other cameras remain independent.
+`EventController` owns a registry of `opening`, `active`, `draining`, and `mutating` state. `draining` stores controller-owned `Arc<DrainState>` objects containing the stable session identity, camera identity, one join owner and a completion condition variable. A worker remains registry-visible until its join has completed; one lifecycle caller leads the join while followers wait the same DrainState. Removal uses exact session/Arc identity, so stale completion cannot erase fresh same-camera ownership. Worker capacity is `opening + active + draining <= 16`; `mutating` does not consume a worker slot but excludes fresh same-camera admission. Same-camera mutation contention fails fast `Busy` instead of creating an unbounded waiter queue. Other cameras remain independent.
 
 Opening and mutation state carry lifecycle generations and completion ownership. A late network result cannot become active after lifecycle cancellation, binding replacement, unpair or camera deletion. Terminal teardown waits openings, workers and mutation side effects, including credential rollback/cleanup. No registry/global lifecycle mutex is held over SOAP requests, SQLite I/O, keyring I/O or thread joins.
 
-Each active camera owns one long-lived worker. The worker recreates subscriptions with bounded camera-local backoff after recoverable failures. It never spawns a thread per poll. Desired state remains On while Runtime reports Starting/Subscribing/Polling/Backoff/Failed.
+Each active camera owns one long-lived worker. Recoverable control/subscription/renew/pull/persistence failures remain inside that worker and recreate subscriptions with the camera-local `2s, 5s, 10s, 30s, 60s` backoff. Subscription creation alone does not reset the failure streak; only a successful `PullMessages` response or a completed bounded long-poll timeout resets it. Terminal Unsupported/Auth/Authority failures keep the worker alive in bounded `Failed` state until cancellation, avoiding a dead JoinHandle stranded in `active`. It never spawns a thread per poll. Desired state remains On while Runtime reports Starting/Subscribing/Polling/Backoff/Failed.
 
 ### Normalize motion transitions before persistence
 
-Each subscription generation begins with motion state `Unknown`. Synchronization `Initialized` notifications establish baseline state without producing historical rows. Live transitions then produce only:
+Each worker begins with motion state `Unknown`. Synchronization `Initialized` notifications establish baseline state without producing historical rows. The normalizer keeps at most 64 hashed source states for the worker lifetime. Once an unknown source arrives at capacity it is not inserted and aggregate `motion_active` becomes `None` for the rest of that worker lifetime, a conservative signal that an untracked source may still be active. Live transitions then produce only:
 
 - `Unknown -> Active`: `MotionStarted`;
 - `Unknown -> Idle`: baseline only;
@@ -49,7 +49,7 @@ Each subscription generation begins with motion state `Unknown`. Synchronization
 - `Active -> Idle`: `MotionEnded`;
 - repeated state: no row.
 
-Reconnect resets the in-memory baseline. When the camera supplies a usable device timestamp, a SHA-256 fingerprint over camera, transition kind, source hash and device timestamp provides cross-generation duplicate suppression. Receive time is always stored and remains the primary host ordering clock.
+Subscription recreation does not reset the bounded in-memory source state. This suppresses timestamp-less immediate redelivery because an already-active source remains Active instead of returning to Unknown. An opposite transition updates state immediately, so a genuine later MotionEnded/MotionStarted sequence still persists. A fresh worker, including Suspend/Resume restoration, starts from Unknown and requires synchronization baseline again. When the camera supplies a usable device timestamp, the existing SHA-256 fingerprint over camera, transition kind, source hash and device timestamp remains an additional persistence dedupe key. Receive time is always stored and remains the primary host ordering clock.
 
 ### Event history is a dedicated rebuildable runtime index
 
@@ -71,6 +71,6 @@ Close-to-tray hides the window and releases transient live/PTZ ownership, but Ev
 - Event failures cannot stop recording, live view or PTZ.
 - Pairing alone does not start monitoring.
 - Motion history contains normalized transitions, not raw ONVIF messages.
-- The frontend can show coarse runtime/motion status with low-frequency polling without receiving subscription authority or secrets.
+- Desktop exposes aggregate `event_statuses` through `spawn_blocking`; Cameras joins that bounded result locally, while Live View polls one aggregate request every five seconds with a single-flight guard, so overlapping timer ticks never queue SQLite/status batches.
 - Exact-host authority proof is intentionally conservative; hostname/IP aliases may require re-pairing rather than silent equivalence.
 - Physical-camera interoperability remains a manual validation boundary; CI uses deterministic parser, local HTTP, lifecycle and persistence fixtures.

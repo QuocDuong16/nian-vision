@@ -1,6 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+use crate::{
+    MAX_EVENT_SUBSCRIPTION_LIFETIME_SECS, MIN_EVENT_SUBSCRIPTION_LIFETIME_SECS, OnvifError,
+};
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct OnvifCredentials {
     pub username: String,
@@ -212,6 +216,25 @@ impl PullPointSubscription {
         self.termination_time_utc
     }
 
+    pub fn bounded_lifetime_secs(&self) -> Result<Option<u64>, OnvifError> {
+        let (Some(current), Some(termination)) = (self.current_time_utc, self.termination_time_utc)
+        else {
+            return Ok(None);
+        };
+        let seconds = termination
+            .timestamp()
+            .checked_sub(current.timestamp())
+            .ok_or(OnvifError::Protocol)?;
+        if seconds <= 0 {
+            return Err(OnvifError::Protocol);
+        }
+        let seconds = u64::try_from(seconds).map_err(|_| OnvifError::Protocol)?;
+        Ok(Some(seconds.clamp(
+            MIN_EVENT_SUBSCRIPTION_LIFETIME_SECS,
+            MAX_EVENT_SUBSCRIPTION_LIFETIME_SECS,
+        )))
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn test_fixture(lifetime_secs: i64) -> Self {
@@ -220,6 +243,19 @@ impl PullPointSubscription {
             endpoint: "http://127.0.0.1/onvif/pullpoint-fixture".to_owned(),
             current_time_utc: Some(current),
             termination_time_utc: Some(current + chrono::Duration::seconds(lifetime_secs)),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_fixture_times(
+        current_time_utc: Option<DateTime<Utc>>,
+        termination_time_utc: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            endpoint: "http://127.0.0.1/onvif/pullpoint-fixture".to_owned(),
+            current_time_utc,
+            termination_time_utc,
         }
     }
 }
@@ -261,4 +297,65 @@ pub(crate) struct ProbeMatch {
     pub xaddrs: Vec<String>,
     pub scopes: Vec<String>,
     pub is_network_video_transmitter: bool,
+}
+
+#[cfg(test)]
+mod event_subscription_tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+
+    #[test]
+    fn subscription_lifetime_is_positive_bounded_and_optional() {
+        assert_eq!(
+            PullPointSubscription::test_fixture(60)
+                .bounded_lifetime_secs()
+                .unwrap(),
+            Some(60)
+        );
+        assert_eq!(
+            PullPointSubscription::test_fixture(1)
+                .bounded_lifetime_secs()
+                .unwrap(),
+            Some(MIN_EVENT_SUBSCRIPTION_LIFETIME_SECS)
+        );
+        assert_eq!(
+            PullPointSubscription::test_fixture(10 * 24 * 60 * 60)
+                .bounded_lifetime_secs()
+                .unwrap(),
+            Some(MAX_EVENT_SUBSCRIPTION_LIFETIME_SECS)
+        );
+        assert_eq!(
+            PullPointSubscription::test_fixture_times(None, None)
+                .bounded_lifetime_secs()
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_or_extreme_subscription_times_are_safe() {
+        assert_eq!(
+            PullPointSubscription::test_fixture(0).bounded_lifetime_secs(),
+            Err(OnvifError::Protocol)
+        );
+        assert_eq!(
+            PullPointSubscription::test_fixture(-5).bounded_lifetime_secs(),
+            Err(OnvifError::Protocol)
+        );
+        let current = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap();
+        let termination = Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 59).unwrap();
+        assert_eq!(
+            PullPointSubscription::test_fixture_times(Some(current), Some(termination))
+                .bounded_lifetime_secs()
+                .unwrap(),
+            Some(MAX_EVENT_SUBSCRIPTION_LIFETIME_SECS)
+        );
+        assert_eq!(
+            PullPointSubscription::test_fixture_times(Some(current), None)
+                .bounded_lifetime_secs()
+                .unwrap(),
+            None
+        );
+    }
 }

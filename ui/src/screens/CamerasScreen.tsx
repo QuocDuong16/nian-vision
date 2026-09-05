@@ -133,27 +133,19 @@ export function CamerasScreen() {
       return;
     }
     try {
-      const rows = await invokeDesktop<CameraSummary[]>("camera_list");
+      const [rows, eventRows] = await Promise.all([
+        invokeDesktop<CameraSummary[]>("camera_list"),
+        invokeDesktop<EventStatus[]>("event_statuses").catch(() => []),
+      ]);
       setCameras(rows);
       const configured = await Promise.all(
         rows.map(async (camera) => {
-          const [ptz, events] = await Promise.all([
-            invokeDesktop<boolean>("ptz_configured", { cameraId: camera.camera_id }).catch(() => false),
-            invokeDesktop<EventStatus>("event_status", { cameraId: camera.camera_id }).catch(() => ({
-              camera_id: camera.camera_id,
-              configured: false,
-              desired: false,
-              state: "disabled" as const,
-              motion_active: null,
-              last_event_at: null,
-              last_error_code: null,
-            })),
-          ]);
-          return [camera.camera_id, ptz, events] as const;
+          const ptz = await invokeDesktop<boolean>("ptz_configured", { cameraId: camera.camera_id }).catch(() => false);
+          return [camera.camera_id, ptz] as const;
         }),
       );
-      setPtzConfigured(new Map(configured.map(([cameraId, ptz]) => [cameraId, ptz])));
-      setEventStatuses(new Map(configured.map(([cameraId, , events]) => [cameraId, events])));
+      setPtzConfigured(new Map(configured));
+      setEventStatuses(new Map(eventRows.map((status) => [status.camera_id, status])));
       setError(null);
     } catch (cause) {
       setError(desktopError(cause));

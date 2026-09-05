@@ -1735,7 +1735,7 @@ mod tests {
                         "<Envelope><Body><GetServicesResponse><Service><Namespace>{EVENT_NS}</Namespace><XAddr>http://{address}/events</XAddr></Service></GetServicesResponse></Body></Envelope>"
                     )
                 } else if request.contains("GetEventProperties") {
-                    "<Envelope><Body><GetEventPropertiesResponse><TopicSet><RuleEngine><CellMotionDetector><Motion/></CellMotionDetector></RuleEngine></TopicSet></GetEventPropertiesResponse></Body></Envelope>".to_owned()
+                    r#"<Envelope xmlns:tns1="http://www.onvif.org/ver10/topics"><Body><GetEventPropertiesResponse><TopicSet><tns1:RuleEngine><tns1:CellMotionDetector><tns1:Motion/></tns1:CellMotionDetector></tns1:RuleEngine></TopicSet></GetEventPropertiesResponse></Body></Envelope>"#.to_owned()
                 } else if request.contains("CreatePullPointSubscription") {
                     format!(
                         "<Envelope><Body><CreatePullPointSubscriptionResponse><SubscriptionReference><Address>http://{address}/pullpoint</Address></SubscriptionReference><CurrentTime>2026-09-05T03:00:00Z</CurrentTime><TerminationTime>2026-09-05T03:01:00Z</TerminationTime></CreatePullPointSubscriptionResponse></Body></Envelope>"
@@ -1744,7 +1744,7 @@ mod tests {
                     "<Envelope><Body><SetSynchronizationPointResponse/></Body></Envelope>"
                         .to_owned()
                 } else if request.contains("PullMessages") {
-                    r#"<Envelope><Body><PullMessagesResponse><NotificationMessage><Topic>tns1:RuleEngine/CellMotionDetector/Motion</Topic><Message UtcTime="2026-09-05T03:00:01Z"><Source><SimpleItem Name="VideoSourceConfigurationToken" Value="RAW-SOURCE-TOKEN"/></Source><Data><SimpleItem Name="IsMotion" Value="true"/></Data></Message></NotificationMessage></PullMessagesResponse></Body></Envelope>"#.to_owned()
+                    r#"<Envelope xmlns:tns1="http://www.onvif.org/ver10/topics"><Body><PullMessagesResponse><NotificationMessage><Topic>tns1:RuleEngine/CellMotionDetector/Motion</Topic><Message UtcTime="2026-09-05T03:00:01Z"><Source><SimpleItem Name="VideoSourceConfigurationToken" Value="RAW-SOURCE-TOKEN"/></Source><Data><SimpleItem Name="IsMotion" Value="true"/></Data></Message></NotificationMessage></PullMessagesResponse></Body></Envelope>"#.to_owned()
                 } else if request.contains("<wsnt:Renew>") {
                     "<Envelope><Body><RenewResponse><CurrentTime>2026-09-05T03:00:20Z</CurrentTime><TerminationTime>2026-09-05T03:01:20Z</TerminationTime></RenewResponse></Body></Envelope>".to_owned()
                 } else if request.contains("Unsubscribe") {

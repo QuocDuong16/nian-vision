@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::name::ResolveResult;
+use quick_xml::name::{QName, ResolveResult};
 use quick_xml::{NsReader, Reader, XmlVersion};
 use sha2::{Digest as _, Sha256};
 
@@ -17,6 +17,8 @@ use crate::{
     MAX_SCOPES_PER_DEVICE, MAX_SOAP_RESPONSE_BYTES, MAX_XADDRS_PER_DEVICE, MAX_XML_DEPTH,
     MAX_XML_TEXT_BYTES, OnvifError,
 };
+
+const ONVIF_TOPICS_NAMESPACE: &str = "http://www.onvif.org/ver10/topics";
 
 fn local_name(raw: &str) -> String {
     raw.rsplit(':').next().unwrap_or(raw).to_owned()
@@ -691,6 +693,7 @@ pub(crate) fn parse_stream_uri(xml: &[u8]) -> Result<String, OnvifError> {
 #[derive(Debug, Default)]
 struct RawEventNotification {
     topic: Option<String>,
+    topic_is_standard_motion: bool,
     utc_time: Option<String>,
     property_operation: Option<String>,
     source_items: Vec<(String, String)>,
@@ -699,21 +702,33 @@ struct RawEventNotification {
 
 pub(crate) fn parse_event_properties(xml: &[u8]) -> Result<EventProperties, OnvifError> {
     validate_recognized_namespaces(xml)?;
-    let mut reader = reader(xml)?;
-    let mut stack = Vec::new();
+    let mut reader = NsReader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    reader.config_mut().check_end_names = true;
+    let mut stack: Vec<(String, bool)> = Vec::new();
     let mut topic_nodes = 0usize;
     let mut motion_supported = false;
 
     loop {
-        let event = reader.read_event().map_err(|_| OnvifError::Protocol)?;
+        let (resolved, event) = reader
+            .read_resolved_event()
+            .map_err(|_| OnvifError::Protocol)?;
         if prohibited(&event) {
             return Err(OnvifError::Protocol);
         }
         match event {
             Event::Start(start) => {
+                if stack.len() >= MAX_XML_DEPTH {
+                    return Err(OnvifError::ResponseTooLarge);
+                }
                 let name = local_name(start.name().as_ref());
-                push_start(&mut stack, name)?;
-                if let Some(topic_set) = stack.iter().position(|name| name == "TopicSet") {
+                let standard_topic = matches!(
+                    resolved,
+                    ResolveResult::Bound(namespace)
+                        if namespace.as_ref() == ONVIF_TOPICS_NAMESPACE
+                );
+                stack.push((name, standard_topic));
+                if let Some(topic_set) = stack.iter().position(|(name, _)| name == "TopicSet") {
                     topic_nodes = topic_nodes.saturating_add(1);
                     if topic_nodes > MAX_EVENT_TOPIC_SET_NODES {
                         return Err(OnvifError::ResponseTooLarge);
@@ -721,24 +736,41 @@ pub(crate) fn parse_event_properties(xml: &[u8]) -> Result<EventProperties, Onvi
                     let relative = &stack[topic_set + 1..];
                     if relative.len() >= 3
                         && relative[relative.len() - 3..]
-                            == ["RuleEngine", "CellMotionDetector", "Motion"]
+                            .iter()
+                            .map(|(name, standard)| (name.as_str(), *standard))
+                            .eq([
+                                ("RuleEngine", true),
+                                ("CellMotionDetector", true),
+                                ("Motion", true),
+                            ])
                     {
                         motion_supported = true;
                     }
                 }
             }
             Event::Empty(start) => {
-                if let Some(topic_set) = stack.iter().position(|name| name == "TopicSet") {
+                if let Some(topic_set) = stack.iter().position(|(name, _)| name == "TopicSet") {
                     topic_nodes = topic_nodes.saturating_add(1);
                     if topic_nodes > MAX_EVENT_TOPIC_SET_NODES {
                         return Err(OnvifError::ResponseTooLarge);
                     }
                     let name = local_name(start.name().as_ref());
+                    let standard_topic = matches!(
+                        resolved,
+                        ResolveResult::Bound(namespace)
+                            if namespace.as_ref() == ONVIF_TOPICS_NAMESPACE
+                    );
                     let mut relative = stack[topic_set + 1..].to_vec();
-                    relative.push(name);
+                    relative.push((name, standard_topic));
                     if relative.len() >= 3
                         && relative[relative.len() - 3..]
-                            == ["RuleEngine", "CellMotionDetector", "Motion"]
+                            .iter()
+                            .map(|(name, standard)| (name.as_str(), *standard))
+                            .eq([
+                                ("RuleEngine", true),
+                                ("CellMotionDetector", true),
+                                ("Motion", true),
+                            ])
                     {
                         motion_supported = true;
                     }
@@ -829,7 +861,9 @@ pub(crate) fn parse_motion_notifications(
     xml: &[u8],
 ) -> Result<Vec<MotionNotification>, OnvifError> {
     validate_recognized_namespaces(xml)?;
-    let mut reader = reader(xml)?;
+    let mut reader = NsReader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    reader.config_mut().check_end_names = true;
     let mut stack = Vec::new();
     let mut current: Option<RawEventNotification> = None;
     let mut notifications = Vec::new();
@@ -905,6 +939,8 @@ pub(crate) fn parse_motion_notifications(
                     if value.len() > MAX_EVENT_TOPIC_BYTES {
                         return Err(OnvifError::ResponseTooLarge);
                     }
+                    notification.topic_is_standard_motion =
+                        is_standard_cell_motion_topic(reader.resolver(), &value);
                     notification.topic = Some(value);
                 }
             }
@@ -931,10 +967,10 @@ pub(crate) fn parse_motion_notifications(
 fn normalize_motion_notification(
     mut raw: RawEventNotification,
 ) -> Result<Option<MotionNotification>, OnvifError> {
-    let Some(topic) = raw.topic.take() else {
+    let Some(_topic) = raw.topic.take() else {
         return Ok(None);
     };
-    if !is_cell_motion_topic(&topic) {
+    if !raw.topic_is_standard_motion {
         return Ok(None);
     }
 
@@ -986,13 +1022,28 @@ fn normalize_motion_notification(
     }))
 }
 
-fn is_cell_motion_topic(topic: &str) -> bool {
-    let parts = topic
-        .trim()
-        .split('/')
-        .map(|part| part.trim().rsplit(':').next().unwrap_or_default())
-        .collect::<Vec<_>>();
-    parts == ["RuleEngine", "CellMotionDetector", "Motion"]
+fn is_standard_cell_motion_topic(
+    resolver: &quick_xml::name::NamespaceResolver,
+    topic: &str,
+) -> bool {
+    let parts = topic.trim().split('/').map(str::trim).collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return false;
+    }
+    let first = QName(parts[0]);
+    let Some(prefix) = first.prefix() else {
+        return false;
+    };
+    if first.local_name().as_ref() != "RuleEngine"
+        || parts[1] != "CellMotionDetector"
+        || parts[2] != "Motion"
+    {
+        return false;
+    }
+    matches!(
+        resolver.resolve_prefix(Some(prefix), false),
+        ResolveResult::Bound(namespace) if namespace.as_ref() == ONVIF_TOPICS_NAMESPACE
+    )
 }
 
 fn parse_strict_event_timestamp(value: &str) -> Result<DateTime<Utc>, OnvifError> {
@@ -1143,6 +1194,14 @@ mod tests {
         let supported = br#"<tev:GetEventPropertiesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:tns1="http://www.onvif.org/ver10/topics"><tev:TopicSet><tns1:RuleEngine><tns1:CellMotionDetector><tns1:Motion/></tns1:CellMotionDetector></tns1:RuleEngine></tev:TopicSet></tev:GetEventPropertiesResponse>"#;
         assert!(parse_event_properties(supported).unwrap().motion_supported);
 
+        let spoofed = br#"<tev:GetEventPropertiesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:tns1="urn:evil"><tev:TopicSet><tns1:RuleEngine><tns1:CellMotionDetector><tns1:Motion/></tns1:CellMotionDetector></tns1:RuleEngine></tev:TopicSet></tev:GetEventPropertiesResponse>"#;
+        assert!(matches!(
+            parse_event_properties(spoofed),
+            Ok(EventProperties {
+                motion_supported: false
+            }) | Err(OnvifError::Protocol)
+        ));
+
         let lookalike = br#"<tev:GetEventPropertiesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl"><tev:TopicSet><RuleEngine><VendorMotion><Motion/></VendorMotion></RuleEngine></tev:TopicSet></tev:GetEventPropertiesResponse>"#;
         assert!(!parse_event_properties(lookalike).unwrap().motion_supported);
     }
@@ -1179,11 +1238,45 @@ mod tests {
         let lookalike = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema"><wsnt:Topic>RuleEngine/VendorMotion/Motion</wsnt:Topic><wsnt:Message><tt:Message><tt:Data><tt:SimpleItem Name="IsMotion" Value="true"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
         assert!(parse_motion_notifications(lookalike).unwrap().is_empty());
 
-        let malformed = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema"><wsnt:Topic>RuleEngine/CellMotionDetector/Motion</wsnt:Topic><wsnt:Message><tt:Message><tt:Data><tt:SimpleItem Name="IsMotion" Value="maybe"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
+        let spoofed = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:tns1="urn:evil"><wsnt:Topic>tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic><wsnt:Message><tt:Message><tt:Data><tt:SimpleItem Name="IsMotion" Value="true"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
+        let spoofed_result = parse_motion_notifications(spoofed);
+        assert!(
+            matches!(&spoofed_result, Ok(notifications) if notifications.is_empty())
+                || matches!(spoofed_result, Err(OnvifError::Protocol))
+        );
+
+        let malformed = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:tns1="http://www.onvif.org/ver10/topics"><wsnt:Topic>tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic><wsnt:Message><tt:Message><tt:Data><tt:SimpleItem Name="IsMotion" Value="maybe"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
         assert_eq!(
             parse_motion_notifications(malformed),
             Err(OnvifError::Protocol)
         );
+    }
+
+    #[test]
+    fn event_topic_namespace_spoofing_cannot_enable_standard_motion() {
+        let spoofed = br#"<tev:GetEventPropertiesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:evil="urn:evil"><tev:TopicSet><evil:RuleEngine><evil:CellMotionDetector><evil:Motion/></evil:CellMotionDetector></evil:RuleEngine></tev:TopicSet></tev:GetEventPropertiesResponse>"#;
+        assert!(matches!(
+            parse_event_properties(spoofed),
+            Ok(EventProperties {
+                motion_supported: false
+            }) | Err(OnvifError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn notification_topic_qname_must_resolve_to_onvif_topics_namespace() {
+        let standard = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:tns1="http://www.onvif.org/ver10/topics"><wsnt:Topic>tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic><wsnt:Message><tt:Message><tt:Data><tt:SimpleItem Name="IsMotion" Value="true"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
+        assert_eq!(parse_motion_notifications(standard).unwrap().len(), 1);
+
+        let spoofed = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:tns1="urn:evil"><wsnt:Topic>tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic><wsnt:Message><tt:Message><tt:Data><tt:SimpleItem Name="IsMotion" Value="true"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
+        let spoofed = parse_motion_notifications(spoofed);
+        assert!(
+            matches!(&spoofed, Ok(notifications) if notifications.is_empty())
+                || matches!(spoofed, Err(OnvifError::Protocol))
+        );
+
+        let vendor = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:tns1="http://www.onvif.org/ver10/topics"><wsnt:Topic>tns1:VendorMotion/Motion</wsnt:Topic><wsnt:Message><tt:Message><tt:Data><tt:SimpleItem Name="IsMotion" Value="true"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
+        assert!(parse_motion_notifications(vendor).unwrap().is_empty());
     }
 
     #[test]

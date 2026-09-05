@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::{CredentialStore, CredentialStoreError, PreparedEventPairing, SettingsRepositoryError};
 
 pub const MAX_ACTIVE_EVENT_SESSIONS: usize = 16;
+pub const MAX_EVENT_SOURCES_PER_SESSION: usize = 64;
 const MAX_CREDENTIAL_REF_GENERATION_ATTEMPTS: usize = 8;
 const WORKER_IDLE_SLEEP_MS: u64 = 50;
 const RENEW_FALLBACK_SECS: u64 = 40;
@@ -46,6 +47,7 @@ pub trait EventSettingsRepository: Send {
         camera_id: &CameraId,
     ) -> Result<bool, SettingsRepositoryError>;
     fn event_monitoring_enabled_cameras(&self) -> Result<Vec<CameraId>, SettingsRepositoryError>;
+    fn event_status_camera_ids(&self) -> Result<Vec<CameraId>, SettingsRepositoryError>;
     fn set_event_monitoring_enabled(
         &mut self,
         camera_id: &CameraId,
@@ -91,6 +93,17 @@ impl EventSettingsRepository for SettingsStore {
 
     fn event_monitoring_enabled_cameras(&self) -> Result<Vec<CameraId>, SettingsRepositoryError> {
         SettingsStore::event_monitoring_enabled_cameras(self)
+            .map_err(|_| SettingsRepositoryError::Persistence)
+    }
+
+    fn event_status_camera_ids(&self) -> Result<Vec<CameraId>, SettingsRepositoryError> {
+        SettingsStore::list_cameras(self)
+            .map(|cameras| {
+                cameras
+                    .into_iter()
+                    .map(|camera| camera.camera_id().clone())
+                    .collect()
+            })
             .map_err(|_| SettingsRepositoryError::Persistence)
     }
 
@@ -143,6 +156,10 @@ pub trait EventBackend: Send + Sync {
         subscription: &PullPointSubscription,
         credentials: &OnvifCredentials,
     ) -> Result<(), OnvifError>;
+
+    fn wait_reconnect(&self, cancel: &AtomicBool, duration: Duration) {
+        sleep_cancellable(cancel, duration);
+    }
 }
 
 impl EventBackend for OnvifClient {
@@ -317,6 +334,37 @@ struct EventSessionHandle {
     join: JoinHandle<()>,
 }
 
+struct DrainState {
+    camera_id: CameraId,
+    session: EventSessionRef,
+    join: Mutex<Option<JoinHandle<()>>>,
+    done: Mutex<bool>,
+    done_cv: Condvar,
+}
+
+impl DrainState {
+    fn from_handle(handle: EventSessionHandle) -> Arc<Self> {
+        Arc::new(Self {
+            camera_id: handle.camera_id,
+            session: handle.session,
+            join: Mutex::new(Some(handle.join)),
+            done: Mutex::new(false),
+            done_cv: Condvar::new(),
+        })
+    }
+
+    fn wait_done(&self) {
+        if let Ok(mut done) = self.done.lock() {
+            while !*done {
+                match self.done_cv.wait(done) {
+                    Ok(next) => done = next,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
 struct OpeningState {
     reservation_id: u64,
     lifecycle_generation: u64,
@@ -367,7 +415,7 @@ impl MutationState {
 struct EventRegistry {
     opening: HashMap<CameraId, Arc<OpeningState>>,
     active: HashMap<CameraId, EventSessionHandle>,
-    draining: HashMap<u64, EventSessionHandle>,
+    draining: HashMap<u64, Arc<DrainState>>,
     statuses: HashMap<CameraId, Arc<Mutex<RuntimeStatus>>>,
     mutating: HashMap<CameraId, Arc<MutationState>>,
 }
@@ -683,16 +731,59 @@ impl EventController {
     }
 
     pub fn statuses(&self) -> Result<Vec<EventStatusDto>, EventError> {
-        let cameras = self
-            .repository
-            .lock()
-            .map_err(|_| EventError::Internal)?
-            .event_monitoring_enabled_cameras()
-            .map_err(|_| EventError::Settings)?;
-        cameras
-            .iter()
-            .map(|camera_id| self.status_for(camera_id))
-            .collect()
+        let bases = {
+            let repository = self.repository.lock().map_err(|_| EventError::Internal)?;
+            let camera_ids = repository
+                .event_status_camera_ids()
+                .map_err(|_| EventError::Settings)?;
+            let mut bases = Vec::with_capacity(camera_ids.len());
+            for camera_id in camera_ids {
+                let configured = repository
+                    .get_event_binding(&camera_id)
+                    .map_err(|_| EventError::Settings)?
+                    .is_some();
+                let desired = repository
+                    .event_monitoring_enabled(&camera_id)
+                    .map_err(|_| EventError::Settings)?;
+                bases.push((camera_id, configured, desired));
+            }
+            bases
+        };
+        let runtime = {
+            let registry = self.registry.lock().map_err(|_| EventError::Internal)?;
+            registry
+                .statuses
+                .iter()
+                .map(|(camera_id, status)| (camera_id.clone(), status.clone()))
+                .collect::<HashMap<_, _>>()
+        };
+        Ok(bases
+            .into_iter()
+            .map(|(camera_id, configured, desired)| {
+                let runtime = runtime
+                    .get(&camera_id)
+                    .and_then(|status| status.lock().ok().map(|value| value.clone()))
+                    .unwrap_or(RuntimeStatus {
+                        state: EventRuntimeState::Disabled,
+                        motion_active: None,
+                        last_event_at: None,
+                        last_error_code: None,
+                    });
+                EventStatusDto {
+                    camera_id: camera_id.as_str().to_owned(),
+                    configured,
+                    desired,
+                    state: if desired {
+                        runtime.state
+                    } else {
+                        EventRuntimeState::Disabled
+                    },
+                    motion_active: desired.then_some(runtime.motion_active).flatten(),
+                    last_event_at: runtime.last_event_at.map(|value| value.to_rfc3339()),
+                    last_error_code: runtime.last_error_code,
+                }
+            })
+            .collect())
     }
 
     pub fn recent(&self, camera_id: &str, limit: u32) -> Result<Vec<EventHistoryDto>, EventError> {
@@ -754,7 +845,8 @@ impl EventController {
                 status.state = EventRuntimeState::Stopping;
                 status.motion_active = None;
             }
-            registry.draining.insert(handle.session.session_id, handle);
+            let drain = DrainState::from_handle(handle);
+            registry.draining.insert(drain.session.session_id, drain);
         }
         Ok(())
     }
@@ -812,6 +904,21 @@ impl EventController {
             .lock()
             .map(|registry| registry.owned_worker_count())
             .unwrap_or(MAX_ACTIVE_EVENT_SESSIONS)
+    }
+
+    #[cfg(test)]
+    fn ownership_counts(&self) -> (usize, usize, usize, usize) {
+        self.registry
+            .lock()
+            .map(|registry| {
+                (
+                    registry.opening.len(),
+                    registry.active.len(),
+                    registry.draining.len(),
+                    registry.mutating.len(),
+                )
+            })
+            .unwrap_or((usize::MAX, usize::MAX, usize::MAX, usize::MAX))
     }
 
     fn ensure_session(&self, camera_id: &CameraId) -> Result<EventStatusDto, EventError> {
@@ -993,7 +1100,8 @@ impl EventController {
                     status.state = EventRuntimeState::Stopping;
                     status.motion_active = None;
                 }
-                registry.draining.insert(handle.session.session_id, handle);
+                let drain = DrainState::from_handle(handle);
+                registry.draining.insert(drain.session.session_id, drain);
             }
         }
     }
@@ -1022,15 +1130,33 @@ impl EventController {
     }
 
     fn reap_drain(&self, session_id: u64) {
-        let handle = self
+        let drain = self
             .registry
             .lock()
             .ok()
-            .and_then(|mut registry| registry.draining.remove(&session_id));
-        if let Some(handle) = handle {
-            let camera_id = handle.camera_id.clone();
-            let _ = handle.join.join();
-            if let Ok(registry) = self.registry.lock() {
+            .and_then(|registry| registry.draining.get(&session_id).cloned());
+        let Some(drain) = drain else {
+            return;
+        };
+
+        let join = drain.join.lock().ok().and_then(|mut join| join.take());
+        if let Some(join) = join {
+            let camera_id = drain.camera_id.clone();
+            let _ = join.join();
+            let desired = self
+                .repository
+                .lock()
+                .ok()
+                .and_then(|repository| repository.event_monitoring_enabled(&camera_id).ok())
+                .unwrap_or(false);
+            if let Ok(mut registry) = self.registry.lock() {
+                if registry
+                    .draining
+                    .get(&session_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &drain))
+                {
+                    registry.draining.remove(&session_id);
+                }
                 let still_owned = registry.active.contains_key(&camera_id)
                     || registry.opening.contains_key(&camera_id)
                     || registry
@@ -1041,10 +1167,21 @@ impl EventController {
                     && let Some(status) = registry.statuses.get(&camera_id)
                     && let Ok(mut status) = status.lock()
                 {
-                    status.state = EventRuntimeState::Disabled;
                     status.motion_active = None;
+                    if desired && self.accepting.load(Ordering::Acquire) {
+                        status.state = EventRuntimeState::Failed;
+                        status.last_error_code = Some("worker_exited".to_owned());
+                    } else {
+                        status.state = EventRuntimeState::Disabled;
+                    }
                 }
             }
+            if let Ok(mut done) = drain.done.lock() {
+                *done = true;
+                drain.done_cv.notify_all();
+            }
+        } else {
+            drain.wait_done();
         }
     }
 
@@ -1158,7 +1295,8 @@ impl EventController {
                     status.state = EventRuntimeState::Stopping;
                     status.motion_active = None;
                 }
-                registry.draining.insert(handle.session.session_id, handle);
+                let drain = DrainState::from_handle(handle);
+                registry.draining.insert(drain.session.session_id, drain);
             }
             let drain_ids = registry
                 .draining
@@ -1279,6 +1417,7 @@ enum MotionState {
 #[derive(Default)]
 struct MotionNormalizer {
     sources: HashMap<Option<String>, MotionState>,
+    overflowed: bool,
 }
 
 impl MotionNormalizer {
@@ -1299,6 +1438,13 @@ impl MotionNormalizer {
         } else {
             MotionState::Idle
         };
+        if current == MotionState::Unknown
+            && !self.sources.contains_key(&key)
+            && self.sources.len() >= MAX_EVENT_SOURCES_PER_SESSION
+        {
+            self.overflowed = true;
+            return None;
+        }
         self.sources.insert(key.clone(), next);
         if notification.synchronization_baseline {
             return None;
@@ -1327,6 +1473,9 @@ impl MotionNormalizer {
     }
 
     fn aggregate_motion(&self) -> Option<bool> {
+        if self.overflowed {
+            return None;
+        }
         if self
             .sources
             .values()
@@ -1342,10 +1491,6 @@ impl MotionNormalizer {
         } else {
             None
         }
-    }
-
-    fn reset(&mut self) {
-        self.sources.clear();
     }
 }
 
@@ -1374,10 +1519,21 @@ fn event_worker(
                     Some("unsupported"),
                     true,
                 );
+                wait_failed_until_cancel(&cancel);
                 break;
             }
             Err(error) => {
                 if cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                if is_terminal_control_error(&error) {
+                    update_status(
+                        &status,
+                        EventRuntimeState::Failed,
+                        Some(onvif_error_code(&error)),
+                        true,
+                    );
+                    wait_failed_until_cancel(&cancel);
                     break;
                 }
                 update_status(
@@ -1386,7 +1542,7 @@ fn event_worker(
                     Some(onvif_error_code(&error)),
                     true,
                 );
-                sleep_cancellable(&cancel, backoff.next_delay());
+                backend.wait_reconnect(&cancel, backoff.next_delay());
                 continue;
             }
         };
@@ -1404,20 +1560,31 @@ fn event_worker(
                     Some(subscription_error_code(&error)),
                     true,
                 );
-                sleep_cancellable(&cancel, backoff.next_delay());
+                backend.wait_reconnect(&cancel, backoff.next_delay());
                 continue;
             }
         };
 
-        normalizer.reset();
         let _ = backend.synchronize(&subscription, &credentials);
         if cancel.load(Ordering::Acquire) {
             let _ = backend.unsubscribe(&subscription, &credentials);
             break;
         }
-        backoff.reset();
         update_status(&status, EventRuntimeState::Polling, None, true);
-        let mut renew_at = subscription_renew_deadline(&subscription);
+        let mut renew_at = match subscription_renew_deadline(&subscription) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                let _ = backend.unsubscribe(&subscription, &credentials);
+                update_status(
+                    &status,
+                    EventRuntimeState::Backoff,
+                    Some(subscription_error_code(&error)),
+                    true,
+                );
+                backend.wait_reconnect(&cancel, backoff.next_delay());
+                continue;
+            }
+        };
         let mut recreate_reason: Option<&'static str> = None;
 
         while !cancel.load(Ordering::Acquire) {
@@ -1426,7 +1593,13 @@ fn event_worker(
                     recreate_reason = Some(subscription_error_code(&error));
                     break;
                 }
-                renew_at = subscription_renew_deadline(&subscription);
+                renew_at = match subscription_renew_deadline(&subscription) {
+                    Ok(deadline) => deadline,
+                    Err(error) => {
+                        recreate_reason = Some(subscription_error_code(&error));
+                        break;
+                    }
+                };
             }
 
             match backend.pull(&subscription, &credentials) {
@@ -1462,9 +1635,10 @@ fn event_worker(
                     }
                 }
                 Err(OnvifError::Timeout) => {
-                    // A bounded long-poll timeout is recoverable. The next poll
-                    // begins immediately without spinning because each request
-                    // itself consumed the configured long-poll interval.
+                    // A completed bounded long-poll timeout proves the subscription
+                    // stayed healthy for the request window, so it resets the
+                    // reconnect failure streak without recreating the subscription.
+                    backoff.reset();
                 }
                 Err(error) => {
                     recreate_reason = Some(onvif_error_code(&error));
@@ -1474,7 +1648,6 @@ fn event_worker(
         }
 
         let _ = backend.unsubscribe(&subscription, &credentials);
-        normalizer.reset();
         if cancel.load(Ordering::Acquire) {
             break;
         }
@@ -1484,7 +1657,7 @@ fn event_worker(
             recreate_reason.or(Some("subscription_failed")),
             true,
         );
-        sleep_cancellable(&cancel, backoff.next_delay());
+        backend.wait_reconnect(&cancel, backoff.next_delay());
     }
 
     if let Ok(mut runtime) = status.lock() {
@@ -1515,16 +1688,29 @@ fn event_fingerprint(
     hasher.finalize().into()
 }
 
-fn subscription_renew_deadline(subscription: &PullPointSubscription) -> Instant {
-    if let (Some(current), Some(termination)) = (
-        subscription.current_time_utc(),
-        subscription.termination_time_utc(),
-    ) && let Ok(lifetime) = (termination - current).to_std()
-    {
-        let delay = lifetime.mul_f64(2.0 / 3.0);
-        return Instant::now() + delay.max(Duration::from_secs(1));
+fn subscription_renew_deadline(
+    subscription: &PullPointSubscription,
+) -> Result<Instant, OnvifError> {
+    let lifetime_secs = subscription
+        .bounded_lifetime_secs()?
+        .unwrap_or(RENEW_FALLBACK_SECS);
+    let delay_secs = lifetime_secs.saturating_mul(2) / 3;
+    Instant::now()
+        .checked_add(Duration::from_secs(delay_secs.max(1)))
+        .ok_or(OnvifError::Protocol)
+}
+
+fn is_terminal_control_error(error: &OnvifError) -> bool {
+    matches!(
+        error,
+        OnvifError::AuthFailed | OnvifError::Unsupported | OnvifError::AuthorityRejected
+    )
+}
+
+fn wait_failed_until_cancel(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(WORKER_IDLE_SLEEP_MS));
     }
-    Instant::now() + Duration::from_secs(RENEW_FALLBACK_SECS)
 }
 
 fn sleep_cancellable(cancel: &AtomicBool, duration: Duration) {
@@ -1735,7 +1921,13 @@ mod tests {
         control_calls: AtomicUsize,
         unsubscribe_calls: AtomicUsize,
         fail_control: AtomicBool,
+        unsupported_after_first_control: AtomicBool,
         block_pull: AtomicBool,
+        scripted_pull_failures: AtomicUsize,
+        scripted_pull_successes: AtomicUsize,
+        scripted_pull_protocol_after: AtomicBool,
+        skip_backoff_sleep: AtomicBool,
+        backoff_delays: Mutex<Vec<u64>>,
         pull_gate: (Mutex<PullGate>, Condvar),
     }
 
@@ -1745,7 +1937,13 @@ mod tests {
                 control_calls: AtomicUsize::new(0),
                 unsubscribe_calls: AtomicUsize::new(0),
                 fail_control: AtomicBool::new(false),
+                unsupported_after_first_control: AtomicBool::new(false),
                 block_pull: AtomicBool::new(false),
+                scripted_pull_failures: AtomicUsize::new(0),
+                scripted_pull_successes: AtomicUsize::new(0),
+                scripted_pull_protocol_after: AtomicBool::new(false),
+                skip_backoff_sleep: AtomicBool::new(false),
+                backoff_delays: Mutex::new(Vec::new()),
                 pull_gate: (Mutex::new(PullGate::default()), Condvar::new()),
             })
         }
@@ -1772,9 +1970,11 @@ mod tests {
             _device_service: &str,
             _credentials: &OnvifCredentials,
         ) -> Result<EventControl, OnvifError> {
-            self.control_calls.fetch_add(1, Ordering::AcqRel);
+            let call = self.control_calls.fetch_add(1, Ordering::AcqRel);
             if self.fail_control.load(Ordering::Acquire) {
                 Err(OnvifError::DeviceUnreachable)
+            } else if self.unsupported_after_first_control.load(Ordering::Acquire) && call >= 1 {
+                Err(OnvifError::Unsupported)
             } else {
                 Ok(EventControl::test_fixture())
             }
@@ -1809,9 +2009,30 @@ mod tests {
                 while !gate.release {
                     gate = cv.wait(gate).unwrap();
                 }
-            } else {
-                thread::sleep(Duration::from_millis(5));
+                return Err(OnvifError::Timeout);
             }
+            if self
+                .scripted_pull_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(OnvifError::Protocol);
+            }
+            if self
+                .scripted_pull_successes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Ok(Vec::new());
+            }
+            if self.scripted_pull_protocol_after.load(Ordering::Acquire) {
+                return Err(OnvifError::Protocol);
+            }
+            thread::sleep(Duration::from_millis(5));
             Err(OnvifError::Timeout)
         }
 
@@ -1830,6 +2051,15 @@ mod tests {
         ) -> Result<(), OnvifError> {
             self.unsubscribe_calls.fetch_add(1, Ordering::AcqRel);
             Ok(())
+        }
+
+        fn wait_reconnect(&self, cancel: &AtomicBool, duration: Duration) {
+            self.backoff_delays.lock().unwrap().push(duration.as_secs());
+            if self.skip_backoff_sleep.load(Ordering::Acquire) {
+                thread::yield_now();
+            } else {
+                sleep_cancellable(cancel, duration);
+            }
         }
     }
 
@@ -1996,5 +2226,190 @@ mod tests {
         shutdown.join().unwrap();
         assert_eq!(controller.owned_worker_count(), 0);
         assert!(backend.unsubscribe_calls.load(Ordering::Acquire) >= 1);
+    }
+
+    #[test]
+    fn motion_source_state_is_bounded_and_overflow_becomes_unknown() {
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let now = Utc::now();
+        let mut normalizer = MotionNormalizer::default();
+        for index in 0..(MAX_EVENT_SOURCES_PER_SESSION + 16) {
+            let notification = MotionNotification {
+                active: true,
+                device_time_utc: None,
+                source_key: Some(format!("source-{index}")),
+                synchronization_baseline: false,
+            };
+            let _ = normalizer.ingest(&camera_id, &notification, now);
+        }
+        assert_eq!(normalizer.sources.len(), MAX_EVENT_SOURCES_PER_SESSION);
+        assert!(normalizer.overflowed);
+        assert_eq!(normalizer.aggregate_motion(), None);
+
+        let known_end = MotionNotification {
+            active: false,
+            device_time_utc: None,
+            source_key: Some("source-0".to_owned()),
+            synchronization_baseline: false,
+        };
+        assert!(normalizer.ingest(&camera_id, &known_end, now).is_some());
+        assert_eq!(normalizer.sources.len(), MAX_EVENT_SOURCES_PER_SESSION);
+        assert_eq!(normalizer.aggregate_motion(), None);
+    }
+
+    #[test]
+    fn timestamp_less_reconnect_replay_is_deduped_but_later_transition_persists() {
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let now = Utc::now();
+        let mut normalizer = MotionNormalizer::default();
+        let started = MotionNotification {
+            active: true,
+            device_time_utc: None,
+            source_key: Some("source-a".to_owned()),
+            synchronization_baseline: false,
+        };
+        assert_eq!(
+            normalizer.ingest(&camera_id, &started, now).unwrap().kind,
+            EventKind::MotionStarted
+        );
+        // Subscription recreation deliberately preserves the bounded normalizer.
+        assert!(normalizer.ingest(&camera_id, &started, now).is_none());
+
+        let ended = MotionNotification {
+            active: false,
+            ..started.clone()
+        };
+        assert_eq!(
+            normalizer.ingest(&camera_id, &ended, now).unwrap().kind,
+            EventKind::MotionEnded
+        );
+        assert_eq!(
+            normalizer.ingest(&camera_id, &started, now).unwrap().kind,
+            EventKind::MotionStarted
+        );
+    }
+
+    #[test]
+    fn subscription_renew_deadline_clamps_remote_lifetime_and_rejects_nonpositive() {
+        let before = Instant::now();
+        let normal = subscription_renew_deadline(&PullPointSubscription::test_fixture(60)).unwrap();
+        let normal_delay = normal.saturating_duration_since(before).as_secs();
+        assert!((39..=40).contains(&normal_delay));
+
+        let before = Instant::now();
+        let short = subscription_renew_deadline(&PullPointSubscription::test_fixture(1)).unwrap();
+        let short_delay = short.saturating_duration_since(before).as_secs();
+        assert!((2..=3).contains(&short_delay));
+
+        let before = Instant::now();
+        let long =
+            subscription_renew_deadline(&PullPointSubscription::test_fixture(10 * 24 * 60 * 60))
+                .unwrap();
+        let long_delay = long.saturating_duration_since(before).as_secs();
+        let expected = nian_onvif::MAX_EVENT_SUBSCRIPTION_LIFETIME_SECS * 2 / 3;
+        assert!((expected.saturating_sub(1)..=expected).contains(&long_delay));
+
+        assert_eq!(
+            subscription_renew_deadline(&PullPointSubscription::test_fixture(0)),
+            Err(OnvifError::Protocol)
+        );
+        let fallback = PullPointSubscription::test_fixture_times(None, None);
+        assert!(subscription_renew_deadline(&fallback).is_ok());
+    }
+
+    #[test]
+    fn terminal_runtime_failure_stays_owned_failed_until_intentional_teardown() {
+        let backend = FakeBackend::new();
+        backend
+            .unsupported_after_first_control
+            .store(true, Ordering::Release);
+        let (controller, _credentials, _temp) =
+            controller_fixture(backend, "192.168.1.8", "192.168.1.8", true);
+        controller.restore_desired().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = controller.status("front-door").unwrap();
+            if status.state == EventRuntimeState::Failed {
+                assert!(status.desired);
+                assert_eq!(status.last_error_code.as_deref(), Some("unsupported"));
+                break;
+            }
+            assert!(Instant::now() < deadline, "worker never entered Failed");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(controller.ownership_counts(), (0, 1, 0, 0));
+        controller.shutdown_sessions();
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn concurrent_shutdown_callers_wait_for_the_same_controller_owned_drain() {
+        let backend = FakeBackend::new();
+        backend.block_pull.store(true, Ordering::Release);
+        let (controller, _credentials, _temp) =
+            controller_fixture(backend.clone(), "192.168.1.8", "192.168.1.8", true);
+        controller.restore_desired().unwrap();
+        backend.wait_for_pull();
+
+        let (a_tx, a_rx) = mpsc::channel();
+        let first = controller.clone();
+        let a = thread::spawn(move || {
+            first.shutdown_sessions();
+            a_tx.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.ownership_counts().2 != 1 {
+            assert!(Instant::now() < deadline, "session never became draining");
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let (b_tx, b_rx) = mpsc::channel();
+        let second = controller.clone();
+        let b = thread::spawn(move || {
+            second.shutdown_sessions();
+            b_tx.send(()).unwrap();
+        });
+        thread::sleep(Duration::from_millis(30));
+        assert!(a_rx.try_recv().is_err());
+        assert!(b_rx.try_recv().is_err());
+        assert_eq!(controller.ownership_counts().2, 1);
+
+        backend.release_pull();
+        a_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        b_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!(controller.ownership_counts(), (0, 0, 0, 0));
+        assert_eq!(backend.unsubscribe_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn pull_failure_backoff_escalates_and_healthy_pull_resets_the_streak() {
+        let backend = FakeBackend::new();
+        backend.scripted_pull_failures.store(5, Ordering::Release);
+        backend.scripted_pull_successes.store(1, Ordering::Release);
+        backend
+            .scripted_pull_protocol_after
+            .store(true, Ordering::Release);
+        backend.skip_backoff_sleep.store(true, Ordering::Release);
+        let (controller, _credentials, _temp) =
+            controller_fixture(backend.clone(), "192.168.1.8", "192.168.1.8", true);
+        controller.restore_desired().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let delays = backend.backoff_delays.lock().unwrap().clone();
+            if delays.len() >= 6 {
+                assert_eq!(&delays[..6], &[2, 5, 10, 30, 60, 2]);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "backoff sequence did not advance"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        controller.shutdown_sessions();
     }
 }

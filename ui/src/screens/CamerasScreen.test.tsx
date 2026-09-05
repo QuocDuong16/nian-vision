@@ -686,7 +686,7 @@ describe("CamerasScreen", () => {
       if (command === "recording_statuses") return [];
       if (command === "recording_intent") return { camera_ids: [] };
       if (command === "ptz_configured") return false;
-      if (command === "event_status") return status;
+      if (command === "event_statuses") return [status];
       if (command === "onvif_discover") return onvifDiscovery;
       if (command === "onvif_connect") return onvifConnection;
       if (command === "event_pair") {

@@ -66,13 +66,17 @@ function installDesktop(
         pan_tilt_supported: false, zoom_supported: false, state: null, error: null,
       };
     }
-    if (command === "event_status") {
-      const cameraId = (args as { cameraId: string }).cameraId;
-      if (eventStatusOverride) return await eventStatusOverride(cameraId);
-      return {
-        camera_id: cameraId, configured: false, desired: false, state: "disabled",
-        motion_active: null, last_event_at: null, last_error_code: null,
-      };
+    if (command === "event_statuses") {
+      return await Promise.all(
+        [front.camera_id, garage.camera_id].map(async (cameraId) =>
+          eventStatusOverride
+            ? await eventStatusOverride(cameraId)
+            : {
+                camera_id: cameraId, configured: false, desired: false, state: "disabled",
+                motion_active: null, last_event_at: null, last_error_code: null,
+              },
+        ),
+      );
     }
     if (command === "live_open") {
       const cameraId = (args as { cameraId: string }).cameraId;
@@ -468,6 +472,57 @@ describe("LiveViewScreen", () => {
     statusTick?.();
     await Promise.resolve();
     expect(calls).toBe(3);
+  });
+
+  it("keeps Event status polling single-flight while a batch is pending", async () => {
+    const gate = deferred<void>();
+    let eventTick: (() => void) | undefined;
+    const realSetInterval = window.setInterval.bind(window);
+    vi.spyOn(window, "setInterval").mockImplementation((handler, timeout, ...args) => {
+      if (timeout === 5_000 && typeof handler === "function") {
+        eventTick = () => handler(...args);
+      }
+      return realSetInterval(handler, timeout, ...args);
+    });
+    installDesktop(undefined, undefined, undefined, async (cameraId) => {
+      await gate.promise;
+      return {
+        camera_id: cameraId,
+        configured: true,
+        desired: true,
+        state: "polling",
+        motion_active: cameraId === front.camera_id,
+        last_event_at: null,
+        last_error_code: null,
+      };
+    });
+    render(<LiveViewScreen />);
+
+    await screen.findByText("No live cameras selected");
+    fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+    await screen.findByRole("article", { name: "Front door live camera" });
+    await waitFor(() => {
+      expect(
+        vi.mocked(invoke).mock.calls.filter(([command]) => command === "event_statuses"),
+      ).toHaveLength(1);
+    });
+    expect(eventTick).toBeTruthy();
+    eventTick?.();
+    eventTick?.();
+    eventTick?.();
+    await Promise.resolve();
+    expect(
+      vi.mocked(invoke).mock.calls.filter(([command]) => command === "event_statuses"),
+    ).toHaveLength(1);
+
+    gate.resolve();
+    await waitFor(() => expect(screen.getByText("Motion detected")).toBeTruthy());
+    eventTick?.();
+    await waitFor(() => {
+      expect(
+        vi.mocked(invoke).mock.calls.filter(([command]) => command === "event_statuses"),
+      ).toHaveLength(2);
+    });
   });
 
   it("closes the backend session on media failure and unmount", async () => {

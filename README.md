@@ -4,8 +4,9 @@ Local-first desktop NVR (network video recorder) for IP cameras. The first
 supported camera is the TP-Link Tapo C200 over RTSP, with a camera-agnostic
 domain so other RTSP/ONVIF cameras can follow.
 
-**Status**: milestones **M0–M13** are implemented. M10 adds local ONVIF discovery
-and provisioning without changing the accepted RTSP recording architecture. M11 adds
+**Status**: milestones **M0–M12** are accepted; **M13 is implemented and undergoing
+final remediation review**. M10 adds local ONVIF discovery and provisioning without
+changing the accepted RTSP recording architecture. M11 adds
 a separate user-selected Live View surface for up to four H.264 cameras. Each live
 camera owns an independent worker/session and opaque loopback capability; live capacity,
 lifecycle and failures remain separate from M9 recording Desired/Runtime ownership. Live
@@ -82,7 +83,7 @@ RTSP camera. M12 keeps PTZ optional and explicitly paired. M13 adds independent 
   completion and resume never restores a previous direction. Camera deletion keeps mutation
   ownership through DB outcome and post-commit credential cleanup. Camera update runs through
   Tauri `spawn_blocking` so PTZ coordination never blocks the main thread.
-* Optional M13 motion-event monitoring reuses explicit ONVIF selection but persists a separate non-secret Event binding and Desired flag. Pairing alone leaves monitoring Off; Enable/Disable controls Desired state independently of runtime Polling/Backoff/Failed status. `EventController` owns bounded per-camera PullPoint workers (`opening + active + draining <= 16`) plus fail-fast same-camera mutation exclusion. Workers request a synchronization baseline, persist only normalized motion transitions, renew subscriptions, recreate with camera-local backoff and unsubscribe during terminal teardown. Raw source tokens are SHA-256 hashed before leaving `nian-onvif`. Event history lives at `<storage_root>/.nian/events.sqlite3` with finite retention, a 250k-row hard cap, bounded cleanup and corruption quarantine. Close-to-tray keeps background Events running; Suspend/Resume/Quit/Update settle or restore them independently of recording/live/PTZ. Storage-root changes switch the Event index at runtime without requiring app restart.
+* Optional M13 motion-event monitoring reuses explicit ONVIF selection but persists a separate non-secret Event binding and Desired flag. Pairing alone leaves monitoring Off; Enable/Disable controls Desired state independently of runtime Polling/Backoff/Failed status. `EventController` owns bounded per-camera PullPoint workers (`opening + active + draining <= 16`) plus fail-fast same-camera mutation exclusion. Controller-owned drain state remains registered through join completion, terminal runtime failures remain owned until intentional cancellation, and motion-source state is capped at 64 sources with overflow reported as unknown aggregate motion. Workers request a synchronization baseline, persist only normalized motion transitions, renew subscriptions using bounded lifetime metadata, recreate with camera-local backoff that resets only after a healthy Pull, and unsubscribe during terminal teardown. Namespace-qualified ONVIF Topics are resolved rather than prefix-stripped, and reconnect normalization retains bounded state so timestamp-less replay cannot manufacture duplicate transitions. Raw source tokens are SHA-256 hashed before leaving `nian-onvif`. Event history lives at `<storage_root>/.nian/events.sqlite3` with finite retention, a 250k-row hard cap, bounded cleanup and corruption quarantine. Event status is exposed through an aggregate off-main command with frontend single-flight polling. Close-to-tray keeps background Events running; Suspend/Resume/Quit/Update settle or restore them independently of recording/live/PTZ. Storage-root changes switch the Event index at runtime without requiring app restart.
 * Playback sessions bind only an ephemeral `127.0.0.1` port. An unguessable
   per-session token maps to one already-validated finalized recording; HTTP Range
   requests provide browser seeking without a directory listing, arbitrary path
@@ -258,7 +259,7 @@ Automated Forgejo tests use deterministic fixtures/local servers and do not requ
 physical ONVIF camera or LAN multicast access. Physical-camera interoperability is
 therefore a manual validation boundary, not a CI guarantee.
 
-**Milestone status:** M0–M13 implemented; physical PTZ and ONVIF Event interoperability remain manual validation boundaries.
+**Milestone status:** M0–M12 accepted; M13 implemented and awaiting final remediation review; physical PTZ and ONVIF Event interoperability remain manual validation boundaries.
 
 ## License notes
 
