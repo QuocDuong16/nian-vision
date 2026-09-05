@@ -18,8 +18,9 @@ pub use client::OnvifClient;
 pub use discovery::{DiscoveryConfig, DiscoveryScanner};
 pub use error::OnvifError;
 pub use types::{
-    DeviceInformation, DiscoveredDevice, MediaProfile, MediaServiceKind, OnvifCredentials,
-    OnvifInterrogation, PtzControl, PtzVelocityRange, StreamEndpoint,
+    DeviceInformation, DiscoveredDevice, EventControl, EventProperties, MediaProfile,
+    MediaServiceKind, MotionNotification, OnvifCredentials, OnvifInterrogation, PtzControl,
+    PtzVelocityRange, PullPointSubscription, StreamEndpoint,
 };
 
 pub const DEFAULT_DISCOVERY_TIMEOUT_MS: u64 = 3_000;
@@ -39,3 +40,12 @@ pub const MAX_PROFILE_NAME_BYTES: usize = 512;
 pub const MAX_PTZ_CONFIGURATION_TOKEN_BYTES: usize = 256;
 pub const PTZ_MOVE_TIMEOUT_MS: u64 = 1_000;
 pub const HTTP_TIMEOUT_MS: u64 = 5_000;
+pub const EVENT_PULL_TIMEOUT_MS: u64 = 4_000;
+pub const EVENT_PULL_MESSAGE_LIMIT: usize = 32;
+pub const EVENT_INITIAL_SUBSCRIPTION_SECS: u64 = 60;
+pub const MAX_EVENT_TOPIC_BYTES: usize = 512;
+pub const MAX_EVENT_SIMPLE_ITEMS: usize = 64;
+pub const MAX_EVENT_SIMPLE_ITEM_NAME_BYTES: usize = 256;
+pub const MAX_EVENT_SIMPLE_ITEM_VALUE_BYTES: usize = 512;
+pub const MAX_EVENT_TIMESTAMP_BYTES: usize = 64;
+pub const MAX_EVENT_TOPIC_SET_NODES: usize = 512;

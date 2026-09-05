@@ -1,15 +1,21 @@
+use chrono::{DateTime, Utc};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::ResolveResult;
 use quick_xml::{NsReader, Reader, XmlVersion};
+use sha2::{Digest as _, Sha256};
 
 use crate::types::{
-    DeviceInformation, MediaProfile, MediaServiceKind, ProbeMatch, PtzConfigurationOptions,
-    PtzProfileAssociation, PtzVelocityRange, ServiceEndpoint,
+    DeviceInformation, EventProperties, MediaProfile, MediaServiceKind, MotionNotification,
+    ProbeMatch, PtzConfigurationOptions, PtzProfileAssociation, PtzVelocityRange,
+    PullPointSubscription, ServiceEndpoint,
 };
 use crate::{
-    MAX_ENDPOINT_REFERENCE_BYTES, MAX_PROFILE_NAME_BYTES, MAX_PROFILE_TOKEN_BYTES, MAX_PROFILES,
-    MAX_PTZ_CONFIGURATION_TOKEN_BYTES, MAX_SCOPE_BYTES, MAX_SCOPES_PER_DEVICE,
-    MAX_SOAP_RESPONSE_BYTES, MAX_XADDRS_PER_DEVICE, MAX_XML_DEPTH, MAX_XML_TEXT_BYTES, OnvifError,
+    EVENT_PULL_MESSAGE_LIMIT, MAX_ENDPOINT_REFERENCE_BYTES, MAX_EVENT_SIMPLE_ITEM_NAME_BYTES,
+    MAX_EVENT_SIMPLE_ITEM_VALUE_BYTES, MAX_EVENT_SIMPLE_ITEMS, MAX_EVENT_TIMESTAMP_BYTES,
+    MAX_EVENT_TOPIC_BYTES, MAX_EVENT_TOPIC_SET_NODES, MAX_PROFILE_NAME_BYTES,
+    MAX_PROFILE_TOKEN_BYTES, MAX_PROFILES, MAX_PTZ_CONFIGURATION_TOKEN_BYTES, MAX_SCOPE_BYTES,
+    MAX_SCOPES_PER_DEVICE, MAX_SOAP_RESPONSE_BYTES, MAX_XADDRS_PER_DEVICE, MAX_XML_DEPTH,
+    MAX_XML_TEXT_BYTES, OnvifError,
 };
 
 fn local_name(raw: &str) -> String {
@@ -82,7 +88,10 @@ const ALLOWED_ONVIF_NAMESPACES: &[&str] = &[
     "http://www.onvif.org/ver10/media/wsdl",
     "http://www.onvif.org/ver20/media/wsdl",
     "http://www.onvif.org/ver20/ptz/wsdl",
+    "http://www.onvif.org/ver10/events/wsdl",
     "http://www.onvif.org/ver10/schema",
+    "http://docs.oasis-open.org/wsn/b-2",
+    "http://docs.oasis-open.org/wsn/t-1",
 ];
 
 fn recognized_onvif_field(name: &str) -> bool {
@@ -127,6 +136,17 @@ fn recognized_onvif_field(name: &str) -> bool {
             | "YRange"
             | "Min"
             | "Max"
+            | "GetEventPropertiesResponse"
+            | "TopicSet"
+            | "Topic"
+            | "NotificationMessage"
+            | "Message"
+            | "Source"
+            | "Data"
+            | "SimpleItem"
+            | "SubscriptionReference"
+            | "CurrentTime"
+            | "TerminationTime"
     )
 }
 
@@ -668,6 +688,341 @@ pub(crate) fn parse_stream_uri(xml: &[u8]) -> Result<String, OnvifError> {
     }
 }
 
+#[derive(Debug, Default)]
+struct RawEventNotification {
+    topic: Option<String>,
+    utc_time: Option<String>,
+    property_operation: Option<String>,
+    source_items: Vec<(String, String)>,
+    data_items: Vec<(String, String)>,
+}
+
+pub(crate) fn parse_event_properties(xml: &[u8]) -> Result<EventProperties, OnvifError> {
+    validate_recognized_namespaces(xml)?;
+    let mut reader = reader(xml)?;
+    let mut stack = Vec::new();
+    let mut topic_nodes = 0usize;
+    let mut motion_supported = false;
+
+    loop {
+        let event = reader.read_event().map_err(|_| OnvifError::Protocol)?;
+        if prohibited(&event) {
+            return Err(OnvifError::Protocol);
+        }
+        match event {
+            Event::Start(start) => {
+                let name = local_name(start.name().as_ref());
+                push_start(&mut stack, name)?;
+                if let Some(topic_set) = stack.iter().position(|name| name == "TopicSet") {
+                    topic_nodes = topic_nodes.saturating_add(1);
+                    if topic_nodes > MAX_EVENT_TOPIC_SET_NODES {
+                        return Err(OnvifError::ResponseTooLarge);
+                    }
+                    let relative = &stack[topic_set + 1..];
+                    if relative.len() >= 3
+                        && relative[relative.len() - 3..]
+                            == ["RuleEngine", "CellMotionDetector", "Motion"]
+                    {
+                        motion_supported = true;
+                    }
+                }
+            }
+            Event::Empty(start) => {
+                if let Some(topic_set) = stack.iter().position(|name| name == "TopicSet") {
+                    topic_nodes = topic_nodes.saturating_add(1);
+                    if topic_nodes > MAX_EVENT_TOPIC_SET_NODES {
+                        return Err(OnvifError::ResponseTooLarge);
+                    }
+                    let name = local_name(start.name().as_ref());
+                    let mut relative = stack[topic_set + 1..].to_vec();
+                    relative.push(name);
+                    if relative.len() >= 3
+                        && relative[relative.len() - 3..]
+                            == ["RuleEngine", "CellMotionDetector", "Motion"]
+                    {
+                        motion_supported = true;
+                    }
+                }
+            }
+            Event::End(_) => {
+                stack.pop().ok_or(OnvifError::Protocol)?;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(EventProperties { motion_supported })
+}
+
+type SubscriptionTimes = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+type SubscriptionMetadata = (Option<String>, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+pub(crate) fn parse_pullpoint_subscription(
+    xml: &[u8],
+) -> Result<PullPointSubscription, OnvifError> {
+    let (endpoint, current_time_utc, termination_time_utc) =
+        parse_subscription_metadata(xml, true)?;
+    Ok(PullPointSubscription {
+        endpoint: endpoint.ok_or(OnvifError::Protocol)?,
+        current_time_utc,
+        termination_time_utc,
+    })
+}
+
+pub(crate) fn parse_renew_times(xml: &[u8]) -> Result<SubscriptionTimes, OnvifError> {
+    let (_, current, termination) = parse_subscription_metadata(xml, false)?;
+    Ok((current, termination))
+}
+
+fn parse_subscription_metadata(
+    xml: &[u8],
+    require_reference: bool,
+) -> Result<SubscriptionMetadata, OnvifError> {
+    validate_recognized_namespaces(xml)?;
+    let mut reader = reader(xml)?;
+    let mut stack = Vec::new();
+    let mut endpoint = None;
+    let mut current = None;
+    let mut termination = None;
+
+    loop {
+        let event = reader.read_event().map_err(|_| OnvifError::Protocol)?;
+        if prohibited(&event) {
+            return Err(OnvifError::Protocol);
+        }
+        match event {
+            Event::Start(start) => push_start(&mut stack, local_name(start.name().as_ref()))?,
+            Event::Text(text) => {
+                let value = decode_text(text)?;
+                match stack.last().map(String::as_str) {
+                    Some("Address") if stack.iter().any(|name| name == "SubscriptionReference") => {
+                        if value.len() > crate::MAX_URL_BYTES {
+                            return Err(OnvifError::ResponseTooLarge);
+                        }
+                        endpoint = Some(value);
+                    }
+                    Some("CurrentTime") => {
+                        current = Some(parse_strict_event_timestamp(&value)?);
+                    }
+                    Some("TerminationTime") => {
+                        termination = Some(parse_strict_event_timestamp(&value)?);
+                    }
+                    _ => {}
+                }
+            }
+            Event::End(_) => {
+                stack.pop().ok_or(OnvifError::Protocol)?;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    if require_reference && endpoint.is_none() {
+        return Err(OnvifError::Protocol);
+    }
+    Ok((endpoint, current, termination))
+}
+
+pub(crate) fn parse_motion_notifications(
+    xml: &[u8],
+) -> Result<Vec<MotionNotification>, OnvifError> {
+    validate_recognized_namespaces(xml)?;
+    let mut reader = reader(xml)?;
+    let mut stack = Vec::new();
+    let mut current: Option<RawEventNotification> = None;
+    let mut notifications = Vec::new();
+    let mut notification_count = 0usize;
+    let mut simple_item_count = 0usize;
+
+    loop {
+        let event = reader.read_event().map_err(|_| OnvifError::Protocol)?;
+        if prohibited(&event) {
+            return Err(OnvifError::Protocol);
+        }
+        match event {
+            Event::Start(start) => {
+                let name = local_name(start.name().as_ref());
+                if name == "NotificationMessage" {
+                    if current.is_some() {
+                        return Err(OnvifError::Protocol);
+                    }
+                    notification_count = notification_count.saturating_add(1);
+                    if notification_count > EVENT_PULL_MESSAGE_LIMIT {
+                        return Err(OnvifError::ResponseTooLarge);
+                    }
+                    current = Some(RawEventNotification::default());
+                    simple_item_count = 0;
+                }
+                if name == "Message"
+                    && stack.iter().any(|part| part == "NotificationMessage")
+                    && let Some(notification) = current.as_mut()
+                {
+                    if let Some(value) = attribute(&start, "UtcTime")? {
+                        if value.len() > MAX_EVENT_TIMESTAMP_BYTES {
+                            return Err(OnvifError::ResponseTooLarge);
+                        }
+                        notification.utc_time = Some(value);
+                    }
+                    notification.property_operation = attribute(&start, "PropertyOperation")?;
+                }
+                push_start(&mut stack, name)?;
+            }
+            Event::Empty(start) => {
+                let name = local_name(start.name().as_ref());
+                if name == "SimpleItem" {
+                    let Some(notification) = current.as_mut() else {
+                        continue;
+                    };
+                    simple_item_count = simple_item_count.saturating_add(1);
+                    if simple_item_count > MAX_EVENT_SIMPLE_ITEMS {
+                        return Err(OnvifError::ResponseTooLarge);
+                    }
+                    let Some(item_name) = attribute(&start, "Name")? else {
+                        continue;
+                    };
+                    let Some(item_value) = attribute(&start, "Value")? else {
+                        continue;
+                    };
+                    if item_name.len() > MAX_EVENT_SIMPLE_ITEM_NAME_BYTES
+                        || item_value.len() > MAX_EVENT_SIMPLE_ITEM_VALUE_BYTES
+                    {
+                        return Err(OnvifError::ResponseTooLarge);
+                    }
+                    if stack.iter().any(|part| part == "Source") {
+                        notification.source_items.push((item_name, item_value));
+                    } else if stack.iter().any(|part| part == "Data") {
+                        notification.data_items.push((item_name, item_value));
+                    }
+                }
+            }
+            Event::Text(text) => {
+                if stack.last().is_some_and(|name| name == "Topic")
+                    && let Some(notification) = current.as_mut()
+                {
+                    let value = decode_text(text)?;
+                    if value.len() > MAX_EVENT_TOPIC_BYTES {
+                        return Err(OnvifError::ResponseTooLarge);
+                    }
+                    notification.topic = Some(value);
+                }
+            }
+            Event::End(end) => {
+                let name = local_name(end.name().as_ref());
+                stack.pop().ok_or(OnvifError::Protocol)?;
+                if name == "NotificationMessage"
+                    && let Some(raw) = current.take()
+                    && let Some(normalized) = normalize_motion_notification(raw)?
+                {
+                    notifications.push(normalized);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    if current.is_some() {
+        return Err(OnvifError::Protocol);
+    }
+    Ok(notifications)
+}
+
+fn normalize_motion_notification(
+    mut raw: RawEventNotification,
+) -> Result<Option<MotionNotification>, OnvifError> {
+    let Some(topic) = raw.topic.take() else {
+        return Ok(None);
+    };
+    if !is_cell_motion_topic(&topic) {
+        return Ok(None);
+    }
+
+    let mut motion = None;
+    for (name, value) in &raw.data_items {
+        if name != "IsMotion" {
+            continue;
+        }
+        let parsed = match value.trim() {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            _ => return Err(OnvifError::Protocol),
+        };
+        if motion.replace(parsed).is_some() {
+            return Err(OnvifError::Protocol);
+        }
+    }
+    let Some(active) = motion else {
+        return Ok(None);
+    };
+
+    let source_key = if raw.source_items.is_empty() {
+        None
+    } else {
+        raw.source_items.sort();
+        let mut digest = Sha256::new();
+        for (name, value) in raw.source_items {
+            let name_len = u32::try_from(name.len()).map_err(|_| OnvifError::ResponseTooLarge)?;
+            let value_len = u32::try_from(value.len()).map_err(|_| OnvifError::ResponseTooLarge)?;
+            digest.update(name_len.to_be_bytes());
+            digest.update(name.as_bytes());
+            digest.update(value_len.to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        Some(hex_lower(&digest.finalize()))
+    };
+
+    Ok(Some(MotionNotification {
+        active,
+        device_time_utc: raw
+            .utc_time
+            .as_deref()
+            .and_then(parse_lenient_event_timestamp),
+        source_key,
+        synchronization_baseline: raw
+            .property_operation
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("Initialized")),
+    }))
+}
+
+fn is_cell_motion_topic(topic: &str) -> bool {
+    let parts = topic
+        .trim()
+        .split('/')
+        .map(|part| part.trim().rsplit(':').next().unwrap_or_default())
+        .collect::<Vec<_>>();
+    parts == ["RuleEngine", "CellMotionDetector", "Motion"]
+}
+
+fn parse_strict_event_timestamp(value: &str) -> Result<DateTime<Utc>, OnvifError> {
+    if value.len() > MAX_EVENT_TIMESTAMP_BYTES {
+        return Err(OnvifError::ResponseTooLarge);
+    }
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| OnvifError::Protocol)
+}
+
+fn parse_lenient_event_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    if value.len() > MAX_EVENT_TIMESTAMP_BYTES {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,6 +1134,54 @@ mod tests {
         let invalid = br#"<root><Spaces><ContinuousPanTiltVelocitySpace><XRange><Min>1</Min><Max>-1</Max></XRange><YRange><Min>-1</Min><Max>1</Max></YRange></ContinuousPanTiltVelocitySpace></Spaces></root>"#;
         assert_eq!(
             parse_ptz_configuration_options(invalid),
+            Err(OnvifError::Protocol)
+        );
+    }
+
+    #[test]
+    fn event_properties_recognize_only_standard_cell_motion_topic_path() {
+        let supported = br#"<tev:GetEventPropertiesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:tns1="http://www.onvif.org/ver10/topics"><tev:TopicSet><tns1:RuleEngine><tns1:CellMotionDetector><tns1:Motion/></tns1:CellMotionDetector></tns1:RuleEngine></tev:TopicSet></tev:GetEventPropertiesResponse>"#;
+        assert!(parse_event_properties(supported).unwrap().motion_supported);
+
+        let lookalike = br#"<tev:GetEventPropertiesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl"><tev:TopicSet><RuleEngine><VendorMotion><Motion/></VendorMotion></RuleEngine></tev:TopicSet></tev:GetEventPropertiesResponse>"#;
+        assert!(!parse_event_properties(lookalike).unwrap().motion_supported);
+    }
+
+    #[test]
+    fn pullpoint_subscription_metadata_is_bounded_and_typed() {
+        let xml = br#"<tev:CreatePullPointSubscriptionResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:wsa="http://www.w3.org/2005/08/addressing"><tev:SubscriptionReference><wsa:Address>http://192.168.1.8:8080/onvif/pullpoint/42</wsa:Address></tev:SubscriptionReference><tev:CurrentTime>2026-09-05T00:00:00Z</tev:CurrentTime><tev:TerminationTime>2026-09-05T00:01:00Z</tev:TerminationTime></tev:CreatePullPointSubscriptionResponse>"#;
+        let subscription = parse_pullpoint_subscription(xml).unwrap();
+        assert_eq!(
+            subscription.current_time_utc().unwrap().to_rfc3339(),
+            "2026-09-05T00:00:00+00:00"
+        );
+        assert_eq!(
+            subscription.termination_time_utc().unwrap().to_rfc3339(),
+            "2026-09-05T00:01:00+00:00"
+        );
+        assert!(!format!("{subscription:?}").contains("pullpoint/42"));
+    }
+
+    #[test]
+    fn motion_notification_normalizes_boolean_source_and_synchronization_without_raw_tokens() {
+        let xml = br#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:tns1="http://www.onvif.org/ver10/topics"><s:Body><wsnt:NotificationMessage><wsnt:Topic>tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic><wsnt:Message><tt:Message UtcTime="2026-09-05T00:00:01Z" PropertyOperation="Initialized"><tt:Source><tt:SimpleItem Name="VideoSourceConfigurationToken" Value="SENTINEL-raw-camera-token"/></tt:Source><tt:Data><tt:SimpleItem Name="IsMotion" Value="true"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage></s:Body></s:Envelope>"#;
+        let notifications = parse_motion_notifications(xml).unwrap();
+        assert_eq!(notifications.len(), 1);
+        let notification = &notifications[0];
+        assert!(notification.active);
+        assert!(notification.synchronization_baseline);
+        assert_eq!(notification.source_key.as_deref().map(str::len), Some(64));
+        assert!(!format!("{notification:?}").contains("SENTINEL-raw-camera-token"));
+    }
+
+    #[test]
+    fn incompatible_motion_topic_is_ignored_and_malformed_ismotion_is_rejected() {
+        let lookalike = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema"><wsnt:Topic>RuleEngine/VendorMotion/Motion</wsnt:Topic><wsnt:Message><tt:Message><tt:Data><tt:SimpleItem Name="IsMotion" Value="true"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
+        assert!(parse_motion_notifications(lookalike).unwrap().is_empty());
+
+        let malformed = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema"><wsnt:Topic>RuleEngine/CellMotionDetector/Motion</wsnt:Topic><wsnt:Message><tt:Message><tt:Data><tt:SimpleItem Name="IsMotion" Value="maybe"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
+        assert_eq!(
+            parse_motion_notifications(malformed),
             Err(OnvifError::Protocol)
         );
     }

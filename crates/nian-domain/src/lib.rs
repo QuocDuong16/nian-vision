@@ -23,6 +23,7 @@
 pub mod backoff;
 pub mod camera;
 pub mod error;
+pub mod events;
 pub mod ids;
 pub mod media;
 pub mod ptz;
@@ -37,6 +38,7 @@ pub use camera::{
     MAX_RTSP_PATH_LEN,
 };
 pub use error::DomainError;
+pub use events::EventBinding;
 pub use ids::{CameraId, RecordingId};
 pub use media::{MediaPacketMetadata, MediaProbeReport, MediaRational, MediaStreamInfo, MediaType};
 pub use ptz::{

@@ -11,13 +11,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use nian_domain::{
-    AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Host,
-    OnvifScheme, PtzBinding, RetentionPolicy, StorageQuota,
+    AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, EventBinding,
+    Host, OnvifScheme, PtzBinding, RetentionPolicy, StorageQuota,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
@@ -236,6 +236,136 @@ impl SettingsStore {
             "DELETE FROM ptz_bindings WHERE camera_id=?1",
             [camera_id.as_str()],
         )? > 0)
+    }
+
+    /// Returns the optional ONVIF Event-plane binding for a camera.
+    pub fn get_event_binding(
+        &self,
+        camera_id: &CameraId,
+    ) -> Result<Option<EventBinding>, SettingsError> {
+        let raw = self.connection.query_row(
+            "SELECT camera_id, scheme, host, port, device_path, endpoint_reference, credential_ref, owns_credential \
+             FROM event_bindings WHERE camera_id=?1",
+            [camera_id.as_str()],
+            |row| {
+                Ok(RawEventBinding {
+                    camera_id: row.get(0)?,
+                    scheme: row.get(1)?,
+                    host: row.get(2)?,
+                    port: row.get(3)?,
+                    device_path: row.get(4)?,
+                    endpoint_reference: row.get(5)?,
+                    credential_ref: row.get(6)?,
+                    owns_credential: row.get(7)?,
+                })
+            },
+        ).optional()?;
+        raw.map(raw_to_event_binding).transpose()
+    }
+
+    pub fn save_event_binding(&mut self, binding: &EventBinding) -> Result<(), SettingsError> {
+        let row = event_binding_row(binding);
+        self.connection.execute(
+            "INSERT INTO event_bindings \
+             (camera_id, scheme, host, port, device_path, endpoint_reference, credential_ref, owns_credential) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(camera_id) DO UPDATE SET \
+             scheme=excluded.scheme, host=excluded.host, port=excluded.port, \
+             device_path=excluded.device_path, endpoint_reference=excluded.endpoint_reference, \
+             credential_ref=excluded.credential_ref, owns_credential=excluded.owns_credential",
+            params![
+                row.camera_id,
+                row.scheme,
+                row.host,
+                row.port,
+                row.device_path,
+                row.endpoint_reference,
+                row.credential_ref,
+                row.owns_credential,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_event_binding(&mut self, camera_id: &CameraId) -> Result<bool, SettingsError> {
+        Ok(self.connection.execute(
+            "DELETE FROM event_bindings WHERE camera_id=?1",
+            [camera_id.as_str()],
+        )? > 0)
+    }
+
+    pub fn event_monitoring_enabled_cameras(&self) -> Result<Vec<CameraId>, SettingsError> {
+        let mut statement = self.connection.prepare(
+            "SELECT camera_id FROM cameras WHERE event_monitoring_enabled=1 ORDER BY camera_id",
+        )?;
+        let raw_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        raw_ids
+            .into_iter()
+            .map(|raw| CameraId::parse(raw).map_err(invalid_domain))
+            .collect()
+    }
+
+    pub fn event_monitoring_enabled(&self, camera_id: &CameraId) -> Result<bool, SettingsError> {
+        let value = self
+            .connection
+            .query_row(
+                "SELECT event_monitoring_enabled FROM cameras WHERE camera_id=?1",
+                [camera_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        match value {
+            Some(value) => parse_bool(value, "event_monitoring_enabled"),
+            None => Ok(false),
+        }
+    }
+
+    pub fn set_event_monitoring_enabled(
+        &mut self,
+        camera_id: &CameraId,
+        enabled: bool,
+    ) -> Result<bool, SettingsError> {
+        Ok(self.connection.execute(
+            "UPDATE cameras SET event_monitoring_enabled=?2 WHERE camera_id=?1",
+            params![camera_id.as_str(), if enabled { 1_i64 } else { 0_i64 }],
+        )? == 1)
+    }
+
+    /// Atomically clears Desired Event monitoring and removes the Event binding.
+    pub fn disable_and_delete_event_binding(
+        &mut self,
+        camera_id: &CameraId,
+    ) -> Result<Option<EventBinding>, SettingsError> {
+        let transaction = self.connection.transaction()?;
+        let raw = transaction.query_row(
+            "SELECT camera_id, scheme, host, port, device_path, endpoint_reference, credential_ref, owns_credential \
+             FROM event_bindings WHERE camera_id=?1",
+            [camera_id.as_str()],
+            |row| {
+                Ok(RawEventBinding {
+                    camera_id: row.get(0)?,
+                    scheme: row.get(1)?,
+                    host: row.get(2)?,
+                    port: row.get(3)?,
+                    device_path: row.get(4)?,
+                    endpoint_reference: row.get(5)?,
+                    credential_ref: row.get(6)?,
+                    owns_credential: row.get(7)?,
+                })
+            },
+        ).optional()?;
+        transaction.execute(
+            "UPDATE cameras SET event_monitoring_enabled=0 WHERE camera_id=?1",
+            [camera_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM event_bindings WHERE camera_id=?1",
+            [camera_id.as_str()],
+        )?;
+        transaction.commit()?;
+        raw.map(raw_to_event_binding).transpose()
     }
 
     /// Returns persisted recording intent in deterministic CameraId order.
@@ -493,12 +623,43 @@ fn migrate(connection: &mut Connection) -> Result<(), SettingsError> {
              PRAGMA user_version=4;",
         )?;
         transaction.commit()?;
+        version = 4;
+    }
+    if version == 4 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN event_monitoring_enabled INTEGER NOT NULL DEFAULT 0 CHECK(event_monitoring_enabled IN (0,1));\
+             CREATE TABLE event_bindings (\
+                camera_id TEXT PRIMARY KEY NOT NULL REFERENCES cameras(camera_id) ON DELETE CASCADE,\
+                scheme TEXT NOT NULL CHECK(scheme IN ('http','https')),\
+                host TEXT NOT NULL,\
+                port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),\
+                device_path TEXT NOT NULL,\
+                endpoint_reference TEXT NOT NULL,\
+                credential_ref TEXT NOT NULL,\
+                owns_credential INTEGER NOT NULL CHECK(owns_credential IN (0,1))\
+             );\
+             PRAGMA user_version=5;",
+        )?;
+        transaction.commit()?;
     }
     Ok(())
 }
 
 #[derive(Debug)]
 struct RawPtzBinding {
+    camera_id: String,
+    scheme: String,
+    host: String,
+    port: i64,
+    device_path: String,
+    endpoint_reference: String,
+    credential_ref: String,
+    owns_credential: i64,
+}
+
+#[derive(Debug)]
+struct RawEventBinding {
     camera_id: String,
     scheme: String,
     host: String,
@@ -576,6 +737,41 @@ fn raw_to_ptz_binding(raw: RawPtzBinding) -> Result<PtzBinding, SettingsError> {
 
 fn ptz_binding_row(binding: &PtzBinding) -> RawPtzBinding {
     RawPtzBinding {
+        camera_id: binding.camera_id().as_str().to_owned(),
+        scheme: binding.scheme().as_str().to_owned(),
+        host: binding.host().as_str().to_owned(),
+        port: i64::from(binding.port()),
+        device_path: binding.device_path().to_owned(),
+        endpoint_reference: binding.endpoint_reference().to_owned(),
+        credential_ref: binding.credential_ref().as_str().to_owned(),
+        owns_credential: if binding.owns_credential() { 1 } else { 0 },
+    }
+}
+
+fn raw_to_event_binding(raw: RawEventBinding) -> Result<EventBinding, SettingsError> {
+    let camera_id = CameraId::parse(raw.camera_id).map_err(invalid_domain)?;
+    let scheme = OnvifScheme::from_wire(&raw.scheme)
+        .ok_or_else(|| SettingsError::InvalidData("invalid Event ONVIF scheme".to_owned()))?;
+    let host = Host::parse(raw.host).map_err(invalid_domain)?;
+    let port = u16::try_from(raw.port)
+        .map_err(|_| SettingsError::InvalidData("invalid Event ONVIF port".to_owned()))?;
+    let credential_ref = CredentialRef::parse(raw.credential_ref).map_err(invalid_domain)?;
+    let owns_credential = parse_bool(raw.owns_credential, "events owns_credential")?;
+    EventBinding::new(
+        camera_id,
+        scheme,
+        host,
+        port,
+        raw.device_path,
+        raw.endpoint_reference,
+        credential_ref,
+        owns_credential,
+    )
+    .map_err(invalid_domain)
+}
+
+fn event_binding_row(binding: &EventBinding) -> RawEventBinding {
+    RawEventBinding {
         camera_id: binding.camera_id().as_str().to_owned(),
         scheme: binding.scheme().as_str().to_owned(),
         host: binding.host().as_str().to_owned(),

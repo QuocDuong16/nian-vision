@@ -5,6 +5,7 @@ import { desktopError, invokeDesktop, isTauri } from "../lib/tauri";
 import type {
   CameraSummary,
   DesktopError,
+  EventStatus,
   LiveOpenDto,
   LiveState,
   LiveStatus,
@@ -16,6 +17,7 @@ import type {
 
 const MAX_LIVE_VIEWS = 4;
 const STATUS_POLL_MS = 1_000;
+const EVENT_STATUS_POLL_MS = 5_000;
 const KEEPALIVE_MS = 30_000;
 
 const ACTIVE_RECORDING_STATES = new Set<RecordingState>([
@@ -219,6 +221,7 @@ export function LiveViewScreen() {
   const [tileErrors, setTileErrors] = useState<Map<string, DesktopError>>(() => new Map());
   const [ptzCapabilities, setPtzCapabilities] = useState<Map<string, PtzCapabilities>>(() => new Map());
   const [ptzErrors, setPtzErrors] = useState<Map<string, DesktopError>>(() => new Map());
+  const [eventStatuses, setEventStatuses] = useState<Map<string, EventStatus>>(() => new Map());
   const [recordingBusy, setRecordingBusy] = useState<Set<string>>(() => new Set());
   const [loading, setLoading] = useState(isTauri());
   const [error, setError] = useState<DesktopError | null>(null);
@@ -344,6 +347,30 @@ export function LiveViewScreen() {
     }
     return () => { disposed = true; };
   }, [selected, ptzCapabilities]);
+
+  useEffect(() => {
+    if (!isTauri() || selected.length === 0) {
+      setEventStatuses(new Map());
+      return;
+    }
+    let disposed = false;
+    const poll = async () => {
+      const rows = await Promise.all(
+        selected.map(async (cameraId) => {
+          const status = await invokeDesktop<EventStatus>("event_status", { cameraId }).catch(() => null);
+          return [cameraId, status] as const;
+        }),
+      );
+      if (disposed) return;
+      setEventStatuses(new Map(rows.filter((row): row is readonly [string, EventStatus] => row[1] !== null)));
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), EVENT_STATUS_POLL_MS);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [selected]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -584,6 +611,7 @@ export function LiveViewScreen() {
             const desiredOn = intent.camera_ids.includes(cameraId);
             const recordingActive = recording ? ACTIVE_RECORDING_STATES.has(recording.state) : false;
             const recordingConvergingOff = !desiredOn && recordingActive;
+            const events = eventStatuses.get(cameraId);
             const canRenderVideo = Boolean(session && backendStatus?.state === "live" && !tileError);
             return (
               <article className="live-tile" key={cameraId} aria-label={`${camera.display_name} live camera`}>
@@ -633,6 +661,9 @@ export function LiveViewScreen() {
                 <div className="live-tile-meta">
                   <span>Recording desired: <strong>{desiredOn ? "On" : "Off"}</strong></span>
                   <span>Runtime: <strong>{recording?.state ?? "stopped"}</strong></span>
+                  <span>Motion events: <strong>{events?.configured ? (events.desired ? events.state : "off") : "unpaired"}</strong></span>
+                  {events?.motion_active === true && <span className="motion-indicator">Motion detected</span>}
+                  {events?.last_error_code && <span>Event error: <strong>{events.last_error_code}</strong></span>}
                 </div>
 
                 <div className="button-row">

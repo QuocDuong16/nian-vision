@@ -61,6 +61,21 @@ pub(crate) fn validate_service_xaddr(
     Ok(candidate.to_string())
 }
 
+/// Event-service and PullPoint endpoints are stricter than the older generic
+/// service policy: no query/fragment/userinfo, same physical device host, and
+/// only HTTP(S). Different ports/paths remain interoperable.
+pub(crate) fn validate_event_xaddr(
+    candidate: &str,
+    device_service: &str,
+) -> Result<String, OnvifError> {
+    let normalized = validate_service_xaddr(candidate, device_service)?;
+    let url = Url::parse(&normalized).map_err(|_| OnvifError::Protocol)?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(OnvifError::AuthorityRejected);
+    }
+    Ok(normalized)
+}
+
 pub(crate) fn parse_stream_uri(
     raw: &str,
     device_service: &str,
@@ -161,6 +176,31 @@ mod tests {
                 "http://camera.local/onvif/media",
                 "http://192.168.1.20/onvif/device_service"
             ),
+            Err(OnvifError::AuthorityRejected)
+        );
+    }
+
+    #[test]
+    fn event_and_pullpoint_authority_require_same_host_and_reject_query_or_userinfo() {
+        let device = "http://192.168.1.20/onvif/device_service";
+        assert_eq!(
+            validate_event_xaddr("https://192.168.1.20:8443/onvif/events", device),
+            Ok("https://192.168.1.20:8443/onvif/events".to_owned())
+        );
+        assert_eq!(
+            validate_event_xaddr("http://192.168.1.90/onvif/events", device),
+            Err(OnvifError::AuthorityRejected)
+        );
+        assert_eq!(
+            validate_event_xaddr("http://admin:secret@192.168.1.20/onvif/events", device),
+            Err(OnvifError::AuthorityRejected)
+        );
+        assert_eq!(
+            validate_event_xaddr("http://192.168.1.20/onvif/pull?token=opaque", device),
+            Err(OnvifError::AuthorityRejected)
+        );
+        assert_eq!(
+            validate_event_xaddr("ftp://192.168.1.20/onvif/pull", device),
             Err(OnvifError::AuthorityRejected)
         );
     }

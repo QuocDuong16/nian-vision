@@ -14,6 +14,7 @@ pub mod camera_service;
 pub mod config;
 pub mod desktop_lifecycle;
 pub mod error;
+pub mod event_controller;
 pub mod live_controller;
 pub mod onvif_controller;
 pub mod playback;
@@ -33,6 +34,11 @@ pub use camera_service::{
 pub use config::{AppConfig, SegmentTargetDuration};
 pub use desktop_lifecycle::{DesktopLifecycle, DesktopLifecycleError, DesktopLifecycleState};
 pub use error::ApplicationError;
+pub use event_controller::{
+    EventBackend, EventController, EventError, EventHistoryDto, EventHistoryKind, EventMutation,
+    EventRuntimeState, EventSettingsRepository, EventStatusDto, EventTeardownBatch, EventWarning,
+    MAX_ACTIVE_EVENT_SESSIONS,
+};
 pub use live_controller::{
     LiveError, LiveFailureCategory, LiveOpenDto, LiveRunner, LiveRunnerFactory, LiveState,
     LiveStatus, LiveTeardownBatch, LiveViewController, LiveWorkerStatus,
@@ -40,7 +46,8 @@ pub use live_controller::{
 };
 pub use onvif_controller::{
     OnvifConnectionDto, OnvifController, OnvifControllerError, OnvifDiscoveredDeviceDto,
-    OnvifDiscoveryDto, OnvifMediaProfileDto, OnvifPreparedProfileDto, PreparedPtzPairing,
+    OnvifDiscoveryDto, OnvifMediaProfileDto, OnvifPreparedProfileDto, PreparedEventPairing,
+    PreparedPtzPairing,
 };
 pub use playback::{
     AdjacentRecordingsDto, PlaybackBackend, PlaybackController, PlaybackError, PlaybackErrorCode,

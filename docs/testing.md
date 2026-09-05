@@ -22,6 +22,7 @@ Testing is part of the definition of done for every milestone (master spec
 | `nian-onvif` / `nian-application` / desktop/UI (M10) | bounded/cancellable discovery aggregation, hostile XML and authority validation, Device/Media2/legacy Media fixtures, Digest/UsernameToken secret safety, H.264 profile selection, stream-URI sanitation, opaque session invalidation, per-device failure isolation, lifecycle cancellation and ONVIF/manual onboarding UI |
 | `nian-application` / media worker / desktop/UI (M11) | four-camera live capacity, duplicate/open reservation RAII, opaque loopback session capability, Host/Origin/path/method rejection, background keepalive expiry/reaper, per-camera worker-status isolation, bounded live retry/cancel, recording/live independence, suspend/hide/update cleanup and reconnect media remount |
 | `nian-domain` / `nian-settings` / `nian-onvif` / `nian-application` / desktop/UI (M12) | schema-v4 optional PTZ binding, secret-safe credential reuse/separation/rollback, PTZ service/profile/configuration parsing and authority hardening, capability-gated pan/tilt/zoom, per-camera bounded workers, movement generations, renew/dead-man Stop, lifecycle cancellation/no resume resurrection, pairing/unpairing and frontend pending/stale-generation races |
+| `nian-domain` / `nian-settings` / `nian-index` / `nian-onvif` / `nian-application` / desktop/UI (M13) | schema-v5 Event binding + independent Desired monitoring, PullPoint service/subscription authority hardening, standard CellMotion parsing/source hashing, transition normalization/dedupe, bounded event history retention/quarantine, per-camera Event ownership/reconnect, storage-root runtime switch, lifecycle settlement, Pair/Enable/Disable/Unpair and low-frequency motion UI isolation |
 | `nian-storage` | recordings layout, partial/final naming round-trip, traversal rejection, exclusive claims (incl. sub-second clock regression), no-replace publication (success, collision refusal, recoverable abandoned partials) |
 | `nian-storage` (M3/M4) | partial-file classification plus deterministic exact-grammar filesystem inventory; normal + recovered first-class recordings; foreign/control artifacts excluded; recording-looking symlinks never followed; shared strict recovery-tombstone v2 validation; typed path-presence semantics where only `NotFound` proves absence; shared whole-second filesystem identity normalization |
 | `nian-ipc` | envelope round-trips, framing limits (1 MiB cap, CRLF, truncation), dispatch loop (ping/describe/shutdown/unknown), protocol version guard, handler event emission through the writer before replies (M3) |
@@ -759,11 +760,57 @@ candidate camera, verify every advertised direction, hold-to-renew behavior, nav
 while moving, suspend/resume with no movement restoration, and continued recording/live
 ownership during PTZ failure or unpair. Unsupported zoom is recorded as capability absence.
 
+### ONVIF PullPoint motion events (M13)
+
+`nian-settings` tests cover schema v5 migration with Event Desired state defaulting Off, independent
+EventBinding round-trip, atomic disable+unpair and camera-delete cascade. CameraService tests prove
+shared Event credentials block camera credential replacement, Event-owned credentials survive an
+independent camera credential replacement, and camera deletion cleans camera/PTZ/Event-owned
+credentials once and only after the database commit.
+
+`nian-onvif` parser fixtures cover the exact `RuleEngine/CellMotionDetector/Motion` TopicSet path,
+boolean `IsMotion`, synchronization `Initialized`, malformed/lookalike messages, bounded PullPoint
+metadata and SHA-256 source-token normalization. A local HTTP fixture executes the complete
+GetServices/GetEventProperties/CreatePullPointSubscription/SetSynchronizationPoint/PullMessages/
+Renew/Unsubscribe sequence using the production client. It checks the four-second bounded poll,
+32-message cap, secret redaction and normalized source digest. A separate fixture advertises a
+cross-host Event service and proves rejection occurs before follow-up authenticated traffic.
+
+`OnvifController` blocks Event capability lookup while the owning discovery session is cancelled or
+reconnected. Both paths must reject the stale `PreparedEventPairing`, including connection-generation
+replacement after credentials change.
+
+`EventController` fake-backend tests cover synchronization baseline semantics, transition-only
+persistence, repeated-state suppression, Desired-On survival after runtime startup failure, runtime
+exact-host rejection before authenticated Event traffic, and shutdown waiting for a blocked pull plus
+Unsubscribe. Worker ownership uses opening/active/draining/mutating state and terminal lifecycle waits
+mutation cleanup as well as workers. Per-camera failure/reconnect remains isolated and no test relies
+on a thread-per-poll implementation.
+
+The dedicated Event index tests cover stable insert/query, fingerprint dedupe, bounded cleanup, corrupt
+DB quarantine/recreation, WAL/SHM evidence preservation and future-schema refusal without replacement.
+Desktop settings tests switch recording storage root at runtime and assert the new authoritative Event
+index appears at `<new-root>/.nian/events.sqlite3`; a failed settings commit keeps the previous storage
+root authoritative and reopens Event admission. Existing close-to-tray regression also asserts Event
+admission remains available while transient live/PTZ ownership is released. Suspend/Resume/Quit/Update
+continue through the terminal Event settlement path rather than the Hide path.
+
+Frontend coverage pairs Events through explicit ONVIF selection without forwarding username/password
+to `event_pair`, verifies Pair leaves Desired Off until Enable, and exercises Unpair. Live View polls
+Event status at low frequency and verifies a motion/error indicator does not close or replace a healthy
+video tile. Event failures therefore remain presentation-local rather than becoming live/recording
+failures.
+
+Physical Event validation is manual and never claimed by CI. On a compatible camera, verify standard
+CellMotion start/end transitions, reconnect replay suppression, camera reboot, network interruption,
+Suspend/Resume fresh synchronization baseline, close-to-tray continued monitoring, storage-root
+switching, and continued RTSP recording/live/PTZ behavior while Event monitoring fails.
+
 ## Planned per milestone
 
-* **M13+**: ONVIF events/presets or further control/live-view expansion only if separately
-  specified. macOS distribution, H.265/transcoding/WebRTC, clip export, thumbnails/motion
-  analysis and AI/cloud behavior remain outside M12.
+* **Future scope**: ONVIF presets, vendor event dialects, push delivery, talkback, macOS distribution,
+  H.265/transcoding/WebRTC, clip export, thumbnails/motion analysis and AI/cloud behavior require
+  separate design/review and are not part of M13.
 * **Hardware/manual** (never in CI): real Tapo C200 via
   `NIAN_VISION_RTSP_URL` with
   `nian-media-worker record --rtsp-from-env ...` and/or an IPC-driven

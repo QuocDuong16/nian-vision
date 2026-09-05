@@ -14,7 +14,7 @@ use nian_application::{
 };
 use nian_domain::{
     AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Credentials,
-    Host, OnvifScheme, PtzBinding, RetentionPolicy,
+    EventBinding, Host, OnvifScheme, PtzBinding, RetentionPolicy,
 };
 use nian_index::{RecordingIndex, RecordingKind, RecordingUpsert};
 use nian_settings::ApplicationSettings;
@@ -24,6 +24,7 @@ use tempfile::tempdir;
 struct RepoState {
     cameras: HashMap<String, CameraConfig>,
     ptz_bindings: HashMap<String, PtzBinding>,
+    event_bindings: HashMap<String, EventBinding>,
     fail_insert: bool,
     fail_update: bool,
     fail_delete: bool,
@@ -90,6 +91,7 @@ impl SettingsRepository for FakeRepo {
         let removed = state.cameras.remove(camera_id.as_str()).is_some();
         if removed {
             state.ptz_bindings.remove(camera_id.as_str());
+            state.event_bindings.remove(camera_id.as_str());
         }
         Ok(removed)
     }
@@ -102,6 +104,18 @@ impl SettingsRepository for FakeRepo {
             .lock()
             .unwrap()
             .ptz_bindings
+            .get(camera_id.as_str())
+            .cloned())
+    }
+    fn get_event_binding(
+        &self,
+        camera_id: &CameraId,
+    ) -> Result<Option<EventBinding>, SettingsRepositoryError> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .event_bindings
             .get(camera_id.as_str())
             .cloned())
     }
@@ -293,6 +307,20 @@ fn ptz_binding(ref_text: &str, owns_credential: bool) -> PtzBinding {
         80,
         "/onvif/device_service",
         "urn:uuid:front-door",
+        CredentialRef::parse(ref_text).unwrap(),
+        owns_credential,
+    )
+    .unwrap()
+}
+
+fn event_binding(ref_text: &str, owns_credential: bool) -> EventBinding {
+    EventBinding::new(
+        CameraId::parse("front-door").unwrap(),
+        OnvifScheme::Http,
+        Host::parse("192.168.1.50").unwrap(),
+        80,
+        "/onvif/device_service",
+        "urn:uuid:front-door-events",
         CredentialRef::parse(ref_text).unwrap(),
         owns_credential,
     )
@@ -519,6 +547,85 @@ fn paired_ptz_reusing_camera_credential_rejects_credential_replacement() {
 }
 
 #[test]
+fn paired_events_reusing_camera_credential_rejects_credential_replacement() {
+    let (mut service, repo, secrets) = seeded();
+    repo.lock()
+        .unwrap()
+        .event_bindings
+        .insert("front-door".into(), event_binding("old-ref", false));
+
+    assert!(matches!(
+        service.update_camera(draft("Front door", Some("replacement")), None),
+        Err(CameraServiceError::EventBindingRequiresUnpair)
+    ));
+    let state = repo.lock().unwrap();
+    assert_eq!(
+        state
+            .cameras
+            .get("front-door")
+            .unwrap()
+            .credential_ref()
+            .as_str(),
+        "old-ref"
+    );
+    assert_eq!(
+        state
+            .event_bindings
+            .get("front-door")
+            .unwrap()
+            .credential_ref()
+            .as_str(),
+        "old-ref"
+    );
+    drop(state);
+    let secrets = secrets.0.lock().unwrap();
+    assert!(secrets.entries.contains_key("old-ref"));
+    assert!(secrets.puts.is_empty());
+}
+
+#[test]
+fn event_owned_credential_survives_camera_credential_replacement() {
+    let (mut service, repo, secrets) = seeded();
+    repo.lock()
+        .unwrap()
+        .event_bindings
+        .insert("front-door".into(), event_binding("event-ref", true));
+    secrets.0.lock().unwrap().entries.insert(
+        "event-ref".into(),
+        Credentials::new("events", "event-password"),
+    );
+
+    service
+        .update_camera(draft("Front door", Some("replacement")), None)
+        .unwrap();
+
+    let state = repo.lock().unwrap();
+    let camera_ref = state
+        .cameras
+        .get("front-door")
+        .unwrap()
+        .credential_ref()
+        .as_str()
+        .to_owned();
+    assert_ne!(camera_ref, "old-ref");
+    assert_eq!(
+        state
+            .event_bindings
+            .get("front-door")
+            .unwrap()
+            .credential_ref()
+            .as_str(),
+        "event-ref"
+    );
+    drop(state);
+    let secrets = secrets.0.lock().unwrap();
+    assert!(!secrets.entries.contains_key("old-ref"));
+    assert!(secrets.entries.contains_key("event-ref"));
+    assert!(secrets.entries.contains_key(&camera_ref));
+    assert!(!secrets.deletes.iter().any(|value| value == "event-ref"));
+}
+
+#[test]
 fn delete_with_reused_ptz_credential_cleans_camera_secret_once_and_binding_cascades() {
     let (mut service, repo, secrets) = seeded();
     repo.lock()
@@ -559,6 +666,41 @@ fn delete_with_ptz_owned_credential_cleans_both_secrets_after_db_commit() {
     drop(state);
     let secrets = secrets.0.lock().unwrap();
     assert_eq!(secrets.deletes, vec!["old-ref", "ptz-ref"]);
+    assert!(secrets.entries.is_empty());
+}
+
+#[test]
+fn delete_cleans_independent_ptz_and_event_owned_credentials_once_after_db_commit() {
+    let (mut service, repo, secrets) = seeded();
+    {
+        let mut state = repo.lock().unwrap();
+        state
+            .ptz_bindings
+            .insert("front-door".into(), ptz_binding("ptz-ref", true));
+        state
+            .event_bindings
+            .insert("front-door".into(), event_binding("event-ref", true));
+    }
+    {
+        let mut state = secrets.0.lock().unwrap();
+        state
+            .entries
+            .insert("ptz-ref".into(), Credentials::new("ptz", "ptz-password"));
+        state.entries.insert(
+            "event-ref".into(),
+            Credentials::new("events", "event-password"),
+        );
+    }
+
+    let outcome = service.delete_camera("front-door", None).unwrap();
+    assert_eq!(outcome.warning, None);
+    let state = repo.lock().unwrap();
+    assert!(!state.cameras.contains_key("front-door"));
+    assert!(!state.ptz_bindings.contains_key("front-door"));
+    assert!(!state.event_bindings.contains_key("front-door"));
+    drop(state);
+    let secrets = secrets.0.lock().unwrap();
+    assert_eq!(secrets.deletes, vec!["old-ref", "ptz-ref", "event-ref"]);
     assert!(secrets.entries.is_empty());
 }
 

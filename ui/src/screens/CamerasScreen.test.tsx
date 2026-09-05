@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { invoke } from "@tauri-apps/api/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CamerasScreen } from "./CamerasScreen";
-import type { CameraSummary, RecordingStatus } from "../lib/tauri";
+import type { CameraSummary, EventStatus, RecordingStatus } from "../lib/tauri";
 
 const tauriWindowMock = vi.hoisted(() => ({
   closeHandler: undefined as undefined | (() => void),
@@ -672,6 +672,72 @@ describe("CamerasScreen", () => {
     expect(serialized).not.toContain("password");
     expect(serialized).not.toContain("SENTINEL-ptz-password");
     expect(document.body.textContent).not.toContain("SENTINEL-ptz-password");
+  });
+
+  it("pairs Motion Events without forwarding credentials and keeps Desired Off until explicitly enabled", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    let status: EventStatus = {
+      camera_id: camera.camera_id, configured: false, desired: false, state: "disabled",
+      motion_active: null, last_event_at: null, last_error_code: null,
+    };
+    let pairArgs: unknown;
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "camera_list") return [camera];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "ptz_configured") return false;
+      if (command === "event_status") return status;
+      if (command === "onvif_discover") return onvifDiscovery;
+      if (command === "onvif_connect") return onvifConnection;
+      if (command === "event_pair") {
+        pairArgs = args;
+        status = { ...status, configured: true };
+        return { value: status, warning: null };
+      }
+      if (command === "event_enable") {
+        status = { ...status, desired: true, state: "polling" as const };
+        return status;
+      }
+      if (command === "event_disable") {
+        status = { ...status, desired: false, state: "disabled" as const };
+        return status;
+      }
+      if (command === "event_unpair") {
+        status = { ...status, configured: false, desired: false, state: "disabled" as const };
+        return { value: status, warning: null };
+      }
+      if (command === "onvif_cancel") return undefined;
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<CamerasScreen />);
+    await screen.findByText("Front door");
+    fireEvent.click(screen.getByRole("button", { name: "Pair Motion Events" }));
+    expect(await screen.findByRole("dialog", { name: "ONVIF motion event pairing" })).toBeTruthy();
+    await screen.findByText("Front ONVIF");
+    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    fireEvent.change(screen.getByLabelText("ONVIF username"), { target: { value: "admin" } });
+    fireEvent.change(screen.getByLabelText("ONVIF password"), {
+      target: { value: "SENTINEL-event-password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Authenticate & Pair" }));
+
+    expect(await screen.findByRole("button", { name: "Replace Motion Events" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Enable Events" })).toBeTruthy();
+    expect(screen.getByText(/Motion Events: Off/)).toBeTruthy();
+    const serialized = JSON.stringify(pairArgs);
+    expect(serialized).toContain(camera.camera_id);
+    expect(serialized).toContain("session-1");
+    expect(serialized).toContain("device-1");
+    expect(serialized).not.toContain("username");
+    expect(serialized).not.toContain("password");
+    expect(serialized).not.toContain("SENTINEL-event-password");
+    expect(document.body.textContent).not.toContain("SENTINEL-event-password");
+
+    fireEvent.click(screen.getByRole("button", { name: "Enable Events" }));
+    expect(await screen.findByRole("button", { name: "Disable Events" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Unpair Events" }));
+    expect(await screen.findByRole("button", { name: "Pair Motion Events" })).toBeTruthy();
   });
 
   it("unpairs PTZ without deleting or mutating the RTSP camera row", async () => {

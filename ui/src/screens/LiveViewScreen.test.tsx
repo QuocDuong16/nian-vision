@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LiveViewScreen } from "./LiveViewScreen";
 import type {
   CameraSummary,
+  EventStatus,
   LiveOpenDto,
   LiveStatus,
   RecordingIntent,
@@ -44,6 +45,7 @@ function installDesktop(
   stateForCamera?: (cameraId: string, sessionId: string) => LiveStatus,
   openOverride?: (cameraId: string) => Promise<LiveOpenDto>,
   liveStatusesOverride?: () => Promise<LiveStatus[]>,
+  eventStatusOverride?: (cameraId: string) => EventStatus | Promise<EventStatus>,
 ) {
   Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
   let live: LiveStatus[] = [];
@@ -62,6 +64,14 @@ function installDesktop(
       return {
         camera_id: cameraId, configured: false, ptz_supported: false,
         pan_tilt_supported: false, zoom_supported: false, state: null, error: null,
+      };
+    }
+    if (command === "event_status") {
+      const cameraId = (args as { cameraId: string }).cameraId;
+      if (eventStatusOverride) return await eventStatusOverride(cameraId);
+      return {
+        camera_id: cameraId, configured: false, desired: false, state: "disabled",
+        motion_active: null, last_event_at: null, last_error_code: null,
       };
     }
     if (command === "live_open") {
@@ -198,6 +208,34 @@ describe("LiveViewScreen", () => {
       expect(garageTile.querySelector("video")).toBeTruthy();
     });
     expect(screen.getByRole("article", { name: "Front door live camera" })).toBeTruthy();
+  });
+
+  it("shows motion status without disturbing a healthy live tile", async () => {
+    installDesktop(
+      undefined,
+      undefined,
+      undefined,
+      (cameraId) => ({
+        camera_id: cameraId,
+        configured: true,
+        desired: true,
+        state: "polling",
+        motion_active: true,
+        last_event_at: "2026-09-05T03:00:01Z",
+        last_error_code: "subscription_failed",
+      }),
+    );
+    render(<LiveViewScreen />);
+
+    await screen.findByText("No live cameras selected");
+    fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+    const tile = await screen.findByRole("article", { name: "Front door live camera" });
+
+    expect(await screen.findByText("Motion detected")).toBeTruthy();
+    expect(screen.getByText(/Event error:/)).toBeTruthy();
+    expect(screen.getByText("subscription_failed")).toBeTruthy();
+    await waitFor(() => expect(tile.querySelector("video")).toBeTruthy());
+    expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "live_close")).toBe(false);
   });
 
   it("uses existing recording commands without closing a healthy live session", async () => {

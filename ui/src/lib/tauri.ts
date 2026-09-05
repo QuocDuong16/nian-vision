@@ -113,6 +113,40 @@ export interface PtzMutation<T> {
   warning: "orphan_credential_cleanup_failed" | null;
 }
 
+export type EventRuntimeState =
+  | "disabled"
+  | "starting"
+  | "subscribing"
+  | "polling"
+  | "backoff"
+  | "stopping"
+  | "failed";
+
+export interface EventStatus {
+  camera_id: string;
+  configured: boolean;
+  desired: boolean;
+  state: EventRuntimeState;
+  motion_active: boolean | null;
+  last_event_at: string | null;
+  last_error_code: string | null;
+}
+
+export type EventHistoryKind = "motion_started" | "motion_ended";
+
+export interface EventHistory {
+  event_id: number;
+  camera_id: string;
+  kind: EventHistoryKind;
+  device_time_utc: string | null;
+  received_time_utc: string;
+}
+
+export interface EventMutation<T> {
+  value: T;
+  warning: "orphan_credential_cleanup_failed" | null;
+}
+
 export interface ProbeResult {
   reachable: boolean;
   video_stream_found: boolean;

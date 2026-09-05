@@ -14,16 +14,20 @@ use sha2::Sha256;
 use url::Url;
 use uuid::Uuid;
 
-use crate::authority::{parse_stream_uri as normalize_stream_uri, validate_service_xaddr};
+use crate::authority::{
+    parse_stream_uri as normalize_stream_uri, validate_event_xaddr, validate_service_xaddr,
+};
 use crate::types::{
-    MediaProfile, MediaServiceKind, OnvifCredentials, OnvifInterrogation, PtzControl,
-    PtzProfileAssociation, ServiceEndpoint,
+    EventControl, MediaProfile, MediaServiceKind, MotionNotification, OnvifCredentials,
+    OnvifInterrogation, PtzControl, PtzProfileAssociation, PullPointSubscription, ServiceEndpoint,
 };
 use crate::xml::{
-    parse_device_information, parse_hostname, parse_profiles, parse_ptz_configuration_options,
-    parse_ptz_profile_associations, parse_services, parse_stream_uri,
+    parse_device_information, parse_event_properties, parse_hostname, parse_motion_notifications,
+    parse_profiles, parse_ptz_configuration_options, parse_ptz_profile_associations,
+    parse_pullpoint_subscription, parse_renew_times, parse_services, parse_stream_uri,
 };
 use crate::{
+    EVENT_INITIAL_SUBSCRIPTION_SECS, EVENT_PULL_MESSAGE_LIMIT, EVENT_PULL_TIMEOUT_MS,
     HTTP_TIMEOUT_MS, MAX_SOAP_RESPONSE_BYTES, OnvifError, PTZ_MOVE_TIMEOUT_MS, StreamEndpoint,
 };
 
@@ -31,6 +35,7 @@ const DEVICE_NS: &str = "http://www.onvif.org/ver10/device/wsdl";
 const MEDIA1_NS: &str = "http://www.onvif.org/ver10/media/wsdl";
 const MEDIA2_NS: &str = "http://www.onvif.org/ver20/media/wsdl";
 const PTZ_NS: &str = "http://www.onvif.org/ver20/ptz/wsdl";
+const EVENT_NS: &str = "http://www.onvif.org/ver10/events/wsdl";
 
 #[derive(Clone)]
 pub struct OnvifClient {
@@ -303,6 +308,156 @@ impl OnvifClient {
         Ok(())
     }
 
+    pub fn event_control(
+        &self,
+        device_service: &str,
+        credentials: &OnvifCredentials,
+    ) -> Result<EventControl, OnvifError> {
+        let services_xml = self.soap(
+            device_service,
+            credentials,
+            &format!("{DEVICE_NS}/GetServices"),
+            "<tds:GetServices><tds:IncludeCapability>false</tds:IncludeCapability></tds:GetServices>",
+        )?;
+        let services = parse_services(&services_xml)?;
+        let (event_services, rejected_event) =
+            validated_event_service_xaddrs(&services, device_service);
+        if event_services.is_empty() {
+            return Err(if rejected_event {
+                OnvifError::AuthorityRejected
+            } else {
+                OnvifError::Unsupported
+            });
+        }
+
+        let mut last_error = OnvifError::Unsupported;
+        for service in event_services {
+            match self.soap(
+                &service,
+                credentials,
+                &format!("{EVENT_NS}/EventPortType/GetEventPropertiesRequest"),
+                "<tev:GetEventProperties/>",
+            ) {
+                Ok(xml) => {
+                    let properties = parse_event_properties(&xml)?;
+                    if properties.motion_supported {
+                        return Ok(EventControl {
+                            device_service: device_service.to_owned(),
+                            event_service: service,
+                            properties,
+                        });
+                    }
+                    last_error = OnvifError::Unsupported;
+                }
+                Err(OnvifError::AuthFailed) => return Err(OnvifError::AuthFailed),
+                Err(error) => last_error = error,
+            }
+        }
+        Err(last_error)
+    }
+
+    pub fn create_pullpoint_subscription(
+        &self,
+        control: &EventControl,
+        credentials: &OnvifCredentials,
+    ) -> Result<PullPointSubscription, OnvifError> {
+        if !control.properties.motion_supported {
+            return Err(OnvifError::Unsupported);
+        }
+        let body = format!(
+            "<tev:CreatePullPointSubscription><tev:InitialTerminationTime>PT{}S</tev:InitialTerminationTime></tev:CreatePullPointSubscription>",
+            EVENT_INITIAL_SUBSCRIPTION_SECS
+        );
+        let xml = self.soap(
+            &control.event_service,
+            credentials,
+            &format!("{EVENT_NS}/EventPortType/CreatePullPointSubscriptionRequest"),
+            &body,
+        )?;
+        let mut subscription = parse_pullpoint_subscription(&xml)?;
+        subscription.endpoint =
+            validate_event_xaddr(&subscription.endpoint, &control.device_service)?;
+        if let (Some(current), Some(termination)) = (
+            subscription.current_time_utc,
+            subscription.termination_time_utc,
+        ) && termination <= current
+        {
+            return Err(OnvifError::Protocol);
+        }
+        Ok(subscription)
+    }
+
+    pub fn set_synchronization_point(
+        &self,
+        subscription: &PullPointSubscription,
+        credentials: &OnvifCredentials,
+    ) -> Result<(), OnvifError> {
+        self.soap(
+            &subscription.endpoint,
+            credentials,
+            &format!("{EVENT_NS}/PullPointSubscription/SetSynchronizationPointRequest"),
+            "<tev:SetSynchronizationPoint/>",
+        )?;
+        Ok(())
+    }
+
+    pub fn pull_messages(
+        &self,
+        subscription: &PullPointSubscription,
+        credentials: &OnvifCredentials,
+    ) -> Result<Vec<MotionNotification>, OnvifError> {
+        let timeout_seconds = EVENT_PULL_TIMEOUT_MS as f64 / 1000.0;
+        let body = format!(
+            "<tev:PullMessages><tev:Timeout>PT{timeout_seconds:.3}S</tev:Timeout><tev:MessageLimit>{EVENT_PULL_MESSAGE_LIMIT}</tev:MessageLimit></tev:PullMessages>"
+        );
+        let xml = self.soap(
+            &subscription.endpoint,
+            credentials,
+            &format!("{EVENT_NS}/PullPointSubscription/PullMessagesRequest"),
+            &body,
+        )?;
+        parse_motion_notifications(&xml)
+    }
+
+    pub fn renew_subscription(
+        &self,
+        subscription: &mut PullPointSubscription,
+        credentials: &OnvifCredentials,
+    ) -> Result<(), OnvifError> {
+        let body = format!(
+            "<wsnt:Renew><wsnt:TerminationTime>PT{}S</wsnt:TerminationTime></wsnt:Renew>",
+            EVENT_INITIAL_SUBSCRIPTION_SECS
+        );
+        let xml = self.soap(
+            &subscription.endpoint,
+            credentials,
+            &format!("{EVENT_NS}/SubscriptionManager/RenewRequest"),
+            &body,
+        )?;
+        let (current, termination) = parse_renew_times(&xml)?;
+        if let (Some(current), Some(termination)) = (current, termination)
+            && termination <= current
+        {
+            return Err(OnvifError::Protocol);
+        }
+        subscription.current_time_utc = current;
+        subscription.termination_time_utc = termination;
+        Ok(())
+    }
+
+    pub fn unsubscribe(
+        &self,
+        subscription: &PullPointSubscription,
+        credentials: &OnvifCredentials,
+    ) -> Result<(), OnvifError> {
+        self.soap(
+            &subscription.endpoint,
+            credentials,
+            &format!("{EVENT_NS}/SubscriptionManager/UnsubscribeRequest"),
+            "<wsnt:Unsubscribe/>",
+        )?;
+        Ok(())
+    }
     fn get_ptz_associations(
         &self,
         service: &str,
@@ -512,6 +667,26 @@ fn validated_service_xaddrs(
     (candidates, rejected)
 }
 
+fn validated_event_service_xaddrs(
+    services: &[ServiceEndpoint],
+    device_service: &str,
+) -> (Vec<String>, bool) {
+    let mut rejected = false;
+    let mut candidates = Vec::new();
+    for service in services
+        .iter()
+        .filter(|service| service.namespace.contains("/ver10/events/wsdl"))
+    {
+        match validate_event_xaddr(&service.xaddr, device_service) {
+            Ok(xaddr) if !candidates.contains(&xaddr) => candidates.push(xaddr),
+            Ok(_) => {}
+            Err(_) => rejected = true,
+        }
+    }
+    candidates.sort();
+    (candidates, rejected)
+}
+
 fn auth_authority_key(url: &Url) -> Result<String, OnvifError> {
     let host = url.host_str().ok_or(OnvifError::AuthorityRejected)?;
     let port = url
@@ -586,7 +761,7 @@ fn read_response(mut response: Response) -> Result<Vec<u8>, OnvifError> {
 fn anonymous_soap_envelope(body: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tr2="http://www.onvif.org/ver20/media/wsdl" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tr2="http://www.onvif.org/ver20/media/wsdl" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:wsa="http://www.w3.org/2005/08/addressing" xmlns:tt="http://www.onvif.org/ver10/schema">
 <s:Body>{body}</s:Body></s:Envelope>"#
     )
 }
@@ -603,7 +778,7 @@ fn soap_envelope(credentials: &OnvifCredentials, body: &str) -> String {
     let username = xml_escape(&credentials.username);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tr2="http://www.onvif.org/ver20/media/wsdl" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tr2="http://www.onvif.org/ver20/media/wsdl" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:wsa="http://www.w3.org/2005/08/addressing" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
 <s:Header><wsse:Security s:mustUnderstand="1"><wsse:UsernameToken><wsse:Username>{username}</wsse:Username><wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{digest}</wsse:Password><wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{nonce}</wsse:Nonce><wsu:Created>{created}</wsu:Created></wsse:UsernameToken></wsse:Security></s:Header>
 <s:Body>{body}</s:Body></s:Envelope>"#
     )
@@ -1544,6 +1719,117 @@ mod tests {
             validated_service_xaddrs(&services, "/ver20/ptz/wsdl", "http://127.0.0.1/device");
         assert!(candidates.is_empty());
         assert!(rejected);
+    }
+
+    #[test]
+    fn local_event_fixture_runs_pullpoint_sync_pull_renew_and_unsubscribe() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..7 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let body = if request.contains("GetServices") {
+                    format!(
+                        "<Envelope><Body><GetServicesResponse><Service><Namespace>{EVENT_NS}</Namespace><XAddr>http://{address}/events</XAddr></Service></GetServicesResponse></Body></Envelope>"
+                    )
+                } else if request.contains("GetEventProperties") {
+                    "<Envelope><Body><GetEventPropertiesResponse><TopicSet><RuleEngine><CellMotionDetector><Motion/></CellMotionDetector></RuleEngine></TopicSet></GetEventPropertiesResponse></Body></Envelope>".to_owned()
+                } else if request.contains("CreatePullPointSubscription") {
+                    format!(
+                        "<Envelope><Body><CreatePullPointSubscriptionResponse><SubscriptionReference><Address>http://{address}/pullpoint</Address></SubscriptionReference><CurrentTime>2026-09-05T03:00:00Z</CurrentTime><TerminationTime>2026-09-05T03:01:00Z</TerminationTime></CreatePullPointSubscriptionResponse></Body></Envelope>"
+                    )
+                } else if request.contains("SetSynchronizationPoint") {
+                    "<Envelope><Body><SetSynchronizationPointResponse/></Body></Envelope>"
+                        .to_owned()
+                } else if request.contains("PullMessages") {
+                    r#"<Envelope><Body><PullMessagesResponse><NotificationMessage><Topic>tns1:RuleEngine/CellMotionDetector/Motion</Topic><Message UtcTime="2026-09-05T03:00:01Z"><Source><SimpleItem Name="VideoSourceConfigurationToken" Value="RAW-SOURCE-TOKEN"/></Source><Data><SimpleItem Name="IsMotion" Value="true"/></Data></Message></NotificationMessage></PullMessagesResponse></Body></Envelope>"#.to_owned()
+                } else if request.contains("<wsnt:Renew>") {
+                    "<Envelope><Body><RenewResponse><CurrentTime>2026-09-05T03:00:20Z</CurrentTime><TerminationTime>2026-09-05T03:01:20Z</TerminationTime></RenewResponse></Body></Envelope>".to_owned()
+                } else if request.contains("Unsubscribe") {
+                    "<Envelope><Body><UnsubscribeResponse/></Body></Envelope>".to_owned()
+                } else {
+                    panic!("unexpected Event fixture request: {request}");
+                };
+                write_http_response(&mut stream, "200 OK", &[], &body);
+                requests.push(request);
+            }
+            requests
+        });
+
+        let client = OnvifClient::new().unwrap();
+        let credentials = OnvifCredentials {
+            username: "admin".into(),
+            password: "SENTINEL-event-password".into(),
+        };
+        let device_service = format!("http://{address}/onvif/device_service");
+        let control = client.event_control(&device_service, &credentials).unwrap();
+        assert!(control.properties().motion_supported);
+        let mut subscription = client
+            .create_pullpoint_subscription(&control, &credentials)
+            .unwrap();
+        client
+            .set_synchronization_point(&subscription, &credentials)
+            .unwrap();
+        let notifications = client.pull_messages(&subscription, &credentials).unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(notifications[0].active);
+        assert_eq!(
+            notifications[0].source_key.as_ref().map(String::len),
+            Some(64)
+        );
+        assert_ne!(
+            notifications[0].source_key.as_deref(),
+            Some("RAW-SOURCE-TOKEN")
+        );
+        client
+            .renew_subscription(&mut subscription, &credentials)
+            .unwrap();
+        client.unsubscribe(&subscription, &credentials).unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert!(requests.iter().any(|request| request.contains("PT4.000S")));
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("MessageLimit>32"))
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("SENTINEL-event-password"))
+        );
+    }
+
+    #[test]
+    fn cross_host_event_service_is_rejected_before_followup_authenticated_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            let body = format!(
+                "<Envelope><Body><GetServicesResponse><Service><Namespace>{EVENT_NS}</Namespace><XAddr>http://127.0.0.2:6553/events</XAddr></Service></GetServicesResponse></Body></Envelope>"
+            );
+            write_http_response(&mut stream, "200 OK", &[], &body);
+            request
+        });
+
+        let client = OnvifClient::new().unwrap();
+        let credentials = OnvifCredentials {
+            username: "admin".into(),
+            password: "SENTINEL-cross-host-password".into(),
+        };
+        let device_service = format!("http://{address}/onvif/device_service");
+        assert_eq!(
+            client.event_control(&device_service, &credentials),
+            Err(OnvifError::AuthorityRejected)
+        );
+        let request = server.join().unwrap();
+        assert!(request.contains("GetServices"));
+        assert!(!request.contains("SENTINEL-cross-host-password"));
     }
 
     #[test]

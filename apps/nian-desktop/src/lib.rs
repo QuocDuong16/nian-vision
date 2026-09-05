@@ -16,19 +16,22 @@ use chrono::NaiveDateTime;
 use nian_application::{
     ApplicationSettingsDto, CameraDraft, CameraService, CameraServiceError, CameraSummary,
     CredentialStore, CredentialStoreError, DesktopLifecycle, DesktopLifecycleError,
-    DesktopLifecycleState, LiveError, LiveOpenDto, LiveStatus, LiveTeardownBatch,
-    LiveViewController, OnvifConnectionDto, OnvifController, OnvifControllerError,
-    OnvifDiscoveryDto, OnvifPreparedProfileDto, PlaybackController, PlaybackError, PlaybackOpenDto,
-    ProbeController, ProbeError, ProbeResult, PtzCapabilitiesDto, PtzController, PtzDirection,
-    PtzError, PtzMovementDto, PtzMutation, PtzTeardownBatch, RecordingController,
-    RecordingControllerError, RecordingDto, RecordingState, RecordingStatus,
-    SupervisorRecordingRunnerFactory, WorkerProbeRunner,
+    DesktopLifecycleState, EventController, EventError, EventHistoryDto, EventMutation,
+    EventStatusDto, LiveError, LiveOpenDto, LiveStatus, LiveTeardownBatch, LiveViewController,
+    OnvifConnectionDto, OnvifController, OnvifControllerError, OnvifDiscoveryDto,
+    OnvifPreparedProfileDto, PlaybackController, PlaybackError, PlaybackOpenDto, ProbeController,
+    ProbeError, ProbeResult, PtzCapabilitiesDto, PtzController, PtzDirection, PtzError,
+    PtzMovementDto, PtzMutation, PtzTeardownBatch, RecordingController, RecordingControllerError,
+    RecordingDto, RecordingState, RecordingStatus, SupervisorRecordingRunnerFactory,
+    WorkerProbeRunner,
 };
 use nian_domain::{
     AudioPolicy, CameraId, CredentialRef, Credentials, RetentionPolicy, StorageQuota,
 };
+use nian_index::EventIndex;
 use nian_onvif::OnvifError;
 use nian_settings::SettingsStore;
+use nian_storage::RecordingsLayout;
 use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -169,6 +172,20 @@ struct PtzPairInput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct EventPairInput {
+    camera_id: String,
+    session_id: String,
+    device_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EventRecentInput {
+    camera_id: String,
+    #[serde(default = "default_event_recent_limit")]
+    limit: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct PtzMoveInput {
     camera_id: String,
     direction: PtzDirection,
@@ -182,6 +199,10 @@ struct PtzGenerationInput {
 
 const fn default_probe_timeout_ms() -> u64 {
     10_000
+}
+
+const fn default_event_recent_limit() -> u32 {
+    50
 }
 
 #[derive(Debug, Default)]
@@ -248,6 +269,7 @@ struct DesktopState {
     probe_controller: ProbeController,
     onvif_controller: OnvifController,
     ptz_controller: PtzController,
+    event_controller: EventController,
     lifecycle: DesktopLifecycle,
     power_subscription: Mutex<Option<Box<dyn PowerEventSubscription>>>,
     power_dispatch_tx: Mutex<Option<mpsc::Sender<PowerDispatchMessage>>>,
@@ -260,6 +282,9 @@ struct DesktopState {
     /// Serializes operations whose correctness depends on lifecycle admission
     /// and a stable recording ownership snapshot.
     control_gate: Mutex<()>,
+    /// Serializes application-settings mutations without monopolizing the
+    /// lifecycle gate across Event teardown or filesystem work.
+    settings_update_gate: Mutex<()>,
 }
 
 impl std::fmt::Debug for DesktopState {
@@ -700,14 +725,19 @@ fn update_camera_config(
     state
         .ptz_controller
         .coordinate_camera_update(&camera_id, || {
-            let _gate = lock(&state.control_gate)?;
-            require_running(state)?;
-            let active = lock(&state.recording_controller)?
-                .is_owned(&camera_id)
-                .map_err(map_recording_error)?;
-            lock(&state.camera_service)?
-                .update_camera(input.into_draft()?, active.then_some(&camera_id))
-                .map_err(map_camera_error)
+            state
+                .event_controller
+                .coordinate_camera_update(&camera_id, || {
+                    let _gate = lock(&state.control_gate)?;
+                    require_running(state)?;
+                    let active = lock(&state.recording_controller)?
+                        .is_owned(&camera_id)
+                        .map_err(map_recording_error)?;
+                    lock(&state.camera_service)?
+                        .update_camera(input.into_draft()?, active.then_some(&camera_id))
+                        .map_err(map_camera_error)
+                })
+                .map_err(map_event_error)?
         })
         .map_err(map_ptz_error)?
 }
@@ -759,16 +789,21 @@ fn delete_camera_config(
     state
         .ptz_controller
         .coordinate_camera_delete(&id, || {
-            let _gate = lock(&state.control_gate)?;
-            require_running(state)?;
-            ensure_camera_delete_allowed(state, &id)?;
-            let deleted = lock(&state.camera_service)?
-                .delete_camera(camera_id, None)
-                .map_err(map_camera_error)?;
-            lock(&state.recording_controller)?
-                .forget_status(&id)
-                .map_err(map_recording_error)?;
-            Ok(deleted)
+            state
+                .event_controller
+                .coordinate_camera_delete(&id, || {
+                    let _gate = lock(&state.control_gate)?;
+                    require_running(state)?;
+                    ensure_camera_delete_allowed(state, &id)?;
+                    let deleted = lock(&state.camera_service)?
+                        .delete_camera(camera_id, None)
+                        .map_err(map_camera_error)?;
+                    lock(&state.recording_controller)?
+                        .forget_status(&id)
+                        .map_err(map_recording_error)?;
+                    Ok(deleted)
+                })
+                .map_err(map_event_error)?
         })
         .map_err(map_ptz_error)?
 }
@@ -1094,6 +1129,133 @@ async fn ptz_stop(
     .map_err(|_| DesktopErrorDto::new("ptz_internal", "PTZ stop task failed"))?
 }
 
+#[tauri::command]
+async fn event_pair(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    input: EventPairInput,
+) -> Result<EventMutation<EventStatusDto>, DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let prepared = state
+            .onvif_controller
+            .prepare_event_pairing(&input.session_id, &input.device_id)
+            .map_err(map_onvif_error)?;
+        let result = state
+            .event_controller
+            .pair(&input.camera_id, prepared)
+            .map_err(map_event_error)?;
+        let _ = state.onvif_controller.cancel_session(&input.session_id);
+        Ok(result)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("event_internal", "event pairing task failed"))?
+}
+
+#[tauri::command]
+async fn event_unpair(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    camera_id: String,
+) -> Result<EventMutation<EventStatusDto>, DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .event_controller
+            .unpair(&camera_id)
+            .map_err(map_event_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("event_internal", "event unpair task failed"))?
+}
+
+#[tauri::command]
+async fn event_enable(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    camera_id: String,
+) -> Result<EventStatusDto, DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .event_controller
+            .enable(&camera_id)
+            .map_err(map_event_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("event_internal", "event enable task failed"))?
+}
+
+#[tauri::command]
+async fn event_disable(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    camera_id: String,
+) -> Result<EventStatusDto, DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .event_controller
+            .disable(&camera_id)
+            .map_err(map_event_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("event_internal", "event disable task failed"))?
+}
+
+#[tauri::command]
+fn event_configured(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    camera_id: String,
+) -> Result<bool, DesktopErrorDto> {
+    admit_running(&state)?;
+    state
+        .event_controller
+        .configured(&camera_id)
+        .map_err(map_event_error)
+}
+
+#[tauri::command]
+fn event_status(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    camera_id: String,
+) -> Result<EventStatusDto, DesktopErrorDto> {
+    admit_running(&state)?;
+    state
+        .event_controller
+        .status(&camera_id)
+        .map_err(map_event_error)
+}
+
+#[tauri::command]
+async fn event_recent(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    input: EventRecentInput,
+) -> Result<Vec<EventHistoryDto>, DesktopErrorDto> {
+    admit_running(&state)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .event_controller
+            .recent(&input.camera_id, input.limit)
+            .map_err(map_event_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("event_internal", "event history task failed"))?
+}
+
 fn start_recording(
     state: &DesktopState,
     camera_id: &str,
@@ -1410,26 +1572,101 @@ fn settings_get(
 }
 
 #[tauri::command]
-fn settings_update(
+async fn settings_update(
     app: AppHandle,
     state: tauri::State<'_, Arc<DesktopState>>,
     settings: ApplicationSettingsDto,
 ) -> Result<ApplicationSettingsDto, DesktopErrorDto> {
-    let _gate = lock(&state.control_gate)?;
-    require_running(&state)?;
-    let active = lock(&state.recording_controller)?
-        .any_active()
-        .map_err(map_recording_error)?;
-    let mut camera_service = lock(&state.camera_service)?;
-    let mut playback = lock(&state.playback_controller)?;
-    let autostart = NativeAutostartService { app: &app };
-    update_settings_transaction(
-        &mut camera_service,
-        &mut playback,
-        &autostart,
-        settings,
-        active,
-    )
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let autostart = NativeAutostartService { app: &app };
+        update_settings_runtime(&state, &autostart, settings)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("internal", "settings update task failed"))?
+}
+
+fn update_settings_runtime(
+    state: &DesktopState,
+    autostart: &dyn AutostartService,
+    settings: ApplicationSettingsDto,
+) -> Result<ApplicationSettingsDto, DesktopErrorDto> {
+    let _settings_gate = lock(&state.settings_update_gate)?;
+    let (previous, prepared_dto) = {
+        let _gate = lock(&state.control_gate)?;
+        require_running(state)?;
+        let active = lock(&state.recording_controller)?
+            .any_active()
+            .map_err(map_recording_error)?;
+        let camera_service = lock(&state.camera_service)?;
+        let previous = camera_service
+            .application_settings()
+            .map_err(map_camera_error)?;
+        let prepared = camera_service
+            .prepare_application_settings(settings.clone(), active)
+            .map_err(map_camera_error)?;
+        (previous, prepared.dto())
+    };
+
+    let event_storage_changed = previous.storage_root != prepared_dto.storage_root
+        || previous.max_age_days != prepared_dto.max_age_days;
+    let prepared_event_index = if event_storage_changed {
+        Some(event_index_for_settings(&prepared_dto)?)
+    } else {
+        None
+    };
+
+    if event_storage_changed {
+        state
+            .event_controller
+            .stop_accepting_and_stop_all()
+            .map_err(map_event_error)?;
+        state.event_controller.shutdown_sessions();
+    }
+
+    let committed = (|| {
+        let _gate = lock(&state.control_gate)?;
+        require_running(state)?;
+        let active = lock(&state.recording_controller)?
+            .any_active()
+            .map_err(map_recording_error)?;
+        let mut camera_service = lock(&state.camera_service)?;
+        let mut playback = lock(&state.playback_controller)?;
+        update_settings_transaction(
+            &mut camera_service,
+            &mut playback,
+            autostart,
+            settings,
+            active,
+        )
+    })();
+
+    let saved = match committed {
+        Ok(saved) => saved,
+        Err(error) => {
+            resume_events_after_settings_abort(state);
+            return Err(error);
+        }
+    };
+
+    if let Some(event_index) = prepared_event_index {
+        state
+            .event_controller
+            .configure_event_storage(event_index, saved.max_age_days)
+            .map_err(map_event_error)?;
+        state.event_controller.resume_accepting();
+        if let Err(error) = state.event_controller.restore_desired() {
+            return Err(map_event_error(error));
+        }
+    }
+    Ok(saved)
+}
+
+fn resume_events_after_settings_abort(state: &DesktopState) {
+    if matches!(state.lifecycle.state(), Ok(DesktopLifecycleState::Running)) {
+        state.event_controller.resume_accepting();
+        let _ = state.event_controller.restore_desired();
+    }
 }
 
 fn update_settings_transaction(
@@ -1532,6 +1769,34 @@ fn playback_storage_config(
     ))
 }
 
+fn event_index_for_settings(
+    settings: &ApplicationSettingsDto,
+) -> Result<Option<EventIndex>, DesktopErrorDto> {
+    let Some(root) = settings.storage_root.as_deref() else {
+        return Ok(None);
+    };
+    let layout = RecordingsLayout::new(PathBuf::from(root)).map_err(|_| {
+        DesktopErrorDto::new("event_persistence_failed", "event storage root is invalid")
+    })?;
+    layout.ensure_control_dir().map_err(|_| {
+        DesktopErrorDto::new(
+            "event_persistence_failed",
+            "event storage control directory is unavailable",
+        )
+    })?;
+    let (index, quarantined) =
+        EventIndex::open_with_recovery(layout.event_index_path()).map_err(|_| {
+            DesktopErrorDto::new("event_persistence_failed", "event index is unavailable")
+        })?;
+    if let Some(path) = quarantined {
+        tracing::warn!(
+            path = %path.display(),
+            "corrupt event index was quarantined and recreated"
+        );
+    }
+    Ok(Some(index))
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, DesktopErrorDto> {
     mutex
         .lock()
@@ -1553,6 +1818,10 @@ fn map_camera_error(error: CameraServiceError) -> DesktopErrorDto {
         CameraServiceError::PtzBindingRequiresUnpair => DesktopErrorDto::new(
             "ptz_requires_unpair",
             "unpair PTZ before changing camera identity or shared credentials",
+        ),
+        CameraServiceError::EventBindingRequiresUnpair => DesktopErrorDto::new(
+            "events_require_unpair",
+            "unpair ONVIF events before changing camera identity or shared credentials",
         ),
         CameraServiceError::CredentialStore(_) => {
             DesktopErrorDto::new("credential_store", "credential store operation failed")
@@ -1676,6 +1945,71 @@ fn map_ptz_error(error: PtzError) -> DesktopErrorDto {
             "PTZ credential rollback cleanup failed",
         ),
         PtzError::Internal => DesktopErrorDto::new("ptz_internal", "PTZ controller is unavailable"),
+    }
+}
+
+fn map_event_error(error: EventError) -> DesktopErrorDto {
+    match error {
+        EventError::CameraNotFound => {
+            DesktopErrorDto::new("camera_not_found", "camera was not found")
+        }
+        EventError::NotConfigured => DesktopErrorDto::new(
+            "event_not_configured",
+            "ONVIF event monitoring is not configured",
+        ),
+        EventError::Unsupported => DesktopErrorDto::new(
+            "event_unsupported",
+            "camera does not advertise compatible motion events",
+        ),
+        EventError::AuthFailed => {
+            DesktopErrorDto::new("auth_failed", "ONVIF event authentication failed")
+        }
+        EventError::DeviceUnreachable => {
+            DesktopErrorDto::new("device_unreachable", "ONVIF event device is unreachable")
+        }
+        EventError::SubscriptionFailed => DesktopErrorDto::new(
+            "event_subscription_failed",
+            "ONVIF event subscription failed",
+        ),
+        EventError::PullTimeout => {
+            DesktopErrorDto::new("event_pull_timeout", "ONVIF event pull timed out")
+        }
+        EventError::ProtocolError => {
+            DesktopErrorDto::new("event_protocol", "ONVIF event protocol failed")
+        }
+        EventError::PersistenceFailed => DesktopErrorDto::new(
+            "event_persistence_failed",
+            "event history storage is unavailable",
+        ),
+        EventError::Capacity => DesktopErrorDto::new(
+            "event_capacity",
+            "event monitoring capacity has been reached",
+        ),
+        EventError::Busy => {
+            DesktopErrorDto::new("event_busy", "event monitoring operation is busy")
+        }
+        EventError::LifecycleCancelled => DesktopErrorDto::new(
+            "lifecycle_cancelled",
+            "event monitoring is unavailable during lifecycle transition",
+        ),
+        EventError::AuthorityMismatch => DesktopErrorDto::new(
+            "authority_mismatch",
+            "selected ONVIF device does not match the configured camera authority",
+        ),
+        EventError::Settings => DesktopErrorDto::new(
+            "event_settings",
+            "event monitoring settings are unavailable",
+        ),
+        EventError::CredentialStore(_) => {
+            DesktopErrorDto::new("credential_store", "event credential store is unavailable")
+        }
+        EventError::CredentialRollbackCleanup => DesktopErrorDto::new(
+            "credential_rollback_cleanup",
+            "event credential rollback cleanup failed",
+        ),
+        EventError::Internal => {
+            DesktopErrorDto::new("event_internal", "event controller is unavailable")
+        }
     }
 }
 
@@ -1880,6 +2214,7 @@ fn classify_restoration_failure(error: &CameraServiceError) -> RestorationFailur
         CameraServiceError::DuplicateCamera
         | CameraServiceError::CameraBusy
         | CameraServiceError::PtzBindingRequiresUnpair
+        | CameraServiceError::EventBindingRequiresUnpair
         | CameraServiceError::CredentialRollbackCleanup { .. }
         | CameraServiceError::CredentialRefGeneration(_)
         | CameraServiceError::CredentialRefCollision => {
@@ -2237,7 +2572,11 @@ fn shutdown_runtime_resources(state: &DesktopState) -> Result<(), DesktopErrorDt
     if let Err(error) = state.ptz_controller.stop_accepting_and_stop_all() {
         capture_first_error(&mut first_error, map_ptz_error(error));
     }
+    if let Err(error) = state.event_controller.stop_accepting_and_stop_all() {
+        capture_first_error(&mut first_error, map_event_error(error));
+    }
     state.ptz_controller.shutdown_sessions();
+    state.event_controller.shutdown_sessions();
     match state.recording_controller.lock() {
         Ok(mut controller) => {
             if let Err(error) = controller.shutdown_all() {
@@ -2290,6 +2629,9 @@ fn begin_update_shutdown(state: &DesktopState) -> Result<(), DesktopErrorDto> {
         if let Err(error) = state.ptz_controller.stop_accepting_and_stop_all() {
             capture_first_error(&mut admission_error, map_ptz_error(error));
         }
+        if let Err(error) = state.event_controller.stop_accepting_and_stop_all() {
+            capture_first_error(&mut admission_error, map_event_error(error));
+        }
         state.probe_controller.stop_accepting_and_cancel();
         state.live_controller.stop_accepting();
         match state.playback_controller.lock() {
@@ -2335,6 +2677,9 @@ fn request_quit(app: &AppHandle) -> Result<(), DesktopErrorDto> {
         // Admission closes before any potentially blocking teardown begins.
         if let Err(error) = state.ptz_controller.stop_accepting_and_stop_all() {
             capture_first_error(&mut admission_error, map_ptz_error(error));
+        }
+        if let Err(error) = state.event_controller.stop_accepting_and_stop_all() {
+            capture_first_error(&mut admission_error, map_event_error(error));
         }
         state.probe_controller.stop_accepting_and_cancel();
         state.live_controller.stop_accepting();
@@ -2408,6 +2753,9 @@ fn handle_power_event(
             if let Err(error) = state.ptz_controller.stop_accepting_and_stop_all() {
                 capture_first_error(&mut first_error, map_ptz_error(error));
             }
+            if let Err(error) = state.event_controller.stop_accepting_and_stop_all() {
+                capture_first_error(&mut first_error, map_event_error(error));
+            }
             state.probe_controller.stop_accepting_and_cancel();
             state.live_controller.stop_accepting();
             match state.playback_controller.lock() {
@@ -2430,13 +2778,14 @@ fn handle_power_event(
             }
             drop(gate);
             state.ptz_controller.shutdown_sessions();
+            state.event_controller.shutdown_sessions();
             state.live_controller.close_all();
             if let Some(error) = first_error {
                 return Err(error);
             }
         }
         nian_platform_windows::PowerEvent::Resume => {
-            let _gate = lock(&state.control_gate)?;
+            let gate = lock(&state.control_gate)?;
             if !state.lifecycle.resume().map_err(map_lifecycle_error)? {
                 return Ok(());
             }
@@ -2493,6 +2842,11 @@ fn handle_power_event(
             state.probe_controller.resume_accepting();
             state.onvif_controller.resume_accepting();
             state.ptz_controller.resume_accepting();
+            state.event_controller.resume_accepting();
+            drop(gate);
+            if let Err(error) = state.event_controller.restore_desired() {
+                capture_first_error(&mut first_error, map_event_error(error));
+            }
             if let Some(error) = first_error {
                 return Err(error);
             }
@@ -2674,7 +3028,8 @@ pub fn run() {
             let app_data = app.path().app_data_dir()?;
             let settings_path = app_data.join("settings.sqlite3");
             let settings = SettingsStore::open(settings_path.clone())?;
-            let ptz_settings = SettingsStore::open(settings_path)?;
+            let ptz_settings = SettingsStore::open(settings_path.clone())?;
+            let event_settings = SettingsStore::open(settings_path)?;
             let credentials: Arc<dyn CredentialStore> = Arc::new(NativeCredentialStore);
             let camera_service = CameraService::new(Box::new(settings), credentials.clone());
             let ptz_controller =
@@ -2683,6 +3038,17 @@ pub fn run() {
             let initial_settings = camera_service
                 .application_settings()
                 .map_err(|_| std::io::Error::other("application settings are unavailable"))?;
+            let event_index = event_index_for_settings(&initial_settings).unwrap_or_else(|error| {
+                tracing::warn!(code = error.code, "event index is unavailable at startup");
+                None
+            });
+            let event_controller = EventController::production(
+                Box::new(event_settings),
+                credentials.clone(),
+                event_index,
+                initial_settings.max_age_days,
+            )
+            .map_err(|_| std::io::Error::other("event monitoring service could not start"))?;
 
             let worker_name = if cfg!(windows) {
                 "nian-media-worker.exe"
@@ -2738,6 +3104,7 @@ pub fn run() {
                 probe_controller,
                 onvif_controller,
                 ptz_controller,
+                event_controller,
                 lifecycle: DesktopLifecycle::new(),
                 power_subscription: Mutex::new(None),
                 power_dispatch_tx: Mutex::new(None),
@@ -2748,6 +3115,7 @@ pub fn run() {
                 update_installing: std::sync::atomic::AtomicBool::new(false),
                 startup_complete: std::sync::atomic::AtomicBool::new(false),
                 control_gate: Mutex::new(()),
+                settings_update_gate: Mutex::new(()),
             });
             app.manage(state.clone());
 
@@ -2814,6 +3182,16 @@ pub fn run() {
                     *startup_error = Some(error);
                 }
             }
+            let event_state = state.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = event_state.event_controller.restore_desired() {
+                    let mapped = map_event_error(error);
+                    tracing::warn!(
+                        code = mapped.code,
+                        "desired event monitoring restoration failed"
+                    );
+                }
+            });
             emit_startup_smoke_marker()?;
             #[cfg(windows)]
             start_containment_smoke_worker()?;
@@ -2842,6 +3220,13 @@ pub fn run() {
             ptz_move,
             ptz_renew,
             ptz_stop,
+            event_pair,
+            event_unpair,
+            event_enable,
+            event_disable,
+            event_configured,
+            event_status,
+            event_recent,
             recording_start,
             recording_stop,
             recording_stop_all,
@@ -2951,6 +3336,14 @@ mod tests {
             &self,
             _camera_id: &CameraId,
         ) -> Result<Option<nian_domain::PtzBinding>, nian_application::SettingsRepositoryError>
+        {
+            Ok(None)
+        }
+
+        fn get_event_binding(
+            &self,
+            _camera_id: &CameraId,
+        ) -> Result<Option<nian_domain::EventBinding>, nian_application::SettingsRepositoryError>
         {
             Ok(None)
         }
@@ -3614,6 +4007,16 @@ mod tests {
             SettingsStore::open(root.with_extension("ptz-settings.sqlite3")).unwrap();
         let ptz_controller =
             PtzController::production(Box::new(ptz_settings), credentials.clone()).unwrap();
+        let event_settings =
+            SettingsStore::open(root.with_extension("event-settings.sqlite3")).unwrap();
+        let event_index = EventIndex::open(root.with_extension("events.sqlite3")).unwrap();
+        let event_controller = EventController::production(
+            Box::new(event_settings),
+            credentials.clone(),
+            Some(event_index),
+            Some(30),
+        )
+        .unwrap();
         let cache_root = root.with_extension("playback-cache");
         let live_controller =
             LiveViewController::with_factory(live_factory, root.with_extension("live-cache"))
@@ -3633,6 +4036,7 @@ mod tests {
                 probe_controller,
                 onvif_controller: OnvifController::production().unwrap(),
                 ptz_controller,
+                event_controller,
                 lifecycle: DesktopLifecycle::new(),
                 power_subscription: Mutex::new(None),
                 power_dispatch_tx: Mutex::new(None),
@@ -3643,6 +4047,7 @@ mod tests {
                 update_installing: std::sync::atomic::AtomicBool::new(false),
                 startup_complete: std::sync::atomic::AtomicBool::new(false),
                 control_gate: Mutex::new(()),
+                settings_update_gate: Mutex::new(()),
             },
             repository,
             recording_runner,
@@ -4210,6 +4615,7 @@ mod tests {
         open_live(&state, "front-door").unwrap();
 
         release_hidden_window_resources(&state);
+        assert!(state.event_controller.restore_desired().is_ok());
 
         assert!(state.live_controller.statuses().unwrap().is_empty());
         assert_eq!(
@@ -5517,6 +5923,67 @@ mod tests {
         release_tx.send(()).unwrap();
         owner.join().unwrap();
         update.join().unwrap();
+    }
+
+    #[test]
+    fn settings_runtime_switches_event_index_with_storage_root_without_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("recordings-a");
+        let root_b = temp.path().join("recordings-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let (state, repository, _runner, _probe) = lifecycle_state(&root_a, true);
+        let autostart = FakeAutostart::default();
+
+        let saved = update_settings_runtime(&state, &autostart, settings_for(&root_b)).unwrap();
+
+        assert_eq!(
+            saved.storage_root.as_deref(),
+            Some(root_b.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            repository.lock().unwrap().settings.storage_root.as_deref(),
+            Some(root_b.as_path())
+        );
+        assert_eq!(
+            state
+                .playback_controller
+                .lock()
+                .unwrap()
+                .configured_storage_root(),
+            Some(root_b.as_path())
+        );
+        assert!(root_b.join(".nian/events.sqlite3").is_file());
+        assert!(state.event_controller.event_index_configured());
+    }
+
+    #[test]
+    fn failed_settings_commit_restores_event_admission_and_keeps_old_storage_authoritative() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("recordings-a");
+        let root_b = temp.path().join("recordings-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let (state, repository, _runner, _probe) = lifecycle_state(&root_a, true);
+        repository.lock().unwrap().fail_save = true;
+
+        assert!(
+            update_settings_runtime(&state, &FakeAutostart::default(), settings_for(&root_b))
+                .is_err()
+        );
+        assert_eq!(
+            repository.lock().unwrap().settings.storage_root.as_deref(),
+            Some(root_a.as_path())
+        );
+        assert_eq!(
+            state
+                .playback_controller
+                .lock()
+                .unwrap()
+                .configured_storage_root(),
+            Some(root_a.as_path())
+        );
+        assert!(state.event_controller.restore_desired().is_ok());
     }
 
     #[test]

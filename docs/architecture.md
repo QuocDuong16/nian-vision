@@ -60,10 +60,10 @@ Key properties:
 | Crate | Role | Notes |
 |---|---|---|
 | `nian-domain` | Camera/Recording/Media vocabulary | path-safe IDs, redacted credentials, backoff schedule |
-| `nian-application` | config validation and orchestration policies | `WorkerSupervisor` (M3), `StorageManager` (M4), camera/record/probe controllers, M6 `PlaybackController`, M7 lifecycle admission, M10 `OnvifController`, M11 `LiveViewController`, M12 `PtzController` per-camera control ownership |
-| `nian-onvif` | ONVIF discovery/protocol infrastructure | bounded WS-Discovery, SOAP Device/Media2/Media/PTZ client, XML/authority hardening; no Tauri, settings, keyring or FFmpeg |
-| `nian-index` | rebuildable SQLite recording catalog | bundled SQLite, schema v1 migrations, WAL, timeline queries; no camera settings or credentials (M4) |
-| `nian-settings` | authoritative non-secret desktop configuration | app-data `settings.sqlite3`, schema v4 camera/storage/desired/autostart + optional PTZ binding; no passwords, FFmpeg/Tauri/process logic |
+| `nian-application` | config validation and orchestration policies | `WorkerSupervisor` (M3), `StorageManager` (M4), camera/record/probe controllers, M6 `PlaybackController`, M7 lifecycle admission, M10 `OnvifController`, M11 `LiveViewController`, M12 `PtzController`, M13 `EventController` PullPoint ownership |
+| `nian-onvif` | ONVIF discovery/protocol infrastructure | bounded WS-Discovery, SOAP Device/Media2/Media/PTZ/Events client, XML/authority hardening; no Tauri, settings, keyring or FFmpeg |
+| `nian-index` | rebuildable SQLite runtime catalogs | bundled SQLite, recording timeline plus M13 motion-event index, WAL, bounded queries/cleanup; no camera settings or credentials |
+| `nian-settings` | authoritative non-secret desktop configuration | app-data `settings.sqlite3`, schema v5 camera/storage/desired/autostart + independent PTZ/Event bindings and Event Desired intent; no passwords, FFmpeg/Tauri/process logic |
 | `nian-storage` | recordings layout, claiming, publication, inventory/transaction facts | traversal-proof paths, race-safe `claim_segment`, atomic no-replace publish, lease-aware partial primitives, symlink-safe deterministic inventory (M4) |
 | `nian-ipc` | NDJSON protocol + serve loop | versioned envelopes, size-capped framing; handlers may emit events mid-request (M3) |
 | `nian-media` | backend-agnostic facade | `Probe`, `MediaSource`; errors distinguish cancellation vs timeout (M3); packets travel as backend-owned types |
@@ -853,3 +853,22 @@ without preventing the remaining subsystems from converging.
 * Development setup: `docs/development.md`
 * Linux releases/updater: `docs/releasing.md`
 * Testing: `docs/testing.md`
+
+
+## ONVIF motion events and PullPoint ingestion (M13)
+
+M13 adds an optional background Event plane without changing RTSP recording/live ownership. `CameraConfig` remains the physical RTSP authority. Settings schema v5 stores an independent `EventBinding` plus per-camera Desired Event Monitoring; Pairing and Enable are separate, so merely pairing a camera never starts monitoring. The binding persists only Device-service identity and an opaque credential reference. Event-service XAddr, PullPoint SubscriptionReference, SOAP payloads and credentials are runtime-only.
+
+`OnvifController::prepare_event_pairing` reuses explicit M10 discovery/authentication. The frontend supplies only selected session/device handles. The controller snapshots endpoint reference plus authenticated `connection_id`, performs Event capability lookup, then revalidates that same session/device/connection generation. Cancel, refresh or reconnect therefore invalidates stale preparation. `EventController` performs a second exact-host check against the current RTSP camera and persisted Event binding before authenticated runtime traffic. `nian-onvif` independently validates Event/PullPoint URLs as HTTP(S), same-host, no userinfo/query/fragment, with redirects disabled and the existing proxy-free hardened SOAP client.
+
+One Event worker is owned per Desired-On camera. Its lifecycle is `opening -> active -> draining`, with independent `mutating` exclusion for pair/replace/unpair/update/delete. `opening + active + draining` is capped at 16; same-camera mutation contention fails fast Busy rather than building a waiter queue. Lifecycle generations and completion states prevent stale openings or mutation side effects from escaping after Suspend/Quit/Update. The registry/global desktop gates are never held over SOAP, SQLite, keyring I/O or joins.
+
+The worker resolves the Event service, creates a PullPoint subscription, requests a synchronization point, performs bounded `PullMessages`, renews near two-thirds of the advertised subscription lifetime, and unsubscribes during teardown. Recoverable failures recreate only that camera's subscription through bounded backoff. Runtime failure is status, not intent: Desired remains On until the user disables or unpairs monitoring.
+
+Motion normalization is stateful per subscription generation. State starts `Unknown`; synchronization `Initialized` notifications establish baseline without creating history. Only Idle-to-Active and Active-to-Idle transitions become `MotionStarted`/`MotionEnded` rows. Repeated state is ignored. Raw ONVIF source `SimpleItem` values are sorted and SHA-256 hashed inside `nian-onvif`; only the opaque digest crosses into application/persistence. Optional bad device timestamps degrade to absent while receive time always provides host ordering. Reconnect resets baseline and a device-time fingerprint suppresses duplicate transitions replayed across subscription generations.
+
+History is stored separately at `<storage_root>/.nian/events.sqlite3`. It is not authoritative settings and contains no password, SOAP, Event URL, PullPoint URL or raw source token. Retention reuses configured max age when present, otherwise 30 days, with a 250,000-row cap and at most 500 deletions per cleanup pass. Recent-history API queries are bounded. Corrupt SQLite families are quarantined, including WAL/SHM sidecars, before a fresh index is created; future schemas and ordinary I/O errors are preserved and surfaced instead.
+
+Changing `storage_root` does not require restart. Desktop settings mutation owns a dedicated `settings_update_gate`, prepares the candidate Event index, stops/settles Event workers outside `control_gate`, rechecks lifecycle/recording state for the short settings commit, swaps playback/Event storage, then restores Desired Event monitoring after releasing the global gate. A failed commit leaves the previous storage root authoritative and reopens Event admission if lifecycle is still Running.
+
+Lifecycle intentionally differs from live/PTZ. Close-to-tray releases transient live/PTZ resources but leaves background Event monitoring admitted. Suspend settles Event workers and mutations; Resume opens admission and restores Desired monitoring using a fresh synchronization baseline. Quit and updater handoff perform terminal Event settlement before exit. Event failures remain isolated from recording, live view and PTZ.

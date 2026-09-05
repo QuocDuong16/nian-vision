@@ -6,6 +6,10 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+mod events;
+
+pub use events::*;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -81,6 +85,8 @@ pub mod test_hooks {
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
+    #[error("index I/O failed: {0}")]
+    Io(#[from] std::io::Error),
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("index schema version {found} is newer than supported version {supported}")]

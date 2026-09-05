@@ -14,9 +14,11 @@ tauri-build = { workspace = true }
 chrono = { workspace = true }
 nian-application = { workspace = true }
 nian-domain = { workspace = true }
+nian-index = { workspace = true }
 nian-onvif = { workspace = true }
 nian-platform-windows = { workspace = true }
 nian-settings = { workspace = true }
+nian-storage = { workspace = true }
 keyring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

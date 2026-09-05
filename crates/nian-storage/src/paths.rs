@@ -32,6 +32,8 @@ static PREFLIGHT_FAULT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub const CONTROL_DIRECTORY_NAME: &str = ".nian";
 /// Rebuildable recording index filename inside the control directory.
 pub const RECORDING_INDEX_FILE_NAME: &str = "recordings.sqlite3";
+/// Normalized ONVIF event-history index beside the recording index.
+pub const EVENT_INDEX_FILE_NAME: &str = "events.sqlite3";
 /// File extension used for finalized recording segments.
 pub const SEGMENT_EXTENSION: &str = "mkv";
 
@@ -88,6 +90,11 @@ impl RecordingsLayout {
     /// Centralized path of the rebuildable SQLite recording index.
     pub fn recording_index_path(&self) -> PathBuf {
         self.control_dir().join(RECORDING_INDEX_FILE_NAME)
+    }
+
+    /// Centralized path of the bounded normalized event-history SQLite index.
+    pub fn event_index_path(&self) -> PathBuf {
+        self.control_dir().join(EVENT_INDEX_FILE_NAME)
     }
 
     /// Creates the reserved control directory without accepting a symlink in

@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -146,6 +147,93 @@ impl PtzControl {
     pub fn zoom_supported(&self) -> bool {
         self.zoom.is_some()
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct EventProperties {
+    pub motion_supported: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct EventControl {
+    pub(crate) device_service: String,
+    pub(crate) event_service: String,
+    pub(crate) properties: EventProperties,
+}
+
+impl std::fmt::Debug for EventControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventControl")
+            .field("motion_supported", &self.properties.motion_supported)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EventControl {
+    pub fn properties(&self) -> EventProperties {
+        self.properties
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_fixture() -> Self {
+        Self {
+            device_service: "http://127.0.0.1/onvif/device_service".to_owned(),
+            event_service: "http://127.0.0.1/onvif/events".to_owned(),
+            properties: EventProperties {
+                motion_supported: true,
+            },
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PullPointSubscription {
+    pub(crate) endpoint: String,
+    pub(crate) current_time_utc: Option<DateTime<Utc>>,
+    pub(crate) termination_time_utc: Option<DateTime<Utc>>,
+}
+
+impl std::fmt::Debug for PullPointSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PullPointSubscription")
+            .field("current_time_utc", &self.current_time_utc)
+            .field("termination_time_utc", &self.termination_time_utc)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PullPointSubscription {
+    pub fn current_time_utc(&self) -> Option<DateTime<Utc>> {
+        self.current_time_utc
+    }
+
+    pub fn termination_time_utc(&self) -> Option<DateTime<Utc>> {
+        self.termination_time_utc
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_fixture(lifetime_secs: i64) -> Self {
+        let current = Utc::now();
+        Self {
+            endpoint: "http://127.0.0.1/onvif/pullpoint-fixture".to_owned(),
+            current_time_utc: Some(current),
+            termination_time_utc: Some(current + chrono::Duration::seconds(lifetime_secs)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MotionNotification {
+    pub active: bool,
+    pub device_time_utc: Option<DateTime<Utc>>,
+    /// SHA-256 of bounded canonical Source SimpleItems. Raw source tokens never
+    /// escape the protocol crate.
+    pub source_key: Option<String>,
+    /// `Initialized` synchronization messages establish baseline state and are
+    /// never interpreted as historical transitions.
+    pub synchronization_baseline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

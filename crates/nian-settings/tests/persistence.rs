@@ -5,7 +5,7 @@ use std::fs;
 
 use nian_domain::{
     AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Credentials,
-    Host, OnvifScheme, PtzBinding, RetentionPolicy, StorageQuota,
+    EventBinding, Host, OnvifScheme, PtzBinding, RetentionPolicy, StorageQuota,
 };
 use nian_settings::{ApplicationSettings, SettingsError, SettingsStore};
 use rusqlite::Connection;
@@ -25,11 +25,11 @@ fn camera(name: &str, credential_ref: &str) -> CameraConfig {
 }
 
 #[test]
-fn fresh_database_creates_schema_v4() {
+fn fresh_database_creates_schema_v5() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.sqlite3");
     let store = SettingsStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
     assert!(path.exists());
 }
 
@@ -91,7 +91,7 @@ fn future_schema_fails_without_replacing_database() {
         error,
         SettingsError::FutureSchema {
             found: 99,
-            supported: 4
+            supported: 5
         }
     ));
     let after = fs::read(&path).unwrap();
@@ -303,7 +303,7 @@ fn corrupt_database_bytes_survive_failed_open_unchanged() {
 }
 
 #[test]
-fn schema_v1_migrates_through_v4_with_safe_lifecycle_defaults() {
+fn schema_v1_migrates_through_v5_with_safe_lifecycle_defaults() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.sqlite3");
     {
@@ -334,17 +334,17 @@ fn schema_v1_migrates_through_v4_with_safe_lifecycle_defaults() {
     }
 
     let store = SettingsStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
     assert!(!store.application_settings().unwrap().launch_at_login);
     assert!(store.recording_enabled_cameras().unwrap().is_empty());
     drop(store);
 
     let reopened = SettingsStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 4);
+    assert_eq!(reopened.schema_version().unwrap(), 5);
 }
 
 #[test]
-fn schema_v2_migrates_to_v4_preserving_desired_camera_and_removing_unique_index() {
+fn schema_v2_migrates_to_v5_preserving_desired_camera_and_removing_unique_index() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.sqlite3");
     {
@@ -379,7 +379,7 @@ fn schema_v2_migrates_to_v4_preserving_desired_camera_and_removing_unique_index(
     }
 
     let mut store = SettingsStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
     assert_eq!(
         store.recording_enabled_cameras().unwrap(),
         vec![CameraId::parse("cam-a").unwrap()]
@@ -461,23 +461,40 @@ fn recording_intent_is_per_camera_and_persists_across_reopen() {
 }
 
 #[test]
-fn schema_v3_migrates_to_v4_without_mutating_existing_camera_rows() {
+fn schema_v3_migrates_to_v5_without_mutating_existing_camera_rows() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.sqlite3");
     {
-        let mut store = SettingsStore::open(&path).unwrap();
-        store
-            .insert_camera(&camera("Front door", "cred-v1"))
-            .unwrap();
-    }
-    {
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE ptz_bindings; PRAGMA user_version=3;")
+            .execute_batch(
+                "CREATE TABLE cameras (
+                    camera_id TEXT PRIMARY KEY NOT NULL,
+                    display_name TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+                    rtsp_path TEXT NOT NULL,
+                    audio_policy TEXT NOT NULL CHECK(audio_policy IN ('copy_all','exclude')),
+                    credential_ref TEXT NOT NULL UNIQUE,
+                    recording_enabled INTEGER NOT NULL DEFAULT 0 CHECK(recording_enabled IN (0,1))
+                 );
+                 CREATE TABLE application_settings (
+                    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+                    storage_root TEXT NULL,
+                    segment_target_secs INTEGER NOT NULL,
+                    max_age_days INTEGER NULL,
+                    max_storage_bytes INTEGER NULL,
+                    cleanup_target_bytes INTEGER NULL,
+                    launch_at_login INTEGER NOT NULL DEFAULT 0 CHECK(launch_at_login IN (0,1))
+                 );
+                 INSERT INTO application_settings VALUES (1, NULL, 300, NULL, NULL, NULL, 0);
+                 INSERT INTO cameras VALUES ('front-door','Front door','192.168.1.50',554,'/stream1','copy_all','cred-v1',0);
+                 PRAGMA user_version=3;",
+            )
             .unwrap();
     }
     let store = SettingsStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
     let saved = store
         .get_camera(&CameraId::parse("front-door").unwrap())
         .unwrap()
@@ -516,4 +533,56 @@ fn ptz_binding_round_trips_independently_and_cascades_with_camera_delete() {
     );
     assert!(store.delete_camera(camera.camera_id()).unwrap());
     assert!(store.get_ptz_binding(camera.camera_id()).unwrap().is_none());
+}
+
+#[test]
+fn event_binding_and_desired_monitoring_round_trip_independently() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.sqlite3");
+    let mut store = SettingsStore::open(&path).unwrap();
+    let camera = camera("Front door", "cred-v1");
+    store.insert_camera(&camera).unwrap();
+
+    assert!(!store.event_monitoring_enabled(camera.camera_id()).unwrap());
+    assert!(store.event_monitoring_enabled_cameras().unwrap().is_empty());
+
+    let binding = EventBinding::new(
+        camera.camera_id().clone(),
+        OnvifScheme::Http,
+        Host::parse("192.168.1.50").unwrap(),
+        80,
+        "/onvif/device_service",
+        "urn:uuid:front-door-events",
+        CredentialRef::parse("nian-vision/front-door/events/fixture").unwrap(),
+        true,
+    )
+    .unwrap();
+    store.save_event_binding(&binding).unwrap();
+    assert_eq!(
+        store.get_event_binding(camera.camera_id()).unwrap(),
+        Some(binding)
+    );
+
+    assert!(
+        store
+            .set_event_monitoring_enabled(camera.camera_id(), true)
+            .unwrap()
+    );
+    assert_eq!(
+        store.event_monitoring_enabled_cameras().unwrap(),
+        vec![camera.camera_id().clone()]
+    );
+
+    let removed = store
+        .disable_and_delete_event_binding(camera.camera_id())
+        .unwrap()
+        .unwrap();
+    assert!(removed.owns_credential());
+    assert!(!store.event_monitoring_enabled(camera.camera_id()).unwrap());
+    assert!(
+        store
+            .get_event_binding(camera.camera_id())
+            .unwrap()
+            .is_none()
+    );
 }

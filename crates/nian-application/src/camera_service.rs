@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use nian_domain::{
     AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Credentials,
-    Host, PtzBinding, RetentionPolicy, StorageQuota,
+    EventBinding, Host, PtzBinding, RetentionPolicy, StorageQuota,
 };
 use nian_settings::{ApplicationSettings, SettingsError, SettingsStore};
 use serde::{Deserialize, Serialize};
@@ -139,6 +139,10 @@ pub trait SettingsRepository: Send {
         &self,
         camera_id: &CameraId,
     ) -> Result<Option<PtzBinding>, SettingsRepositoryError>;
+    fn get_event_binding(
+        &self,
+        camera_id: &CameraId,
+    ) -> Result<Option<EventBinding>, SettingsRepositoryError>;
     fn application_settings(&self) -> Result<ApplicationSettings, SettingsRepositoryError>;
     fn save_application_settings(
         &mut self,
@@ -182,6 +186,13 @@ impl SettingsRepository for SettingsStore {
         camera_id: &CameraId,
     ) -> Result<Option<PtzBinding>, SettingsRepositoryError> {
         SettingsStore::get_ptz_binding(self, camera_id).map_err(repository_error)
+    }
+
+    fn get_event_binding(
+        &self,
+        camera_id: &CameraId,
+    ) -> Result<Option<EventBinding>, SettingsRepositoryError> {
+        SettingsStore::get_event_binding(self, camera_id).map_err(repository_error)
     }
 
     fn application_settings(&self) -> Result<ApplicationSettings, SettingsRepositoryError> {
@@ -273,6 +284,8 @@ pub enum CameraServiceError {
     CameraBusy,
     #[error("camera identity or shared credentials cannot change while PTZ is paired")]
     PtzBindingRequiresUnpair,
+    #[error("camera identity or shared credentials cannot change while Event monitoring is paired")]
+    EventBindingRequiresUnpair,
     #[error("credential store unavailable")]
     CredentialStore(#[from] CredentialStoreError),
     #[error("settings persistence failed")]
@@ -486,6 +499,20 @@ impl CameraService {
             }
         }
 
+        if let Some(binding) = self
+            .repository
+            .get_event_binding(&camera_id)
+            .map_err(map_repository_service_error)?
+        {
+            let CameraSource::Rtsp(previous_endpoint) = previous.source();
+            let host_changed = previous_endpoint.host() != endpoint.host();
+            let replacing_shared_credentials =
+                draft.replacement_credentials.is_some() && !binding.owns_credential();
+            if host_changed || replacing_shared_credentials {
+                return Err(CameraServiceError::EventBindingRequiresUnpair);
+            }
+        }
+
         let replacing_credentials = draft.replacement_credentials.is_some();
         let credential_ref = if replacing_credentials {
             self.allocate_credential_ref(&camera_id, Some(previous.credential_ref()))?
@@ -568,6 +595,10 @@ impl CameraService {
             .repository
             .get_ptz_binding(&camera_id)
             .map_err(map_repository_service_error)?;
+        let event_binding = self
+            .repository
+            .get_event_binding(&camera_id)
+            .map_err(map_repository_service_error)?;
         if !self
             .repository
             .delete_camera(&camera_id)
@@ -576,9 +607,19 @@ impl CameraService {
             return Err(CameraServiceError::CameraNotFound);
         }
         let mut cleanup_failed = self.credentials.delete(existing.credential_ref()).is_err();
-        if let Some(binding) = ptz_binding
+        if let Some(binding) = &ptz_binding
             && binding.owns_credential()
             && binding.credential_ref() != existing.credential_ref()
+            && self.credentials.delete(binding.credential_ref()).is_err()
+        {
+            cleanup_failed = true;
+        }
+        if let Some(binding) = &event_binding
+            && binding.owns_credential()
+            && binding.credential_ref() != existing.credential_ref()
+            && ptz_binding.as_ref().is_none_or(|ptz| {
+                !ptz.owns_credential() || ptz.credential_ref() != binding.credential_ref()
+            })
             && self.credentials.delete(binding.credential_ref()).is_err()
         {
             cleanup_failed = true;
