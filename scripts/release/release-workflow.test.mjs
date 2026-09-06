@@ -114,6 +114,15 @@ test("release trust contract proves mirrored tag version SHA actor and default-b
   assert.match(preflight, /version-check\.mjs --tag "\$tag" --require-clean/);
 });
 
+test("Linux container build explicitly executes run steps with Bash", () => {
+  const linux = jobBody("build-linux");
+  assert.match(linux, /container:\n      image: rust:1\.98\.0-bookworm/);
+  assert.match(linux, /defaults:\n      run:\n        shell: bash/);
+  assert.match(linux, /set -Eeuo pipefail/);
+  assert.match(linux, /\[\[/);
+  assert.equal(jobBody("build-windows").includes("defaults:\n      run:\n        shell: bash"), false);
+});
+
 test("Linux and Windows build jobs are peers and both signed candidates gate verification", () => {
   assert.match(jobBody("build-linux"), /needs: release-preflight/);
   assert.match(jobBody("build-windows"), /needs: release-preflight/);
