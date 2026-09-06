@@ -4,7 +4,7 @@ Local-first desktop NVR (network video recorder) for IP cameras. The first
 supported camera is the TP-Link Tapo C200 over RTSP, with a camera-agnostic
 domain so other RTSP/ONVIF cameras can follow.
 
-**Status**: milestones **M0–M14 are accepted**. **M15 is the final v1 production-hardening/release milestone**. The source is being prepared as Nian Vision 1.0.0, but v1 is not considered released until Forgejo CI, final review, tag-build validation and the documented Windows/Linux release-candidate checklist pass. M10 adds local ONVIF discovery and provisioning without
+**Status**: milestones **M0–M14 are accepted**. **M15 is the final v1 production-hardening/release milestone**. The current release-candidate source identity is Nian Vision 1.0.0-rc.1; final 1.0.0 source is created only after RC acceptance. v1 is not considered released until Forgejo CI, final review, tag-build validation and the documented Windows/Linux release-candidate checklist pass. M10 adds local ONVIF discovery and provisioning without
 changing the accepted RTSP recording architecture. M11 adds
 a separate user-selected Live View surface for up to four H.264 cameras. Each live
 camera owns an independent worker/session and opaque loopback capability; live capacity,
@@ -209,8 +209,11 @@ platform. GitHub is a one-way mirror used only for hosted release CI and public
 GitHub Releases. Release tags originate on Forgejo and the mirror must synchronize
 tags as well as branches. One verification stage assembles Linux and Windows into a
 single `latest.json`, multi-platform release manifest and global `SHA256SUMS.txt`.
-Release-candidate SemVer tags are published as prereleases and are explicitly excluded
-from the production `latest` updater channel; only a final release may become `latest`.
+Release-candidate commits use an actual prerelease source version such as `1.0.0-rc.1`;
+the immutable tag must be exactly `v1.0.0-rc.1`. RC tags are published as prereleases
+and are explicitly excluded from the production `latest` updater channel. After RC
+acceptance, a separate minimal version-only commit changes every version surface to
+`1.0.0`; only its exact `v1.0.0` tag may become production `latest`.
 The existing draft-first GitHub Release flow then uploads, re-downloads and
 byte-verifies every public asset before publication. See `docs/releasing.md`, `docs/release-checklist.md` and ADR-0018. macOS packaging remains outside v1.
 

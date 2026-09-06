@@ -89,6 +89,8 @@ pub enum IndexError {
     Io(#[from] std::io::Error),
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    SqliteFamily(#[from] nian_storage::SqliteFamilyError),
     #[error("index schema version {found} is newer than supported version {supported}")]
     FutureSchema { found: i32, supported: i32 },
     #[error("SQLite WAL journal mode is unavailable (actual mode: {mode})")]

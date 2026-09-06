@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
@@ -178,6 +177,11 @@ impl EventIndex {
         path: impl Into<PathBuf>,
     ) -> Result<(Self, Option<PathBuf>), IndexError> {
         let path = path.into();
+        if let Some(quarantined) =
+            nian_storage::prepare_sqlite_family(&path, MAX_EVENT_INDEX_CORRUPT_BACKUPS)?
+        {
+            return Self::open(path).map(|index| (index, Some(quarantined.evidence_path())));
+        }
         match Self::open(path.clone()) {
             Ok(index) => Ok((index, None)),
             Err(error) if error.is_corruption() => {
@@ -511,94 +515,13 @@ fn validate_query(query: &EventQuery) -> Result<(), IndexError> {
 }
 
 fn quarantine_corrupt_sqlite_family(path: &Path) -> Result<PathBuf, IndexError> {
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| IndexError::InvalidData("event index path has no filename".to_owned()))?;
-    let stamp = Utc::now().timestamp_millis();
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    prune_event_index_quarantine_backups(path, MAX_EVENT_INDEX_CORRUPT_BACKUPS.saturating_sub(1))?;
-
-    for attempt in 0_u16..100 {
-        let mut candidate_name = OsString::from(file_name);
-        candidate_name.push(format!(".corrupt-{stamp}-{attempt}"));
-        let candidate = parent.join(candidate_name);
-        if candidate.exists() || sqlite_sidecar(&candidate, "-wal").exists() {
-            continue;
-        }
-
-        // Move sidecars first. If the main-file move then fails, the original
-        // corrupt DB remains authoritative and a later recovery can retry; a
-        // fresh DB is never opened beside stale WAL/SHM state.
-        for suffix in ["-wal", "-shm"] {
-            let source = sqlite_sidecar(path, suffix);
-            if source.exists() {
-                std::fs::rename(&source, sqlite_sidecar(&candidate, suffix))?;
-            }
-        }
-        std::fs::rename(path, &candidate)?;
-        return Ok(candidate);
-    }
-
-    Err(IndexError::InvalidData(
-        "could not allocate event-index quarantine path".to_owned(),
-    ))
+    let report = nian_storage::quarantine_sqlite_family(path, MAX_EVENT_INDEX_CORRUPT_BACKUPS)?;
+    Ok(report.evidence_path())
 }
 
-fn prune_event_index_quarantine_backups(path: &Path, keep: usize) -> Result<(), IndexError> {
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| IndexError::InvalidData("event index path has no filename".to_owned()))?;
-    let prefix = format!("{}.corrupt-", file_name.to_string_lossy());
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut retained: Vec<(String, PathBuf)> = Vec::with_capacity(keep.saturating_add(1));
-
-    for entry in std::fs::read_dir(parent)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let text = name.to_string_lossy();
-        let Some(suffix) = text.strip_prefix(&prefix) else {
-            continue;
-        };
-        let mut parts = suffix.split('-');
-        let valid_stamp = parts.next().is_some_and(|value| {
-            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
-        });
-        let valid_attempt = parts.next().is_some_and(|value| {
-            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
-        });
-        if !valid_stamp || !valid_attempt || parts.next().is_some() {
-            continue;
-        }
-
-        retained.push((text.into_owned(), entry.path()));
-        retained.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        if retained.len() > keep {
-            let (_, expired) = retained.remove(0);
-            remove_event_quarantine_family(&expired)?;
-        }
-    }
-    Ok(())
-}
-
-fn remove_event_quarantine_family(path: &Path) -> Result<(), IndexError> {
-    for candidate in [
-        path.to_path_buf(),
-        sqlite_sidecar(path, "-wal"),
-        sqlite_sidecar(path, "-shm"),
-    ] {
-        match std::fs::remove_file(candidate) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_os_string();
-    value.push(suffix);
-    PathBuf::from(value)
+    nian_storage::sqlite_sidecar_path(path, suffix).expect("valid SQLite sidecar path")
 }
 
 #[derive(Debug)]
@@ -660,6 +583,44 @@ mod tests {
             received_time_utc: DateTime::from_timestamp(second + 1, 0).unwrap(),
             fingerprint: Some([u8::from(active); 32]),
         }
+    }
+
+    fn quarantine_serials(path: &Path) -> std::collections::BTreeSet<u32> {
+        let sources = [
+            path.to_path_buf(),
+            sqlite_sidecar(path, "-wal"),
+            sqlite_sidecar(path, "-shm"),
+        ];
+        std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let text = name.to_string_lossy();
+                sources.iter().find_map(|source| {
+                    let prefix = format!("{}.corrupt-", source.file_name()?.to_string_lossy());
+                    let serial = text.strip_prefix(&prefix)?.parse::<u32>().ok()?;
+                    (serial != 0).then_some(serial)
+                })
+            })
+            .collect()
+    }
+
+    fn assert_fresh_event_index_works(path: &Path) {
+        let mut index = EventIndex::open(path).unwrap();
+        let row = event("front-door", true, 123);
+        let event_id = index.insert(&row).unwrap().unwrap();
+        let review = index
+            .query(&EventQuery {
+                camera_ids: vec![row.camera_id],
+                kind: Some(EventKind::MotionStarted),
+                from_utc: DateTime::from_timestamp(100, 0).unwrap(),
+                to_utc: DateTime::from_timestamp(200, 0).unwrap(),
+                limit: 10,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(review.rows[0].event_id, event_id);
     }
 
     #[test]
@@ -995,20 +956,223 @@ mod tests {
         std::fs::write(sqlite_sidecar(&path, "-wal"), b"wal-evidence").unwrap();
         std::fs::write(sqlite_sidecar(&path, "-shm"), b"shm-evidence").unwrap();
 
-        let quarantined = quarantine_corrupt_sqlite_family(&path).unwrap();
+        let quarantined =
+            nian_storage::quarantine_sqlite_family(&path, MAX_EVENT_INDEX_CORRUPT_BACKUPS).unwrap();
 
-        assert_eq!(std::fs::read(&quarantined).unwrap(), b"main-evidence");
         assert_eq!(
-            std::fs::read(sqlite_sidecar(&quarantined, "-wal")).unwrap(),
+            std::fs::read(&quarantined.main_backup).unwrap(),
+            b"main-evidence"
+        );
+        assert_eq!(
+            std::fs::read(&quarantined.wal_backup).unwrap(),
             b"wal-evidence"
         );
         assert_eq!(
-            std::fs::read(sqlite_sidecar(&quarantined, "-shm")).unwrap(),
+            std::fs::read(&quarantined.shm_backup).unwrap(),
             b"shm-evidence"
         );
         assert!(!path.exists());
         assert!(!sqlite_sidecar(&path, "-wal").exists());
         assert!(!sqlite_sidecar(&path, "-shm").exists());
+    }
+
+    #[test]
+    fn interrupted_quarantine_after_wal_move_converges_on_retry() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("events.sqlite3");
+        let wal = sqlite_sidecar(&path, "-wal");
+        let shm = sqlite_sidecar(&path, "-shm");
+        std::fs::write(&path, b"corrupt-main").unwrap();
+        std::fs::write(&wal, b"old-wal").unwrap();
+        std::fs::write(&shm, b"old-shm").unwrap();
+
+        let guard = nian_storage::test_hooks::arm_sqlite_quarantine_interruption(&path, 1);
+        let error = nian_storage::quarantine_sqlite_family(&path, MAX_EVENT_INDEX_CORRUPT_BACKUPS)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            nian_storage::SqliteFamilyError::InjectedInterruption
+        ));
+        drop(guard);
+
+        let marker = nian_storage::quarantine_marker_path(&path).unwrap();
+        assert!(marker.is_file());
+        assert!(!wal.exists());
+        assert!(shm.is_file());
+        assert!(path.is_file());
+        assert_eq!(
+            std::fs::read(nian_storage::quarantine_target_path(&wal, 1).unwrap()).unwrap(),
+            b"old-wal"
+        );
+
+        let report = nian_storage::prepare_sqlite_family(&path, MAX_EVENT_INDEX_CORRUPT_BACKUPS)
+            .unwrap()
+            .expect("pending quarantine must settle");
+        assert_eq!(report.serial, 1);
+        assert!(!path.exists());
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+        assert!(!marker.exists());
+        assert_eq!(std::fs::read(&report.main_backup).unwrap(), b"corrupt-main");
+        assert_eq!(std::fs::read(&report.wal_backup).unwrap(), b"old-wal");
+        assert_eq!(std::fs::read(&report.shm_backup).unwrap(), b"old-shm");
+        assert_fresh_event_index_works(&path);
+    }
+
+    #[test]
+    fn open_with_recovery_resumes_pending_quarantine_before_sqlite_open() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("events.sqlite3");
+        let wal = sqlite_sidecar(&path, "-wal");
+        let shm = sqlite_sidecar(&path, "-shm");
+        std::fs::write(&path, b"corrupt-main").unwrap();
+        std::fs::write(&wal, b"old-wal").unwrap();
+        std::fs::write(&shm, b"old-shm").unwrap();
+
+        let guard = nian_storage::test_hooks::arm_sqlite_quarantine_interruption(&path, 1);
+        assert!(
+            nian_storage::quarantine_sqlite_family(&path, MAX_EVENT_INDEX_CORRUPT_BACKUPS).is_err()
+        );
+        drop(guard);
+
+        let main_backup = nian_storage::quarantine_target_path(&path, 1).unwrap();
+        let wal_backup = nian_storage::quarantine_target_path(&wal, 1).unwrap();
+        let shm_backup = nian_storage::quarantine_target_path(&shm, 1).unwrap();
+        let (mut index, quarantined) = EventIndex::open_with_recovery(&path).unwrap();
+        assert_eq!(quarantined.as_deref(), Some(main_backup.as_path()));
+        assert_eq!(std::fs::read(main_backup).unwrap(), b"corrupt-main");
+        assert_eq!(std::fs::read(wal_backup).unwrap(), b"old-wal");
+        assert_eq!(std::fs::read(shm_backup).unwrap(), b"old-shm");
+        assert!(
+            !nian_storage::quarantine_marker_path(&path)
+                .unwrap()
+                .exists()
+        );
+
+        let row = event("front-door", true, 321);
+        let event_id = index.insert(&row).unwrap().unwrap();
+        let page = index
+            .query(&EventQuery {
+                camera_ids: vec![row.camera_id],
+                kind: Some(EventKind::MotionStarted),
+                from_utc: DateTime::from_timestamp(300, 0).unwrap(),
+                to_utc: DateTime::from_timestamp(400, 0).unwrap(),
+                limit: 10,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(page.rows[0].event_id, event_id);
+    }
+
+    #[test]
+    fn interrupted_quarantine_before_main_move_converges_same_generation() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("events.sqlite3");
+        let wal = sqlite_sidecar(&path, "-wal");
+        let shm = sqlite_sidecar(&path, "-shm");
+        std::fs::write(&path, b"corrupt-main").unwrap();
+        std::fs::write(&wal, b"old-wal").unwrap();
+        std::fs::write(&shm, b"old-shm").unwrap();
+
+        let guard = nian_storage::test_hooks::arm_sqlite_quarantine_interruption(&path, 2);
+        assert!(
+            nian_storage::quarantine_sqlite_family(&path, MAX_EVENT_INDEX_CORRUPT_BACKUPS).is_err()
+        );
+        drop(guard);
+        assert!(path.is_file());
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+
+        let report = nian_storage::prepare_sqlite_family(&path, MAX_EVENT_INDEX_CORRUPT_BACKUPS)
+            .unwrap()
+            .expect("pending quarantine must settle");
+        assert_eq!(report.serial, 1);
+        assert!(!path.exists());
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+        assert_eq!(std::fs::read(&report.main_backup).unwrap(), b"corrupt-main");
+        assert_eq!(std::fs::read(&report.wal_backup).unwrap(), b"old-wal");
+        assert_eq!(std::fs::read(&report.shm_backup).unwrap(), b"old-shm");
+    }
+
+    #[test]
+    fn sidecar_only_generation_counts_for_bounded_pruning() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("events.sqlite3");
+        let shm = sqlite_sidecar(&path, "-shm");
+
+        // Reproduce the pre-remediation EventIndex naming scheme, including an
+        // interrupted generation whose only surviving evidence is WAL.
+        let legacy_orphan = temp.path().join("events.sqlite3.corrupt-100-0-wal");
+        std::fs::write(&legacy_orphan, b"orphan-wal").unwrap();
+        for stamp in [200, 300, 400] {
+            std::fs::write(
+                temp.path()
+                    .join(format!("events.sqlite3.corrupt-{stamp}-0")),
+                b"old-main",
+            )
+            .unwrap();
+        }
+        std::fs::write(&path, b"new-corrupt-main").unwrap();
+
+        let report =
+            nian_storage::quarantine_sqlite_family(&path, MAX_EVENT_INDEX_CORRUPT_BACKUPS).unwrap();
+        assert_eq!(report.serial, 1);
+        assert!(!legacy_orphan.exists());
+        assert!(temp.path().join("events.sqlite3.corrupt-200-0").exists());
+        assert!(temp.path().join("events.sqlite3.corrupt-300-0").exists());
+        assert!(temp.path().join("events.sqlite3.corrupt-400-0").exists());
+        assert_eq!(
+            std::fs::read(&report.main_backup).unwrap(),
+            b"new-corrupt-main"
+        );
+        assert_eq!(quarantine_serials(&path), [1].into_iter().collect());
+        assert!(!shm.exists());
+    }
+
+    #[test]
+    fn repeated_interrupted_quarantine_remains_bounded() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("events.sqlite3");
+        let wal = sqlite_sidecar(&path, "-wal");
+        let shm = sqlite_sidecar(&path, "-shm");
+
+        for generation in 0..(MAX_EVENT_INDEX_CORRUPT_BACKUPS + 4) {
+            std::fs::write(&path, format!("main-{generation}")).unwrap();
+            std::fs::write(&wal, format!("wal-{generation}")).unwrap();
+            std::fs::write(&shm, format!("shm-{generation}")).unwrap();
+            let guard = nian_storage::test_hooks::arm_sqlite_quarantine_interruption(&path, 1);
+            assert!(
+                nian_storage::quarantine_sqlite_family(&path, MAX_EVENT_INDEX_CORRUPT_BACKUPS)
+                    .is_err()
+            );
+            drop(guard);
+            nian_storage::prepare_sqlite_family(&path, MAX_EVENT_INDEX_CORRUPT_BACKUPS)
+                .unwrap()
+                .expect("retry settles interrupted generation");
+            assert!(quarantine_serials(&path).len() <= MAX_EVENT_INDEX_CORRUPT_BACKUPS);
+        }
+        assert_eq!(
+            quarantine_serials(&path).len(),
+            MAX_EVENT_INDEX_CORRUPT_BACKUPS
+        );
+    }
+
+    #[test]
+    fn quarantine_collision_allocates_new_generation_without_overwrite() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("events.sqlite3");
+        let wal = sqlite_sidecar(&path, "-wal");
+        let preexisting = nian_storage::quarantine_target_path(&wal, 1).unwrap();
+        std::fs::write(&preexisting, b"keep-me").unwrap();
+        std::fs::write(&path, b"new-main").unwrap();
+        std::fs::write(&wal, b"new-wal").unwrap();
+
+        let report =
+            nian_storage::quarantine_sqlite_family(&path, MAX_EVENT_INDEX_CORRUPT_BACKUPS).unwrap();
+        assert_eq!(report.serial, 2);
+        assert_eq!(std::fs::read(&preexisting).unwrap(), b"keep-me");
+        assert_eq!(std::fs::read(&report.wal_backup).unwrap(), b"new-wal");
     }
 
     #[test]

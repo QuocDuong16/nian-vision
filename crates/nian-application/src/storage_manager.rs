@@ -1,7 +1,6 @@
 //! Filesystem/SQLite reconciliation and retention orchestration for M4.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -34,6 +33,8 @@ pub enum StorageManagerError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Index(#[from] IndexError),
+    #[error(transparent)]
+    SqliteFamily(#[from] nian_storage::SqliteFamilyError),
     #[error("invalid retention configuration: {0}")]
     Policy(String),
     #[error("retention requires a successful reconciliation or rebuild first")]
@@ -1191,252 +1192,38 @@ fn relative_path(
 }
 
 fn prepare_index_family(index_path: &Path) -> Result<(), StorageManagerError> {
-    let wal = sqlite_sidecar_path(index_path, "-wal")?;
-    let shm = sqlite_sidecar_path(index_path, "-shm")?;
-    let marker = quarantine_pending_marker(index_path)?;
-
-    let marker_present = control_path_present(&marker)?;
-    let main_present = control_path_present(index_path)?;
-    let wal_present = control_path_present(&wal)?;
-    let shm_present = control_path_present(&shm)?;
-    if marker_present || (!main_present && (wal_present || shm_present)) {
-        quarantine_corrupt_index(index_path)?;
-    }
+    nian_storage::prepare_sqlite_family(index_path, MAX_RECORDING_INDEX_CORRUPT_BACKUPS)?;
     Ok(())
-}
-
-fn control_path_present(path: &Path) -> Result<bool, StorageManagerError> {
-    match inspect_path_presence(path) {
-        PathPresence::Present(_) => Ok(true),
-        PathPresence::Absent => Ok(false),
-        PathPresence::Uninspectable(source) => {
-            Err(StorageManagerError::Storage(StorageError::Io {
-                path: path.to_path_buf(),
-                source,
-            }))
-        }
-    }
-}
-
-fn storage_io(path: &Path, source: std::io::Error) -> StorageManagerError {
-    StorageManagerError::Storage(StorageError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn quarantine_pending_marker(index_path: &Path) -> Result<PathBuf, StorageManagerError> {
-    sqlite_sidecar_path(index_path, ".quarantine-pending")
-}
-
-fn ensure_quarantine_marker(marker: &Path) -> Result<(), StorageManagerError> {
-    match inspect_path_presence(marker) {
-        PathPresence::Present(metadata) if metadata.is_file() => Ok(()),
-        PathPresence::Present(_) => Err(StorageManagerError::Policy(
-            "SQLite quarantine marker is not a regular file".to_owned(),
-        )),
-        PathPresence::Uninspectable(source) => Err(storage_io(marker, source)),
-        PathPresence::Absent => {
-            let opened = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(marker);
-            let mut file = match opened {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return match inspect_path_presence(marker) {
-                        PathPresence::Present(metadata) if metadata.is_file() => Ok(()),
-                        PathPresence::Present(_) => Err(StorageManagerError::Policy(
-                            "SQLite quarantine marker is not a regular file".to_owned(),
-                        )),
-                        PathPresence::Absent => Err(storage_io(marker, error)),
-                        PathPresence::Uninspectable(source) => Err(storage_io(marker, source)),
-                    };
-                }
-                Err(source) => return Err(storage_io(marker, source)),
-            };
-            file.write_all(b"pending\n")
-                .and_then(|()| file.sync_all())
-                .map_err(|source| storage_io(marker, source))
-        }
-    }
-}
-
-fn corrupt_target_path(source: &Path, serial: u32) -> Result<PathBuf, StorageManagerError> {
-    let Some(file_name) = source.file_name() else {
-        return Err(StorageManagerError::Policy(
-            "SQLite control path has no filename".to_owned(),
-        ));
-    };
-    let mut name = file_name.to_os_string();
-    name.push(format!(".corrupt-{serial}"));
-    Ok(source.with_file_name(name))
-}
-
-fn corrupt_serial_from_name(name: &str, sources: &[PathBuf]) -> Option<u32> {
-    sources.iter().find_map(|source| {
-        let file_name = source.file_name()?.to_string_lossy();
-        let prefix = format!("{file_name}.corrupt-");
-        let suffix = name.strip_prefix(&prefix)?;
-        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        suffix.parse().ok()
-    })
-}
-
-fn highest_corrupt_serial(sources: &[PathBuf]) -> Result<u32, StorageManagerError> {
-    let parent = sources
-        .first()
-        .and_then(|source| source.parent())
-        .ok_or_else(|| StorageManagerError::Policy("SQLite index path has no parent".to_owned()))?;
-    let mut highest = 0_u32;
-    for entry in std::fs::read_dir(parent).map_err(|source| storage_io(parent, source))? {
-        let entry = entry.map_err(|source| storage_io(parent, source))?;
-        let name = entry.file_name();
-        let text = name.to_string_lossy();
-        if let Some(serial) = corrupt_serial_from_name(&text, sources) {
-            highest = highest.max(serial);
-        }
-    }
-    Ok(highest)
-}
-
-fn remove_corrupt_index_family(
-    sources: &[PathBuf],
-    serial: u32,
-) -> Result<(), StorageManagerError> {
-    for source in sources {
-        let target = corrupt_target_path(source, serial)?;
-        match std::fs::remove_file(&target) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(storage_io(&target, error)),
-        }
-    }
-    Ok(())
-}
-
-fn prune_corrupt_index_backups(
-    sources: &[PathBuf],
-    keep: usize,
-) -> Result<(), StorageManagerError> {
-    let parent = sources
-        .first()
-        .and_then(|source| source.parent())
-        .ok_or_else(|| StorageManagerError::Policy("SQLite index path has no parent".to_owned()))?;
-    let mut retained: Vec<u32> = Vec::with_capacity(keep.saturating_add(1));
-    for entry in std::fs::read_dir(parent).map_err(|source| storage_io(parent, source))? {
-        let entry = entry.map_err(|source| storage_io(parent, source))?;
-        let name = entry.file_name();
-        let text = name.to_string_lossy();
-        let Some(serial) = corrupt_serial_from_name(&text, sources) else {
-            continue;
-        };
-        if retained.contains(&serial) {
-            continue;
-        }
-        retained.push(serial);
-        retained.sort_unstable();
-        if retained.len() > keep {
-            let expired = retained.remove(0);
-            remove_corrupt_index_family(sources, expired)?;
-        }
-    }
-    Ok(())
-}
-
-fn allocate_corrupt_serial(sources: &[PathBuf]) -> Result<u32, StorageManagerError> {
-    let highest = highest_corrupt_serial(sources)?;
-    let first = highest.checked_add(1).ok_or_else(|| {
-        StorageManagerError::Policy("cannot allocate corruption backup name".to_owned())
-    })?;
-
-    for offset in 0_u32..100 {
-        let serial = first.checked_add(offset).ok_or_else(|| {
-            StorageManagerError::Policy("cannot allocate corruption backup name".to_owned())
-        })?;
-        let mut available = true;
-        for source in sources {
-            let target = corrupt_target_path(source, serial)?;
-            match inspect_path_presence(&target) {
-                PathPresence::Absent => {}
-                PathPresence::Present(_) => {
-                    available = false;
-                    break;
-                }
-                PathPresence::Uninspectable(source_error) => {
-                    return Err(StorageManagerError::Storage(StorageError::Io {
-                        path: target,
-                        source: source_error,
-                    }));
-                }
-            }
-        }
-        if available {
-            return Ok(serial);
-        }
-    }
-    Err(StorageManagerError::Policy(
-        "cannot allocate corruption backup name".to_owned(),
-    ))
 }
 
 fn quarantine_corrupt_index(index_path: &Path) -> Result<(), StorageManagerError> {
-    let wal = sqlite_sidecar_path(index_path, "-wal")?;
-    let shm = sqlite_sidecar_path(index_path, "-shm")?;
-    let sources = [index_path.to_path_buf(), wal, shm];
-    let marker = quarantine_pending_marker(index_path)?;
-    ensure_quarantine_marker(&marker)?;
-    prune_corrupt_index_backups(
-        &sources,
-        MAX_RECORDING_INDEX_CORRUPT_BACKUPS.saturating_sub(1),
-    )?;
-    let serial = allocate_corrupt_serial(&sources)?;
-
-    for source in &sources {
-        match inspect_path_presence(source) {
-            PathPresence::Present(_) => {
-                let target = corrupt_target_path(source, serial)?;
-                nian_storage::paths::publish_no_replace(source, &target)?;
-            }
-            PathPresence::Absent => {}
-            PathPresence::Uninspectable(source_error) => {
-                return Err(storage_io(source, source_error));
-            }
-        }
-    }
-
-    for source in &sources {
-        match inspect_path_presence(source) {
-            PathPresence::Absent => {}
-            PathPresence::Present(_) => {
-                return Err(StorageManagerError::Policy(format!(
-                    "canonical SQLite family member remained after quarantine: {source:?}"
-                )));
-            }
-            PathPresence::Uninspectable(source_error) => {
-                return Err(storage_io(source, source_error));
-            }
-        }
-    }
-
-    match std::fs::remove_file(&marker) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(storage_io(&marker, source)),
-    }
+    nian_storage::quarantine_sqlite_family(index_path, MAX_RECORDING_INDEX_CORRUPT_BACKUPS)?;
+    Ok(())
 }
 
+#[cfg(test)]
+fn quarantine_pending_marker(index_path: &Path) -> Result<PathBuf, StorageManagerError> {
+    Ok(nian_storage::quarantine_marker_path(index_path)?)
+}
+
+#[cfg(test)]
+fn corrupt_target_path(source: &Path, serial: u32) -> Result<PathBuf, StorageManagerError> {
+    Ok(nian_storage::quarantine_target_path(source, serial)?)
+}
+
+#[cfg(test)]
 fn sqlite_sidecar_path(index_path: &Path, suffix: &str) -> Result<PathBuf, StorageManagerError> {
-    let Some(file_name) = index_path.file_name() else {
-        return Err(StorageManagerError::Policy(
-            "SQLite index path has no filename".to_owned(),
-        ));
-    };
-    let mut sidecar_name = file_name.to_os_string();
-    sidecar_name.push(suffix);
-    Ok(index_path.with_file_name(sidecar_name))
+    Ok(nian_storage::sqlite_sidecar_path(index_path, suffix)?)
+}
+
+#[cfg(test)]
+fn corrupt_serial_from_name(name: &str, sources: &[PathBuf]) -> Option<u32> {
+    sources.iter().find_map(|source| {
+        let file_name = source.file_name()?.to_string_lossy();
+        let suffix = name.strip_prefix(&format!("{file_name}.corrupt-"))?;
+        let serial = suffix.parse::<u32>().ok()?;
+        (serial != 0).then_some(serial)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1629,7 +1416,7 @@ mod tests {
         std::fs::write(&main_corrupt_1, b"old main evidence").unwrap();
         std::fs::write(&wal, b"old wal").unwrap();
         std::fs::write(&shm, b"old shm").unwrap();
-        std::fs::write(&marker, b"pending\n").unwrap();
+        std::fs::write(&marker, b"NIAN-SQLITE-QUARANTINE v1\nserial: 2\n").unwrap();
 
         prepare_index_family(&index_path).unwrap();
 

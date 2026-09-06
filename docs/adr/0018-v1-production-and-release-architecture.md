@@ -19,7 +19,7 @@ GitHub is a one-way mirror. `.github/workflows/release.yml` runs only for intent
 
 `[workspace.package].version` is the application version authority. The committed Tauri, root package and UI versions must match it, and `scripts/release/version-check.mjs` rejects drift or a release tag other than `v<application-version>`. A release is built from the exact tag commit and that commit must be reachable from the mirrored default branch.
 
-A prerelease SemVer tag such as `v1.0.0-rc.1` is published as a GitHub prerelease and is explicitly not `latest`. This prevents a release-candidate workflow validation from becoming the production updater channel. Only a final SemVer release may become GitHub `latest`.
+An RC is a real prerelease source version, not a tag alias over final-version source. For example every authoritative source surface is `1.0.0-rc.1` and the only valid tag is `v1.0.0-rc.1`; that GitHub Release is `prerelease=true` and `latest=false`. If RC validation finds a blocker, the next commit advances the source prerelease and receives a new immutable matching tag. After RC acceptance, a separate minimal version-only commit changes all surfaces to `1.0.0`, passes Forgejo CI/review, and only then may receive `v1.0.0` and become GitHub `latest`. RC binaries are never promoted as final artifacts.
 
 ### Supported release matrix
 
@@ -44,7 +44,7 @@ Tauri updater signing is mandatory. Windows Authenticode remains a separately pr
 
 `settings.sqlite3` is authoritative user configuration. It is not disposable. Future schema versions fail closed; migration steps are transactional; corrupt authoritative bytes are preserved and startup fails rather than replacing or quarantining the database. Credential values are not stored there, only opaque credential references.
 
-`recordings.sqlite3` and `events.sqlite3` are derived operational indexes. Corrupt index families may be quarantined and rebuilt while authoritative settings/footage remain untouched. M15 bounds retained corruption evidence to four SQLite families per index so repeated corruption cannot consume storage without limit. Future index schema versions fail closed and are not treated as corruption.
+`recordings.sqlite3` and `events.sqlite3` are derived operational indexes. Both use the shared restart-convergent SQLite-family quarantine protocol: main/WAL/SHM share one numeric generation, a `.quarantine-pending` marker persists that generation across interruption, no-replace moves preserve prior evidence, canonical members are verified absent before a fresh index may be created, and partial main-only/WAL-only/SHM-only generations count toward the same bounded retention set. M15 retains at most four corruption families per index. Future index schema versions fail closed and are not treated as corruption.
 
 EventIndex recovery produces a fresh usable index: new normalized Events can be inserted and Event Review queries work afterward. Historical Event rows lost with a corrupt derived index are not reconstructed into fabricated history.
 
@@ -66,7 +66,7 @@ Nian Vision v1 has no cloud video upload, remote-access service or cloud notific
 
 ## Acceptance boundary
 
-Automated source/release-contract tests are necessary but do not substitute for release-candidate installation and hardware interoperability. M15 is not accepted, and `v1.0.0` must not be tagged, until the authoritative Forgejo commit is green and the documented clean Windows/Linux release checklist is completed. Any blocker found after an RC requires a new commit, Forgejo CI pass and a new immutable tag.
+Automated source/release-contract tests are necessary but do not substitute for release-candidate installation and hardware interoperability. The RC source commit must first pass Forgejo CI/review and receive an exact prerelease tag such as `v1.0.0-rc.1`. M15 is not accepted, and final `v1.0.0` source/tag must not exist, until the documented clean Windows/Linux RC checklist is completed. Any RC blocker requires a new commit, advanced prerelease source version, Forgejo CI pass and new immutable matching RC tag; final acceptance then uses a separate `1.0.0` version-only commit and review.
 
 ## Known limitations
 

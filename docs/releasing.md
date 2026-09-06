@@ -25,14 +25,14 @@ version or creates a tag.
 The mirror must synchronize **tags as well as branches**. A release therefore flows:
 
 ```text
-Forgejo commit
--> Forgejo vX.Y.Z tag
+Forgejo versioned commit (X.Y.Z or X.Y.Z-rc.N)
+-> Forgejo v<exact-source-version> tag
 -> mirror pushes the same tag/object to GitHub
 -> GitHub Actions validates the mirrored identity
--> release candidate builds
+-> exact-version platform builds
 -> draft GitHub Release
 -> asset verification
--> publish
+-> publish as prerelease/latest=false or final/latest
 ```
 
 ## GitHub mirror and tag protection
@@ -54,7 +54,7 @@ are defense in depth and do not replace the tag ruleset.
 
 ## Version and release-note contract
 
-The `vX.Y.Z` tag must exactly match all committed version surfaces:
+The release tag must be exactly `v<authoritative-source-version>`, including any SemVer prerelease suffix. All committed version surfaces must match:
 
 - `[workspace.package].version` in `Cargo.toml`;
 - `apps/nian-desktop/tauri.conf.json`;
@@ -113,7 +113,7 @@ The stable updater endpoint needs no secret:
 https://github.com/<owner>/<repo>/releases/latest/download/latest.json
 ```
 
-`latest` resolves only the production release channel, so a draft is never advertised. SemVer prerelease tags such as `v1.0.0-rc.1` are explicitly published as GitHub prereleases with `latest=false`; they can validate the tag workflow without becoming the production updater endpoint. Every platform URL inside `latest.json` uses the exact tagged GitHub Release asset.
+`latest` resolves only the production release channel, so a draft is never advertised. An RC commit must itself use a prerelease source version such as `1.0.0-rc.1`, and its tag must be exactly `v1.0.0-rc.1`. That tag is published as a GitHub prerelease with `latest=false`; source version, tag, artifacts, updater metadata and release manifest therefore retain one identity. Every platform URL inside `latest.json` uses the exact tagged GitHub Release asset.
 
 ## GitHub Actions permissions and dependency pins
 
@@ -281,8 +281,7 @@ create draft release for existing mirrored tag
 
 An already-published release is never overwritten. A failed attempt may leave a
 draft, which a retry can delete and recreate; publication is the terminal transition.
-An RC is never promoted by moving its tag: if source changes, create a new commit and new
-RC tag. The final `v1.0.0` tag is created only after M15 acceptance and the release-candidate checklist passes.
+An RC is never promoted by moving its tag. If RC validation finds a blocker, create a new commit whose synchronized source version advances to the next prerelease (for example `1.0.0-rc.2`), run Forgejo CI again, and create a new immutable matching tag. After RC acceptance, create a minimal final version-only commit changing every authoritative surface from `1.0.0-rc.N` to `1.0.0`; run Forgejo CI and final review on that new commit, then create `v1.0.0`. Final artifacts are rebuilt from the final commit rather than reusing RC binaries.
 
 Canonical public names include:
 

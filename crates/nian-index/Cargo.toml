@@ -10,10 +10,12 @@ license.workspace = true
 [dependencies]
 chrono = { workspace = true }
 nian-domain = { workspace = true }
+nian-storage = { workspace = true }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+nian-storage = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }
 
 [features]

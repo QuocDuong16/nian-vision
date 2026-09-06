@@ -4,7 +4,7 @@ Record the exact tag, commit SHA, OS image/VM and result for every run. A checkb
 
 ## Pre-tag authority
 
-- [ ] Release commit is on authoritative Forgejo default branch.
+- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, for the first RC `1.0.0-rc.1`.
 - [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
@@ -14,7 +14,7 @@ Record the exact tag, commit SHA, OS image/VM and result for every run. A checkb
 
 ## GitHub RC workflow
 
-- [ ] Use an immutable prerelease tag such as `v1.0.0-rc.1` for workflow validation before the final tag.
+- [ ] Create an immutable prerelease tag exactly matching the RC source version, for the first RC `v1.0.0-rc.1`. Source `1.0.0` with tag `v1.0.0-rc.1` is forbidden.
 - [ ] GitHub tag resolves to exactly the same commit as Forgejo.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.
@@ -69,4 +69,4 @@ Record the exact tag, commit SHA, OS image/VM and result for every run. A checkb
 - [ ] `RELEASE_NOTES.md`, README, support matrix and known limitations match the artifact being released.
 - [ ] No mandatory blocker remains.
 
-Only after the RC evidence above is accepted should `v1.0.0` be created from the reviewed Forgejo commit. If any source/config change is needed, create a new commit and new RC/final tag. Never move an already-tested tag.
+Only after the RC evidence above is accepted should a separate minimal final release-version commit change every authoritative version surface from `1.0.0-rc.N` to `1.0.0`. That final commit must pass Forgejo CI and final review before the immutable `v1.0.0` tag is created. Do not reuse RC binaries as final artifacts. If an RC needs any source/config fix, make a new commit, advance the prerelease source version (for example `rc.1` to `rc.2`), and create a new matching immutable RC tag. Never move an already-tested tag.

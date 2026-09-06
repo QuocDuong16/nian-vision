@@ -1,5 +1,4 @@
-# Nian Vision 1.0.0
-
+# Nian Vision 1.0.0-rc.1
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 
 ## Main capabilities

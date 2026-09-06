@@ -76,7 +76,7 @@ Production desktop resolves `nian-media-worker[.exe]` as a sibling of `current_e
 
 Release-critical versions are pinned or locked; M15 does not introduce gratuitous dependency upgrades. FFmpeg stays at source-pinned 8.0.3 shared LGPL configuration. GitHub release actions are immutable-SHA pinned and publication has the only `contents: write` permission.
 
-The release workflow requires both Linux and Windows candidates before assembling metadata/checksums. Tauri updater signatures are mandatory; Windows Authenticode is optional unless the external repository policy marks it required. RC tags are prereleases with `latest=false`; final SemVer is the only path to production `latest`.
+The release workflow requires both Linux and Windows candidates before assembling metadata/checksums. Tauri updater signatures are mandatory; Windows Authenticode is optional unless the external repository policy marks it required. RC commits use synchronized prerelease source metadata such as `1.0.0-rc.1` and only the exact matching tag may build them; RC Releases are prereleases with `latest=false`. After RC acceptance a separate final version-only commit changes all surfaces to `1.0.0`, passes Forgejo CI/review, and only its exact final tag is eligible for production `latest`.
 
 ## Remaining non-source evidence
 

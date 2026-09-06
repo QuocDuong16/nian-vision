@@ -26,6 +26,7 @@ pub mod inventory;
 pub mod lease;
 pub mod paths;
 pub mod recovery;
+pub mod sqlite_family;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod test_hooks;
 pub mod transaction;
@@ -43,6 +44,10 @@ pub use paths::{
     RecordingsLayout, SEGMENT_EXTENSION, SEGMENT_PARTIAL_SUFFIX, filesystem_identity_datetime,
 };
 pub use recovery::{PartialDisposition, PartialFile, scan_camera_partials};
+pub use sqlite_family::{
+    SqliteFamilyError, SqliteFamilyQuarantine, prepare_sqlite_family, quarantine_marker_path,
+    quarantine_sqlite_family, quarantine_target_path, sqlite_sidecar_path,
+};
 pub use transaction::{
     PathPresence, RECOVERY_TOMBSTONE_MAGIC, RecoveredRetentionState, RecoveryTombstone,
     RecoveryTransactionPaths, inspect_path_presence, inspect_recovered_retention,

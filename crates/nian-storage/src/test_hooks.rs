@@ -25,6 +25,56 @@ pub static CLAIM_IDENTITY_GATE: Mutex<Option<ClaimGateArm>> = Mutex::new(None);
 /// process (hooks are day-dir keyed, so unrelated claims stay lock-free).
 pub static FAULT_LOCK: Mutex<()> = Mutex::new(());
 
+#[derive(Debug)]
+struct SqliteQuarantineInterruption {
+    main: PathBuf,
+    moves_remaining: usize,
+}
+
+static SQLITE_QUARANTINE_INTERRUPTION: Mutex<Option<SqliteQuarantineInterruption>> =
+    Mutex::new(None);
+
+/// Arms a one-shot interruption after exactly `moves` successful SQLite-family
+/// member moves for `main`.
+pub fn arm_sqlite_quarantine_interruption(main: &Path, moves: usize) -> SqliteQuarantineGuard {
+    assert!(
+        moves != 0,
+        "SQLite quarantine interruption requires at least one move"
+    );
+    *SQLITE_QUARANTINE_INTERRUPTION
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(SqliteQuarantineInterruption {
+        main: main.to_path_buf(),
+        moves_remaining: moves,
+    });
+    SqliteQuarantineGuard
+}
+
+pub(crate) fn sqlite_quarantine_interrupt_after_move(main: &Path) -> bool {
+    let mut armed = SQLITE_QUARANTINE_INTERRUPTION
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(state) = armed.as_mut().filter(|state| state.main == main) else {
+        return false;
+    };
+    state.moves_remaining = state.moves_remaining.saturating_sub(1);
+    if state.moves_remaining != 0 {
+        return false;
+    }
+    *armed = None;
+    true
+}
+
+pub struct SqliteQuarantineGuard;
+
+impl Drop for SqliteQuarantineGuard {
+    fn drop(&mut self) {
+        *SQLITE_QUARANTINE_INTERRUPTION
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
 /// One-shot arrival/release gate parked inside `claim_segment`.
 pub struct ClaimIdentityGate {
     arrived: (Mutex<bool>, Condvar),
