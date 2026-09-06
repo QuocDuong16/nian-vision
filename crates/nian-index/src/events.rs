@@ -16,6 +16,7 @@ pub const MAX_EVENT_QUERY_ROWS: u32 = 200;
 pub const MAX_EVENT_QUERY_RANGE_DAYS: i64 = 31;
 pub const MAX_EVENT_QUERY_CAMERAS: usize = 128;
 const MAX_SOURCE_KEY_BYTES: usize = 64;
+const MAX_EVENT_INDEX_CORRUPT_BACKUPS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
@@ -515,6 +516,7 @@ fn quarantine_corrupt_sqlite_family(path: &Path) -> Result<PathBuf, IndexError> 
         .ok_or_else(|| IndexError::InvalidData("event index path has no filename".to_owned()))?;
     let stamp = Utc::now().timestamp_millis();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    prune_event_index_quarantine_backups(path, MAX_EVENT_INDEX_CORRUPT_BACKUPS.saturating_sub(1))?;
 
     for attempt in 0_u16..100 {
         let mut candidate_name = OsString::from(file_name);
@@ -540,6 +542,57 @@ fn quarantine_corrupt_sqlite_family(path: &Path) -> Result<PathBuf, IndexError> 
     Err(IndexError::InvalidData(
         "could not allocate event-index quarantine path".to_owned(),
     ))
+}
+
+fn prune_event_index_quarantine_backups(path: &Path, keep: usize) -> Result<(), IndexError> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| IndexError::InvalidData("event index path has no filename".to_owned()))?;
+    let prefix = format!("{}.corrupt-", file_name.to_string_lossy());
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut retained: Vec<(String, PathBuf)> = Vec::with_capacity(keep.saturating_add(1));
+
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        let Some(suffix) = text.strip_prefix(&prefix) else {
+            continue;
+        };
+        let mut parts = suffix.split('-');
+        let valid_stamp = parts.next().is_some_and(|value| {
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        });
+        let valid_attempt = parts.next().is_some_and(|value| {
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        });
+        if !valid_stamp || !valid_attempt || parts.next().is_some() {
+            continue;
+        }
+
+        retained.push((text.into_owned(), entry.path()));
+        retained.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        if retained.len() > keep {
+            let (_, expired) = retained.remove(0);
+            remove_event_quarantine_family(&expired)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_event_quarantine_family(path: &Path) -> Result<(), IndexError> {
+    for candidate in [
+        path.to_path_buf(),
+        sqlite_sidecar(path, "-wal"),
+        sqlite_sidecar(path, "-shm"),
+    ] {
+        match std::fs::remove_file(candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -907,12 +960,31 @@ mod tests {
         let corrupt = b"not-a-sqlite-event-index\0keep-evidence";
         std::fs::write(&path, corrupt).unwrap();
 
-        let (index, quarantined) = EventIndex::open_with_recovery(&path).unwrap();
+        let (mut index, quarantined) = EventIndex::open_with_recovery(&path).unwrap();
         let quarantined = quarantined.expect("corruption must be quarantined");
 
         assert_eq!(index.schema_version().unwrap(), EVENT_SCHEMA_VERSION);
         assert_eq!(std::fs::read(&quarantined).unwrap(), corrupt);
         assert!(path.is_file());
+
+        let row = event("front-door", true, 123);
+        let event_id = index.insert(&row).unwrap().unwrap();
+        assert_eq!(
+            index.get(event_id).unwrap().unwrap().camera_id,
+            row.camera_id
+        );
+        let review = index
+            .query(&EventQuery {
+                camera_ids: vec![CameraId::parse("front-door").unwrap()],
+                kind: Some(EventKind::MotionStarted),
+                from_utc: DateTime::from_timestamp(100, 0).unwrap(),
+                to_utc: DateTime::from_timestamp(200, 0).unwrap(),
+                limit: 10,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(review.rows.len(), 1);
+        assert_eq!(review.rows[0].event_id, event_id);
     }
 
     #[test]
@@ -937,6 +1009,32 @@ mod tests {
         assert!(!path.exists());
         assert!(!sqlite_sidecar(&path, "-wal").exists());
         assert!(!sqlite_sidecar(&path, "-shm").exists());
+    }
+
+    #[test]
+    fn repeated_event_index_corruption_keeps_only_a_bounded_backup_set() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("events.sqlite3");
+
+        for generation in 0..(MAX_EVENT_INDEX_CORRUPT_BACKUPS + 3) {
+            std::fs::write(&path, format!("corrupt-generation-{generation}")).unwrap();
+            let (index, quarantined) = EventIndex::open_with_recovery(&path).unwrap();
+            assert!(quarantined.is_some());
+            drop(index);
+        }
+
+        let backups = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let text = name.to_string_lossy();
+                text.starts_with("events.sqlite3.corrupt-")
+                    && !text.ends_with("-wal")
+                    && !text.ends_with("-shm")
+            })
+            .count();
+        assert_eq!(backups, MAX_EVENT_INDEX_CORRUPT_BACKUPS);
     }
 
     #[test]

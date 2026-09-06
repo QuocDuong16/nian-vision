@@ -26,6 +26,8 @@ struct RetentionTestGate {
 #[cfg(test)]
 static RETENTION_PRE_DELETE_GATE: Mutex<Option<RetentionTestGate>> = Mutex::new(None);
 
+const MAX_RECORDING_INDEX_CORRUPT_BACKUPS: usize = 4;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageManagerError {
     #[error(transparent)]
@@ -1271,13 +1273,98 @@ fn corrupt_target_path(source: &Path, serial: u32) -> Result<PathBuf, StorageMan
     Ok(source.with_file_name(name))
 }
 
+fn corrupt_serial_from_name(name: &str, sources: &[PathBuf]) -> Option<u32> {
+    sources.iter().find_map(|source| {
+        let file_name = source.file_name()?.to_string_lossy();
+        let prefix = format!("{file_name}.corrupt-");
+        let suffix = name.strip_prefix(&prefix)?;
+        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        suffix.parse().ok()
+    })
+}
+
+fn highest_corrupt_serial(sources: &[PathBuf]) -> Result<u32, StorageManagerError> {
+    let parent = sources
+        .first()
+        .and_then(|source| source.parent())
+        .ok_or_else(|| StorageManagerError::Policy("SQLite index path has no parent".to_owned()))?;
+    let mut highest = 0_u32;
+    for entry in std::fs::read_dir(parent).map_err(|source| storage_io(parent, source))? {
+        let entry = entry.map_err(|source| storage_io(parent, source))?;
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        if let Some(serial) = corrupt_serial_from_name(&text, sources) {
+            highest = highest.max(serial);
+        }
+    }
+    Ok(highest)
+}
+
+fn remove_corrupt_index_family(
+    sources: &[PathBuf],
+    serial: u32,
+) -> Result<(), StorageManagerError> {
+    for source in sources {
+        let target = corrupt_target_path(source, serial)?;
+        match std::fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(storage_io(&target, error)),
+        }
+    }
+    Ok(())
+}
+
+fn prune_corrupt_index_backups(
+    sources: &[PathBuf],
+    keep: usize,
+) -> Result<(), StorageManagerError> {
+    let parent = sources
+        .first()
+        .and_then(|source| source.parent())
+        .ok_or_else(|| StorageManagerError::Policy("SQLite index path has no parent".to_owned()))?;
+    let mut retained: Vec<u32> = Vec::with_capacity(keep.saturating_add(1));
+    for entry in std::fs::read_dir(parent).map_err(|source| storage_io(parent, source))? {
+        let entry = entry.map_err(|source| storage_io(parent, source))?;
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        let Some(serial) = corrupt_serial_from_name(&text, sources) else {
+            continue;
+        };
+        if retained.contains(&serial) {
+            continue;
+        }
+        retained.push(serial);
+        retained.sort_unstable();
+        if retained.len() > keep {
+            let expired = retained.remove(0);
+            remove_corrupt_index_family(sources, expired)?;
+        }
+    }
+    Ok(())
+}
+
 fn allocate_corrupt_serial(sources: &[PathBuf]) -> Result<u32, StorageManagerError> {
-    'serial: for serial in 1..=u32::MAX {
+    let highest = highest_corrupt_serial(sources)?;
+    let first = highest.checked_add(1).ok_or_else(|| {
+        StorageManagerError::Policy("cannot allocate corruption backup name".to_owned())
+    })?;
+
+    for offset in 0_u32..100 {
+        let serial = first.checked_add(offset).ok_or_else(|| {
+            StorageManagerError::Policy("cannot allocate corruption backup name".to_owned())
+        })?;
+        let mut available = true;
         for source in sources {
             let target = corrupt_target_path(source, serial)?;
             match inspect_path_presence(&target) {
                 PathPresence::Absent => {}
-                PathPresence::Present(_) => continue 'serial,
+                PathPresence::Present(_) => {
+                    available = false;
+                    break;
+                }
                 PathPresence::Uninspectable(source_error) => {
                     return Err(StorageManagerError::Storage(StorageError::Io {
                         path: target,
@@ -1286,7 +1373,9 @@ fn allocate_corrupt_serial(sources: &[PathBuf]) -> Result<u32, StorageManagerErr
                 }
             }
         }
-        return Ok(serial);
+        if available {
+            return Ok(serial);
+        }
     }
     Err(StorageManagerError::Policy(
         "cannot allocate corruption backup name".to_owned(),
@@ -1299,6 +1388,10 @@ fn quarantine_corrupt_index(index_path: &Path) -> Result<(), StorageManagerError
     let sources = [index_path.to_path_buf(), wal, shm];
     let marker = quarantine_pending_marker(index_path)?;
     ensure_quarantine_marker(&marker)?;
+    prune_corrupt_index_backups(
+        &sources,
+        MAX_RECORDING_INDEX_CORRUPT_BACKUPS.saturating_sub(1),
+    )?;
     let serial = allocate_corrupt_serial(&sources)?;
 
     for source in &sources {
@@ -1553,6 +1646,33 @@ mod tests {
             std::fs::read(corrupt_target_path(&shm, 2).unwrap()).unwrap(),
             b"old shm"
         );
+    }
+
+    #[test]
+    fn repeated_recording_index_quarantine_keeps_only_a_bounded_backup_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let index_path = temp.path().join("recordings.sqlite3");
+        let wal = sqlite_sidecar_path(&index_path, "-wal").unwrap();
+        let shm = sqlite_sidecar_path(&index_path, "-shm").unwrap();
+        let sources = [index_path.clone(), wal, shm];
+
+        for generation in 0..(MAX_RECORDING_INDEX_CORRUPT_BACKUPS + 3) {
+            std::fs::write(&index_path, format!("corrupt-{generation}")).unwrap();
+            quarantine_corrupt_index(&index_path).unwrap();
+        }
+
+        let mut serials = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                corrupt_serial_from_name(&name.to_string_lossy(), &sources)
+            })
+            .collect::<Vec<_>>();
+        serials.sort_unstable();
+        serials.dedup();
+        assert_eq!(serials.len(), MAX_RECORDING_INDEX_CORRUPT_BACKUPS);
+        assert!(serials.iter().all(|serial| *serial >= 4));
     }
 
     #[test]

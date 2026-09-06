@@ -113,8 +113,7 @@ The stable updater endpoint needs no secret:
 https://github.com/<owner>/<repo>/releases/latest/download/latest.json
 ```
 
-`latest` resolves only published GitHub Releases, so a draft is never advertised.
-Every platform URL inside `latest.json` uses the exact tagged GitHub Release asset.
+`latest` resolves only the production release channel, so a draft is never advertised. SemVer prerelease tags such as `v1.0.0-rc.1` are explicitly published as GitHub prereleases with `latest=false`; they can validate the tag workflow without becoming the production updater endpoint. Every platform URL inside `latest.json` uses the exact tagged GitHub Release asset.
 
 ## GitHub Actions permissions and dependency pins
 
@@ -233,8 +232,7 @@ directory. CI proves:
   installer/Tauri app-running path; the owning desktop exits, its Job Object reaps the
   worker, no global worker-name kill is used, and the new desktop starts afterward;
 - a fresh install leaves `launch_at_login=false`;
-- authoritative camera settings, credential refs, `recording_enabled`, selected
-  recording root and footage bytes survive reinstall/upgrade;
+- authoritative camera settings, camera/PTZ/Event credential refs and ownership, Recording Desired, Event Desired/binding, notification preference, selected recording root and footage bytes survive reinstall/upgrade;
 - M7 startup reconciliation repairs a deliberately stale Windows Run entry to the
   actual installed executable path; and
 - silent uninstall removes application binaries and stale autostart registration
@@ -278,11 +276,13 @@ create draft release for existing mirrored tag
 -> download every draft asset back from GitHub
 -> compare the exact filename set and bytes
 -> verify the global SHA256SUMS.txt again
--> publish the draft as the latest release
+-> publish final SemVer as latest, or publish prerelease SemVer with latest=false
 ```
 
 An already-published release is never overwritten. A failed attempt may leave a
 draft, which a retry can delete and recreate; publication is the terminal transition.
+An RC is never promoted by moving its tag: if source changes, create a new commit and new
+RC tag. The final `v1.0.0` tag is created only after M15 acceptance and the release-candidate checklist passes.
 
 Canonical public names include:
 
@@ -327,12 +327,9 @@ update installs.
 
 ## Platform status
 
-- **Linux x86_64 AppImage**: M8 CI-validated release target.
-- **Windows x86_64 NSIS**: M8 release automation is implemented on explicit
-  `windows-2022`, including bundled FFmpeg, install/upgrade/uninstall smoke, updater
-  signing and optional Authenticode. It remains unmarked as validated until the
-  hosted Windows tag-release path completes successfully.
-- **macOS**: distribution remains outside current M8 scope.
+- **Linux x86_64 AppImage**: required v1 release target. The release workflow builds, signs, validates bundled runtime paths and performs headless package startup smoke; clean-machine/manual RC evidence remains required for final v1 acceptance.
+- **Windows x86_64 NSIS**: required v1 release target on explicit `windows-2022`, including bundled FFmpeg, installed-package upgrade/uninstall smoke, updater signing and optional Authenticode. Clean-machine/manual RC evidence remains required for final v1 acceptance.
+- **macOS**: outside v1.
 
 ## Local validation
 
@@ -340,7 +337,8 @@ update installs.
 pnpm release:test
 cargo test -p nian-release-verifier
 cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
+cargo check --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 pnpm lint
 pnpm typecheck
@@ -349,7 +347,8 @@ pnpm build
 ```
 
 A full local Linux AppImage proof additionally needs Xvfb, D-Bus/FUSE helpers and a
-disposable updater signing key. The authoritative Windows packaging proof requires a
+disposable updater signing key. `docs/release-checklist.md` is the authority for the
+manual/clean-machine RC evidence that automation cannot honestly manufacture. The authoritative Windows packaging proof requires a
 real Windows/MSVC environment equivalent to the explicit `windows-2022` release
 runner; a Linux cross-check cannot prove MSVC linking, NSIS behavior, WebView2
 bootstrap, Authenticode or Windows loader/Job Object/power-event behavior. Never use

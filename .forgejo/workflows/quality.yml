@@ -70,12 +70,19 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
+      - name: cargo check
+        run: |
+          set -Eeuo pipefail
+          export NIAN_FFMPEG_LIB_DIR="$PWD/ffmpeg-dist/lib"
+          export LD_LIBRARY_PATH="$PWD/ffmpeg-dist/lib"
+          cargo check --workspace
+
       - name: cargo clippy
         run: |
           set -Eeuo pipefail
           export NIAN_FFMPEG_LIB_DIR="$PWD/ffmpeg-dist/lib"
           export LD_LIBRARY_PATH="$PWD/ffmpeg-dist/lib"
-          cargo clippy --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: cargo test
         run: |

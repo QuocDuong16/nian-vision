@@ -649,7 +649,11 @@ jobs:
             [[ "$is_draft" == "true" ]] || { echo "refusing to overwrite an already-published release" >&2; exit 1; }
             gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --yes
           fi
-          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+          release_flags=(--verify-tag --draft)
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "${release_flags[@]}" \
             --title "Nian Vision ${RELEASE_TAG#v}" --notes-file dist/release/RELEASE_NOTES.md
 
       - name: Upload all finalized public assets to draft
@@ -677,4 +681,10 @@ jobs:
       - name: Publish verified draft release
         env:
           RELEASE_TAG: ${{ needs.release-preflight.outputs.tag }}
-        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+        run: |
+          set -Eeuo pipefail
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi

@@ -3,13 +3,16 @@
 use std::path::{Path, PathBuf};
 
 use nian_domain::{
-    AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Host,
+    AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, EventBinding,
+    Host, OnvifScheme, PtzBinding,
 };
 use nian_settings::{ApplicationSettings, SettingsStore};
 use serde_json::json;
 
 const CAMERA_ID: &str = "release-fixture-camera";
 const CREDENTIAL_REF: &str = "nian-vision/release-fixture/credential-ref";
+const PTZ_CREDENTIAL_REF: &str = "nian-vision/release-fixture/ptz-credential-ref";
+const EVENT_CREDENTIAL_REF: &str = "nian-vision/release-fixture/event-credential-ref";
 
 fn camera() -> Result<CameraConfig, String> {
     CameraConfig::new(
@@ -55,6 +58,45 @@ fn create(path: &Path, footage_root: &Path) -> Result<(), String> {
             "release fixture camera disappeared while setting desired recording".to_owned(),
         );
     }
+    let ptz = PtzBinding::new(
+        camera.camera_id().clone(),
+        OnvifScheme::Http,
+        Host::parse("192.0.2.10").map_err(|error| error.to_string())?,
+        80,
+        "/onvif/device_service",
+        "urn:uuid:release-fixture-ptz",
+        CredentialRef::parse(PTZ_CREDENTIAL_REF).map_err(|error| error.to_string())?,
+        true,
+    )
+    .map_err(|error| error.to_string())?;
+    store
+        .save_ptz_binding(&ptz)
+        .map_err(|error| error.to_string())?;
+    let events = EventBinding::new(
+        camera.camera_id().clone(),
+        OnvifScheme::Http,
+        Host::parse("192.0.2.10").map_err(|error| error.to_string())?,
+        80,
+        "/onvif/device_service",
+        "urn:uuid:release-fixture-events",
+        CredentialRef::parse(EVENT_CREDENTIAL_REF).map_err(|error| error.to_string())?,
+        true,
+    )
+    .map_err(|error| error.to_string())?;
+    store
+        .save_event_binding(&events)
+        .map_err(|error| error.to_string())?;
+    if !store
+        .set_event_monitoring_enabled(camera.camera_id(), true)
+        .map_err(|error| error.to_string())?
+    {
+        return Err(
+            "release fixture camera disappeared while setting desired Event monitoring".to_owned(),
+        );
+    }
+    store
+        .set_motion_notifications_enabled(true)
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -71,8 +113,34 @@ fn verify(path: &Path, footage_root: &Path) -> Result<(), String> {
     let desired = store
         .recording_enabled_cameras()
         .map_err(|error| error.to_string())?;
-    if desired != vec![camera_id] {
+    if desired != vec![camera_id.clone()] {
         return Err("recording_enabled desired intent changed across installed upgrade".to_owned());
+    }
+    let ptz = store
+        .get_ptz_binding(&camera_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "PTZ binding missing after installed upgrade".to_owned())?;
+    if ptz.credential_ref().as_str() != PTZ_CREDENTIAL_REF || !ptz.owns_credential() {
+        return Err("PTZ credential ownership changed across installed upgrade".to_owned());
+    }
+    let events = store
+        .get_event_binding(&camera_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Event binding missing after installed upgrade".to_owned())?;
+    if events.credential_ref().as_str() != EVENT_CREDENTIAL_REF || !events.owns_credential() {
+        return Err("Event credential ownership changed across installed upgrade".to_owned());
+    }
+    let event_desired = store
+        .event_monitoring_enabled_cameras()
+        .map_err(|error| error.to_string())?;
+    if event_desired != vec![camera_id.clone()] {
+        return Err("Event monitoring Desired intent changed across installed upgrade".to_owned());
+    }
+    if !store
+        .motion_notifications_enabled()
+        .map_err(|error| error.to_string())?
+    {
+        return Err("motion notification preference changed across installed upgrade".to_owned());
     }
     let settings = store
         .application_settings()
@@ -89,7 +157,15 @@ fn verify(path: &Path, footage_root: &Path) -> Result<(), String> {
     }
     println!(
         "{}",
-        json!({"settings_preserved": true, "footage_preserved": true})
+        json!({
+            "settings_preserved": true,
+            "recording_desired_preserved": true,
+            "event_desired_preserved": true,
+            "ptz_binding_preserved": true,
+            "event_binding_preserved": true,
+            "notification_preference_preserved": true,
+            "footage_preserved": true
+        })
     );
     Ok(())
 }

@@ -8,10 +8,12 @@ import test from "node:test";
 import { assembleRelease } from "./assemble-release.mjs";
 import { validateMultiplatformRelease } from "./validate-multiplatform-release.mjs";
 
-const version = "0.1.0";
+const { version } = JSON.parse(
+  readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+);
 const commit = "0b468e5520cf89ee4a10c31de92e48a975c3ffe2";
 const sourceSha = "6136812ea6d4e68bdba27e33c2a94382711cdf4f8602ffef056ff792bd6f9818";
-const releaseBase = "https://github.com/niand/nian-vision/releases/download/v0.1.0";
+const releaseBase = `https://github.com/niand/nian-vision/releases/download/v${version}`;
 
 function hash(data) {
   return createHash("sha256").update(data).digest("hex");

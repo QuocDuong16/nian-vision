@@ -48,29 +48,118 @@ fn motion_notification_preference_defaults_off_and_persists_independently() {
 }
 
 #[test]
-fn schema_v5_migrates_notification_preference_to_off() {
+fn schema_v5_migrates_to_v6_preserving_event_ptz_desired_and_storage_state() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.sqlite3");
+    let storage_root = dir.path().join("recordings");
     {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE application_settings (
-                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
-                storage_root TEXT NULL,
-                segment_target_secs INTEGER NOT NULL,
-                max_age_days INTEGER NULL,
-                max_storage_bytes INTEGER NULL,
-                cleanup_target_bytes INTEGER NULL,
-                launch_at_login INTEGER NOT NULL DEFAULT 0 CHECK(launch_at_login IN (0,1))
-             );
-             INSERT INTO application_settings VALUES (1, NULL, 300, NULL, NULL, NULL, 0);
-             PRAGMA user_version=5;",
+                "CREATE TABLE cameras (
+                    camera_id TEXT PRIMARY KEY NOT NULL,
+                    display_name TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+                    rtsp_path TEXT NOT NULL,
+                    audio_policy TEXT NOT NULL CHECK(audio_policy IN ('copy_all','exclude')),
+                    credential_ref TEXT NOT NULL UNIQUE,
+                    recording_enabled INTEGER NOT NULL DEFAULT 0 CHECK(recording_enabled IN (0,1)),
+                    event_monitoring_enabled INTEGER NOT NULL DEFAULT 0 CHECK(event_monitoring_enabled IN (0,1))
+                 );
+                 CREATE TABLE application_settings (
+                    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+                    storage_root TEXT NULL,
+                    segment_target_secs INTEGER NOT NULL,
+                    max_age_days INTEGER NULL,
+                    max_storage_bytes INTEGER NULL,
+                    cleanup_target_bytes INTEGER NULL,
+                    launch_at_login INTEGER NOT NULL DEFAULT 0 CHECK(launch_at_login IN (0,1))
+                 );
+                 CREATE TABLE ptz_bindings (
+                    camera_id TEXT PRIMARY KEY NOT NULL REFERENCES cameras(camera_id) ON DELETE CASCADE,
+                    scheme TEXT NOT NULL CHECK(scheme IN ('http','https')),
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+                    device_path TEXT NOT NULL,
+                    endpoint_reference TEXT NOT NULL,
+                    credential_ref TEXT NOT NULL,
+                    owns_credential INTEGER NOT NULL CHECK(owns_credential IN (0,1))
+                 );
+                 CREATE TABLE event_bindings (
+                    camera_id TEXT PRIMARY KEY NOT NULL REFERENCES cameras(camera_id) ON DELETE CASCADE,
+                    scheme TEXT NOT NULL CHECK(scheme IN ('http','https')),
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+                    device_path TEXT NOT NULL,
+                    endpoint_reference TEXT NOT NULL,
+                    credential_ref TEXT NOT NULL,
+                    owns_credential INTEGER NOT NULL CHECK(owns_credential IN (0,1))
+                 );
+                 INSERT INTO cameras VALUES (
+                    'front-door','Front door','192.168.1.50',554,'/stream1','copy_all','cred-v5',1,1
+                 );
+                 INSERT INTO ptz_bindings VALUES (
+                    'front-door','https','192.168.1.50',443,'/onvif/device_service',
+                    'urn:uuid:front-door-ptz','nian-vision/front-door/ptz/fixture',1
+                 );
+                 INSERT INTO event_bindings VALUES (
+                    'front-door','http','192.168.1.50',80,'/onvif/device_service',
+                    'urn:uuid:front-door-events','nian-vision/front-door/events/fixture',1
+                 );
+                 PRAGMA user_version=5;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO application_settings VALUES (1, ?1, 120, 14, 4000000, 3000000, 1)",
+                [storage_root.to_string_lossy().as_ref()],
             )
             .unwrap();
     }
+
     let store = SettingsStore::open(&path).unwrap();
+    let camera_id = CameraId::parse("front-door").unwrap();
     assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(
+        store
+            .get_camera(&camera_id)
+            .unwrap()
+            .unwrap()
+            .credential_ref()
+            .as_str(),
+        "cred-v5"
+    );
+    assert_eq!(
+        store.recording_enabled_cameras().unwrap(),
+        vec![camera_id.clone()]
+    );
+    assert_eq!(
+        store.event_monitoring_enabled_cameras().unwrap(),
+        vec![camera_id.clone()]
+    );
+    let ptz = store.get_ptz_binding(&camera_id).unwrap().unwrap();
+    assert!(ptz.owns_credential());
+    assert_eq!(
+        ptz.credential_ref().as_str(),
+        "nian-vision/front-door/ptz/fixture"
+    );
+    let events = store.get_event_binding(&camera_id).unwrap().unwrap();
+    assert!(events.owns_credential());
+    assert_eq!(
+        events.credential_ref().as_str(),
+        "nian-vision/front-door/events/fixture"
+    );
+    let settings = store.application_settings().unwrap();
+    assert_eq!(
+        settings.storage_root.as_deref(),
+        Some(storage_root.as_path())
+    );
+    assert_eq!(settings.segment_target_secs, 120);
+    assert_eq!(settings.retention.max_age_days, Some(14));
+    assert_eq!(settings.retention.max_storage_bytes, Some(4_000_000));
+    assert_eq!(settings.quota.unwrap().cleanup_target_bytes, 3_000_000);
+    assert!(settings.launch_at_login);
     assert!(!store.motion_notifications_enabled().unwrap());
 }
 
@@ -547,6 +636,99 @@ fn schema_v3_migrates_to_v6_without_mutating_existing_camera_rows() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn schema_v4_migrates_to_v6_preserving_ptz_recording_and_storage_state() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.sqlite3");
+    let storage_root = dir.path().join("recordings-v4");
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE cameras (
+                    camera_id TEXT PRIMARY KEY NOT NULL,
+                    display_name TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+                    rtsp_path TEXT NOT NULL,
+                    audio_policy TEXT NOT NULL CHECK(audio_policy IN ('copy_all','exclude')),
+                    credential_ref TEXT NOT NULL UNIQUE,
+                    recording_enabled INTEGER NOT NULL DEFAULT 0 CHECK(recording_enabled IN (0,1))
+                 );
+                 CREATE TABLE application_settings (
+                    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+                    storage_root TEXT NULL,
+                    segment_target_secs INTEGER NOT NULL,
+                    max_age_days INTEGER NULL,
+                    max_storage_bytes INTEGER NULL,
+                    cleanup_target_bytes INTEGER NULL,
+                    launch_at_login INTEGER NOT NULL DEFAULT 0 CHECK(launch_at_login IN (0,1))
+                 );
+                 CREATE TABLE ptz_bindings (
+                    camera_id TEXT PRIMARY KEY NOT NULL REFERENCES cameras(camera_id) ON DELETE CASCADE,
+                    scheme TEXT NOT NULL CHECK(scheme IN ('http','https')),
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+                    device_path TEXT NOT NULL,
+                    endpoint_reference TEXT NOT NULL,
+                    credential_ref TEXT NOT NULL,
+                    owns_credential INTEGER NOT NULL CHECK(owns_credential IN (0,1))
+                 );
+                 INSERT INTO cameras VALUES (
+                    'front-door','Front door','192.168.1.50',554,'/stream1','copy_all','cred-v4',1
+                 );
+                 INSERT INTO ptz_bindings VALUES (
+                    'front-door','http','192.168.1.50',80,'/onvif/device_service',
+                    'urn:uuid:front-door-ptz','nian-vision/front-door/ptz/v4',1
+                 );
+                 PRAGMA user_version=4;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO application_settings VALUES (1, ?1, 180, 30, 2000000, 1500000, 1)",
+                [storage_root.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+    }
+
+    let store = SettingsStore::open(&path).unwrap();
+    let camera_id = CameraId::parse("front-door").unwrap();
+    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(
+        store
+            .get_camera(&camera_id)
+            .unwrap()
+            .unwrap()
+            .credential_ref()
+            .as_str(),
+        "cred-v4"
+    );
+    assert_eq!(
+        store.recording_enabled_cameras().unwrap(),
+        vec![camera_id.clone()]
+    );
+    let ptz = store.get_ptz_binding(&camera_id).unwrap().unwrap();
+    assert_eq!(
+        ptz.credential_ref().as_str(),
+        "nian-vision/front-door/ptz/v4"
+    );
+    assert!(ptz.owns_credential());
+    assert!(!store.event_monitoring_enabled(&camera_id).unwrap());
+    assert!(store.get_event_binding(&camera_id).unwrap().is_none());
+    assert!(!store.motion_notifications_enabled().unwrap());
+    let settings = store.application_settings().unwrap();
+    assert_eq!(
+        settings.storage_root.as_deref(),
+        Some(storage_root.as_path())
+    );
+    assert_eq!(settings.segment_target_secs, 180);
+    assert_eq!(settings.retention.max_age_days, Some(30));
+    assert_eq!(settings.retention.max_storage_bytes, Some(2_000_000));
+    assert_eq!(settings.quota.unwrap().cleanup_target_bytes, 1_500_000);
+    assert!(settings.launch_at_login);
 }
 
 #[test]

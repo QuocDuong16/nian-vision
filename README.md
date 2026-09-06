@@ -4,7 +4,7 @@ Local-first desktop NVR (network video recorder) for IP cameras. The first
 supported camera is the TP-Link Tapo C200 over RTSP, with a camera-agnostic
 domain so other RTSP/ONVIF cameras can follow.
 
-**Status**: milestones **M0–M13** are accepted; **M14 Event Review & Local Notifications is implemented and undergoing final validation**. M10 adds local ONVIF discovery and provisioning without
+**Status**: milestones **M0–M14 are accepted**. **M15 is the final v1 production-hardening/release milestone**. The source is being prepared as Nian Vision 1.0.0, but v1 is not considered released until Forgejo CI, final review, tag-build validation and the documented Windows/Linux release-candidate checklist pass. M10 adds local ONVIF discovery and provisioning without
 changing the accepted RTSP recording architecture. M11 adds
 a separate user-selected Live View surface for up to four H.264 cameras. Each live
 camera owns an independent worker/session and opaque loopback capability; live capacity,
@@ -36,7 +36,7 @@ same pinned LGPL FFmpeg 8.0.3 source authority and signed Tauri updater trust ro
 owns independent per-camera recording slots with a conservative eight-recording safety
 cap and separate Desired/Runtime state. M10 keeps ONVIF observational until explicit
 provisioning and never makes ONVIF availability a prerequisite for an already configured
-RTSP camera. M12 keeps PTZ optional and explicitly paired. M13 adds independent ONVIF PullPoint motion-event monitoring with persisted Desired state, bounded per-camera workers, normalized MotionStarted/MotionEnded history, and a dedicated rebuildable `<storage_root>/.nian/events.sqlite3` index. M14 adds a dedicated Event Review screen backed only by that persisted index, bounded keyset pagination, recording correlation by CameraId plus local receive time, five-second pre-roll playback, explicit missing-footage states, and optional post-persistence local desktop MotionStarted notifications with bounded dispatch and per-camera rate limiting. macOS distribution, ONVIF presets/talkback/vendor event dialects, H.265 recording/live view, transcoding, motion analysis, AI, cloud and remote streaming remain outside M14.
+RTSP camera. M12 keeps PTZ optional and explicitly paired. M13 adds independent ONVIF PullPoint motion-event monitoring with persisted Desired state, bounded per-camera workers, normalized MotionStarted/MotionEnded history, and a dedicated rebuildable `<storage_root>/.nian/events.sqlite3` index. M14 adds a dedicated Event Review screen backed only by that persisted index, bounded keyset pagination, recording correlation by CameraId plus local receive time, five-second pre-roll playback, explicit missing-footage states, and optional post-persistence local desktop MotionStarted notifications with bounded dispatch and per-camera rate limiting. macOS distribution, ONVIF presets/talkback/vendor event dialects, H.265 recording/live view, transcoding, motion analysis, AI, cloud and remote streaming remain outside v1.
 
 ## What it does today
 
@@ -209,9 +209,19 @@ platform. GitHub is a one-way mirror used only for hosted release CI and public
 GitHub Releases. Release tags originate on Forgejo and the mirror must synchronize
 tags as well as branches. One verification stage assembles Linux and Windows into a
 single `latest.json`, multi-platform release manifest and global `SHA256SUMS.txt`.
+Release-candidate SemVer tags are published as prereleases and are explicitly excluded
+from the production `latest` updater channel; only a final release may become `latest`.
 The existing draft-first GitHub Release flow then uploads, re-downloads and
-byte-verifies every public asset before publication. See `docs/releasing.md` and
-ADR-0011. macOS packaging remains deferred.
+byte-verifies every public asset before publication. See `docs/releasing.md`, `docs/release-checklist.md` and ADR-0018. macOS packaging remains outside v1.
+
+## Installing a release
+
+Use only artifacts from the same verified GitHub Release/tag and verify `SHA256SUMS.txt` before treating the download as a release candidate or final build.
+
+- **Windows x86_64:** run `Nian-Vision_<version>_windows-x86_64-setup.exe`. The current NSIS strategy is per-user and bundles the media worker plus required application-local runtime files.
+- **Linux x86_64:** make `Nian-Vision_<version>_linux-x86_64.AppImage` executable and run it. The AppImage contains the sibling media worker and application-owned FFmpeg runtime and must not depend on a repository checkout or development FFmpeg path.
+
+A fresh first run has no configured cameras. Add one through **Add RTSP manually** or **Discover ONVIF cameras**. Choose the recording storage root in Settings before relying on persistent recording/Event history. Launch-at-login and local motion notifications remain explicit user preferences, not first-run defaults.
 
 ## Supported camera protocols
 
@@ -254,12 +264,29 @@ Troubleshooting:
   RTSP authority and then opens the stream through the existing media worker. Cameras
   returning unusable ONVIF addresses can still be configured with the known-good RTSP
   host/port/path using the manual path.
+* **Recording capacity reached**: v1 owns at most 8 simultaneous Recording sessions. Desired state can remain On while runtime reports the capacity failure; stop another recording before retrying runtime admission.
+* **Event capacity reached**: v1 owns at most 16 Event-monitoring sessions. Event Desired state remains independent from Recording.
+* **Storage failure/read-only/full**: stop relying on new recording output until the configured local storage root is writable and has capacity. Do not delete `.nian` control files to “repair” the system; derived indexes have controlled recovery and authoritative settings live elsewhere.
+* **No recording available for an Event**: Event history may outlive the correlated segment or the segment may not yet have trusted duration. This is an ordinary unavailable-footage state, not evidence that the Event row is corrupt.
+* **Notifications unsupported/unavailable**: leave the preference Off or restore the desktop notification service. Notification delivery failure is isolated from Event monitoring.
+* **Media worker unavailable**: reinstall/repair the matching release package so the sibling `nian-media-worker[.exe]` and bundled runtime are present. Do not point production at a repository `target/debug` worker.
+
+When collecting diagnostics, include safe camera IDs/display names and typed failure categories, never passwords, authenticated RTSP URLs, authorization headers or raw credential-store contents.
 
 Automated Forgejo tests use deterministic fixtures/local servers and do not require a
 physical ONVIF camera or LAN multicast access. Physical-camera interoperability is
 therefore a manual validation boundary, not a CI guarantee.
 
-**Milestone status:** M0–M13 accepted; M14 implemented and awaiting final validation; physical PTZ and ONVIF Event interoperability remain manual validation boundaries.
+**Milestone status:** M0–M14 accepted; M15 hardening/release preparation is in progress. Physical-camera interoperability and clean installed-package checks remain manual release-candidate evidence and are never inferred from automated protocol tests.
+
+
+## v1 privacy and support boundary
+
+Nian Vision is local-first. Camera RTSP/PTZ/Event passwords stay in the native operating-system CredentialStore; `settings.sqlite3` contains only opaque credential references and non-secret configuration. Recordings stay under the configured local storage root and normalized Event history stays in the local Event index. v1 has no cloud video upload, remote-access service or cloud notification service.
+
+The v1 release targets are **Windows x86_64 (NSIS)** and **Linux x86_64 (AppImage)**. H.264 RTSP is required; there is no H.265 or transcoding. Accepted runtime limits are 8 simultaneous Recording sessions, 4 Live View sessions and 16 Event-monitoring sessions. The complete intentional boundary, including notification and ONVIF limitations, is in `docs/known-limitations.md`.
+
+The Tapo C200 is the reference camera target, not a magic certification stamp. Automated fixtures verify protocol and ownership contracts; the final release checklist records physical-device results separately for RTSP recording, Live View, ONVIF provisioning, PTZ and Events.
 
 ## License notes
 

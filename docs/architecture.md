@@ -63,7 +63,7 @@ Key properties:
 | `nian-application` | config validation and orchestration policies | `WorkerSupervisor` (M3), `StorageManager` (M4), camera/record/probe controllers, M6 `PlaybackController`, M7 lifecycle admission, M10 `OnvifController`, M11 `LiveViewController`, M12 `PtzController`, M13 `EventController` PullPoint ownership |
 | `nian-onvif` | ONVIF discovery/protocol infrastructure | bounded WS-Discovery, SOAP Device/Media2/Media/PTZ/Events client, XML/authority hardening; no Tauri, settings, keyring or FFmpeg |
 | `nian-index` | rebuildable SQLite runtime catalogs | bundled SQLite, recording timeline plus M13 motion-event index, WAL, bounded queries/cleanup; no camera settings or credentials |
-| `nian-settings` | authoritative non-secret desktop configuration | app-data `settings.sqlite3`, schema v5 camera/storage/desired/autostart + independent PTZ/Event bindings and Event Desired intent; no passwords, FFmpeg/Tauri/process logic |
+| `nian-settings` | authoritative non-secret desktop configuration | app-data `settings.sqlite3`, schema v6 camera/storage/Recording Desired/autostart + independent PTZ/Event bindings, Event Desired intent and motion-notification preference; no passwords, FFmpeg/Tauri/process logic |
 | `nian-storage` | recordings layout, claiming, publication, inventory/transaction facts | traversal-proof paths, race-safe `claim_segment`, atomic no-replace publish, lease-aware partial primitives, symlink-safe deterministic inventory (M4) |
 | `nian-ipc` | NDJSON protocol + serve loop | versioned envelopes, size-capped framing; handlers may emit events mid-request (M3) |
 | `nian-media` | backend-agnostic facade | `Probe`, `MediaSource`; errors distinguish cancellation vs timeout (M3); packets travel as backend-owned types |
@@ -73,6 +73,12 @@ Key properties:
 | `nian-platform-windows` | isolated Win32 desktop boundary | M7 suspend/resume notifications and kill-on-close Job Object worker containment |
 | `apps/nian-desktop` | Tauri 2 host | single-instance/tray/autostart/lifecycle owner, platform app-data + native credentials, playback/live loopback HTTP owner, thin typed commands |
 | `apps/nian-media-worker` | media process | `probe` CLI, `run` IPC with `recording.*`, bounded `camera.probe`, M6 `playback.prepare`, M11 `live.*`, manual `record` smoke command |
+
+## v1 production/release boundary
+
+Forgejo is the authoritative source and normal CI system. GitHub receives a one-way mirror and runs only the tag-triggered Windows/Linux release pipeline. The v1 package matrix is Linux x86_64 AppImage plus Windows x86_64 NSIS; both include the sibling media worker and pinned shared FFmpeg 8.0.3 runtime. Version/tag consistency is mechanically enforced before release compilation, and RC SemVer tags are prereleases that cannot replace the production `latest` updater channel. See ADR-0018 and `docs/releasing.md`.
+
+Authoritative `settings.sqlite3` is never automatically rebuilt on corruption. The recording and Event SQLite databases are derived indexes and may be quarantined/recreated; M15 retains at most four corrupt SQLite families for each index to keep repeated recovery evidence storage-bounded. Future schema versions fail closed rather than being mistaken for corruption.
 
 ## Recording data flow
 
@@ -851,7 +857,10 @@ without preventing the remaining subsystems from converging.
 * ADRs: `docs/adr/` (resilience model: ADR-0007)
 * FFmpeg specifics: `docs/ffmpeg.md`
 * Development setup: `docs/development.md`
-* Linux releases/updater: `docs/releasing.md`
+* v1 releases/updater: `docs/releasing.md`
+* v1 release-candidate checklist: `docs/release-checklist.md`
+* v1 known limitations: `docs/known-limitations.md`
+* v1 production audit: `docs/v1-production-audit.md`
 * Testing: `docs/testing.md`
 
 
@@ -867,7 +876,7 @@ The worker resolves the Event service, creates a PullPoint subscription, request
 
 Motion normalization is stateful per worker lifetime. Topic capability nodes and notification QName prefixes must resolve to the standard `http://www.onvif.org/ver10/topics` namespace; same-local-name vendor namespaces do not qualify. State starts `Unknown`; synchronization `Initialized` notifications establish baseline without creating history. Only Idle-to-Active and Active-to-Idle transitions become `MotionStarted`/`MotionEnded` rows. Transition evaluation is non-mutating until the Event row plus required bounded cleanup commits in one SQLite transaction; only then does normalized source state and runtime motion status advance. Persistence failure therefore retains the prior state so replay can retry, while an already-persisted duplicate fingerprint still counts as success and commits runtime state. Repeated state is ignored. At most 64 hashed source states are retained per worker; an unknown source beyond the bound is ignored and aggregate motion becomes Unknown (`None`) rather than falsely reporting idle. Raw ONVIF source `SimpleItem` values are sorted and SHA-256 hashed inside `nian-onvif`; only the opaque digest crosses into application/persistence. Optional bad device timestamps degrade to absent while receive time always provides host ordering. Subscription recreation preserves the bounded source state, suppressing timestamp-less redelivery only after successful persistence; a failed transition remains uncommitted so replay retries it. A genuine opposite transition permits the next persisted transition. A fresh worker after lifecycle restoration starts with a fresh synchronization baseline.
 
-History is stored separately at `<storage_root>/.nian/events.sqlite3`. It is not authoritative settings and contains no password, SOAP, Event URL, PullPoint URL or raw source token. Retention reuses configured max age when present, otherwise 30 days, with a 250,000-row cap and at most 500 deletions per cleanup pass. Recent-history API queries are bounded. Corrupt SQLite families are quarantined, including WAL/SHM sidecars, before a fresh index is created; future schemas and ordinary I/O errors are preserved and surfaced instead.
+History is stored separately at `<storage_root>/.nian/events.sqlite3`. It is not authoritative settings and contains no password, SOAP, Event URL, PullPoint URL or raw source token. Retention reuses configured max age when present, otherwise 30 days, with a 250,000-row cap and at most 500 deletions per cleanup pass. Recent-history API queries are bounded. Corrupt SQLite families are quarantined, including WAL/SHM sidecars, before a fresh index is created; M15 retains at most four corrupt Event-index families so repeated failure remains storage-bounded. Future schemas and ordinary I/O errors are preserved and surfaced instead.
 
 Changing `storage_root` does not require restart. Desktop settings mutation owns a dedicated `settings_update_gate`, prepares the candidate Event index, stops/settles Event workers outside `control_gate`, rechecks lifecycle/recording state for the short settings commit, swaps playback/Event storage, then restores Desired Event monitoring after releasing the global gate. A failed commit leaves the previous storage root authoritative and reopens Event admission if lifecycle is still Running.
 
@@ -883,3 +892,26 @@ Recording context is resolved by the existing recording index using `CameraId + 
 Settings schema v6 adds only the independent `motion_notifications_enabled` preference, default Off. Newly committed normalized Events may publish a non-blocking application signal after `EventIndex::insert_and_cleanup` returns a new event ID. Duplicate fingerprints, persistence failures and historical queries cannot publish. The application dispatcher owns a 32-item `sync_channel`, admits only `MotionStarted`, uses `try_send` so a full queue drops UX work instead of blocking Event ingestion, rate-limits each camera to one notification per 15 seconds, and bounds rate-limiter state to 128 camera entries. Native delivery failures are counted/ignored by the projection and do not change Event monitoring state. Notification text is limited to `Motion detected` and the current camera display name.
 
 Notification lifecycle follows background Event ownership: Hide leaves the dispatcher active; Suspend closes admission and joins the bounded dispatcher before Event restoration can occur; Resume starts a fresh queue before Desired Event monitoring is restored; Quit and Update close notification admission during coordinated teardown. The dispatcher never re-queries persisted history, so Resume/startup cannot replay old notifications. The current Tauri 2.4 desktop notification abstraction exposes display but no desktop click/action callback; M14 therefore keeps the Event-ID lookup/selection path safe for a future real activation callback but does not manufacture a fake notification deep link. See ADR-0017.
+
+
+## v1 final architecture (M15)
+
+M15 freezes the accepted product architecture rather than introducing a new data plane:
+
+```text
+Camera
+├── RTSP Recording ───────────────→ nian-media-worker ─→ local recordings
+├── RTSP Live ────────────────────→ nian-media-worker ─→ bounded loopback live cache
+├── Playback of finalized media ─→ nian-media-worker ─→ bounded loopback playback cache
+├── ONVIF Provisioning
+├── ONVIF PTZ
+└── ONVIF Event PullPoint
+      ↓
+   EventIndex (local derived SQLite)
+      ├── Event Review projection
+      └── post-persistence local notification dispatcher
+             ↓
+        short-lived native notification helper
+```
+
+The four per-camera ownership planes remain independent: Recording, Live, PTZ and Events. Authoritative non-secret configuration remains in platform app-data `settings.sqlite3`; passwords remain in the native CredentialStore. There is no cloud/server/WebRTC/mobile component in v1. Release/process/corruption guarantees are fixed by ADR-0018.

@@ -10,7 +10,6 @@
 //! Normal builds never invoke bindgen; they compile the committed output.
 
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
 const HEADER_FILES: &[&str] = &[
     "libavutil/avutil.h",
@@ -115,7 +114,9 @@ const ALLOWLISTED_VARS: &[&str] = &[
     "AV_ROUND_PASS_MINMAX",
 ];
 
-fn main() -> ExitCode {
+fn main() -> Result<(), String> {
+    let current_dir = std::env::current_dir()
+        .map_err(|error| format!("cannot resolve current directory: {error}"))?;
     let repo_root: PathBuf = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
@@ -131,9 +132,9 @@ fn main() -> ExitCode {
                     None => break,
                 }
             }
-            std::env::current_dir().expect("current directory")
+            current_dir.clone()
         })
-        .unwrap_or_else(|| std::env::current_dir().expect("current directory"));
+        .unwrap_or(current_dir);
 
     let include_root = repo_root.join("thirdparty").join("ffmpeg");
     let output_path = repo_root
@@ -143,11 +144,10 @@ fn main() -> ExitCode {
         .join("bindings.rs");
 
     if !include_root.join("libavformat").join("avformat.h").exists() {
-        eprintln!(
-            "FFmpeg headers not found under {}.\nRun scripts/fetch-ffmpeg-headers.sh first.",
+        return Err(format!(
+            "FFmpeg headers not found under {}. Run scripts/fetch-ffmpeg-headers.sh first.",
             include_root.display()
-        );
-        return ExitCode::FAILURE;
+        ));
     }
 
     let mut builder = bindgen::Builder::default()
@@ -184,19 +184,11 @@ fn main() -> ExitCode {
         builder = builder.allowlist_var(variable);
     }
 
-    let bindings = match builder.generate() {
-        Ok(bindings) => bindings,
-        Err(error) => {
-            eprintln!("bindgen failed: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    if let Err(error) = bindings.write_to_file(&output_path) {
-        eprintln!("cannot write {}: {error}", output_path.display());
-        return ExitCode::FAILURE;
-    }
-
-    println!("wrote {}", output_path.display());
-    ExitCode::SUCCESS
+    let bindings = builder
+        .generate()
+        .map_err(|error| format!("bindgen failed: {error}"))?;
+    bindings
+        .write_to_file(&output_path)
+        .map_err(|error| format!("cannot write {}: {error}", output_path.display()))?;
+    Ok(())
 }

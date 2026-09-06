@@ -33,8 +33,9 @@ test("Forgejo production release workflow is removed while normal quality CI rem
   assert.equal(existsSync(forgejoQualityPath), true);
   const quality = readFileSync(forgejoQualityPath, "utf8");
   assert.match(quality, /pull_request:/);
-  assert.match(quality, /cargo clippy/);
-  assert.match(quality, /cargo test/);
+  assert.match(quality, /cargo check --workspace/);
+  assert.match(quality, /cargo clippy --workspace --all-targets --all-features -- -D warnings/);
+  assert.match(quality, /cargo test --workspace/);
 });
 
 test("GitHub release workflow auto-triggers only from v* tag pushes", () => {
@@ -165,6 +166,14 @@ test("publication is draft-first and byte-verifies uploaded assets before publis
   assert.ok(createAt >= 0 && createAt < uploadAt && uploadAt < downloadAt && downloadAt < compareAt && compareAt < publishAt);
   assert.match(publish, /--draft/);
   assert.match(publish, /refusing to overwrite an already-published release/);
+});
+
+test("release candidates remain prereleases and cannot replace the production latest channel", () => {
+  const publish = jobBody("publish-release");
+  assert.match(publish, /RELEASE_TAG" == \*-\*/);
+  assert.match(publish, /release_flags\+=\(--prerelease\)/);
+  assert.match(publish, /--draft=false --prerelease --latest=false/);
+  assert.match(publish, /--draft=false --latest/);
 });
 
 test("release workflow never pushes source changes or creates release tags", () => {

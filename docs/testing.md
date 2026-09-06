@@ -528,8 +528,9 @@ Windows power-notification subscription, and prove the accepted kill-on-close Jo
 Object reaps the exact installed worker after hard desktop death.
 
 Windows upgrade/data smoke creates settings through the real `nian-settings` API. It
-proves camera configuration, credential reference, persisted `recording_enabled`,
-`launch_at_login`, selected footage root and footage bytes survive reinstall. The
+proves camera configuration plus camera/PTZ/Event credential references and ownership,
+Recording Desired, Event Desired/binding, notification preference, `launch_at_login`,
+selected footage root and footage bytes survive reinstall. The
 second installer run is executed directly while the installed desktop and Job Object
 worker are alive; bounded readiness markers prove the desktop is handled by the NSIS
 app-running path, the owned worker exits with its desktop, file replacement succeeds
@@ -554,6 +555,8 @@ bytes and checksum drift. `verify-release` requires both signed candidates, re-v
 both updater signatures, scans the combined release boundary, and only then emits
 `verified-release`. Draft publication still uploads every asset, downloads them back,
 compares the exact filename set and bytes, verifies the global checksums and publishes.
+Release-contract tests additionally require prerelease SemVer tags to publish as GitHub
+prereleases with `latest=false`, so an RC cannot silently replace the production updater channel.
 
 ### Simultaneous multi-camera recording (M9)
 
@@ -807,11 +810,23 @@ Frontend Event Review tests cover the default 24-hour bounded query, camera filt
 
 Manual M14 validation on an installed Windows/Linux desktop should verify OS notification presentation while the window is visible and hidden, no historical replay after restart/Resume, MotionStarted-only behavior, notification privacy text, correct Event Review recording jump, missing-footage state after retention, and continued Event ingestion when OS notification display fails. Notification click activation is not claimed on the current Tauri desktop abstraction because it provides no click callback.
 
+### v1 production hardening and release acceptance (M15)
+
+M15 adds an explicit v1 persistence matrix for every supported historical settings schema v1 through v5 into schema v6. Fixtures preserve every field that existed at that historical version and verify current-safe defaults for fields introduced later. The v5 fixture preserves camera credential reference, Recording Desired, PTZ/Event bindings and independent owned credential references, Event Desired, storage/retention/quota/autostart state, while the v6 notification preference enters with the required default Off. Future authoritative schemas and corrupt authoritative settings continue to fail without replacing bytes; migration failures keep their prior user version/evidence.
+
+Derived-index recovery is storage-bounded. Repeated EventIndex corruption retains at most four quarantine SQLite families and the recovered index immediately accepts a new normalized Event and Event Review query. Recording-index quarantine also retains at most four main/WAL/SHM families; allocation uses checked arithmetic and bounded collision attempts. The existing interrupted-family marker regression still proves half-finished quarantine converges before reopen.
+
+M15 normal Forgejo CI adds `cargo check --workspace` and makes the strict Rust lint contract authoritative: `cargo clippy --workspace --all-targets --all-features -- -D warnings`. `bindgen-gen` now returns typed generator errors instead of using production `expect`/stdout/stderr macros that prevented that gate from passing. GitHub remains release-tag-only and is not a duplicate normal CI system.
+
+Release-contract tests prove version/tag convergence, mirror identity, least privilege, immutable action pins, required Linux+Windows candidate assembly, sidecar/runtime inclusion, updater signatures, deterministic checksums, draft-first byte verification and RC isolation from the production `latest` channel. The enhanced Windows installed-upgrade fixture exercises Recording/Event Desired state, PTZ/Event bindings, opaque credential ownership, notification preference, storage settings and footage preservation.
+
+Automated evidence is intentionally not a substitute for clean-machine/hardware release evidence. `docs/release-checklist.md` records the mandatory Windows/Linux package, upgrade, lifecycle, updater and compatible-camera checks. Until that checklist and the actual tag workflow are completed, M15 must be reported as release-ready implementation rather than a completed v1 release.
+
 ## Planned per milestone
 
-* **Future scope**: ONVIF presets, vendor event dialects, push delivery, talkback, macOS distribution,
+* **Future/v2 scope**: ONVIF presets, vendor event dialects, push delivery, talkback, macOS distribution,
   H.265/transcoding/WebRTC, clip export, thumbnails/motion analysis and AI/cloud behavior require
-  separate design/review and are not part of M14.
+  separate design/review and are not part of Nian Vision v1.
 * **Hardware/manual** (never in CI): real Tapo C200 via
   `NIAN_VISION_RTSP_URL` with
   `nian-media-worker record --rtsp-from-env ...` and/or an IPC-driven
