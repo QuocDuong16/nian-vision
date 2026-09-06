@@ -1,0 +1,30 @@
+{
+  "buildContractVersion": 1,
+  "outputRuntimeContractVersion": 1,
+  "toolchain": "msvc",
+  "architecture": "x86_64",
+  "configureFlags": [
+    "--prefix=/opt/nian-vision-ffmpeg",
+    "--toolchain=msvc",
+    "--arch=x86_64",
+    "--disable-doc",
+    "--disable-programs",
+    "--disable-static",
+    "--enable-shared",
+    "--disable-gpl",
+    "--disable-nonfree",
+    "--disable-autodetect",
+    "--disable-everything",
+    "--disable-x86asm",
+    "--disable-avdevice",
+    "--disable-avfilter",
+    "--disable-swresample",
+    "--disable-swscale",
+    "--enable-network",
+    "--enable-protocol=file,tcp,rtsp,rtp,udp",
+    "--enable-demuxer=matroska,mov,rtsp",
+    "--enable-muxer=matroska,mov,mp4",
+    "--enable-parser=h264,mpeg4video,mpegaudio,aac",
+    "--enable-decoder=mpeg4,aac"
+  ]
+}

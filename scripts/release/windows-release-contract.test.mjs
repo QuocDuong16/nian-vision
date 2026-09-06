@@ -6,6 +6,10 @@ import { normalizeNewlines, readNormalizedText } from "./test-text.mjs";
 const workflow = readNormalizedText(new URL("../../.github/workflows/release.yml", import.meta.url));
 const windowsConfigWriter = readNormalizedText(new URL("./write-tauri-windows-release-config.mjs", import.meta.url));
 const windowsFfmpeg = readNormalizedText(new URL("./build-ffmpeg-windows.ps1", import.meta.url));
+const windowsFfmpegValidator = readNormalizedText(new URL("./validate-ffmpeg-windows.mjs", import.meta.url));
+const windowsFfmpegValidatorPs = readNormalizedText(new URL("./validate-ffmpeg-windows.ps1", import.meta.url));
+const windowsFfmpegArtifactCache = readNormalizedText(new URL("./restore-ffmpeg-windows-artifact-cache.ps1", import.meta.url));
+const windowsFfmpegContract = JSON.parse(readNormalizedText(new URL("./ffmpeg-windows-contract.json", import.meta.url)));
 const windowsNative = readNormalizedText(new URL("./windows-native.ps1", import.meta.url));
 const releaseConfig = JSON.parse(readNormalizedText(new URL("./release-config.json", import.meta.url)));
 const windowsStage = readNormalizedText(new URL("./stage-windows.ps1", import.meta.url));
@@ -27,11 +31,12 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   assert.equal(releaseConfig.ffmpegVersion, "8.0.3");
   assert.equal(releaseConfig.ffmpegSourceUrl, "https://ffmpeg.org/releases/ffmpeg-8.0.3.tar.xz");
   assert.equal(releaseConfig.ffmpegSourceSha256, "6136812ea6d4e68bdba27e33c2a94382711cdf4f8602ffef056ff792bd6f9818");
-  assert.match(windowsFfmpeg, /--toolchain=msvc/);
-  assert.match(windowsFfmpeg, /--enable-shared/);
-  assert.match(windowsFfmpeg, /--disable-static/);
-  assert.match(windowsFfmpeg, /--disable-gpl/);
-  assert.match(windowsFfmpeg, /--disable-nonfree/);
+  assert.equal(windowsFfmpegContract.toolchain, "msvc");
+  assert.equal(windowsFfmpegContract.architecture, "x86_64");
+  for (const flag of ["--toolchain=msvc", "--enable-shared", "--disable-static", "--disable-gpl", "--disable-nonfree", "--disable-autodetect", "--disable-everything"]) {
+    assert.ok(windowsFfmpegContract.configureFlags.includes(flag), `missing authoritative FFmpeg configure flag ${flag}`);
+  }
+  assert.match(windowsFfmpeg, /ffmpeg-windows-contract\.json/);
   assert.match(windowsFfmpeg, /Get-FileHash -Algorithm SHA256/);
   assert.match(windowsFfmpeg, /Invoke-NianNative \{ curl\.exe/);
   assert.match(windowsFfmpeg, /Invoke-NianNative \{ tar\.exe/);
@@ -39,23 +44,21 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   assert.match(windowsFfmpeg, /\[Math\]::Max\(2, \[Math\]::Min\(\$reportedCpuCount, 8\)\)/);
   assert.match(windowsFfmpeg, /make -j\$buildJobs/);
   assert.equal(windowsFfmpeg.includes("make -j2"), false);
-  for (const phase of ["download", "SHA-256 verification", "extraction", "configure", "compile", "install", "configuration and license validation", "runtime staging and validation"]) {
+  for (const phase of ["download", "SHA-256 verification", "extraction", "configure", "compile", "install", "configuration and license validation", "runtime staging and validation", "publish validated output"]) {
     assert.ok(windowsFfmpeg.includes(`Invoke-FfmpegPhase "${phase}"`), `missing FFmpeg phase timing for ${phase}`);
   }
-  assert.match(windowsFfmpeg, /avformat\.lib/);
-  assert.match(windowsFfmpeg, /avcodec\.lib/);
-  assert.match(windowsFfmpeg, /avutil\.lib/);
-  assert.match(windowsFfmpeg, /avformat-62\.dll/);
-  assert.match(windowsFfmpeg, /avcodec-62\.dll/);
-  assert.match(windowsFfmpeg, /avutil-60\.dll/);
+  for (const name of ["avformat.lib", "avcodec.lib", "avutil.lib"]) assert.match(windowsFfmpeg, new RegExp(name.replace(".", "\\.")));
+  assert.match(windowsFfmpegValidator, /required FFmpeg runtime DLL missing, duplicated, or misplaced/);
+  assert.match(windowsFfmpegValidator, /required MSVC FFmpeg import library missing, duplicated, or misplaced/);
   assert.equal(/gyan\.dev|github\.com\/BtbN|prebuilt/i.test(windowsFfmpeg), false);
-  assert.match(workflow, /Build pinned FFmpeg 8\.0\.3 Windows MSVC runtime[\s\S]*?timeout-minutes: 60[\s\S]*?build-ffmpeg-windows\.ps1/);
+  assert.match(workflow, /Build pinned FFmpeg 8\.0\.3 Windows MSVC runtime[\s\S]*?timeout-minutes: 150[\s\S]*?build-ffmpeg-windows\.ps1/);
 });
 
 test("Windows release PowerShell scripts share the fail-closed native helper", () => {
   for (const [name, source] of [
     ["preflight", windowsPreflight],
     ["FFmpeg", windowsFfmpeg],
+    ["FFmpeg validator", windowsFfmpegValidatorPs],
     ["staging", windowsStage],
     ["Authenticode", windowsAuthenticode],
     ["installer smoke", windowsInstallerSmoke],
@@ -90,6 +93,49 @@ test("Windows release workflow routes required native tools through one fail-clo
   for (const command of ["release:test", "lint", "typecheck", "test", "build"]) {
     assert.match(quality, new RegExp(`Invoke-NianNative \\{ pnpm\\.cmd ${command.replace(":", "\\:")} \\}`));
   }
+});
+
+test("Windows FFmpeg cache is exact, validated, bounded, and source-build backed", () => {
+  const windows = workflow.slice(workflow.indexOf("  build-windows:"), workflow.indexOf("  sign-windows:"));
+  const computeAt = windows.indexOf("- name: Compute Windows FFmpeg build contract");
+  const restoreAt = windows.indexOf("- name: Restore exact Windows FFmpeg build cache");
+  const validateAt = windows.indexOf("- name: Validate restored Windows FFmpeg cache");
+  const buildAt = windows.indexOf("- name: Build pinned FFmpeg 8.0.3 Windows MSVC runtime");
+  const resolvedAt = windows.indexOf("- name: Validate resolved Windows FFmpeg runtime");
+  const saveAt = windows.indexOf("- name: Save validated Windows FFmpeg build cache");
+  const artifactUploadAt = windows.indexOf("- name: Upload validated Windows FFmpeg cross-tag cache artifact");
+  const rustAt = windows.indexOf("- name: Validate Windows release FFmpeg and Rust runtime");
+  assert.ok(computeAt >= 0 && computeAt < restoreAt && restoreAt < validateAt && validateAt < buildAt && buildAt < resolvedAt && resolvedAt < saveAt && saveAt < artifactUploadAt && artifactUploadAt < rustAt);
+
+  assert.match(windows, /actions\/cache\/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4\.3\.0/);
+  assert.match(windows, /actions\/cache\/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4\.3\.0/);
+  assert.match(windows, /path: dist\/ffmpeg-windows-x86_64/);
+  assert.match(windows, /key: \${{ steps\.ffmpeg-contract\.outputs\.key }}/);
+  assert.equal(/restore-keys:/.test(windows), false);
+  assert.match(windows, /Invoke-NianNative \{ node\.exe scripts\/release\/ffmpeg-cache-key\.mjs \}/);
+  assert.match(windows, /FFmpeg cache key:/);
+  assert.match(windows, /FFmpeg cache hit:/);
+  assert.match(windows, /FFmpeg source build required:/);
+  assert.match(windows, /validate-ffmpeg-windows\.ps1/);
+  assert.match(windows, /restore-ffmpeg-windows-artifact-cache\.ps1/);
+  assert.match(windows, /restored FFmpeg cache failed release-contract validation and will be discarded/);
+  assert.match(windows, /Remove-Item -Recurse -Force .*ffmpeg-windows-x86_64/);
+  assert.match(windows, /if: steps\.ffmpeg-cache-state\.outputs\.source-build-required == 'true'/);
+  assert.match(windows, /Build pinned FFmpeg 8\.0\.3 Windows MSVC runtime[\s\S]*?timeout-minutes: 150/);
+  assert.match(windows, /^    timeout-minutes: 240$/m);
+  assert.match(windows, /permissions:\n      contents: read\n      actions: read/);
+  assert.equal(windows.includes("actions: write"), false);
+  assert.match(windows, /name: windows-ffmpeg-cache-\${{ steps\.ffmpeg-contract\.outputs\.digest }}/);
+  assert.match(windows, /retention-days: 90/);
+  assert.equal(windows.includes("secrets.TAURI_SIGNING_PRIVATE_KEY"), false);
+  assert.equal(windows.includes("WINDOWS_SIGNING_PFX"), false);
+
+  assert.match(windowsFfmpegArtifactCache, /actions\/workflows\/release\.yml/);
+  assert.match(windowsFfmpegArtifactCache, /run\.workflow_id -ne \$workflow\.id/);
+  assert.match(windowsFfmpegArtifactCache, /run\.event -ne "push" -or \$run\.conclusion -ne "success"/);
+  assert.match(windowsFfmpegArtifactCache, /run\.head_repository\.full_name -ne \$repo/);
+  assert.match(windowsFfmpegArtifactCache, /validate-ffmpeg-windows\.ps1/);
+  assert.match(windowsFfmpegArtifactCache, /failed validation and was discarded/);
 });
 
 test("Windows staging mechanically rejects missing and developer-resolved DLLs", () => {

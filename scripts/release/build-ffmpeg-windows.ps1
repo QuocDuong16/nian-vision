@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 $Config = Get-Content (Join-Path $RepoRoot "scripts/release/release-config.json") -Raw | ConvertFrom-Json
+$Contract = Get-Content (Join-Path $RepoRoot "scripts/release/ffmpeg-windows-contract.json") -Raw | ConvertFrom-Json
 $OutputDir = if ($args.Count -gt 0) { [IO.Path]::GetFullPath($args[0]) } else { Join-Path $RepoRoot "dist/ffmpeg-windows-x86_64" }
 
 function Invoke-FfmpegPhase([string]$Name, [scriptblock]$Action) {
@@ -44,6 +45,11 @@ function Convert-ToMsysPath([string]$Path, [string]$Bash) {
     return (Invoke-NianNative { & $Bash --noprofile --norc -lc "cygpath -u '$escaped'" } | Out-String).Trim()
 }
 
+if ($Config.windowsTarget -ne "x86_64-pc-windows-msvc") { throw "Windows FFmpeg release target contract drifted" }
+if ($Contract.toolchain -ne "msvc" -or $Contract.architecture -ne "x86_64") { throw "Windows FFmpeg toolchain contract drifted" }
+$flags = @($Contract.configureFlags)
+if ($flags.Count -eq 0) { throw "Windows FFmpeg configure flag contract is empty" }
+
 Import-VsDevEnvironment
 foreach ($tool in @("cl.exe", "lib.exe", "dumpbin.exe", "node.exe", "curl.exe", "tar.exe")) { Require-Command $tool }
 
@@ -58,7 +64,10 @@ $Work = Join-Path $env:RUNNER_TEMP ("nian-ffmpeg-windows-" + [Guid]::NewGuid().T
 $Tarball = Join-Path $Work ("ffmpeg-{0}.tar.xz" -f $Config.ffmpegVersion)
 $Source = Join-Path $Work ("ffmpeg-{0}" -f $Config.ffmpegVersion)
 $DestRoot = Join-Path $Work "install-root"
-New-Item -ItemType Directory -Force $Work | Out-Null
+$OutputParent = Split-Path -Parent $OutputDir
+New-Item -ItemType Directory -Force $Work, $OutputParent | Out-Null
+$CandidateDir = Join-Path $OutputParent (".ffmpeg-windows-x86_64.candidate-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force $CandidateDir | Out-Null
 try {
     Invoke-FfmpegPhase "download" {
         Invoke-NianNative { curl.exe --fail --silent --show-error --location --output $Tarball $Config.ffmpegSourceUrl }
@@ -77,34 +86,7 @@ try {
         if (-not (Test-Path $Source)) { throw "FFmpeg source extraction did not produce the expected source directory" }
     }
 
-    Remove-Item -Recurse -Force $OutputDir -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Force $OutputDir | Out-Null
-
-    $flags = @(
-        "--prefix=/opt/nian-vision-ffmpeg",
-        "--toolchain=msvc",
-        "--arch=x86_64",
-        "--disable-doc",
-        "--disable-programs",
-        "--disable-static",
-        "--enable-shared",
-        "--disable-gpl",
-        "--disable-nonfree",
-        "--disable-autodetect",
-        "--disable-everything",
-        "--disable-x86asm",
-        "--disable-avdevice",
-        "--disable-avfilter",
-        "--disable-swresample",
-        "--disable-swscale",
-        "--enable-network",
-        "--enable-protocol=file,tcp,rtsp,rtp,udp",
-        "--enable-demuxer=matroska,mov,rtsp",
-        "--enable-muxer=matroska,mov,mp4",
-        "--enable-parser=h264,mpeg4video,mpegaudio,aac",
-        "--enable-decoder=mpeg4,aac"
-    )
-    Set-Content -Path (Join-Path $OutputDir "FFMPEG_BUILD_FLAGS.txt") -Value ($flags -join "`n") -NoNewline
+    Set-Content -Path (Join-Path $CandidateDir "FFMPEG_BUILD_FLAGS.txt") -Value ($flags -join "`n") -NoNewline
 
     $sourceUnix = Convert-ToMsysPath $Source $Bash
     $destUnix = Convert-ToMsysPath $DestRoot $Bash
@@ -113,8 +95,11 @@ try {
     Invoke-FfmpegPhase "configure" {
         Invoke-NianNative { & $Bash --noprofile --norc -lc "set -Eeuo pipefail; cd '$sourceUnix'; ./configure $flagText" }
         $configHeader = Join-Path $Source "config.h"
+        $componentHeader = Join-Path $Source "config_components.h"
         if (-not (Test-Path $configHeader)) { throw "FFmpeg configure did not produce config.h" }
-        Copy-Item -Force $configHeader (Join-Path $OutputDir "FFMPEG_CONFIG.h")
+        if (-not (Test-Path $componentHeader)) { throw "FFmpeg configure did not produce config_components.h" }
+        Copy-Item -Force $configHeader (Join-Path $CandidateDir "FFMPEG_CONFIG.h")
+        Copy-Item -Force $componentHeader (Join-Path $CandidateDir "FFMPEG_CONFIG_COMPONENTS.h")
     }
 
     Invoke-FfmpegPhase "compile" {
@@ -127,18 +112,22 @@ try {
 
     Invoke-FfmpegPhase "configuration and license validation" {
         Invoke-NianNative { node.exe (Join-Path $RepoRoot "scripts/release/validate-ffmpeg-config.mjs") `
-            --config-header (Join-Path $OutputDir "FFMPEG_CONFIG.h") `
-            --flags (Join-Path $OutputDir "FFMPEG_BUILD_FLAGS.txt") }
+            --config-header (Join-Path $CandidateDir "FFMPEG_CONFIG.h") `
+            --flags (Join-Path $CandidateDir "FFMPEG_BUILD_FLAGS.txt") }
     }
 
     Invoke-FfmpegPhase "runtime staging and validation" {
         $InstallRoot = Join-Path $DestRoot "opt/nian-vision-ffmpeg"
-        $BinOut = Join-Path $OutputDir "bin"
-        $LibOut = Join-Path $OutputDir "lib"
+        $BinOut = Join-Path $CandidateDir "bin"
+        $LibOut = Join-Path $CandidateDir "lib"
         New-Item -ItemType Directory -Force $BinOut, $LibOut | Out-Null
-        Copy-Item -Recurse -Force (Join-Path $InstallRoot "include") (Join-Path $OutputDir "include")
+        Copy-Item -Recurse -Force (Join-Path $InstallRoot "include") (Join-Path $CandidateDir "include")
 
-        $requiredDlls = @("avformat-62.dll", "avcodec-62.dll", "avutil-60.dll")
+        $requiredDlls = @(
+            "avformat-$($Config.libavformatMajor).dll",
+            "avcodec-$($Config.libavcodecMajor).dll",
+            "avutil-$($Config.libavutilMajor).dll"
+        )
         $requiredLibs = @("avformat.lib", "avcodec.lib", "avutil.lib")
         foreach ($name in $requiredDlls) {
             $match = @(Get-ChildItem $InstallRoot -Recurse -File -Filter $name)
@@ -150,18 +139,25 @@ try {
             if ($match.Count -ne 1) { throw "required MSVC FFmpeg import library missing or ambiguous: $name" }
             Copy-Item -Force $match[0].FullName (Join-Path $LibOut $name)
         }
-        Copy-Item -Force (Join-Path $Source "COPYING.LGPLv2.1") (Join-Path $OutputDir "FFMPEG-LGPL-2.1.txt")
+        Copy-Item -Force (Join-Path $Source "COPYING.LGPLv2.1") (Join-Path $CandidateDir "FFMPEG-LGPL-2.1.txt")
 
         if (Get-ChildItem $InstallRoot -Recurse -File | Where-Object Name -Match '^ff(mpeg|probe|play)\.exe$') {
             throw "FFmpeg CLI program unexpectedly present in Windows release runtime"
         }
-        if (Get-ChildItem $OutputDir -Recurse -File | Select-String -SimpleMatch $env:GITHUB_WORKSPACE -Quiet -ErrorAction SilentlyContinue) {
-            throw "Windows FFmpeg release evidence contains the repository build path"
-        }
+
+        Invoke-NianNative { node.exe (Join-Path $RepoRoot "scripts/release/ffmpeg-cache-key.mjs") `
+            --write-metadata (Join-Path $CandidateDir "FFMPEG_BUILD_METADATA.json") }
+        & (Join-Path $RepoRoot "scripts/release/validate-ffmpeg-windows.ps1") -OutputDir $CandidateDir
     }
 
-    Write-Host "FFmpeg $($Config.ffmpegVersion) Windows MSVC shared runtime built at $OutputDir"
+    Invoke-FfmpegPhase "publish validated output" {
+        Remove-Item -Recurse -Force $OutputDir -ErrorAction SilentlyContinue
+        Move-Item -Path $CandidateDir -Destination $OutputDir
+    }
+
+    Write-Host "FFmpeg $($Config.ffmpegVersion) Windows MSVC shared runtime built and validated at $OutputDir"
 }
 finally {
+    Remove-Item -Recurse -Force $CandidateDir -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
 }
