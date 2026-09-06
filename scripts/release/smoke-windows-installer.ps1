@@ -5,6 +5,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot "windows-native.ps1")
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 $Installer = (Resolve-Path $Installer).Path
 $Isolation = Join-Path $env:RUNNER_TEMP ("nian-windows-install-smoke-" + [Guid]::NewGuid().ToString("N"))
@@ -136,10 +137,7 @@ function Verify-InstalledLayout {
 
 function Scan-InstalledSecrets {
     if (-not [string]::IsNullOrEmpty($env:NIAN_RELEASE_SECRET_SENTINEL)) {
-        & $Node (Join-Path $RepoRoot "scripts/release/scan-release-secrets.mjs") $InstallRoot
-        if ($LASTEXITCODE -ne 0) {
-            throw "installed Windows application contains the configured release secret sentinel"
-        }
+        Invoke-NianNative { & $Node (Join-Path $RepoRoot "scripts/release/scan-release-secrets.mjs") $InstallRoot }
     }
 }
 
@@ -153,9 +151,8 @@ try {
     try {
         Remove-Item Env:NIAN_FFMPEG_LIB_DIR -ErrorAction SilentlyContinue
         $env:PATH = $InstallRoot
-        & $Node (Join-Path $RepoRoot "scripts/release/stage-runtime-smoke.mjs") `
-            (Join-Path $InstallRoot "nian-media-worker.exe") (Join-Path $Isolation "worker-smoke")
-        if ($LASTEXITCODE -ne 0) { throw "installed Windows worker smoke failed" }
+        Invoke-NianNative { & $Node (Join-Path $RepoRoot "scripts/release/stage-runtime-smoke.mjs") `
+            (Join-Path $InstallRoot "nian-media-worker.exe") (Join-Path $Isolation "worker-smoke") }
     }
     finally {
         $env:PATH = $oldPath
@@ -167,8 +164,7 @@ try {
     if ($freshRun) { throw "fresh install unexpectedly enabled launch-at-login" }
 
     $settings = Find-SettingsDatabase
-    & cargo.exe run --quiet -p nian-settings-fixture -- create $settings $Footage
-    if ($LASTEXITCODE -ne 0) { throw "settings preservation fixture creation failed" }
+    Invoke-NianNative { cargo.exe run --quiet -p nian-settings-fixture -- create $settings $Footage }
 
     $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     New-Item $runKey -Force | Out-Null
@@ -189,8 +185,7 @@ try {
         throw "owned worker restarted or survived during installer file replacement"
     }
     Run-DesktopSmoke (Join-Path $InstallRoot "nian-desktop.exe")
-    & cargo.exe run --quiet -p nian-settings-fixture -- verify $settings $Footage
-    if ($LASTEXITCODE -ne 0) { throw "settings preservation verification failed" }
+    Invoke-NianNative { cargo.exe run --quiet -p nian-settings-fixture -- verify $settings $Footage }
 
     $runValue = Get-ItemPropertyValue `
         -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `

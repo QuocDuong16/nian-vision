@@ -1,24 +1,30 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import test from "node:test";
+
+import { normalizeNewlines, readNormalizedText } from "./test-text.mjs";
 
 const githubWorkflowPath = new URL("../../.github/workflows/release.yml", import.meta.url);
 const forgejoReleasePath = new URL("../../.forgejo/workflows/release.yml", import.meta.url);
 const forgejoQualityPath = new URL("../../.forgejo/workflows/quality.yml", import.meta.url);
-const workflow = readFileSync(githubWorkflowPath, "utf8");
-const viteConfig = readFileSync(new URL("../../ui/vite.config.ts", import.meta.url), "utf8");
+const workflow = readNormalizedText(githubWorkflowPath);
+const viteConfig = readNormalizedText(new URL("../../ui/vite.config.ts", import.meta.url));
 
-function jobBody(name) {
+function jobBodyFrom(source, name) {
   const marker = `  ${name}:\n`;
-  const start = workflow.indexOf(marker);
+  const start = source.indexOf(marker);
   assert.ok(start >= 0, `missing job ${name}`);
-  const rest = workflow.slice(start + marker.length);
+  const rest = source.slice(start + marker.length);
   const next = rest.search(/^  [a-zA-Z0-9_-]+:\n/m);
   return next >= 0 ? rest.slice(0, next) : rest;
 }
 
-function stepBody(job, name) {
-  const body = jobBody(job);
+function jobBody(name) {
+  return jobBodyFrom(workflow, name);
+}
+
+function stepBodyFrom(source, job, name) {
+  const body = jobBodyFrom(source, job);
   const marker = `      - name: ${name}\n`;
   const start = body.indexOf(marker);
   assert.ok(start >= 0, `missing step ${job}/${name}`);
@@ -27,15 +33,32 @@ function stepBody(job, name) {
   return next >= 0 ? rest.slice(0, next) : rest;
 }
 
+function stepBody(job, name) {
+  return stepBodyFrom(workflow, job, name);
+}
+
 test("Forgejo production release workflow is removed while normal quality CI remains", () => {
   assert.equal(existsSync(forgejoReleasePath), false);
   assert.equal(existsSync(githubWorkflowPath), true);
   assert.equal(existsSync(forgejoQualityPath), true);
-  const quality = readFileSync(forgejoQualityPath, "utf8");
+  const quality = readNormalizedText(forgejoQualityPath);
   assert.match(quality, /pull_request:/);
   assert.match(quality, /cargo check --workspace/);
   assert.match(quality, /cargo clippy --workspace --all-targets --all-features -- -D warnings/);
   assert.match(quality, /cargo test --workspace/);
+});
+
+test("workflow contract parsing is identical for LF and CRLF source text", () => {
+  const crlf = workflow.replace(/\n/g, "\r\n");
+  const normalized = normalizeNewlines(crlf);
+  assert.equal(normalized, workflow);
+  for (const job of ["release-preflight", "build-linux", "build-windows", "sign-linux", "sign-windows", "verify-release", "publish-release"]) {
+    assert.equal(jobBodyFrom(normalized, job), jobBodyFrom(workflow, job));
+  }
+  assert.equal(
+    stepBodyFrom(normalized, "build-linux", "Re-prove release source identity"),
+    stepBodyFrom(workflow, "build-linux", "Re-prove release source identity"),
+  );
 });
 
 test("GitHub release workflow auto-triggers only from v* tag pushes", () => {
@@ -145,6 +168,45 @@ test("Linux container trusts only the exact checkout before repository Git opera
   const firstDirectRepositoryGit = linux.search(/^\s+git (?:fetch|status|rev-parse|show|merge-base)\b/m);
   assert.ok(firstDirectRepositoryGit > trust, "workspace trust must precede direct repository Git commands");
   assert.ok(linux.indexOf("version-check.mjs") > trust, "workspace trust must precede release scripts that inspect Git state");
+});
+
+test("Linux release compilation owns and disposes quality and worker intermediates before Tauri", () => {
+  const linux = jobBody("build-linux");
+  for (const step of [
+    "Release script and updater-verifier tests",
+    "Validate candidate FFmpeg against media fixtures",
+    "Rust quality against release FFmpeg",
+  ]) {
+    assert.match(stepBody("build-linux", step), /CARGO_TARGET_DIR="\$RUNNER_TEMP\/nian-quality-target"/);
+  }
+
+  const qualityCleanup = stepBody("build-linux", "Dispose Linux quality Cargo target");
+  assert.match(qualityCleanup, /if: always\(\)/);
+  assert.match(qualityCleanup, /rm -rf "\$RUNNER_TEMP\/nian-quality-target"/);
+
+  const stageAt = linux.indexOf("- name: Stage and clean-smoke Linux runtime");
+  const handoffAt = linux.indexOf("- name: Release Linux Cargo intermediates before desktop build");
+  const tauriAt = linux.indexOf("- name: Build unsigned AppImage bundle");
+  assert.ok(stageAt >= 0 && stageAt < handoffAt && handoffAt < tauriAt);
+  const handoff = stepBody("build-linux", "Release Linux Cargo intermediates before desktop build");
+  assert.match(handoff, /rm -rf target\/release/);
+  assert.equal(handoff.includes("rm -rf dist/linux-x86_64"), false);
+  assert.equal(handoff.includes("rm -rf ui/dist"), false);
+
+  const guard = stepBody("build-linux", "Guard Linux disk before Tauri build");
+  assert.match(guard, /df -h "\$GITHUB_WORKSPACE"/);
+  assert.match(guard, /du -sh target dist ui\/dist/);
+  assert.match(guard, /minimum_free_kb=\$\(\(10 \* 1024 \* 1024\)\)/);
+  assert.match(guard, /available_kb/);
+  assert.match(stepBody("build-linux", "Upload unsigned Linux build"), /dist\/linux-x86_64\//);
+});
+
+test("generated release-only Tauri configs are disposed even after a preceding failure", () => {
+  assert.match(stepBody("build-linux", "Dispose generated Tauri release configuration"), /if: always\(\)/);
+  const windowsDisposals = [...jobBody("build-windows").matchAll(/- name: Dispose generated Windows Tauri configuration\n([\s\S]*?)(?=\n      - name: )/g)];
+  assert.equal(windowsDisposals.length, 1);
+  assert.match(windowsDisposals[0][1], /if: always\(\)/);
+  assert.match(stepBody("sign-windows", "Dispose generated Windows Tauri configuration"), /if: always\(\)/);
 });
 
 test("Linux and Windows build jobs are peers and both signed candidates gate verification", () => {

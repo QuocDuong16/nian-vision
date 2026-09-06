@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot "windows-native.ps1")
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 $Config = Get-Content (Join-Path $RepoRoot "scripts/release/release-config.json") -Raw | ConvertFrom-Json
@@ -18,10 +19,10 @@ $System32 = Join-Path $env:SystemRoot "System32"
 function Import-VsDevEnvironment {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     if (-not (Test-Path $vswhere)) { throw "vswhere.exe is unavailable" }
-    $install = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    $install = (Invoke-NianNative { & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath } | Out-String).Trim()
     if (-not $install) { throw "Visual Studio C++ build tools are unavailable" }
     $vsdev = Join-Path $install "Common7\Tools\VsDevCmd.bat"
-    $lines = & cmd.exe /d /s /c "`"$vsdev`" -arch=amd64 -host_arch=amd64 >nul && set"
+    $lines = Invoke-NianNative { cmd.exe /d /s /c "`"$vsdev`" -arch=amd64 -host_arch=amd64 >nul && set" }
     foreach ($line in $lines) {
         $split = $line.IndexOf('=')
         if ($split -gt 0) {
@@ -36,8 +37,7 @@ if (-not (Get-Command dumpbin.exe -ErrorAction SilentlyContinue)) {
 }
 
 function Get-Dependencies([string]$Path) {
-    $lines = & dumpbin.exe /nologo /dependents $Path
-    if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $Path" }
+    $lines = Invoke-NianNative { dumpbin.exe /nologo /dependents $Path }
     $names = @()
     foreach ($line in $lines) {
         if ($line -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$') { $names += $Matches[1] }
@@ -72,10 +72,9 @@ foreach ($path in @(
     if (-not (Test-Path $path)) { throw "Windows staging prerequisite missing: $path" }
 }
 
-& $Node (Join-Path $RepoRoot "scripts/release/validate-ffmpeg-config.mjs") `
+Invoke-NianNative { & $Node (Join-Path $RepoRoot "scripts/release/validate-ffmpeg-config.mjs") `
     --config-header (Join-Path $Ffmpeg "FFMPEG_CONFIG.h") `
-    --flags (Join-Path $Ffmpeg "FFMPEG_BUILD_FLAGS.txt")
-if ($LASTEXITCODE -ne 0) { throw "Windows FFmpeg configuration validation failed" }
+    --flags (Join-Path $Ffmpeg "FFMPEG_BUILD_FLAGS.txt") }
 
 Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $Runtime, $Tauri | Out-Null
@@ -89,9 +88,8 @@ foreach ($name in @("THIRD_PARTY_NOTICES.txt", "FFMPEG-LGPL-2.1.txt", "FFMPEG_BU
     Copy-Item -Force $source (Join-Path $Stage $name)
 }
 
-& $Node (Join-Path $RepoRoot "scripts/release/build-metadata.mjs") `
-    --output (Join-Path $Stage "BUILD_METADATA.json") --target $Target
-if ($LASTEXITCODE -ne 0) { throw "Windows build metadata generation failed" }
+Invoke-NianNative { & $Node (Join-Path $RepoRoot "scripts/release/build-metadata.mjs") `
+    --output (Join-Path $Stage "BUILD_METADATA.json") --target $Target }
 
 $closureRoots = @(
     (Join-Path $Runtime "nian-media-worker.exe"),
@@ -124,9 +122,8 @@ $oldOverride = $env:NIAN_FFMPEG_LIB_DIR
 try {
     $env:PATH = $Runtime
     Remove-Item Env:NIAN_FFMPEG_LIB_DIR -ErrorAction SilentlyContinue
-    & $Node (Join-Path $RepoRoot "scripts/release/stage-runtime-smoke.mjs") `
-        (Join-Path $Runtime "nian-media-worker.exe") (Join-Path $Stage "smoke")
-    if ($LASTEXITCODE -ne 0) { throw "clean Windows staged worker smoke failed" }
+    Invoke-NianNative { & $Node (Join-Path $RepoRoot "scripts/release/stage-runtime-smoke.mjs") `
+        (Join-Path $Runtime "nian-media-worker.exe") (Join-Path $Stage "smoke") }
 }
 finally {
     $env:PATH = $oldPath

@@ -1,7 +1,7 @@
-# Nian Vision 1.0.0-rc.3
+# Nian Vision 1.0.0-rc.4
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 
-RC1 remains immutable after failing because the Linux container used `/bin/sh` for Bash-only release commands. RC2 fixed Bash, passed release preflight, then failed when Git rejected the mounted Linux checkout ownership. RC3 trusts only the exact `$GITHUB_WORKSPACE` before container-side Git operations; application behavior is unchanged.
+RC1, RC2 and RC3 remain immutable historical release attempts. RC1 exposed the Linux Bash-shell mismatch, RC2 exposed Git safe-directory ownership rejection inside the Linux container, and RC3 exposed Windows CRLF/fail-open native-command behavior plus Linux/Windows hosted-runner resource pressure. RC4 hardens only release infrastructure: newline-portable contracts, fail-closed Windows native commands, bounded Linux Cargo disk ownership, and bounded host-aware Windows FFmpeg compilation.
 
 ## Main capabilities
 

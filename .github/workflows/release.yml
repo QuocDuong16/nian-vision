@@ -138,6 +138,7 @@ jobs:
       - name: Release script and updater-verifier tests
         run: |
           set -Eeuo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/nian-quality-target"
           pnpm release:test
           cargo clippy -p nian-release-verifier --all-targets -- -D warnings
           cargo test -p nian-release-verifier
@@ -156,6 +157,7 @@ jobs:
       - name: Validate candidate FFmpeg against media fixtures
         run: |
           set -Eeuo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/nian-quality-target"
           export NIAN_FFMPEG_LIB_DIR="$PWD/dist/ffmpeg-linux-x86_64/lib"
           export LD_LIBRARY_PATH="$NIAN_FFMPEG_LIB_DIR"
           cargo test -p nian-media-ffmpeg --test media_integration
@@ -163,11 +165,19 @@ jobs:
       - name: Rust quality against release FFmpeg
         run: |
           set -Eeuo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/nian-quality-target"
           export NIAN_FFMPEG_LIB_DIR="$PWD/dist/ffmpeg-linux-x86_64/lib"
           export LD_LIBRARY_PATH="$NIAN_FFMPEG_LIB_DIR"
           cargo fmt --all --check
           cargo clippy --all-targets -- -D warnings
           cargo test --workspace
+
+      - name: Dispose Linux quality Cargo target
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          rm -rf "$RUNNER_TEMP/nian-quality-target"
+          df -h "$GITHUB_WORKSPACE"
 
       - name: Build release media worker
         run: |
@@ -179,11 +189,36 @@ jobs:
       - name: Stage and clean-smoke Linux runtime
         run: scripts/release/stage-linux.sh
 
+      - name: Release Linux Cargo intermediates before desktop build
+        run: |
+          set -Eeuo pipefail
+          echo "Disk usage before release-target handoff:"
+          df -h "$GITHUB_WORKSPACE"
+          du -sh target dist ui/dist 2>/dev/null || true
+          rm -rf target/release
+          echo "Disk usage after staged worker handoff:"
+          df -h "$GITHUB_WORKSPACE"
+          du -sh target dist ui/dist 2>/dev/null || true
+
       - name: Generate release-only Tauri configuration
         env:
           NIAN_UPDATER_PUBLIC_KEY: ${{ vars.NIAN_UPDATER_PUBLIC_KEY }}
           NIAN_UPDATER_ENDPOINT: ${{ github.server_url }}/${{ github.repository }}/releases/latest/download/latest.json
         run: node scripts/release/write-tauri-release-config.mjs
+
+      - name: Guard Linux disk before Tauri build
+        run: |
+          set -Eeuo pipefail
+          echo "Pre-Tauri disk diagnostics:"
+          df -h "$GITHUB_WORKSPACE"
+          du -sh target dist ui/dist 2>/dev/null || true
+          minimum_free_kb=$((10 * 1024 * 1024))
+          available_kb="$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 { print $4 }')"
+          [[ "$available_kb" =~ ^[0-9]+$ ]] || { echo "unable to determine pre-Tauri free disk space" >&2; exit 1; }
+          if (( available_kb < minimum_free_kb )); then
+            echo "pre-Tauri free disk space is below the required 10 GiB guard: ${available_kb} KiB available" >&2
+            exit 1
+          fi
 
       - name: Build unsigned AppImage bundle
         env:
@@ -195,6 +230,7 @@ jobs:
           ../../ui/node_modules/.bin/tauri bundle --config tauri.release.generated.conf.json --bundles appimage --ci --no-sign
 
       - name: Dispose generated Tauri release configuration
+        if: always()
         run: rm -f apps/nian-desktop/tauri.release.generated.conf.json
 
       - name: Smoke actual AppImage runtime and desktop startup
@@ -306,16 +342,20 @@ jobs:
       - name: Re-prove release source identity
         shell: pwsh
         run: |
-          git fetch --force --tags origin
-          if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA) { throw "Windows build checkout differs from GITHUB_SHA" }
-          if ((git rev-parse "$env:GITHUB_REF^{commit}").Trim() -ne $env:GITHUB_SHA) { throw "Windows build tag differs from GITHUB_SHA" }
+          . scripts/release/windows-native.ps1
+          Invoke-NianNative { git.exe fetch --force --tags origin }
+          $head = (Invoke-NianNative { git.exe rev-parse HEAD } | Out-String).Trim()
+          $tag = (Invoke-NianNative { git.exe rev-parse "$env:GITHUB_REF^{commit}" } | Out-String).Trim()
+          if ($head -ne $env:GITHUB_SHA) { throw "Windows build checkout differs from GITHUB_SHA" }
+          if ($tag -ne $env:GITHUB_SHA) { throw "Windows build tag differs from GITHUB_SHA" }
 
       - name: Install pinned Rust 1.98.0 MSVC toolchain
         shell: pwsh
         run: |
-          rustup toolchain install 1.98.0-x86_64-pc-windows-msvc --profile minimal
-          rustup override set 1.98.0
-          rustc --version
+          . scripts/release/windows-native.ps1
+          Invoke-NianNative { rustup.exe toolchain install 1.98.0-x86_64-pc-windows-msvc --profile minimal }
+          Invoke-NianNative { rustup.exe override set 1.98.0 }
+          Invoke-NianNative { rustc.exe --version }
 
       - name: Install pinned Node.js 26.7.0
         shell: pwsh
@@ -327,15 +367,23 @@ jobs:
           Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP -Force
           $nodeRoot = Join-Path $env:RUNNER_TEMP 'node-v26.7.0-win-x64'
           Add-Content $env:GITHUB_PATH $nodeRoot
-          & (Join-Path $nodeRoot 'node.exe') --version
+          . scripts/release/windows-native.ps1
+          Invoke-NianNative { & (Join-Path $nodeRoot 'node.exe') --version }
 
       - name: Install pinned pnpm
         shell: pwsh
         run: |
-          npm install --global corepack@0.35.0
-          corepack enable
-          corepack install --global pnpm@11.22.0
-          pnpm --version
+          . scripts/release/windows-native.ps1
+          $corepackRoot = Join-Path $env:RUNNER_TEMP 'nian-corepack-0.35.0'
+          Remove-Item -Recurse -Force $corepackRoot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $corepackRoot | Out-Null
+          Invoke-NianNative { npm.cmd install --global --prefix $corepackRoot corepack@0.35.0 }
+          $corepack = Join-Path $corepackRoot 'corepack.cmd'
+          if (-not (Test-Path $corepack)) { throw "pinned Corepack install did not create corepack.cmd" }
+          Invoke-NianNative { & $corepack enable --install-directory $corepackRoot }
+          Invoke-NianNative { & $corepack install --global pnpm@11.22.0 }
+          Add-Content $env:GITHUB_PATH $corepackRoot
+          Invoke-NianNative { & (Join-Path $corepackRoot 'pnpm.cmd') --version }
 
       - name: Windows runner preflight
         shell: pwsh
@@ -346,54 +394,63 @@ jobs:
         run: scripts/release/test-windows-runtime-classifier.ps1
 
       - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
+        shell: pwsh
+        run: |
+          . scripts/release/windows-native.ps1
+          Invoke-NianNative { pnpm.cmd install --frozen-lockfile }
 
       - name: Release scripts and frontend quality
         shell: pwsh
         run: |
-          pnpm release:test
-          pnpm lint
-          pnpm typecheck
-          pnpm test
-          pnpm build
+          . scripts/release/windows-native.ps1
+          Invoke-NianNative { pnpm.cmd release:test }
+          Invoke-NianNative { pnpm.cmd lint }
+          Invoke-NianNative { pnpm.cmd typecheck }
+          Invoke-NianNative { pnpm.cmd test }
+          Invoke-NianNative { pnpm.cmd build }
 
       - name: Build pinned FFmpeg 8.0.3 Windows MSVC runtime
         shell: pwsh
+        timeout-minutes: 60
         run: scripts/release/build-ffmpeg-windows.ps1
 
       - name: Validate Windows release FFmpeg and Rust runtime
         shell: pwsh
         run: |
+          . scripts/release/windows-native.ps1
           $env:NIAN_FFMPEG_LIB_DIR = Join-Path $pwd 'dist\ffmpeg-windows-x86_64\lib'
           $env:PATH = "$(Join-Path $pwd 'dist\ffmpeg-windows-x86_64\bin');$env:PATH"
-          cargo test -p nian-media-ffmpeg --test media_integration
-          cargo fmt --all --check
-          cargo clippy --all-targets -- -D warnings
-          cargo test --workspace
-          cargo build -p nian-media-worker --target x86_64-pc-windows-msvc --release
+          Invoke-NianNative { cargo.exe test -p nian-media-ffmpeg --test media_integration }
+          Invoke-NianNative { cargo.exe fmt --all --check }
+          Invoke-NianNative { cargo.exe clippy --all-targets -- -D warnings }
+          Invoke-NianNative { cargo.exe test --workspace }
+          Invoke-NianNative { cargo.exe build -p nian-media-worker --target x86_64-pc-windows-msvc --release }
 
       - name: Stage and clean-smoke Windows runtime
         shell: pwsh
         run: scripts/release/stage-windows.ps1
 
       - name: Generate public-only Windows Tauri configuration
+        shell: pwsh
         env:
           NIAN_UPDATER_PUBLIC_KEY: ${{ vars.NIAN_UPDATER_PUBLIC_KEY }}
           NIAN_UPDATER_ENDPOINT: ${{ github.server_url }}/${{ github.repository }}/releases/latest/download/latest.json
-        run: node scripts/release/write-tauri-windows-release-config.mjs
+        run: |
+          . scripts/release/windows-native.ps1
+          Invoke-NianNative { node.exe scripts/release/write-tauri-windows-release-config.mjs }
 
       - name: Build unsigned Windows desktop binary
         shell: pwsh
         env:
           NIAN_UPDATER_CONFIGURED: "1"
         run: |
+          . scripts/release/windows-native.ps1
           $repo = $pwd.Path
           $env:NIAN_FFMPEG_LIB_DIR = Join-Path $repo 'dist\ffmpeg-windows-x86_64\lib'
           $env:PATH = "$(Join-Path $repo 'dist\ffmpeg-windows-x86_64\bin');$env:PATH"
           Push-Location apps/nian-desktop
           try {
-            & ..\..\ui\node_modules\.bin\tauri.CMD build --target x86_64-pc-windows-msvc --config tauri.windows.release.generated.conf.json --no-bundle --ci
-            if ($LASTEXITCODE -ne 0) { throw "Tauri Windows desktop build failed" }
+            Invoke-NianNative { & ..\..\ui\node_modules\.bin\tauri.CMD build --target x86_64-pc-windows-msvc --config tauri.windows.release.generated.conf.json --no-bundle --ci }
           }
           finally { Pop-Location }
 
@@ -402,8 +459,9 @@ jobs:
         run: scripts/release/stage-windows.ps1
 
       - name: Dispose generated Windows Tauri configuration
+        if: always()
         shell: pwsh
-        run: Remove-Item apps/nian-desktop/tauri.windows.release.generated.conf.json -Force
+        run: Remove-Item apps/nian-desktop/tauri.windows.release.generated.conf.json -Force -ErrorAction SilentlyContinue
 
       - name: Upload unsigned Windows build
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -431,9 +489,10 @@ jobs:
       - name: Install pinned Rust 1.98.0 MSVC and Tauri signing toolchain
         shell: pwsh
         run: |
-          rustup toolchain install 1.98.0-x86_64-pc-windows-msvc --profile minimal
-          rustup override set 1.98.0
-          cargo install tauri-cli --version 2.11.4 --locked
+          . scripts/release/windows-native.ps1
+          Invoke-NianNative { rustup.exe toolchain install 1.98.0-x86_64-pc-windows-msvc --profile minimal }
+          Invoke-NianNative { rustup.exe override set 1.98.0 }
+          Invoke-NianNative { cargo.exe install tauri-cli --version 2.11.4 --locked }
 
       - name: Install pinned Node.js
         shell: pwsh
@@ -454,15 +513,21 @@ jobs:
           path: .
 
       - name: Scan staged Windows runtime boundary
+        shell: pwsh
         env:
           NIAN_RELEASE_SECRET_SENTINEL: ${{ secrets.NIAN_RELEASE_SECRET_SENTINEL }}
-        run: node scripts/release/scan-release-secrets.mjs dist/windows-x86_64
+        run: |
+          . scripts/release/windows-native.ps1
+          Invoke-NianNative { node.exe scripts/release/scan-release-secrets.mjs dist/windows-x86_64 }
 
       - name: Generate Windows bundle configuration
+        shell: pwsh
         env:
           NIAN_UPDATER_PUBLIC_KEY: ${{ vars.NIAN_UPDATER_PUBLIC_KEY }}
           NIAN_UPDATER_ENDPOINT: ${{ github.server_url }}/${{ github.repository }}/releases/latest/download/latest.json
-        run: node scripts/release/write-tauri-windows-release-config.mjs
+        run: |
+          . scripts/release/windows-native.ps1
+          Invoke-NianNative { node.exe scripts/release/write-tauri-windows-release-config.mjs }
 
       - name: Authenticode-sign Windows application binaries when configured
         shell: pwsh
@@ -480,16 +545,17 @@ jobs:
       - name: Build NSIS installer from exact signed-or-explicitly-unsigned inputs
         shell: pwsh
         run: |
+          . scripts/release/windows-native.ps1
           Push-Location apps/nian-desktop
           try {
-            cargo tauri bundle --target x86_64-pc-windows-msvc --config tauri.windows.release.generated.conf.json --bundles nsis --ci --no-sign
-            if ($LASTEXITCODE -ne 0) { throw "Tauri Windows NSIS bundle failed" }
+            Invoke-NianNative { cargo.exe tauri bundle --target x86_64-pc-windows-msvc --config tauri.windows.release.generated.conf.json --bundles nsis --ci --no-sign }
           }
           finally { Pop-Location }
 
       - name: Dispose generated Windows Tauri configuration
+        if: always()
         shell: pwsh
-        run: Remove-Item apps/nian-desktop/tauri.windows.release.generated.conf.json -Force
+        run: Remove-Item apps/nian-desktop/tauri.windows.release.generated.conf.json -Force -ErrorAction SilentlyContinue
 
       - name: Authenticode-sign and verify final NSIS installer when configured
         shell: pwsh
@@ -509,18 +575,20 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          . scripts/release/windows-native.ps1
           $installers = @(Get-ChildItem 'target/x86_64-pc-windows-msvc/release/bundle/nsis' -File -Filter '*-setup.exe')
           if ($installers.Count -ne 1) { throw "expected exactly one NSIS installer" }
-          cargo tauri signer sign $installers[0].FullName
+          Invoke-NianNative { cargo.exe tauri signer sign $installers[0].FullName }
 
       - name: Verify Windows updater signature
         shell: pwsh
         env:
           NIAN_UPDATER_PUBLIC_KEY: ${{ vars.NIAN_UPDATER_PUBLIC_KEY }}
         run: |
+          . scripts/release/windows-native.ps1
           $installers = @(Get-ChildItem 'target/x86_64-pc-windows-msvc/release/bundle/nsis' -File -Filter '*-setup.exe')
           $env:NIAN_UPDATER_PUBLIC_KEY = $env:NIAN_UPDATER_PUBLIC_KEY
-          cargo run --quiet -p nian-release-verifier -- $installers[0].FullName "$($installers[0].FullName).sig"
+          Invoke-NianNative { cargo.exe run --quiet -p nian-release-verifier -- $installers[0].FullName "$($installers[0].FullName).sig" }
 
       - name: Smoke actual Windows NSIS install upgrade containment and uninstall
         shell: pwsh
@@ -533,14 +601,18 @@ jobs:
       - name: Finalize Windows platform candidate
         shell: pwsh
         run: |
+          . scripts/release/windows-native.ps1
           $state = Get-Content 'dist/windows-authenticode-state.json' -Raw | ConvertFrom-Json
           $env:NIAN_WINDOWS_AUTHENTICODE_SIGNED = if ($state.authenticode_signed) { 'true' } else { 'false' }
-          node scripts/release/finalize-platform-candidate.mjs windows
+          Invoke-NianNative { node.exe scripts/release/finalize-platform-candidate.mjs windows }
 
       - name: Scan finalized Windows candidate
+        shell: pwsh
         env:
           NIAN_RELEASE_SECRET_SENTINEL: ${{ secrets.NIAN_RELEASE_SECRET_SENTINEL }}
-        run: node scripts/release/scan-release-secrets.mjs dist/candidate-windows
+        run: |
+          . scripts/release/windows-native.ps1
+          Invoke-NianNative { node.exe scripts/release/scan-release-secrets.mjs dist/candidate-windows }
 
       - name: Upload Windows release candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

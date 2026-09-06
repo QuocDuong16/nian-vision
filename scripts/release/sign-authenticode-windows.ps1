@@ -5,6 +5,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot "windows-native.ps1")
 
 function Find-SignTool {
     $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
@@ -43,10 +44,8 @@ try {
     [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64))
     foreach ($raw in $Path) {
         $file = (Resolve-Path $raw).Path
-        & $signTool sign /fd SHA256 /td SHA256 /tr $timestamp /f $pfx /p $env:WINDOWS_SIGNING_PFX_PASSWORD $file
-        if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed for $file" }
-        & $signTool verify /pa /all /v $file
-        if ($LASTEXITCODE -ne 0) { throw "Authenticode verification failed for $file" }
+        Invoke-NianNative { & $signTool sign /fd SHA256 /td SHA256 /tr $timestamp /f $pfx /p $env:WINDOWS_SIGNING_PFX_PASSWORD $file }
+        Invoke-NianNative { & $signTool verify /pa /all /v $file }
     }
     New-Item -ItemType Directory -Force (Split-Path $StateFile -Parent) | Out-Null
     '{"authenticode_signed":true}' | Set-Content -NoNewline $StateFile
