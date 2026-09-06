@@ -20,6 +20,7 @@ nian-platform-windows = { workspace = true }
 nian-settings = { workspace = true }
 nian-storage = { workspace = true }
 keyring = { workspace = true }
+notify-rust = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { workspace = true }

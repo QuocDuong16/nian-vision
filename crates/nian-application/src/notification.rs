@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -18,6 +19,8 @@ use crate::EventHistoryKind;
 pub const NOTIFICATION_QUEUE_CAPACITY: usize = 32;
 pub const MOTION_NOTIFICATION_RATE_LIMIT_SECS: i64 = 15;
 pub const MAX_NOTIFICATION_RATE_LIMIT_ENTRIES: usize = 128;
+pub const NOTIFICATION_DELIVERY_TIMEOUT: Duration = Duration::from_secs(3);
+const NOTIFICATION_DELIVERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedEventSignal {
@@ -61,11 +64,29 @@ pub enum NotificationError {
     WorkerJoin,
     #[error("notification delivery failed")]
     DeliveryFailed,
+    #[error("notification delivery could not be terminated")]
+    DeliveryTerminationFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationDeliveryPoll {
+    Pending,
+    Delivered,
+}
+
+/// One owned native notification delivery. `poll` must be non-blocking and
+/// `terminate` must synchronously settle the owned native operation.
+pub trait DesktopNotificationDelivery: Send {
+    fn poll(&mut self) -> Result<NotificationDeliveryPoll, NotificationError>;
+    fn terminate(&mut self) -> Result<(), NotificationError>;
 }
 
 pub trait DesktopNotifier: Send + Sync {
     fn supported(&self) -> bool;
-    fn show_motion(&self, request: &MotionNotificationRequest) -> Result<(), NotificationError>;
+    fn start_motion(
+        &self,
+        request: &MotionNotificationRequest,
+    ) -> Result<Box<dyn DesktopNotificationDelivery>, NotificationError>;
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -81,6 +102,7 @@ pub struct NotificationCounters {
     pub dropped_rate_limited: AtomicU64,
     pub shown: AtomicU64,
     pub notifier_failures: AtomicU64,
+    pub delivery_timeouts: AtomicU64,
 }
 
 struct AdmissionState {
@@ -119,6 +141,10 @@ impl NotificationAdmission {
 
     pub fn enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire)
+    }
+
+    fn accepting(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
     }
 
     fn attach(&self, sender: SyncSender<PersistedEventSignal>) -> Result<(), NotificationError> {
@@ -177,9 +203,11 @@ pub struct NotificationDispatcher {
     notifier: Arc<dyn DesktopNotifier>,
     admission: Arc<NotificationAdmission>,
     worker: Mutex<Option<DispatcherWorker>>,
+    delivery_start_gate: Arc<Mutex<()>>,
     running: Arc<AtomicBool>,
     counters: Arc<NotificationCounters>,
     last_notified_event_id: Arc<AtomicU64>,
+    delivery_timeout: Duration,
 }
 
 impl std::fmt::Debug for NotificationDispatcher {
@@ -196,6 +224,14 @@ impl NotificationDispatcher {
         notifier: Arc<dyn DesktopNotifier>,
         enabled: bool,
     ) -> Result<Self, NotificationError> {
+        Self::with_delivery_timeout(notifier, enabled, NOTIFICATION_DELIVERY_TIMEOUT)
+    }
+
+    fn with_delivery_timeout(
+        notifier: Arc<dyn DesktopNotifier>,
+        enabled: bool,
+        delivery_timeout: Duration,
+    ) -> Result<Self, NotificationError> {
         let counters = Arc::new(NotificationCounters::default());
         let admission = Arc::new(NotificationAdmission::new(
             enabled && notifier.supported(),
@@ -205,9 +241,11 @@ impl NotificationDispatcher {
             notifier,
             admission,
             worker: Mutex::new(None),
+            delivery_start_gate: Arc::new(Mutex::new(())),
             running: Arc::new(AtomicBool::new(false)),
             counters,
             last_notified_event_id: Arc::new(AtomicU64::new(0)),
+            delivery_timeout,
         };
         dispatcher.resume()?;
         Ok(dispatcher)
@@ -244,8 +282,17 @@ impl NotificationDispatcher {
     }
 
     pub fn suspend(&self) -> Result<(), NotificationError> {
-        self.running.store(false, Ordering::Release);
-        self.admission.detach();
+        {
+            // Linearize admission closure against delivery start. If the worker already
+            // owns this gate, that delivery started before suspension; otherwise no
+            // stale queued signal can cross the closure boundary into native delivery.
+            let _start_guard = self
+                .delivery_start_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.admission.detach();
+            self.running.store(false, Ordering::Release);
+        }
         let worker = self
             .worker
             .lock()
@@ -272,16 +319,21 @@ impl NotificationDispatcher {
         self.running.store(true, Ordering::Release);
         self.admission.attach(sender)?;
         let notifier = self.notifier.clone();
+        let delivery_start_gate = self.delivery_start_gate.clone();
         let running = self.running.clone();
         let admission = self.admission.clone();
         let counters = self.counters.clone();
         let last_notified_event_id = self.last_notified_event_id.clone();
+        let delivery_timeout = self.delivery_timeout;
         let join = thread::Builder::new()
             .name("nian-notifications".to_owned())
             .spawn(move || {
                 let mut limiter = NotificationRateLimiter::default();
                 while let Ok(signal) = receiver.recv() {
-                    if !running.load(Ordering::Acquire) || !admission.enabled() {
+                    if !running.load(Ordering::Acquire)
+                        || !admission.accepting()
+                        || !admission.enabled()
+                    {
                         continue;
                     }
                     if !limiter.allow(&signal.camera_id, signal.received_time_utc) {
@@ -296,14 +348,52 @@ impl NotificationDispatcher {
                         camera_display_name: signal.camera_display_name,
                         received_time_utc: signal.received_time_utc,
                     };
-                    match notifier.show_motion(&request) {
-                        Ok(()) => {
-                            last_notified_event_id.store(request.event_id, Ordering::Release);
-                            counters.shown.fetch_add(1, Ordering::Relaxed);
+                    let mut delivery = {
+                        let _start_guard = delivery_start_gate
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if !running.load(Ordering::Acquire)
+                            || !admission.accepting()
+                            || !admission.enabled()
+                        {
+                            continue;
                         }
-                        Err(_) => {
-                            counters.notifier_failures.fetch_add(1, Ordering::Relaxed);
+                        match notifier.start_motion(&request) {
+                            Ok(delivery) => delivery,
+                            Err(_) => {
+                                counters.notifier_failures.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                         }
+                    };
+                    let deadline = Instant::now() + delivery_timeout;
+                    let delivered = loop {
+                        if !running.load(Ordering::Acquire) || !admission.accepting() {
+                            if delivery.terminate().is_err() {
+                                counters.notifier_failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                            break false;
+                        }
+                        match delivery.poll() {
+                            Ok(NotificationDeliveryPoll::Delivered) => break true,
+                            Ok(NotificationDeliveryPoll::Pending) => {}
+                            Err(_) => {
+                                counters.notifier_failures.fetch_add(1, Ordering::Relaxed);
+                                break false;
+                            }
+                        }
+                        if Instant::now() >= deadline {
+                            counters.delivery_timeouts.fetch_add(1, Ordering::Relaxed);
+                            if delivery.terminate().is_err() {
+                                counters.notifier_failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                            break false;
+                        }
+                        thread::sleep(NOTIFICATION_DELIVERY_POLL_INTERVAL);
+                    };
+                    if delivered {
+                        last_notified_event_id.store(request.event_id, Ordering::Release);
+                        counters.shown.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             })
@@ -356,15 +446,39 @@ impl NotificationRateLimiter {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
     use std::time::Duration;
 
     use super::*;
 
+    struct ImmediateDelivery {
+        fail: bool,
+        finished: bool,
+    }
+
+    impl DesktopNotificationDelivery for ImmediateDelivery {
+        fn poll(&mut self) -> Result<NotificationDeliveryPoll, NotificationError> {
+            if self.finished {
+                return Ok(NotificationDeliveryPoll::Delivered);
+            }
+            self.finished = true;
+            if self.fail {
+                Err(NotificationError::DeliveryFailed)
+            } else {
+                Ok(NotificationDeliveryPoll::Delivered)
+            }
+        }
+
+        fn terminate(&mut self) -> Result<(), NotificationError> {
+            self.finished = true;
+            Ok(())
+        }
+    }
+
     struct FakeNotifier {
         supported: bool,
         fail: AtomicBool,
-        shown: AtomicUsize,
+        started: AtomicUsize,
     }
 
     impl DesktopNotifier for FakeNotifier {
@@ -372,16 +486,106 @@ mod tests {
             self.supported
         }
 
-        fn show_motion(
+        fn start_motion(
             &self,
             _request: &MotionNotificationRequest,
-        ) -> Result<(), NotificationError> {
-            self.shown.fetch_add(1, Ordering::SeqCst);
-            if self.fail.load(Ordering::SeqCst) {
-                Err(NotificationError::DeliveryFailed)
-            } else {
-                Ok(())
+        ) -> Result<Box<dyn DesktopNotificationDelivery>, NotificationError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(ImmediateDelivery {
+                fail: self.fail.load(Ordering::SeqCst),
+                finished: false,
+            }))
+        }
+    }
+
+    #[derive(Default)]
+    struct ControlledNotifierState {
+        started: Mutex<Vec<u64>>,
+        delivered: Mutex<Vec<u64>>,
+        terminations: AtomicUsize,
+    }
+
+    struct ControlledNotifier {
+        block_event_id: AtomicU64,
+        state: Arc<ControlledNotifierState>,
+    }
+
+    impl ControlledNotifier {
+        fn blocking(event_id: u64) -> Self {
+            Self {
+                block_event_id: AtomicU64::new(event_id),
+                state: Arc::new(ControlledNotifierState::default()),
             }
+        }
+
+        fn allow_all(&self) {
+            self.block_event_id.store(0, Ordering::SeqCst);
+        }
+
+        fn started(&self, event_id: u64) -> bool {
+            self.state
+                .started
+                .lock()
+                .is_ok_and(|events| events.contains(&event_id))
+        }
+
+        fn delivered(&self, event_id: u64) -> bool {
+            self.state
+                .delivered
+                .lock()
+                .is_ok_and(|events| events.contains(&event_id))
+        }
+    }
+
+    struct ControlledDelivery {
+        event_id: u64,
+        blocked: bool,
+        settled: bool,
+        state: Arc<ControlledNotifierState>,
+    }
+
+    impl DesktopNotificationDelivery for ControlledDelivery {
+        fn poll(&mut self) -> Result<NotificationDeliveryPoll, NotificationError> {
+            if self.settled {
+                return Ok(NotificationDeliveryPoll::Delivered);
+            }
+            if self.blocked {
+                return Ok(NotificationDeliveryPoll::Pending);
+            }
+            self.settled = true;
+            if let Ok(mut delivered) = self.state.delivered.lock() {
+                delivered.push(self.event_id);
+            }
+            Ok(NotificationDeliveryPoll::Delivered)
+        }
+
+        fn terminate(&mut self) -> Result<(), NotificationError> {
+            if !self.settled {
+                self.settled = true;
+                self.state.terminations.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    impl DesktopNotifier for ControlledNotifier {
+        fn supported(&self) -> bool {
+            true
+        }
+
+        fn start_motion(
+            &self,
+            request: &MotionNotificationRequest,
+        ) -> Result<Box<dyn DesktopNotificationDelivery>, NotificationError> {
+            if let Ok(mut started) = self.state.started.lock() {
+                started.push(request.event_id);
+            }
+            Ok(Box::new(ControlledDelivery {
+                event_id: request.event_id,
+                blocked: self.block_event_id.load(Ordering::SeqCst) == request.event_id,
+                settled: false,
+                state: self.state.clone(),
+            }))
         }
     }
 
@@ -401,12 +605,35 @@ mod tests {
     }
 
     fn wait_until(predicate: impl Fn() -> bool) {
-        for _ in 0..100 {
+        for _ in 0..200 {
             if predicate() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+        assert!(
+            predicate(),
+            "condition did not become true within the test bound"
+        );
+    }
+
+    fn assert_lifecycle_call_finishes(
+        dispatcher: Arc<NotificationDispatcher>,
+        operation: impl FnOnce(&NotificationDispatcher) -> Result<(), NotificationError>
+        + Send
+        + 'static,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = operation(&dispatcher);
+            let _ = tx.send(result);
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500))
+                .expect("lifecycle call exceeded its deterministic test bound")
+                .is_ok()
+        );
+        worker.join().unwrap();
     }
 
     #[test]
@@ -414,7 +641,7 @@ mod tests {
         let notifier = Arc::new(FakeNotifier {
             supported: true,
             fail: AtomicBool::new(false),
-            shown: AtomicUsize::new(0),
+            started: AtomicUsize::new(0),
         });
         let dispatcher = NotificationDispatcher::new(notifier.clone(), true).unwrap();
         let sink = dispatcher.sink();
@@ -423,7 +650,7 @@ mod tests {
         sink.try_publish(signal("cam-a", 3, 105, EventHistoryKind::MotionStarted));
         sink.try_publish(signal("cam-b", 4, 105, EventHistoryKind::MotionStarted));
         wait_until(|| dispatcher.counters().shown.load(Ordering::SeqCst) == 2);
-        assert_eq!(notifier.shown.load(Ordering::SeqCst), 2);
+        assert_eq!(notifier.started.load(Ordering::SeqCst), 2);
         assert_eq!(
             dispatcher
                 .counters()
@@ -435,11 +662,11 @@ mod tests {
     }
 
     #[test]
-    fn notifier_failure_does_not_stop_dispatch_and_suspend_drops_stale_admission() {
+    fn notifier_failure_does_not_stop_dispatch() {
         let notifier = Arc::new(FakeNotifier {
             supported: true,
             fail: AtomicBool::new(true),
-            shown: AtomicUsize::new(0),
+            started: AtomicUsize::new(0),
         });
         let dispatcher = NotificationDispatcher::new(notifier.clone(), true).unwrap();
         let sink = dispatcher.sink();
@@ -454,13 +681,129 @@ mod tests {
         notifier.fail.store(false, Ordering::SeqCst);
         sink.try_publish(signal("cam-b", 2, 100, EventHistoryKind::MotionStarted));
         wait_until(|| dispatcher.counters().shown.load(Ordering::SeqCst) == 1);
+        dispatcher.shutdown().unwrap();
+    }
+
+    #[test]
+    fn blocking_delivery_cannot_hang_suspend() {
+        let notifier = Arc::new(ControlledNotifier::blocking(1));
+        let dispatcher = Arc::new(
+            NotificationDispatcher::with_delivery_timeout(
+                notifier.clone(),
+                true,
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        dispatcher
+            .sink()
+            .try_publish(signal("cam-a", 1, 100, EventHistoryKind::MotionStarted));
+        wait_until(|| notifier.started(1));
+
+        assert_lifecycle_call_finishes(dispatcher, |dispatcher| dispatcher.suspend());
+        assert_eq!(notifier.state.terminations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn blocking_delivery_cannot_hang_shutdown() {
+        let notifier = Arc::new(ControlledNotifier::blocking(1));
+        let dispatcher = Arc::new(
+            NotificationDispatcher::with_delivery_timeout(
+                notifier.clone(),
+                true,
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        dispatcher
+            .sink()
+            .try_publish(signal("cam-a", 1, 100, EventHistoryKind::MotionStarted));
+        wait_until(|| notifier.started(1));
+
+        assert_lifecycle_call_finishes(dispatcher, |dispatcher| dispatcher.shutdown());
+        assert_eq!(notifier.state.terminations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn resume_does_not_replay_old_queued_generation() {
+        let notifier = Arc::new(ControlledNotifier::blocking(1));
+        let dispatcher = NotificationDispatcher::with_delivery_timeout(
+            notifier.clone(),
+            true,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let sink = dispatcher.sink();
+        sink.try_publish(signal("cam-a", 1, 100, EventHistoryKind::MotionStarted));
+        wait_until(|| notifier.started(1));
+        sink.try_publish(signal("cam-b", 2, 100, EventHistoryKind::MotionStarted));
+
         dispatcher.suspend().unwrap();
-        sink.try_publish(signal("cam-c", 3, 100, EventHistoryKind::MotionStarted));
-        std::thread::sleep(Duration::from_millis(10));
-        assert_eq!(notifier.shown.load(Ordering::SeqCst), 2);
+        notifier.allow_all();
         dispatcher.resume().unwrap();
-        sink.try_publish(signal("cam-c", 4, 200, EventHistoryKind::MotionStarted));
-        wait_until(|| dispatcher.counters().shown.load(Ordering::SeqCst) == 2);
+        sink.try_publish(signal("cam-c", 3, 200, EventHistoryKind::MotionStarted));
+        wait_until(|| notifier.delivered(3));
+        assert!(!notifier.started(2));
+        dispatcher.shutdown().unwrap();
+    }
+
+    #[test]
+    fn blocked_delivery_keeps_event_ingestion_non_blocking_and_queue_bounded() {
+        let notifier = Arc::new(ControlledNotifier::blocking(1));
+        let dispatcher = NotificationDispatcher::with_delivery_timeout(
+            notifier.clone(),
+            true,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let sink = dispatcher.sink();
+        sink.try_publish(signal("cam-a", 1, 100, EventHistoryKind::MotionStarted));
+        wait_until(|| notifier.started(1));
+
+        let started = Instant::now();
+        for event_id in 2..=(NOTIFICATION_QUEUE_CAPACITY as u64 + 20) {
+            sink.try_publish(signal(
+                &format!("cam-{event_id}"),
+                event_id,
+                200 + event_id as i64,
+                EventHistoryKind::MotionStarted,
+            ));
+        }
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(
+            dispatcher
+                .counters()
+                .dropped_queue_full
+                .load(Ordering::SeqCst)
+                > 0
+        );
+        dispatcher.shutdown().unwrap();
+    }
+
+    #[test]
+    fn delivery_timeout_is_isolated_and_worker_delivers_future_events() {
+        let notifier = Arc::new(ControlledNotifier::blocking(1));
+        let dispatcher = NotificationDispatcher::with_delivery_timeout(
+            notifier.clone(),
+            true,
+            Duration::from_millis(30),
+        )
+        .unwrap();
+        let sink = dispatcher.sink();
+        sink.try_publish(signal("cam-a", 1, 100, EventHistoryKind::MotionStarted));
+        wait_until(|| {
+            dispatcher
+                .counters()
+                .delivery_timeouts
+                .load(Ordering::SeqCst)
+                == 1
+        });
+        assert_eq!(notifier.state.terminations.load(Ordering::SeqCst), 1);
+
+        notifier.allow_all();
+        sink.try_publish(signal("cam-b", 2, 200, EventHistoryKind::MotionStarted));
+        wait_until(|| notifier.delivered(2));
+        assert_eq!(dispatcher.counters().shown.load(Ordering::SeqCst), 1);
         dispatcher.shutdown().unwrap();
     }
 
@@ -484,7 +827,7 @@ mod tests {
         let notifier = Arc::new(FakeNotifier {
             supported: false,
             fail: AtomicBool::new(false),
-            shown: AtomicUsize::new(0),
+            started: AtomicUsize::new(0),
         });
         let dispatcher = NotificationDispatcher::new(notifier, true).unwrap();
         assert!(!dispatcher.settings().motion_notifications_enabled);

@@ -2653,6 +2653,7 @@ dependencies = [
  "nian-platform-windows",
  "nian-settings",
  "nian-storage",
+ "notify-rust",
  "serde",
  "serde_json",
  "tauri",

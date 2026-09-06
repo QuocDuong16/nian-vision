@@ -59,26 +59,30 @@ A duplicate insert returns no new `event_id`, so it cannot generate a second not
 - only `MotionStarted` is eligible by default;
 - rate limit: one notification per camera per 15 seconds;
 - rate-limiter state: at most 128 camera entries, evicting the oldest entry when necessary;
-- notifier failures are isolated from Event monitoring;
+- notifier failures and delivery timeouts are isolated from Event monitoring;
+- rate-limit admission happens before native delivery, so a failed/timed-out delivery still consumes the 15-second slot and cannot create a retry storm;
+- native delivery has a fixed 3-second ownership deadline;
 - no network I/O and no cloud notification service.
 
 Native notification content is deliberately minimal: title `Motion detected`, body equal to the camera display name. It contains no IP address, ONVIF URL, credential, source token, or recording path.
 
 ### Notification activation capability
 
-Tauri `tauri-plugin-notification` 2.4.0 provides desktop notification display on the current Windows/Linux targets, but its desktop Rust abstraction exposes `show()` and does not expose a notification-click/action callback. M14 therefore does not invent a fake deep-link mechanism. Event IDs remain safely resolvable through `event_get`; stale IDs return a non-fatal unavailable result. A future platform abstraction with a real activation callback can call the same Event Review selection path without changing Event history authority.
+Tauri `tauri-plugin-notification` 2.4.0 provides desktop notification display on the current Windows/Linux targets, but its desktop Rust abstraction does not expose notification-click/action ownership and schedules the underlying `notify-rust` display work without a cancellable/reapable delivery handle. That cannot satisfy bounded Suspend/Quit/Update ownership. M14 therefore runs the same local `notify-rust` display boundary in a short-lived helper invocation of the desktop executable. The dispatcher owns the child process, polls it non-blockingly, and on lifecycle stop or the 3-second deadline terminates and reaps it before its worker can join. No detached delivery thread/process is retained. The helper receives only the camera display name and app identifier; it performs no Event/ONVIF/storage work.
+
+The desktop API still has no notification-click callback, so M14 does not invent a fake deep-link mechanism. Event IDs remain safely resolvable through `event_get`; stale IDs return a non-fatal unavailable result. A future platform abstraction with a real activation callback can call the same Event Review selection path without changing Event history authority.
 
 ### Lifecycle
 
 - Hide: Event monitoring and the notification dispatcher continue. Event Review unmount has no backend ownership effect.
-- Suspend: notification admission closes and the bounded worker joins before Event monitoring is settled. Queued signals are not carried into Resume.
-- Resume: a fresh bounded dispatcher queue starts before Event monitoring is restored. Historical Events are not replayed.
-- Quit / Update install: notification admission closes and dispatcher ownership is joined as part of coordinated teardown.
+- Suspend: notification admission closes first; any current helper delivery is terminated/reaped, queued signals are dropped, and the bounded worker joins before Event monitoring is settled. Queued signals are not carried into Resume.
+- Resume: a fresh bounded dispatcher queue/worker generation starts before Event monitoring is restored. Historical Events are not replayed.
+- Quit / Update install: notification admission closes and any current helper delivery is terminated/reaped before dispatcher ownership is joined and final exit/update handoff proceeds.
 - Storage-root change: Event workers are settled by the existing M13 settings transaction before the Event index is swapped. Subsequent review queries use the committed index.
 
 ### Frontend concurrency
 
-Event Review uses generation ownership for filter reloads, pagination and selected-event recording lookups. A stale page cannot append after filters change, and a stale playback lookup cannot replace a newer selection. Polling is single-flight with a finite 10-second interval; the persisted Event index remains the source of truth.
+Every Event Review root query creates a new dataset generation and freezes its exact camera IDs, kind and `from_utc`/`to_utc` bounds. Filter/range changes, manual Refresh and the finite 10-second poll are all root reloads. Pagination captures that immutable dataset generation, frozen query and cursor; a stale response cannot append rows, replace `nextCursor`, surface an error, or clear loading state owned by a newer dataset. Root reload execution remains single-flight and coalesces to only the newest queued root dataset. Polling deliberately resets a multi-page view to the newest first page rather than mixing database snapshots. Selected-event recording lookups retain their independent generation ownership.
 
 ## Security and privacy
 

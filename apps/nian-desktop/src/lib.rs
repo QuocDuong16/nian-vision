@@ -6,9 +6,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::io::{Read, Write};
 use std::path::PathBuf;
-#[cfg(windows)]
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
@@ -16,16 +16,17 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use nian_application::{
     ApplicationSettingsDto, CameraDraft, CameraService, CameraServiceError, CameraSummary,
     CredentialStore, CredentialStoreError, DesktopLifecycle, DesktopLifecycleError,
-    DesktopLifecycleState, DesktopNotifier, EventController, EventError, EventHistoryDto,
-    EventHistoryKind, EventMutation, EventPlaybackOpenDto, EventRecordingContextDto,
-    EventReviewRowDto, EventStatusDto, LiveError, LiveOpenDto, LiveStatus, LiveTeardownBatch,
-    LiveViewController, MotionNotificationRequest, NotificationDispatcher, NotificationError,
-    NotificationSettingsDto, OnvifConnectionDto, OnvifController, OnvifControllerError,
-    OnvifDiscoveryDto, OnvifPreparedProfileDto, PlaybackController, PlaybackError, PlaybackOpenDto,
-    ProbeController, ProbeError, ProbeResult, PtzCapabilitiesDto, PtzController, PtzDirection,
-    PtzError, PtzMovementDto, PtzMutation, PtzTeardownBatch, RecordingController,
-    RecordingControllerError, RecordingDto, RecordingState, RecordingStatus,
-    SupervisorRecordingRunnerFactory, WorkerProbeRunner,
+    DesktopLifecycleState, DesktopNotificationDelivery, DesktopNotifier, EventController,
+    EventError, EventHistoryDto, EventHistoryKind, EventMutation, EventPlaybackOpenDto,
+    EventRecordingContextDto, EventReviewRowDto, EventStatusDto, LiveError, LiveOpenDto,
+    LiveStatus, LiveTeardownBatch, LiveViewController, MotionNotificationRequest,
+    NotificationDeliveryPoll, NotificationDispatcher, NotificationError, NotificationSettingsDto,
+    OnvifConnectionDto, OnvifController, OnvifControllerError, OnvifDiscoveryDto,
+    OnvifPreparedProfileDto, PlaybackController, PlaybackError, PlaybackOpenDto, ProbeController,
+    ProbeError, ProbeResult, PtzCapabilitiesDto, PtzController, PtzDirection, PtzError,
+    PtzMovementDto, PtzMutation, PtzTeardownBatch, RecordingController, RecordingControllerError,
+    RecordingDto, RecordingState, RecordingStatus, SupervisorRecordingRunnerFactory,
+    WorkerProbeRunner,
 };
 use nian_domain::{
     AudioPolicy, CameraId, CredentialRef, Credentials, RetentionPolicy, StorageQuota,
@@ -39,12 +40,13 @@ use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
-use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
 use tracing_subscriber::EnvFilter;
 
 const CREDENTIAL_SERVICE: &str = "Nian Vision";
 const STARTUP_HIDDEN_ARG: &str = "--startup-hidden";
+const NOTIFICATION_HELPER_ARG: &str = "--nian-notification-helper";
+const MAX_NOTIFICATION_HELPER_INPUT_BYTES: u64 = 4_096;
 static PENDING_MANUAL_ACTIVATION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -244,23 +246,170 @@ struct NativeDesktopNotifier {
     app: AppHandle,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct NativeNotificationHelperInput {
+    camera_display_name: String,
+    app_identifier: String,
+}
+
+#[derive(Debug)]
+struct NativeNotificationDelivery {
+    child: Option<Child>,
+}
+
+impl NativeNotificationDelivery {
+    fn terminate_owned_child(&mut self) -> Result<(), NotificationError> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => {
+                let _ = child.kill();
+                child
+                    .wait()
+                    .map(|_| ())
+                    .map_err(|_| NotificationError::DeliveryTerminationFailed)
+            }
+            Err(_) => {
+                let _ = child.kill();
+                child
+                    .wait()
+                    .map(|_| ())
+                    .map_err(|_| NotificationError::DeliveryTerminationFailed)
+            }
+        }
+    }
+}
+
+impl DesktopNotificationDelivery for NativeNotificationDelivery {
+    fn poll(&mut self) -> Result<NotificationDeliveryPoll, NotificationError> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(NotificationDeliveryPoll::Delivered);
+        };
+        match child.try_wait() {
+            Ok(None) => Ok(NotificationDeliveryPoll::Pending),
+            Ok(Some(status)) => {
+                self.child.take();
+                if status.success() {
+                    Ok(NotificationDeliveryPoll::Delivered)
+                } else {
+                    Err(NotificationError::DeliveryFailed)
+                }
+            }
+            Err(_) => {
+                let _ = self.terminate_owned_child();
+                Err(NotificationError::DeliveryFailed)
+            }
+        }
+    }
+
+    fn terminate(&mut self) -> Result<(), NotificationError> {
+        self.terminate_owned_child()
+    }
+}
+
+impl Drop for NativeNotificationDelivery {
+    fn drop(&mut self) {
+        let _ = self.terminate_owned_child();
+    }
+}
+
 impl DesktopNotifier for NativeDesktopNotifier {
     fn supported(&self) -> bool {
         cfg!(any(windows, target_os = "linux"))
     }
 
-    fn show_motion(&self, request: &MotionNotificationRequest) -> Result<(), NotificationError> {
+    fn start_motion(
+        &self,
+        request: &MotionNotificationRequest,
+    ) -> Result<Box<dyn DesktopNotificationDelivery>, NotificationError> {
         if !self.supported() {
             return Err(NotificationError::Unsupported);
         }
-        self.app
-            .notification()
-            .builder()
-            .title("Motion detected")
-            .body(request.camera_display_name.clone())
-            .show()
-            .map_err(|_| NotificationError::DeliveryFailed)
+        let executable = std::env::current_exe().map_err(|_| NotificationError::DeliveryFailed)?;
+        let payload = serde_json::to_vec(&NativeNotificationHelperInput {
+            camera_display_name: request.camera_display_name.clone(),
+            app_identifier: self.app.config().identifier.clone(),
+        })
+        .map_err(|_| NotificationError::DeliveryFailed)?;
+        let mut child = Command::new(executable)
+            .arg(NOTIFICATION_HELPER_ARG)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| NotificationError::DeliveryFailed)?;
+        let write_result = child
+            .stdin
+            .take()
+            .ok_or(NotificationError::DeliveryFailed)
+            .and_then(|mut stdin| {
+                stdin
+                    .write_all(&payload)
+                    .map_err(|_| NotificationError::DeliveryFailed)
+            });
+        if let Err(error) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok(Box::new(NativeNotificationDelivery { child: Some(child) }))
     }
+}
+
+fn run_native_notification_helper() -> Result<(), NotificationError> {
+    if !cfg!(any(windows, target_os = "linux")) {
+        return Err(NotificationError::Unsupported);
+    }
+    let stdin = std::io::stdin();
+    let mut bounded = stdin.lock().take(MAX_NOTIFICATION_HELPER_INPUT_BYTES + 1);
+    let mut payload = Vec::new();
+    bounded
+        .read_to_end(&mut payload)
+        .map_err(|_| NotificationError::DeliveryFailed)?;
+    if payload.len() as u64 > MAX_NOTIFICATION_HELPER_INPUT_BYTES {
+        return Err(NotificationError::DeliveryFailed);
+    }
+    let input: NativeNotificationHelperInput =
+        serde_json::from_slice(&payload).map_err(|_| NotificationError::DeliveryFailed)?;
+    let mut notification = notify_rust::Notification::new();
+    notification
+        .summary("Motion detected")
+        .body(&input.camera_display_name)
+        .auto_icon();
+    #[cfg(windows)]
+    {
+        if let Ok(executable) = std::env::current_exe()
+            && let Some(directory) = executable.parent()
+        {
+            let separator = std::path::MAIN_SEPARATOR;
+            let directory = directory.display().to_string();
+            let debug_suffix = format!("{separator}target{separator}debug");
+            let release_suffix = format!("{separator}target{separator}release");
+            if !(directory.ends_with(&debug_suffix) || directory.ends_with(&release_suffix)) {
+                notification.app_id(&input.app_identifier);
+            }
+        }
+    }
+    notification
+        .show()
+        .map(|_| ())
+        .map_err(|_| NotificationError::DeliveryFailed)
+}
+
+/// Returns a process exit code when this invocation is the owned notification helper.
+pub fn notification_helper_exit_code() -> Option<i32> {
+    let helper = std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == std::ffi::OsStr::new(NOTIFICATION_HELPER_ARG));
+    helper.then(|| {
+        if run_native_notification_helper().is_ok() {
+            0
+        } else {
+            1
+        }
+    })
 }
 
 #[derive(Debug, Default)]
@@ -3644,22 +3793,54 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[derive(Debug)]
     struct TestDesktopNotifier;
+
+    #[derive(Debug)]
+    struct TestNotificationDelivery;
+
+    impl DesktopNotificationDelivery for TestNotificationDelivery {
+        fn poll(&mut self) -> Result<NotificationDeliveryPoll, NotificationError> {
+            Ok(NotificationDeliveryPoll::Delivered)
+        }
+
+        fn terminate(&mut self) -> Result<(), NotificationError> {
+            Ok(())
+        }
+    }
 
     impl DesktopNotifier for TestDesktopNotifier {
         fn supported(&self) -> bool {
             true
         }
 
-        fn show_motion(
+        fn start_motion(
             &self,
             _request: &MotionNotificationRequest,
-        ) -> Result<(), NotificationError> {
-            Ok(())
+        ) -> Result<Box<dyn DesktopNotificationDelivery>, NotificationError> {
+            Ok(Box::new(TestNotificationDelivery))
         }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn native_notification_delivery_termination_reaps_owned_helper_process() {
+        #[cfg(unix)]
+        let child = Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap();
+        #[cfg(windows)]
+        let child = Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 > NUL"])
+            .spawn()
+            .unwrap();
+        let mut delivery = NativeNotificationDelivery { child: Some(child) };
+        let started = Instant::now();
+
+        delivery.terminate().unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(delivery.child.is_none());
     }
 
     #[derive(Debug)]

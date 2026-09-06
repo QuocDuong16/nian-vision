@@ -46,9 +46,10 @@ pub use live_controller::{
     MAX_SIMULTANEOUS_LIVE_VIEWS, PreparedLive, WorkerLiveRunnerFactory,
 };
 pub use notification::{
-    DesktopNotifier, MAX_NOTIFICATION_RATE_LIMIT_ENTRIES, MOTION_NOTIFICATION_RATE_LIMIT_SECS,
-    MotionNotificationRequest, NOTIFICATION_QUEUE_CAPACITY, NoopPersistedEventSink,
-    NotificationAdmission, NotificationCounters, NotificationDispatcher, NotificationError,
+    DesktopNotificationDelivery, DesktopNotifier, MAX_NOTIFICATION_RATE_LIMIT_ENTRIES,
+    MOTION_NOTIFICATION_RATE_LIMIT_SECS, MotionNotificationRequest, NOTIFICATION_DELIVERY_TIMEOUT,
+    NOTIFICATION_QUEUE_CAPACITY, NoopPersistedEventSink, NotificationAdmission,
+    NotificationCounters, NotificationDeliveryPoll, NotificationDispatcher, NotificationError,
     NotificationSettingsDto, PersistedEventSignal, PersistedEventSink,
 };
 pub use onvif_controller::{

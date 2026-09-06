@@ -14,15 +14,14 @@ import {
 type RangePreset = "hour" | "day" | "week" | "custom";
 type EventKindFilter = "all" | EventHistoryKind;
 
-type EventQueryRequest = {
+type EventDatasetSnapshot = {
   generation: number;
-  input: {
+  query: {
     camera_ids: string[];
     kind: EventHistoryKind | null;
     from_utc: string;
     to_utc: string;
     limit: number;
-    cursor: string | null;
   };
 };
 
@@ -85,11 +84,12 @@ export function EventReviewScreen() {
   const [error, setError] = useState<string | null>(null);
   const [selectionMessage, setSelectionMessage] = useState<string | null>(null);
 
-  const queryGenerationRef = useRef(0);
+  const datasetGenerationRef = useRef(0);
+  const currentDatasetRef = useRef<EventDatasetSnapshot | null>(null);
   const selectionGenerationRef = useRef(0);
   const reloadInFlightRef = useRef(false);
-  const queuedReloadRef = useRef<EventQueryRequest | null>(null);
-  const paginationInFlightRef = useRef(false);
+  const queuedReloadRef = useRef<EventDatasetSnapshot | null>(null);
+  const paginationInFlightRef = useRef<number | null>(null);
   const playbackSessionRef = useRef<string | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
@@ -105,41 +105,41 @@ export function EventReviewScreen() {
     }
   }, []);
 
-  const buildQueryRequest = useCallback((generation: number, cursor: string | null = null): EventQueryRequest | null => {
+  const buildDatasetSnapshot = useCallback((generation: number): EventDatasetSnapshot | null => {
     const bounds = queryBounds(rangePreset, customFrom, customTo);
     if (!bounds) return null;
     return {
       generation,
-      input: {
+      query: {
         camera_ids: cameraId === "all" ? [] : [cameraId],
         kind: eventKind === "all" ? null : eventKind,
         from_utc: bounds.fromUtc,
         to_utc: bounds.toUtc,
         limit: PAGE_SIZE,
-        cursor,
       },
     };
   }, [cameraId, customFrom, customTo, eventKind, rangePreset]);
 
-  const executeReload = useCallback(async (request: EventQueryRequest) => {
-    queuedReloadRef.current = request;
+  const executeReload = useCallback(async () => {
     if (reloadInFlightRef.current || !isTauri()) return;
     reloadInFlightRef.current = true;
     try {
       while (queuedReloadRef.current) {
         const current = queuedReloadRef.current;
         queuedReloadRef.current = null;
-        if (current.generation === queryGenerationRef.current) {
+        if (current.generation === datasetGenerationRef.current) {
           setLoading(true);
           setError(null);
         }
         try {
-          const page = await invokeDesktop<EventReviewPage>("event_query", { input: current.input });
-          if (current.generation !== queryGenerationRef.current) continue;
+          const page = await invokeDesktop<EventReviewPage>("event_query", {
+            input: { ...current.query, cursor: null },
+          });
+          if (current.generation !== datasetGenerationRef.current) continue;
           setRows(page.rows);
           setNextCursor(page.next_cursor);
         } catch (cause) {
-          if (current.generation !== queryGenerationRef.current) continue;
+          if (current.generation !== datasetGenerationRef.current) continue;
           setRows([]);
           setNextCursor(null);
           setError(desktopError(cause).message);
@@ -151,16 +151,25 @@ export function EventReviewScreen() {
     }
   }, []);
 
-  const queueReload = useCallback((generation = queryGenerationRef.current) => {
-    const request = buildQueryRequest(generation);
-    if (!request) {
+  const queueRootReload = useCallback(() => {
+    const generation = ++datasetGenerationRef.current;
+    const dataset = buildDatasetSnapshot(generation);
+    setLoadingMore(false);
+    if (!dataset) {
+      currentDatasetRef.current = null;
+      queuedReloadRef.current = null;
+      setLoading(false);
       setError("Choose a valid custom time range.");
       setRows([]);
       setNextCursor(null);
       return;
     }
-    void executeReload(request);
-  }, [buildQueryRequest, executeReload]);
+    currentDatasetRef.current = dataset;
+    queuedReloadRef.current = dataset;
+    setLoading(true);
+    setError(null);
+    void executeReload();
+  }, [buildDatasetSnapshot, executeReload]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -178,23 +187,25 @@ export function EventReviewScreen() {
   }, []);
 
   useEffect(() => {
-    const generation = ++queryGenerationRef.current;
     selectionGenerationRef.current += 1;
     setSelected(null);
     setRecordingContext(null);
     setSelectionMessage(null);
     void closePlayback();
-    queueReload(generation);
-  }, [cameraId, closePlayback, customFrom, customTo, eventKind, queueReload, rangePreset]);
+    queueRootReload();
+  }, [cameraId, closePlayback, customFrom, customTo, eventKind, queueRootReload, rangePreset]);
 
   useEffect(() => {
     if (!isTauri()) return;
-    const timer = setInterval(() => queueReload(), REFRESH_INTERVAL_MS);
+    // Polling intentionally creates a new root dataset and resets pagination.
+    // Mixing a refreshed page 1 with an older cursor snapshot is never allowed.
+    const timer = setInterval(() => queueRootReload(), REFRESH_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [queueReload]);
+  }, [queueRootReload]);
 
   useEffect(() => () => {
-    queryGenerationRef.current += 1;
+    datasetGenerationRef.current += 1;
+    currentDatasetRef.current = null;
     selectionGenerationRef.current += 1;
     const sessionId = playbackSessionRef.current;
     if (sessionId && isTauri()) {
@@ -230,28 +241,31 @@ export function EventReviewScreen() {
   }, [playback?.playback.session_id]);
 
   const loadMore = useCallback(async () => {
-    if (!isTauri() || !nextCursor || loading || loadingMore || paginationInFlightRef.current) return;
-    const generation = queryGenerationRef.current;
-    const request = buildQueryRequest(generation, nextCursor);
-    if (!request) return;
-    paginationInFlightRef.current = true;
+    if (!isTauri() || !nextCursor || loading || loadingMore || paginationInFlightRef.current !== null) return;
+    const dataset = currentDatasetRef.current;
+    if (!dataset || dataset.generation !== datasetGenerationRef.current) return;
+    const generation = dataset.generation;
+    const cursor = nextCursor;
+    paginationInFlightRef.current = generation;
     setLoadingMore(true);
     setError(null);
     try {
-      const page = await invokeDesktop<EventReviewPage>("event_query", { input: request.input });
-      if (generation !== queryGenerationRef.current) return;
+      const page = await invokeDesktop<EventReviewPage>("event_query", {
+        input: { ...dataset.query, cursor },
+      });
+      if (generation !== datasetGenerationRef.current) return;
       setRows((current) => {
         const known = new Set(current.map((row) => row.event_id));
         return [...current, ...page.rows.filter((row) => !known.has(row.event_id))];
       });
       setNextCursor(page.next_cursor);
     } catch (cause) {
-      if (generation === queryGenerationRef.current) setError(desktopError(cause).message);
+      if (generation === datasetGenerationRef.current) setError(desktopError(cause).message);
     } finally {
-      paginationInFlightRef.current = false;
-      if (generation === queryGenerationRef.current) setLoadingMore(false);
+      if (paginationInFlightRef.current === generation) paginationInFlightRef.current = null;
+      if (generation === datasetGenerationRef.current) setLoadingMore(false);
     }
-  }, [buildQueryRequest, loading, loadingMore, nextCursor]);
+  }, [loading, loadingMore, nextCursor]);
 
   const selectEvent = useCallback(async (event: EventReviewRow) => {
     const generation = ++selectionGenerationRef.current;
@@ -331,7 +345,7 @@ export function EventReviewScreen() {
           <h2>Event Review</h2>
           <p className="muted">Persisted motion history. Reviewing an event never starts recording.</p>
         </div>
-        <button type="button" disabled={loading} onClick={() => queueReload()}>
+        <button type="button" disabled={loading} onClick={queueRootReload}>
           {loading ? "Refreshing…" : "Refresh"}
         </button>
       </div>

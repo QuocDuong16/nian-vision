@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventReviewScreen } from "./EventReviewScreen";
@@ -45,6 +45,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.restoreAllMocks();
   Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
 });
@@ -88,6 +89,144 @@ describe("EventReviewScreen", () => {
         && (args as { input?: { kind?: string | null } })?.input?.kind === "motion_ended",
       )).toBe(true);
     });
+  });
+
+  it("periodic root refresh invalidates an older in-flight pagination response", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T12:00:00Z"));
+    const oldPage = deferred<EventReviewPage>();
+    let rootQueryCount = 0;
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "camera_list") return [];
+      if (command === "event_query") {
+        const input = (args as { input: { cursor: string | null } }).input;
+        if (input.cursor === "cursor-old") return oldPage.promise;
+        if (input.cursor === "cursor-new") return { rows: [], next_cursor: null } satisfies EventReviewPage;
+        rootQueryCount += 1;
+        return rootQueryCount === 1
+          ? { rows: [eventA], next_cursor: "cursor-old" } satisfies EventReviewPage
+          : { rows: [eventB], next_cursor: "cursor-new" } satisfies EventReviewPage;
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<EventReviewScreen />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByRole("button", { name: /Front Door.*Motion detected/ })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(screen.getByRole("button", { name: /Back Door.*Motion detected/ })).toBeTruthy();
+
+    const staleRow = { ...eventA, event_id: 30, camera_display_name: "Stale Poll Page" };
+    oldPage.resolve({ rows: [staleRow], next_cursor: "cursor-stale" });
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.queryByText("Stale Poll Page")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(vi.mocked(invoke).mock.calls.some(([command, args]) =>
+      command === "event_query"
+      && (args as { input?: { cursor?: string | null } })?.input?.cursor === "cursor-new",
+    )).toBe(true);
+  });
+
+  it("manual root refresh invalidates an older in-flight pagination response", async () => {
+    const oldPage = deferred<EventReviewPage>();
+    let rootQueryCount = 0;
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "camera_list") return [];
+      if (command === "event_query") {
+        const input = (args as { input: { cursor: string | null } }).input;
+        if (input.cursor === "cursor-old") return oldPage.promise;
+        if (input.cursor === "cursor-new") return { rows: [], next_cursor: null } satisfies EventReviewPage;
+        rootQueryCount += 1;
+        return rootQueryCount === 1
+          ? { rows: [eventA], next_cursor: "cursor-old" } satisfies EventReviewPage
+          : { rows: [eventB], next_cursor: "cursor-new" } satisfies EventReviewPage;
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<EventReviewScreen />);
+    await screen.findByRole("button", { name: /Front Door.*Motion detected/ });
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(await screen.findByRole("button", { name: /Back Door.*Motion detected/ })).toBeTruthy();
+
+    const staleRow = { ...eventA, event_id: 31, camera_display_name: "Stale Manual Page" };
+    oldPage.resolve({ rows: [staleRow], next_cursor: "cursor-stale" });
+    await act(async () => { await Promise.resolve(); });
+    await waitFor(() => expect(screen.queryByText("Stale Manual Page")).toBeNull());
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    await waitFor(() => expect(vi.mocked(invoke).mock.calls.some(([command, args]) =>
+      command === "event_query"
+      && (args as { input?: { cursor?: string | null } })?.input?.cursor === "cursor-new",
+    )).toBe(true));
+  });
+
+  it("freezes relative query bounds for every page in one dataset generation", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T12:00:00Z"));
+    const queries: Array<{ cursor: string | null; from_utc: string; to_utc: string }> = [];
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "camera_list") return [];
+      if (command === "event_query") {
+        const input = (args as { input: { cursor: string | null; from_utc: string; to_utc: string } }).input;
+        queries.push({ cursor: input.cursor, from_utc: input.from_utc, to_utc: input.to_utc });
+        return input.cursor
+          ? { rows: [], next_cursor: null } satisfies EventReviewPage
+          : { rows: [eventA], next_cursor: "cursor-a" } satisfies EventReviewPage;
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<EventReviewScreen />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(queries).toHaveLength(1);
+    const root = queries[0]!;
+
+    vi.setSystemTime(new Date("2026-09-05T13:00:00Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(queries).toHaveLength(2);
+    expect(queries[1]).toEqual({
+      cursor: "cursor-a",
+      from_utc: root.from_utc,
+      to_utc: root.to_utc,
+    });
+  });
+
+  it("keeps root reloads single-flight and coalesces to the newest queued dataset", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T12:00:00Z"));
+    const firstRoot = deferred<EventReviewPage>();
+    const roots: Array<{ to_utc: string; cursor: string | null }> = [];
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "camera_list") return [];
+      if (command === "event_query") {
+        const input = (args as { input: { cursor: string | null; to_utc: string } }).input;
+        roots.push({ cursor: input.cursor, to_utc: input.to_utc });
+        if (roots.length === 1) return firstRoot.promise;
+        return { rows: [eventB], next_cursor: null } satisfies EventReviewPage;
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<EventReviewScreen />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(roots).toHaveLength(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    expect(roots).toHaveLength(1);
+    firstRoot.resolve({ rows: [eventA], next_cursor: null });
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+
+    expect(roots).toHaveLength(2);
+    expect(roots[1]!.to_utc).toBe("2026-09-05T12:00:20.000Z");
+    expect(screen.getByRole("button", { name: /Back Door.*Motion detected/ })).toBeTruthy();
   });
 
   it("ignores stale selected-event recording lookup completion", async () => {
