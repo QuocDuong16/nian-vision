@@ -123,6 +123,30 @@ test("Linux container build explicitly executes run steps with Bash", () => {
   assert.equal(jobBody("build-windows").includes("defaults:\n      run:\n        shell: bash"), false);
 });
 
+test("Linux container trusts only the exact checkout before repository Git operations", () => {
+  const linux = jobBody("build-linux");
+  const checkoutMarker = "      - name: Check out exact release source\n";
+  const trustMarker = "      - name: Trust checked-out workspace ownership\n";
+  const identityMarker = "      - name: Re-prove release source identity\n";
+  const checkout = linux.indexOf(checkoutMarker);
+  const trust = linux.indexOf(trustMarker);
+  const identity = linux.indexOf(identityMarker);
+
+  assert.ok(checkout >= 0, "missing Linux checkout step");
+  assert.ok(trust > checkout, "workspace trust must follow checkout");
+  assert.ok(identity > trust, "workspace trust must precede source identity proof");
+  assert.match(
+    stepBody("build-linux", "Trust checked-out workspace ownership"),
+    /git config --global --add safe\.directory "\$GITHUB_WORKSPACE"/,
+  );
+  assert.equal(/safe\.directory\s+(?:"\*"|'\*'|\*)/.test(workflow), false);
+  assert.equal(jobBody("build-windows").includes("safe.directory"), false);
+
+  const firstDirectRepositoryGit = linux.search(/^\s+git (?:fetch|status|rev-parse|show|merge-base)\b/m);
+  assert.ok(firstDirectRepositoryGit > trust, "workspace trust must precede direct repository Git commands");
+  assert.ok(linux.indexOf("version-check.mjs") > trust, "workspace trust must precede release scripts that inspect Git state");
+});
+
 test("Linux and Windows build jobs are peers and both signed candidates gate verification", () => {
   assert.match(jobBody("build-linux"), /needs: release-preflight/);
   assert.match(jobBody("build-windows"), /needs: release-preflight/);

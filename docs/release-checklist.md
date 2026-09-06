@@ -2,11 +2,11 @@
 
 Record the exact tag, commit SHA, OS image/VM and result for every run. A checkbox is evidence only when the step was actually executed. Do not reuse a tag after changing source.
 
-Current retry candidate: `1.0.0-rc.2` / `v1.0.0-rc.2`. RC1 failed because the Linux container release job used `/bin/sh` for Bash-only commands; the `v1.0.0-rc.1` tag remains immutable, and RC2 carries the release-infrastructure shell fix.
+Current retry candidate: `1.0.0-rc.3` / `v1.0.0-rc.3`. RC1 failed because the Linux container used `/bin/sh` for Bash-only commands. RC2 fixed Bash but failed when Git rejected the mounted checkout ownership. Both prior tags remain immutable; RC3 adds exact `$GITHUB_WORKSPACE` safe-directory trust.
 
 ## Pre-tag authority
 
-- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.2`.
+- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.3`.
 - [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
@@ -16,7 +16,7 @@ Current retry candidate: `1.0.0-rc.2` / `v1.0.0-rc.2`. RC1 failed because the Li
 
 ## GitHub RC workflow
 
-- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.2`. Never move, delete or reuse `v1.0.0-rc.1`; source/tag cross-pairing is forbidden.
+- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.3`. Never move, delete or reuse `v1.0.0-rc.1` or `v1.0.0-rc.2`; source/tag cross-pairing is forbidden.
 - [ ] GitHub tag resolves to exactly the same commit as Forgejo.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.

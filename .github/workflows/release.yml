@@ -86,6 +86,11 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.sha }}
 
+      - name: Trust checked-out workspace ownership
+        run: |
+          set -Eeuo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Re-prove release source identity
         run: |
           set -Eeuo pipefail
