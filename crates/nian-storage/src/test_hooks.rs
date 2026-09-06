@@ -34,6 +34,8 @@ struct SqliteQuarantineInterruption {
 static SQLITE_QUARANTINE_INTERRUPTION: Mutex<Option<SqliteQuarantineInterruption>> =
     Mutex::new(None);
 
+static SQLITE_QUARANTINE_PARTIAL_PUBLICATION: Mutex<Option<PathBuf>> = Mutex::new(None);
+
 /// Arms a one-shot interruption after exactly `moves` successful SQLite-family
 /// member moves for `main`.
 pub fn arm_sqlite_quarantine_interruption(main: &Path, moves: usize) -> SqliteQuarantineGuard {
@@ -65,11 +67,37 @@ pub(crate) fn sqlite_quarantine_interrupt_after_move(main: &Path) -> bool {
     true
 }
 
+/// Arms a one-shot hard-link publication seam for one SQLite-family member.
+/// The quarantine path will publish the target as the same filesystem object
+/// but deliberately leave the canonical source link in place before returning
+/// an injected interruption. This models the real hard-link fallback state
+/// where target publication succeeds and source unlink fails.
+pub fn arm_sqlite_quarantine_partial_publication(source: &Path) -> SqliteQuarantineGuard {
+    *SQLITE_QUARANTINE_PARTIAL_PUBLICATION
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(source.to_path_buf());
+    SqliteQuarantineGuard
+}
+
+pub(crate) fn sqlite_quarantine_take_partial_publication(source: &Path) -> bool {
+    let mut armed = SQLITE_QUARANTINE_PARTIAL_PUBLICATION
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if armed.as_deref() != Some(source) {
+        return false;
+    }
+    *armed = None;
+    true
+}
+
 pub struct SqliteQuarantineGuard;
 
 impl Drop for SqliteQuarantineGuard {
     fn drop(&mut self) {
         *SQLITE_QUARANTINE_INTERRUPTION
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        *SQLITE_QUARANTINE_PARTIAL_PUBLICATION
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
     }

@@ -1436,6 +1436,74 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pending_recording_family_upgrades_and_converges() {
+        let temp = tempfile::tempdir().unwrap();
+        let index_path = temp.path().join("recordings.sqlite3");
+        let wal = sqlite_sidecar_path(&index_path, "-wal").unwrap();
+        let shm = sqlite_sidecar_path(&index_path, "-shm").unwrap();
+        let marker = quarantine_pending_marker(&index_path).unwrap();
+
+        std::fs::write(&index_path, b"legacy-main").unwrap();
+        std::fs::write(&wal, b"legacy-wal").unwrap();
+        std::fs::write(&shm, b"legacy-shm").unwrap();
+        std::fs::write(&marker, b"pending\n").unwrap();
+
+        prepare_index_family(&index_path).unwrap();
+
+        assert!(!index_path.exists());
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+        assert!(!marker.exists());
+        assert_eq!(
+            std::fs::read(corrupt_target_path(&index_path, 1).unwrap()).unwrap(),
+            b"legacy-main"
+        );
+        assert_eq!(
+            std::fs::read(corrupt_target_path(&wal, 1).unwrap()).unwrap(),
+            b"legacy-wal"
+        );
+        assert_eq!(
+            std::fs::read(corrupt_target_path(&shm, 1).unwrap()).unwrap(),
+            b"legacy-shm"
+        );
+    }
+
+    #[test]
+    fn healthy_recording_index_prepare_prunes_excess_numeric_generations() {
+        let temp = tempfile::tempdir().unwrap();
+        let index_path = temp.path().join("recordings.sqlite3");
+        drop(RecordingIndex::open(&index_path).unwrap());
+        let wal = sqlite_sidecar_path(&index_path, "-wal").unwrap();
+        let shm = sqlite_sidecar_path(&index_path, "-shm").unwrap();
+        let sources = [index_path.clone(), wal, shm];
+
+        for serial in 1..=6 {
+            let source = if serial % 2 == 0 {
+                &sources[1]
+            } else {
+                &sources[2]
+            };
+            std::fs::write(corrupt_target_path(source, serial).unwrap(), b"old").unwrap();
+        }
+
+        prepare_index_family(&index_path).unwrap();
+        drop(RecordingIndex::open(&index_path).unwrap());
+
+        let mut serials = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                corrupt_serial_from_name(&name.to_string_lossy(), &sources)
+            })
+            .collect::<Vec<_>>();
+        serials.sort_unstable();
+        serials.dedup();
+        assert_eq!(serials.len(), MAX_RECORDING_INDEX_CORRUPT_BACKUPS);
+        assert_eq!(serials, vec![3, 4, 5, 6]);
+    }
+
+    #[test]
     fn repeated_recording_index_quarantine_keeps_only_a_bounded_backup_set() {
         let temp = tempfile::tempdir().unwrap();
         let index_path = temp.path().join("recordings.sqlite3");
