@@ -1,12 +1,14 @@
 import { useEffect, useState } from "react";
 import { desktopError, invokeDesktop, isTauri } from "../lib/tauri";
-import type { AppInfo, ApplicationSettings, DesktopError, UpdateCheck } from "../lib/tauri";
+import type { AppInfo, ApplicationSettings, DesktopError, NotificationSettings, UpdateCheck } from "../lib/tauri";
 
 export function SettingsScreen() {
   const [settings, setSettings] = useState<ApplicationSettings | null>(null);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [update, setUpdate] = useState<UpdateCheck | null>(null);
+  const [notificationSettings, setNotificationSettings] = useState<NotificationSettings | null>(null);
   const [saving, setSaving] = useState(false);
+  const [notificationSaving, setNotificationSaving] = useState(false);
   const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [error, setError] = useState<DesktopError | null>(null);
@@ -16,6 +18,7 @@ export function SettingsScreen() {
     void Promise.all([
       invokeDesktop<ApplicationSettings>("settings_get").then(setSettings),
       invokeDesktop<AppInfo>("app_info").then(setAppInfo),
+      invokeDesktop<NotificationSettings>("notification_settings_get").then(setNotificationSettings),
     ]).catch((cause) => setError(desktopError(cause)));
   }, []);
 
@@ -32,6 +35,22 @@ export function SettingsScreen() {
       setError(desktopError(cause));
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function setMotionNotifications(enabled: boolean) {
+    if (!notificationSettings || notificationSaving || !isTauri()) return;
+    setNotificationSaving(true);
+    setError(null);
+    try {
+      const updated = await invokeDesktop<NotificationSettings>("notification_settings_update", {
+        motionNotificationsEnabled: enabled,
+      });
+      setNotificationSettings(updated);
+    } catch (cause) {
+      setError(desktopError(cause));
+    } finally {
+      setNotificationSaving(false);
     }
   }
 
@@ -87,6 +106,24 @@ export function SettingsScreen() {
           <span>Launch at login</span>
         </label>
         <p className="muted">Login launch starts hidden in the system tray. Manual launch opens the main window.</p>
+      </div>
+      <div className="panel form-grid">
+        <h3>Notifications</h3>
+        <label className="checkbox-row">
+          <input
+            aria-label="Desktop motion notifications"
+            type="checkbox"
+            checked={notificationSettings?.motion_notifications_enabled ?? false}
+            disabled={!notificationSettings || !notificationSettings.supported || notificationSaving}
+            onChange={(event) => void setMotionNotifications(event.target.checked)}
+          />
+          <span>Desktop motion notifications</span>
+        </label>
+        {notificationSettings && !notificationSettings.supported ? (
+          <p className="muted">Unavailable on this system.</p>
+        ) : (
+          <p className="muted">Off by default. Only newly persisted MotionStarted events are eligible.</p>
+        )}
       </div>
       <div className="panel">
         <h3>Updates</h3>

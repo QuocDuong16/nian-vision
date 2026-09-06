@@ -16,6 +16,7 @@ pub mod desktop_lifecycle;
 pub mod error;
 pub mod event_controller;
 pub mod live_controller;
+pub mod notification;
 pub mod onvif_controller;
 pub mod playback;
 pub mod probe_controller;
@@ -36,13 +37,19 @@ pub use desktop_lifecycle::{DesktopLifecycle, DesktopLifecycleError, DesktopLife
 pub use error::ApplicationError;
 pub use event_controller::{
     EventBackend, EventController, EventError, EventHistoryDto, EventHistoryKind, EventMutation,
-    EventRuntimeState, EventSettingsRepository, EventStatusDto, EventTeardownBatch, EventWarning,
-    MAX_ACTIVE_EVENT_SESSIONS,
+    EventReviewPageDto, EventReviewRowDto, EventRuntimeState, EventSettingsRepository,
+    EventStatusDto, EventTeardownBatch, EventWarning, MAX_ACTIVE_EVENT_SESSIONS,
 };
 pub use live_controller::{
     LiveError, LiveFailureCategory, LiveOpenDto, LiveRunner, LiveRunnerFactory, LiveState,
     LiveStatus, LiveTeardownBatch, LiveViewController, LiveWorkerStatus,
     MAX_SIMULTANEOUS_LIVE_VIEWS, PreparedLive, WorkerLiveRunnerFactory,
+};
+pub use notification::{
+    DesktopNotifier, MAX_NOTIFICATION_RATE_LIMIT_ENTRIES, MOTION_NOTIFICATION_RATE_LIMIT_SECS,
+    MotionNotificationRequest, NOTIFICATION_QUEUE_CAPACITY, NoopPersistedEventSink,
+    NotificationAdmission, NotificationCounters, NotificationDispatcher, NotificationError,
+    NotificationSettingsDto, PersistedEventSignal, PersistedEventSink,
 };
 pub use onvif_controller::{
     OnvifConnectionDto, OnvifController, OnvifControllerError, OnvifDiscoveredDeviceDto,
@@ -50,8 +57,9 @@ pub use onvif_controller::{
     PreparedPtzPairing,
 };
 pub use playback::{
-    AdjacentRecordingsDto, PlaybackBackend, PlaybackController, PlaybackError, PlaybackErrorCode,
-    PlaybackInspectDto, PlaybackOpenDto, PreparedPlaybackStorage, RecordingDto,
+    AdjacentRecordingsDto, EVENT_PLAYBACK_PREROLL_MS, EventPlaybackOpenDto,
+    EventRecordingContextDto, PlaybackBackend, PlaybackController, PlaybackError,
+    PlaybackErrorCode, PlaybackInspectDto, PlaybackOpenDto, PreparedPlaybackStorage, RecordingDto,
     TimelineRecordingKind, WorkerPlaybackBackend,
 };
 pub use probe_controller::{

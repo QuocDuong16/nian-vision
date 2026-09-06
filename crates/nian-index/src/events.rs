@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
 use nian_domain::CameraId;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 
 use crate::{BUSY_TIMEOUT, IndexError, enable_and_verify_wal, verify_foreign_keys};
 
@@ -12,6 +12,9 @@ pub const DEFAULT_EVENT_RETENTION_DAYS: u32 = 30;
 pub const MAX_EVENT_ROWS: u64 = 250_000;
 pub const EVENT_CLEANUP_BATCH: u32 = 500;
 pub const MAX_RECENT_EVENTS: u32 = 100;
+pub const MAX_EVENT_QUERY_ROWS: u32 = 200;
+pub const MAX_EVENT_QUERY_RANGE_DAYS: i64 = 31;
+pub const MAX_EVENT_QUERY_CAMERAS: usize = 128;
 const MAX_SOURCE_KEY_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +58,63 @@ pub struct EventRecord {
     pub source_key: Option<String>,
     pub device_time_utc: Option<DateTime<Utc>>,
     pub received_time_utc: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventCursor {
+    pub received_time_utc: DateTime<Utc>,
+    pub event_id: u64,
+}
+
+impl EventCursor {
+    pub fn encode(self) -> String {
+        format!(
+            "{}:{}",
+            self.received_time_utc.timestamp_millis(),
+            self.event_id
+        )
+    }
+
+    pub fn decode(value: &str) -> Result<Self, IndexError> {
+        if value.is_empty() || value.len() > 64 || !value.is_ascii() {
+            return Err(IndexError::InvalidData("invalid event cursor".to_owned()));
+        }
+        let Some((received, event_id)) = value.split_once(':') else {
+            return Err(IndexError::InvalidData("invalid event cursor".to_owned()));
+        };
+        if received.is_empty() || event_id.is_empty() || event_id.contains(':') {
+            return Err(IndexError::InvalidData("invalid event cursor".to_owned()));
+        }
+        let received_ms = received
+            .parse::<i64>()
+            .map_err(|_| IndexError::InvalidData("invalid event cursor".to_owned()))?;
+        let event_id = event_id
+            .parse::<u64>()
+            .map_err(|_| IndexError::InvalidData("invalid event cursor".to_owned()))?;
+        if event_id == 0 {
+            return Err(IndexError::InvalidData("invalid event cursor".to_owned()));
+        }
+        Ok(Self {
+            received_time_utc: parse_timestamp(received_ms)?,
+            event_id,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventQuery {
+    pub camera_ids: Vec<CameraId>,
+    pub kind: Option<EventKind>,
+    pub from_utc: DateTime<Utc>,
+    pub to_utc: DateTime<Utc>,
+    pub limit: u32,
+    pub cursor: Option<EventCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventPage {
+    pub rows: Vec<EventRecord>,
+    pub next_cursor: Option<EventCursor>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -267,6 +327,109 @@ impl EventIndex {
         raws.into_iter().map(raw_to_event).collect()
     }
 
+    pub fn get(&self, event_id: u64) -> Result<Option<EventRecord>, IndexError> {
+        let event_id = i64::try_from(event_id)
+            .map_err(|_| IndexError::InvalidData("invalid event id".to_owned()))?;
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT event_id, camera_id, kind, source_key, device_time_utc_ms, received_time_utc_ms \
+                 FROM events WHERE event_id=?1",
+                [event_id],
+                |row| {
+                    Ok(RawEventRecord {
+                        event_id: row.get(0)?,
+                        camera_id: row.get(1)?,
+                        kind: row.get(2)?,
+                        source_key: row.get(3)?,
+                        device_time_utc_ms: row.get(4)?,
+                        received_time_utc_ms: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        raw.map(raw_to_event).transpose()
+    }
+
+    /// Bounded keyset pagination for Event Review. Ordering is authoritative
+    /// and deterministic even when multiple rows share the same receive time.
+    pub fn query(&self, query: &EventQuery) -> Result<EventPage, IndexError> {
+        validate_query(query)?;
+
+        let mut sql = String::from(
+            "SELECT event_id, camera_id, kind, source_key, device_time_utc_ms, received_time_utc_ms \
+             FROM events WHERE received_time_utc_ms >= ? AND received_time_utc_ms <= ?",
+        );
+        let mut values = vec![
+            Value::Integer(query.from_utc.timestamp_millis()),
+            Value::Integer(query.to_utc.timestamp_millis()),
+        ];
+
+        if !query.camera_ids.is_empty() {
+            sql.push_str(" AND camera_id IN (");
+            for (index, camera_id) in query.camera_ids.iter().enumerate() {
+                if index != 0 {
+                    sql.push(',');
+                }
+                sql.push('?');
+                values.push(Value::Text(camera_id.as_str().to_owned()));
+            }
+            sql.push(')');
+        }
+
+        if let Some(kind) = query.kind {
+            sql.push_str(" AND kind = ?");
+            values.push(Value::Text(kind.as_str().to_owned()));
+        }
+
+        if let Some(cursor) = query.cursor {
+            let cursor_ms = cursor.received_time_utc.timestamp_millis();
+            let cursor_id = i64::try_from(cursor.event_id)
+                .map_err(|_| IndexError::InvalidData("invalid event cursor".to_owned()))?;
+            sql.push_str(
+                " AND (received_time_utc_ms < ? OR \
+                 (received_time_utc_ms = ? AND event_id < ?))",
+            );
+            values.push(Value::Integer(cursor_ms));
+            values.push(Value::Integer(cursor_ms));
+            values.push(Value::Integer(cursor_id));
+        }
+
+        sql.push_str(" ORDER BY received_time_utc_ms DESC, event_id DESC LIMIT ?");
+        values.push(Value::Integer(i64::from(query.limit) + 1));
+
+        let mut statement = self.connection.prepare(&sql)?;
+        let raws = statement
+            .query_map(params_from_iter(values.iter()), |row| {
+                Ok(RawEventRecord {
+                    event_id: row.get(0)?,
+                    camera_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    source_key: row.get(3)?,
+                    device_time_utc_ms: row.get(4)?,
+                    received_time_utc_ms: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut rows = raws
+            .into_iter()
+            .map(raw_to_event)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = rows.len() > query.limit as usize;
+        if has_more {
+            rows.truncate(query.limit as usize);
+        }
+        let next_cursor = if has_more {
+            rows.last().map(|last| EventCursor {
+                received_time_utc: last.received_time_utc,
+                event_id: last.event_id,
+            })
+        } else {
+            None
+        };
+        Ok(EventPage { rows, next_cursor })
+    }
+
     pub fn count(&self) -> Result<u64, IndexError> {
         let value: i64 = self
             .connection
@@ -319,6 +482,31 @@ impl EventIndex {
                 .map_err(|_| IndexError::InvalidData("cleanup count overflow".to_owned()))?,
         })
     }
+}
+
+fn validate_query(query: &EventQuery) -> Result<(), IndexError> {
+    if query.from_utc > query.to_utc {
+        return Err(IndexError::InvalidData(
+            "event query start must not be after end".to_owned(),
+        ));
+    }
+    let range = query.to_utc.signed_duration_since(query.from_utc);
+    if range > Duration::days(MAX_EVENT_QUERY_RANGE_DAYS) {
+        return Err(IndexError::InvalidData(format!(
+            "event query range exceeds {MAX_EVENT_QUERY_RANGE_DAYS} days"
+        )));
+    }
+    if query.limit == 0 || query.limit > MAX_EVENT_QUERY_ROWS {
+        return Err(IndexError::InvalidData(format!(
+            "event query limit must be between 1 and {MAX_EVENT_QUERY_ROWS}"
+        )));
+    }
+    if query.camera_ids.len() > MAX_EVENT_QUERY_CAMERAS {
+        return Err(IndexError::InvalidData(format!(
+            "event query camera count exceeds {MAX_EVENT_QUERY_CAMERAS}"
+        )));
+    }
+    Ok(())
 }
 
 fn quarantine_corrupt_sqlite_family(path: &Path) -> Result<PathBuf, IndexError> {
@@ -479,6 +667,237 @@ mod tests {
         let first = index.cleanup(now, Some(1)).unwrap();
         assert_eq!(first.age_deleted, EVENT_CLEANUP_BATCH);
         assert_eq!(index.count().unwrap(), 100);
+    }
+
+    #[test]
+    fn bounded_query_filters_orders_and_paginates_without_duplicates() {
+        let temp = tempdir().unwrap();
+        let mut index = EventIndex::open(temp.path().join("event-index.sqlite3")).unwrap();
+        let front = CameraId::parse("front-door").unwrap();
+        let back = CameraId::parse("back-door").unwrap();
+
+        for (camera, active, second) in [
+            ("front-door", true, 10_i64),
+            ("back-door", true, 11),
+            ("front-door", false, 12),
+            ("front-door", true, 12),
+            ("back-door", false, 13),
+        ] {
+            let mut row = event(camera, active, second);
+            row.fingerprint = None;
+            index.insert(&row).unwrap();
+        }
+
+        let all = index
+            .query(&EventQuery {
+                camera_ids: Vec::new(),
+                kind: None,
+                from_utc: DateTime::from_timestamp(11, 0).unwrap(),
+                to_utc: DateTime::from_timestamp(14, 0).unwrap(),
+                limit: 20,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(all.rows.len(), 5);
+        assert!(all.next_cursor.is_none());
+        assert_eq!(all.rows[0].camera_id, back);
+        assert_eq!(all.rows[0].received_time_utc.timestamp(), 14);
+        assert_eq!(all.rows[1].received_time_utc.timestamp(), 13);
+        assert_eq!(all.rows[2].received_time_utc.timestamp(), 13);
+        assert!(all.rows[1].event_id > all.rows[2].event_id);
+
+        let front_only = index
+            .query(&EventQuery {
+                camera_ids: vec![front.clone()],
+                kind: None,
+                from_utc: DateTime::from_timestamp(11, 0).unwrap(),
+                to_utc: DateTime::from_timestamp(14, 0).unwrap(),
+                limit: 20,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(front_only.rows.len(), 3);
+        assert!(front_only.rows.iter().all(|row| row.camera_id == front));
+
+        let started_only = index
+            .query(&EventQuery {
+                camera_ids: Vec::new(),
+                kind: Some(EventKind::MotionStarted),
+                from_utc: DateTime::from_timestamp(11, 0).unwrap(),
+                to_utc: DateTime::from_timestamp(14, 0).unwrap(),
+                limit: 20,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(started_only.rows.len(), 3);
+        assert!(
+            started_only
+                .rows
+                .iter()
+                .all(|row| row.kind == EventKind::MotionStarted)
+        );
+
+        let range = index
+            .query(&EventQuery {
+                camera_ids: Vec::new(),
+                kind: None,
+                from_utc: DateTime::from_timestamp(12, 0).unwrap(),
+                to_utc: DateTime::from_timestamp(13, 0).unwrap(),
+                limit: 20,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(range.rows.len(), 3);
+
+        let first = index
+            .query(&EventQuery {
+                camera_ids: Vec::new(),
+                kind: None,
+                from_utc: DateTime::from_timestamp(11, 0).unwrap(),
+                to_utc: DateTime::from_timestamp(14, 0).unwrap(),
+                limit: 2,
+                cursor: None,
+            })
+            .unwrap();
+        let second = index
+            .query(&EventQuery {
+                camera_ids: Vec::new(),
+                kind: None,
+                from_utc: DateTime::from_timestamp(11, 0).unwrap(),
+                to_utc: DateTime::from_timestamp(14, 0).unwrap(),
+                limit: 2,
+                cursor: first.next_cursor,
+            })
+            .unwrap();
+        let third = index
+            .query(&EventQuery {
+                camera_ids: Vec::new(),
+                kind: None,
+                from_utc: DateTime::from_timestamp(11, 0).unwrap(),
+                to_utc: DateTime::from_timestamp(14, 0).unwrap(),
+                limit: 2,
+                cursor: second.next_cursor,
+            })
+            .unwrap();
+        let paged_ids: Vec<_> = first
+            .rows
+            .iter()
+            .chain(&second.rows)
+            .chain(&third.rows)
+            .map(|row| row.event_id)
+            .collect();
+        let all_ids: Vec<_> = all.rows.iter().map(|row| row.event_id).collect();
+        assert_eq!(paged_ids, all_ids);
+        assert!(third.next_cursor.is_none());
+    }
+
+    #[test]
+    fn query_validation_cursor_and_empty_results_are_strict() {
+        let temp = tempdir().unwrap();
+        let index = EventIndex::open(temp.path().join("event-index.sqlite3")).unwrap();
+        let start = DateTime::from_timestamp(100, 0).unwrap();
+        let end = DateTime::from_timestamp(200, 0).unwrap();
+
+        let empty = index
+            .query(&EventQuery {
+                camera_ids: Vec::new(),
+                kind: None,
+                from_utc: start,
+                to_utc: end,
+                limit: 10,
+                cursor: None,
+            })
+            .unwrap();
+        assert!(empty.rows.is_empty());
+        assert!(empty.next_cursor.is_none());
+
+        assert!(
+            index
+                .query(&EventQuery {
+                    camera_ids: Vec::new(),
+                    kind: None,
+                    from_utc: end,
+                    to_utc: start,
+                    limit: 10,
+                    cursor: None,
+                })
+                .is_err()
+        );
+        assert!(
+            index
+                .query(&EventQuery {
+                    camera_ids: Vec::new(),
+                    kind: None,
+                    from_utc: start,
+                    to_utc: start + Duration::days(MAX_EVENT_QUERY_RANGE_DAYS + 1),
+                    limit: 10,
+                    cursor: None,
+                })
+                .is_err()
+        );
+        for limit in [0, MAX_EVENT_QUERY_ROWS + 1] {
+            assert!(
+                index
+                    .query(&EventQuery {
+                        camera_ids: Vec::new(),
+                        kind: None,
+                        from_utc: start,
+                        to_utc: end,
+                        limit,
+                        cursor: None,
+                    })
+                    .is_err()
+            );
+        }
+        let camera = CameraId::parse("front-door").unwrap();
+        assert!(
+            index
+                .query(&EventQuery {
+                    camera_ids: vec![camera; MAX_EVENT_QUERY_CAMERAS + 1],
+                    kind: None,
+                    from_utc: start,
+                    to_utc: end,
+                    limit: 10,
+                    cursor: None,
+                })
+                .is_err()
+        );
+
+        for malformed in ["", "abc", "1:", ":1", "1:0", "1:2:3", "nope:2"] {
+            assert!(EventCursor::decode(malformed).is_err(), "{malformed}");
+        }
+        let cursor = EventCursor {
+            received_time_utc: end,
+            event_id: 42,
+        };
+        assert_eq!(EventCursor::decode(&cursor.encode()).unwrap(), cursor);
+    }
+
+    #[test]
+    fn retention_cleaned_rows_are_unavailable_to_get_and_query() {
+        let temp = tempdir().unwrap();
+        let mut index = EventIndex::open(temp.path().join("event-index.sqlite3")).unwrap();
+        let mut row = event("front-door", true, 10);
+        row.fingerprint = None;
+        let event_id = index.insert(&row).unwrap().unwrap();
+        assert!(index.get(event_id).unwrap().is_some());
+
+        let now = DateTime::from_timestamp(3 * 86_400, 0).unwrap();
+        let report = index.cleanup(now, Some(1)).unwrap();
+        assert_eq!(report.age_deleted, 1);
+        assert!(index.get(event_id).unwrap().is_none());
+        let page = index
+            .query(&EventQuery {
+                camera_ids: vec![CameraId::parse("front-door").unwrap()],
+                kind: None,
+                from_utc: DateTime::from_timestamp(0, 0).unwrap(),
+                to_utc: now,
+                limit: 10,
+                cursor: None,
+            })
+            .unwrap();
+        assert!(page.rows.is_empty());
+        assert!(page.next_cursor.is_none());
     }
 
     #[test]

@@ -312,6 +312,45 @@ impl RecordingIndex {
         collect_rows(rows)
     }
 
+    /// Finds a finalized recording whose known media interval contains the
+    /// supplied local wall-clock timestamp. Unknown durations are deliberately
+    /// not guessed: returning no match is safer than opening unrelated footage.
+    pub fn find_recording_at(
+        &self,
+        camera: &CameraId,
+        timestamp: NaiveDateTime,
+    ) -> Result<Option<IndexedRecording>, IndexError> {
+        let raw = self
+            .connection
+            .query_row(
+                &format!(
+                    "{SELECT_SQL} WHERE camera_id=?1 AND state='complete' AND media_duration_ms IS NOT NULL AND started_at<=?2 \
+                     ORDER BY started_at DESC, sequence DESC, relative_path DESC LIMIT 1"
+                ),
+                params![camera.as_str(), encode_time(timestamp)],
+                raw_row,
+            )
+            .optional()?;
+        let Some(recording) = raw.map(IndexedRecording::try_from).transpose()? else {
+            return Ok(None);
+        };
+        let Some(duration_ms) = recording.media_duration_ms else {
+            return Ok(None);
+        };
+        let duration_ms = i64::try_from(duration_ms).map_err(|_| {
+            IndexError::InvalidData("media duration exceeds chrono range".to_owned())
+        })?;
+        let Some(end) = recording
+            .started_at
+            .checked_add_signed(chrono::Duration::milliseconds(duration_ms))
+        else {
+            return Err(IndexError::InvalidData(
+                "recording end timestamp overflow".to_owned(),
+            ));
+        };
+        Ok((timestamp < end).then_some(recording))
+    }
+
     pub fn available_days(&self, camera: &CameraId) -> Result<Vec<NaiveDate>, IndexError> {
         let mut statement = self.connection.prepare(
             "SELECT DISTINCT substr(started_at, 1, 10)
@@ -860,6 +899,97 @@ mod tests {
         );
         assert!(queried[0].media_duration_ms.is_none());
         assert_eq!(queried[1].kind, RecordingKind::Recovered);
+    }
+
+    #[test]
+    fn recording_lookup_at_timestamp_is_camera_local_and_interval_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut index = RecordingIndex::open(temp.path().join("index.sqlite3")).unwrap();
+        let cam_a = CameraId::parse("cam-a").unwrap();
+        let cam_b = CameraId::parse("cam-b").unwrap();
+
+        let first = sample_at(
+            "cam-a/2026/08/29/10-00-00.mkv",
+            RecordingKind::Normal,
+            "2026-08-29T10:00:00",
+            1,
+            Some(60_000),
+        );
+        let second = sample_at(
+            "cam-a/2026/08/29/10-02-00.mkv",
+            RecordingKind::Normal,
+            "2026-08-29T10:02:00",
+            1,
+            Some(60_000),
+        );
+        let unknown = sample_at(
+            "cam-a/2026/08/29/10-04-00.mkv",
+            RecordingKind::Normal,
+            "2026-08-29T10:04:00",
+            1,
+            None,
+        );
+        let mut other_camera = sample_at(
+            "cam-b/2026/08/29/10-00-00.mkv",
+            RecordingKind::Normal,
+            "2026-08-29T10:00:00",
+            1,
+            Some(180_000),
+        );
+        other_camera.camera_id = cam_b.clone();
+        for row in [&first, &second, &unknown, &other_camera] {
+            index.upsert(row).unwrap();
+        }
+
+        let at = |value: &str| NaiveDateTime::parse_from_str(value, TIME_FORMAT).unwrap();
+        assert!(
+            index
+                .find_recording_at(&cam_a, at("2026-08-29T09:59:59"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            index
+                .find_recording_at(&cam_a, at("2026-08-29T10:00:30"))
+                .unwrap()
+                .unwrap()
+                .relative_path,
+            first.relative_path
+        );
+        assert!(
+            index
+                .find_recording_at(&cam_a, at("2026-08-29T10:01:30"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            index
+                .find_recording_at(&cam_a, at("2026-08-29T10:02:30"))
+                .unwrap()
+                .unwrap()
+                .relative_path,
+            second.relative_path
+        );
+        assert!(
+            index
+                .find_recording_at(&cam_a, at("2026-08-29T10:03:00"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            index
+                .find_recording_at(&cam_a, at("2026-08-29T10:04:10"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            index
+                .find_recording_at(&cam_b, at("2026-08-29T10:00:30"))
+                .unwrap()
+                .unwrap()
+                .relative_path,
+            other_camera.relative_path
+        );
     }
 
     #[test]

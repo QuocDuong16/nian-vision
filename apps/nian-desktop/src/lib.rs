@@ -12,18 +12,20 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
-use chrono::NaiveDateTime;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use nian_application::{
     ApplicationSettingsDto, CameraDraft, CameraService, CameraServiceError, CameraSummary,
     CredentialStore, CredentialStoreError, DesktopLifecycle, DesktopLifecycleError,
-    DesktopLifecycleState, EventController, EventError, EventHistoryDto, EventMutation,
-    EventStatusDto, LiveError, LiveOpenDto, LiveStatus, LiveTeardownBatch, LiveViewController,
-    OnvifConnectionDto, OnvifController, OnvifControllerError, OnvifDiscoveryDto,
-    OnvifPreparedProfileDto, PlaybackController, PlaybackError, PlaybackOpenDto, ProbeController,
-    ProbeError, ProbeResult, PtzCapabilitiesDto, PtzController, PtzDirection, PtzError,
-    PtzMovementDto, PtzMutation, PtzTeardownBatch, RecordingController, RecordingControllerError,
-    RecordingDto, RecordingState, RecordingStatus, SupervisorRecordingRunnerFactory,
-    WorkerProbeRunner,
+    DesktopLifecycleState, DesktopNotifier, EventController, EventError, EventHistoryDto,
+    EventHistoryKind, EventMutation, EventPlaybackOpenDto, EventRecordingContextDto,
+    EventReviewRowDto, EventStatusDto, LiveError, LiveOpenDto, LiveStatus, LiveTeardownBatch,
+    LiveViewController, MotionNotificationRequest, NotificationDispatcher, NotificationError,
+    NotificationSettingsDto, OnvifConnectionDto, OnvifController, OnvifControllerError,
+    OnvifDiscoveryDto, OnvifPreparedProfileDto, PlaybackController, PlaybackError, PlaybackOpenDto,
+    ProbeController, ProbeError, ProbeResult, PtzCapabilitiesDto, PtzController, PtzDirection,
+    PtzError, PtzMovementDto, PtzMutation, PtzTeardownBatch, RecordingController,
+    RecordingControllerError, RecordingDto, RecordingState, RecordingStatus,
+    SupervisorRecordingRunnerFactory, WorkerProbeRunner,
 };
 use nian_domain::{
     AudioPolicy, CameraId, CredentialRef, Credentials, RetentionPolicy, StorageQuota,
@@ -37,6 +39,7 @@ use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
 use tracing_subscriber::EnvFilter;
 
@@ -186,6 +189,33 @@ struct EventRecentInput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct EventQueryInput {
+    #[serde(default)]
+    camera_ids: Vec<String>,
+    #[serde(default)]
+    kind: Option<EventHistoryKind>,
+    from_utc: String,
+    to_utc: String,
+    #[serde(default = "default_event_query_limit")]
+    limit: u32,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DesktopEventReviewRowDto {
+    #[serde(flatten)]
+    event: EventReviewRowDto,
+    recording_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DesktopEventReviewPageDto {
+    rows: Vec<DesktopEventReviewRowDto>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct PtzMoveInput {
     camera_id: String,
     direction: PtzDirection,
@@ -203,6 +233,34 @@ const fn default_probe_timeout_ms() -> u64 {
 
 const fn default_event_recent_limit() -> u32 {
     50
+}
+
+const fn default_event_query_limit() -> u32 {
+    50
+}
+
+#[derive(Debug, Clone)]
+struct NativeDesktopNotifier {
+    app: AppHandle,
+}
+
+impl DesktopNotifier for NativeDesktopNotifier {
+    fn supported(&self) -> bool {
+        cfg!(any(windows, target_os = "linux"))
+    }
+
+    fn show_motion(&self, request: &MotionNotificationRequest) -> Result<(), NotificationError> {
+        if !self.supported() {
+            return Err(NotificationError::Unsupported);
+        }
+        self.app
+            .notification()
+            .builder()
+            .title("Motion detected")
+            .body(request.camera_display_name.clone())
+            .show()
+            .map_err(|_| NotificationError::DeliveryFailed)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -270,6 +328,8 @@ struct DesktopState {
     onvif_controller: OnvifController,
     ptz_controller: PtzController,
     event_controller: EventController,
+    notification_dispatcher: NotificationDispatcher,
+    notification_settings: Mutex<SettingsStore>,
     lifecycle: DesktopLifecycle,
     power_subscription: Mutex<Option<Box<dyn PowerEventSubscription>>>,
     power_dispatch_tx: Mutex<Option<mpsc::Sender<PowerDispatchMessage>>>,
@@ -1286,6 +1346,150 @@ async fn event_recent(
     .map_err(|_| DesktopErrorDto::new("event_internal", "event history task failed"))?
 }
 
+fn parse_event_utc(value: &str) -> Result<DateTime<Utc>, DesktopErrorDto> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| DesktopErrorDto::new("event_query_invalid", "invalid UTC event timestamp"))
+}
+
+fn event_recording_available(playback: &PlaybackController, event: &EventReviewRowDto) -> bool {
+    let Ok(camera_id) = CameraId::parse(&event.camera_id) else {
+        return false;
+    };
+    let Ok(received_time_utc) = parse_event_utc(&event.received_time_utc) else {
+        return false;
+    };
+    playback
+        .event_recording_context(&camera_id, received_time_utc)
+        .map(|context| context.available)
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+async fn event_query(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    input: EventQueryInput,
+) -> Result<DesktopEventReviewPageDto, DesktopErrorDto> {
+    admit_running(&state)?;
+    let from_utc = parse_event_utc(&input.from_utc)?;
+    let to_utc = parse_event_utc(&input.to_utc)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let page = state
+            .event_controller
+            .review_query(
+                &input.camera_ids,
+                input.kind,
+                from_utc,
+                to_utc,
+                input.limit,
+                input.cursor.as_deref(),
+            )
+            .map_err(map_event_error)?;
+        let playback = state.playback_controller.lock().ok();
+        let rows = page
+            .rows
+            .into_iter()
+            .map(|event| DesktopEventReviewRowDto {
+                recording_available: playback
+                    .as_deref()
+                    .is_some_and(|playback| event_recording_available(playback, &event)),
+                event,
+            })
+            .collect();
+        Ok(DesktopEventReviewPageDto {
+            rows,
+            next_cursor: page.next_cursor,
+        })
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("event_internal", "event query task failed"))?
+}
+
+#[tauri::command]
+async fn event_get(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    event_id: u64,
+) -> Result<Option<DesktopEventReviewRowDto>, DesktopErrorDto> {
+    admit_running(&state)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(event) = state
+            .event_controller
+            .review_get(event_id)
+            .map_err(map_event_error)?
+        else {
+            return Ok(None);
+        };
+        let recording_available = state
+            .playback_controller
+            .lock()
+            .ok()
+            .is_some_and(|playback| event_recording_available(&playback, &event));
+        Ok(Some(DesktopEventReviewRowDto {
+            event,
+            recording_available,
+        }))
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("event_internal", "event lookup task failed"))?
+}
+
+fn event_identity(event: &EventReviewRowDto) -> Result<(CameraId, DateTime<Utc>), DesktopErrorDto> {
+    let camera_id = CameraId::parse(&event.camera_id)
+        .map_err(|_| DesktopErrorDto::new("event_not_found", "event camera is unavailable"))?;
+    let received_time_utc = parse_event_utc(&event.received_time_utc)?;
+    Ok((camera_id, received_time_utc))
+}
+
+#[tauri::command]
+async fn event_recording_context(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    event_id: u64,
+) -> Result<EventRecordingContextDto, DesktopErrorDto> {
+    admit_running(&state)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let event = state
+            .event_controller
+            .review_get(event_id)
+            .map_err(map_event_error)?
+            .ok_or_else(|| {
+                DesktopErrorDto::new("event_not_found", "event is no longer available")
+            })?;
+        let (camera_id, received_time_utc) = event_identity(&event)?;
+        lock(&state.playback_controller)?
+            .event_recording_context(&camera_id, received_time_utc)
+            .map_err(map_playback_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("event_internal", "event recording lookup task failed"))?
+}
+
+#[tauri::command]
+async fn event_playback_open(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    event_id: u64,
+) -> Result<Option<EventPlaybackOpenDto>, DesktopErrorDto> {
+    admit_running(&state)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let event = state
+            .event_controller
+            .review_get(event_id)
+            .map_err(map_event_error)?
+            .ok_or_else(|| {
+                DesktopErrorDto::new("event_not_found", "event is no longer available")
+            })?;
+        let (camera_id, received_time_utc) = event_identity(&event)?;
+        lock(&state.playback_controller)?
+            .open_event_recording(&camera_id, received_time_utc)
+            .map_err(map_playback_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("event_internal", "event playback task failed"))?
+}
+
 fn start_recording(
     state: &DesktopState,
     camera_id: &str,
@@ -1614,6 +1818,69 @@ async fn settings_update(
     })
     .await
     .map_err(|_| DesktopErrorDto::new("internal", "settings update task failed"))?
+}
+
+#[tauri::command]
+fn notification_settings_get(
+    state: tauri::State<'_, Arc<DesktopState>>,
+) -> Result<NotificationSettingsDto, DesktopErrorDto> {
+    admit_running(&state)?;
+    Ok(state.notification_dispatcher.settings())
+}
+
+#[tauri::command]
+async fn notification_settings_update(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    motion_notifications_enabled: bool,
+) -> Result<NotificationSettingsDto, DesktopErrorDto> {
+    admit_running(&state)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let previous = state.notification_dispatcher.settings();
+        if motion_notifications_enabled && !previous.supported {
+            return Err(DesktopErrorDto::new(
+                "notification_unsupported",
+                "desktop notifications are unavailable on this system",
+            ));
+        }
+        {
+            let mut settings = lock(&state.notification_settings)?;
+            settings
+                .set_motion_notifications_enabled(motion_notifications_enabled)
+                .map_err(|_| {
+                    DesktopErrorDto::new(
+                        "notification_settings",
+                        "notification preference could not be saved",
+                    )
+                })?;
+        }
+        match state
+            .notification_dispatcher
+            .set_enabled(motion_notifications_enabled)
+        {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if let Ok(mut settings) = state.notification_settings.lock() {
+                    let _ = settings
+                        .set_motion_notifications_enabled(previous.motion_notifications_enabled);
+                }
+                match error {
+                    NotificationError::Unsupported => Err(DesktopErrorDto::new(
+                        "notification_unsupported",
+                        "desktop notifications are unavailable on this system",
+                    )),
+                    _ => Err(DesktopErrorDto::new(
+                        "notification_runtime",
+                        "desktop notification runtime is unavailable",
+                    )),
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        DesktopErrorDto::new("notification_internal", "notification settings task failed")
+    })?
 }
 
 fn update_settings_runtime(
@@ -2011,6 +2278,7 @@ fn map_event_error(error: EventError) -> DesktopErrorDto {
             "event_persistence_failed",
             "event history storage is unavailable",
         ),
+        EventError::InvalidQuery(message) => DesktopErrorDto::new("event_query_invalid", message),
         EventError::Capacity => DesktopErrorDto::new(
             "event_capacity",
             "event monitoring capacity has been reached",
@@ -2607,6 +2875,15 @@ fn shutdown_runtime_resources(state: &DesktopState) -> Result<(), DesktopErrorDt
     }
     state.ptz_controller.shutdown_sessions();
     state.event_controller.shutdown_sessions();
+    if state.notification_dispatcher.shutdown().is_err() {
+        capture_first_error(
+            &mut first_error,
+            DesktopErrorDto::new(
+                "notification_internal",
+                "notification dispatcher shutdown failed",
+            ),
+        );
+    }
     match state.recording_controller.lock() {
         Ok(mut controller) => {
             if let Err(error) = controller.shutdown_all() {
@@ -2652,6 +2929,15 @@ fn begin_update_shutdown(state: &DesktopState) -> Result<(), DesktopErrorDto> {
                 "quitting",
                 "application is already quitting",
             ));
+        }
+        if state.notification_dispatcher.suspend().is_err() {
+            capture_first_error(
+                &mut admission_error,
+                DesktopErrorDto::new(
+                    "notification_internal",
+                    "notification update admission failed",
+                ),
+            );
         }
         if let Err(error) = state.onvif_controller.stop_accepting_and_cancel() {
             capture_first_error(&mut admission_error, map_onvif_error(error));
@@ -2705,6 +2991,15 @@ fn request_quit(app: &AppHandle) -> Result<(), DesktopErrorDto> {
             return Ok(());
         }
         // Admission closes before any potentially blocking teardown begins.
+        if state.notification_dispatcher.suspend().is_err() {
+            capture_first_error(
+                &mut admission_error,
+                DesktopErrorDto::new(
+                    "notification_internal",
+                    "notification shutdown admission failed",
+                ),
+            );
+        }
         if let Err(error) = state.ptz_controller.stop_accepting_and_stop_all() {
             capture_first_error(&mut admission_error, map_ptz_error(error));
         }
@@ -2777,6 +3072,12 @@ fn handle_power_event(
                 return Ok(());
             }
             let mut first_error = None;
+            if state.notification_dispatcher.suspend().is_err() {
+                capture_first_error(
+                    &mut first_error,
+                    DesktopErrorDto::new("notification_internal", "notification suspend failed"),
+                );
+            }
             if let Err(error) = state.onvif_controller.stop_accepting_and_cancel() {
                 capture_first_error(&mut first_error, map_onvif_error(error));
             }
@@ -2872,6 +3173,12 @@ fn handle_power_event(
             state.probe_controller.resume_accepting();
             state.onvif_controller.resume_accepting();
             state.ptz_controller.resume_accepting();
+            if state.notification_dispatcher.resume().is_err() {
+                capture_first_error(
+                    &mut first_error,
+                    DesktopErrorDto::new("notification_internal", "notification resume failed"),
+                );
+            }
             state.event_controller.resume_accepting();
             drop(gate);
             if let Err(error) = state.event_controller.restore_desired() {
@@ -3029,6 +3336,7 @@ pub fn run() {
                 .arg(STARTUP_HIDDEN_ARG)
                 .build(),
         )
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
             if window.label() != "main" {
@@ -3059,7 +3367,8 @@ pub fn run() {
             let settings_path = app_data.join("settings.sqlite3");
             let settings = SettingsStore::open(settings_path.clone())?;
             let ptz_settings = SettingsStore::open(settings_path.clone())?;
-            let event_settings = SettingsStore::open(settings_path)?;
+            let event_settings = SettingsStore::open(settings_path.clone())?;
+            let notification_settings = SettingsStore::open(settings_path)?;
             let credentials: Arc<dyn CredentialStore> = Arc::new(NativeCredentialStore);
             let camera_service = CameraService::new(Box::new(settings), credentials.clone());
             let ptz_controller =
@@ -3079,6 +3388,19 @@ pub fn run() {
                 initial_settings.max_age_days,
             )
             .map_err(|_| std::io::Error::other("event monitoring service could not start"))?;
+            let notifications_enabled = notification_settings
+                .motion_notifications_enabled()
+                .map_err(|_| std::io::Error::other("notification settings are unavailable"))?;
+            let notification_dispatcher = NotificationDispatcher::new(
+                Arc::new(NativeDesktopNotifier {
+                    app: app.handle().clone(),
+                }),
+                notifications_enabled,
+            )
+            .map_err(|_| std::io::Error::other("notification dispatcher could not start"))?;
+            event_controller
+                .set_persisted_event_sink(notification_dispatcher.sink())
+                .map_err(|_| std::io::Error::other("notification event sink could not attach"))?;
 
             let worker_name = if cfg!(windows) {
                 "nian-media-worker.exe"
@@ -3135,6 +3457,8 @@ pub fn run() {
                 onvif_controller,
                 ptz_controller,
                 event_controller,
+                notification_dispatcher,
+                notification_settings: Mutex::new(notification_settings),
                 lifecycle: DesktopLifecycle::new(),
                 power_subscription: Mutex::new(None),
                 power_dispatch_tx: Mutex::new(None),
@@ -3258,6 +3582,10 @@ pub fn run() {
             event_status,
             event_statuses,
             event_recent,
+            event_query,
+            event_get,
+            event_recording_context,
+            event_playback_open,
             recording_start,
             recording_stop,
             recording_stop_all,
@@ -3278,6 +3606,8 @@ pub fn run() {
             playback_status,
             settings_get,
             settings_update,
+            notification_settings_get,
+            notification_settings_update,
         ]);
 
     let app = match builder.build(tauri::generate_context!()) {
@@ -3315,6 +3645,22 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[derive(Debug)]
+    struct TestDesktopNotifier;
+
+    impl DesktopNotifier for TestDesktopNotifier {
+        fn supported(&self) -> bool {
+            true
+        }
+
+        fn show_motion(
+            &self,
+            _request: &MotionNotificationRequest,
+        ) -> Result<(), NotificationError> {
+            Ok(())
+        }
+    }
 
     #[derive(Debug)]
     struct TestRepositoryState {
@@ -4048,6 +4394,13 @@ mod tests {
             Some(30),
         )
         .unwrap();
+        let notification_settings =
+            SettingsStore::open(root.with_extension("notification-settings.sqlite3")).unwrap();
+        let notification_dispatcher =
+            NotificationDispatcher::new(Arc::new(TestDesktopNotifier), false).unwrap();
+        event_controller
+            .set_persisted_event_sink(notification_dispatcher.sink())
+            .unwrap();
         let cache_root = root.with_extension("playback-cache");
         let live_controller =
             LiveViewController::with_factory(live_factory, root.with_extension("live-cache"))
@@ -4068,6 +4421,8 @@ mod tests {
                 onvif_controller: OnvifController::production().unwrap(),
                 ptz_controller,
                 event_controller,
+                notification_dispatcher,
+                notification_settings: Mutex::new(notification_settings),
                 lifecycle: DesktopLifecycle::new(),
                 power_subscription: Mutex::new(None),
                 power_dispatch_tx: Mutex::new(None),

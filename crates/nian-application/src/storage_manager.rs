@@ -431,6 +431,14 @@ impl StorageManager {
         Ok(self.index()?.query_time_range(camera_id, start, end)?)
     }
 
+    pub fn find_recording_at(
+        &self,
+        camera_id: &CameraId,
+        timestamp: NaiveDateTime,
+    ) -> Result<Option<IndexedRecording>, StorageManagerError> {
+        Ok(self.index()?.find_recording_at(camera_id, timestamp)?)
+    }
+
     pub fn available_recording_days(
         &self,
         camera_id: &CameraId,

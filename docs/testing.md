@@ -762,7 +762,7 @@ ownership during PTZ failure or unpair. Unsupported zoom is recorded as capabili
 
 ### ONVIF PullPoint motion events (M13)
 
-`nian-settings` tests cover schema v5 migration with Event Desired state defaulting Off, independent
+`nian-settings` tests cover the schema v5 Event migration with Desired state defaulting Off, independent
 EventBinding round-trip, atomic disable+unpair and camera-delete cascade. CameraService tests prove
 shared Event credentials block camera credential replacement, Event-owned credentials survive an
 independent camera credential replacement, and camera deletion cleans camera/PTZ/Event-owned
@@ -795,11 +795,23 @@ CellMotion start/end transitions, reconnect replay suppression, camera reboot, n
 Suspend/Resume fresh synchronization baseline, close-to-tray continued monitoring, storage-root
 switching, and continued RTSP recording/live/PTZ behavior while Event monitoring fails.
 
+### Event Review and local notifications (M14)
+
+`nian-index` Event Review tests cover all-camera and single-camera filtering, bounded receive-time ranges, deterministic receive-time/event-ID ordering, equal-timestamp tie breaking, page limits, keyset next cursors, no duplicate/skip across stable pages, malformed cursors, excessive limits, invalid ranges, empty results and retained-away rows. Recording-index fixtures cover event-before/inside/after segment boundaries, correct selection across multiple segments, CameraId isolation at identical timestamps and conservative rejection when media duration is unknown. Playback unit tests fix the M14 pre-roll at five seconds and prove clamping at segment start.
+
+`EventController` projection tests prove a notification signal appears only after a genuinely new committed Event insert, a duplicate fingerprint discovered by a fresh normalizer does not publish again, and persistence failure publishes nothing while preserving the prior normalization state for retry. Notification-dispatch tests use a deterministic fake notifier and cover MotionStarted eligibility, MotionEnded suppression, per-camera 15-second rate limiting, camera isolation, notifier failure isolation, queue-full non-blocking drop, unsupported capability, Suspend admission closure and Resume with a fresh queue. Settings persistence tests cover schema v6 default-Off migration and independent preference round-trip.
+
+Desktop compilation/tests exercise the new state ownership and lifecycle wiring. Event history/query/get/recording-context/playback commands run blocking index/filesystem work through `spawn_blocking`; Event Review never changes recording Desired state. Hide retains the dispatcher, while Suspend/Quit/Update close notification admission and join dispatcher ownership before Event restoration or process handoff; Resume opens a fresh queue before Desired Event workers restore. The current Tauri desktop notification abstraction exposes display but no click/action callback, so CI does not claim a native click deep-link test that the API cannot perform. Stale Event IDs remain typed/non-fatal through `event_get` and recording lookup.
+
+Frontend Event Review tests cover the default 24-hour bounded query, camera filter propagation, selection-generation protection and stale-pagination rejection after filter changes. The screen uses semantic controls, finite ten-second single-flight refresh, cursor pagination and backend-provided five-second seek offsets. Settings tests verify the dedicated notification preference command rather than routing the toggle through storage settings.
+
+Manual M14 validation on an installed Windows/Linux desktop should verify OS notification presentation while the window is visible and hidden, no historical replay after restart/Resume, MotionStarted-only behavior, notification privacy text, correct Event Review recording jump, missing-footage state after retention, and continued Event ingestion when OS notification display fails. Notification click activation is not claimed on the current Tauri desktop abstraction because it provides no click callback.
+
 ## Planned per milestone
 
 * **Future scope**: ONVIF presets, vendor event dialects, push delivery, talkback, macOS distribution,
   H.265/transcoding/WebRTC, clip export, thumbnails/motion analysis and AI/cloud behavior require
-  separate design/review and are not part of M13.
+  separate design/review and are not part of M14.
 * **Hardware/manual** (never in CI): real Tapo C200 via
   `NIAN_VISION_RTSP_URL` with
   `nian-media-worker record --rtsp-from-env ...` and/or an IPC-driven

@@ -17,7 +17,7 @@ use nian_domain::{
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
@@ -523,6 +523,28 @@ impl SettingsStore {
         }
         Ok(())
     }
+
+    pub fn motion_notifications_enabled(&self) -> Result<bool, SettingsError> {
+        let value: i64 = self.connection.query_row(
+            "SELECT motion_notifications_enabled FROM application_settings WHERE singleton_id=1",
+            [],
+            |row| row.get(0),
+        )?;
+        parse_bool(value, "motion_notifications_enabled")
+    }
+
+    pub fn set_motion_notifications_enabled(&mut self, enabled: bool) -> Result<(), SettingsError> {
+        let affected = self.connection.execute(
+            "UPDATE application_settings SET motion_notifications_enabled=?1 WHERE singleton_id=1",
+            [if enabled { 1_i64 } else { 0_i64 }],
+        )?;
+        if affected != 1 {
+            return Err(SettingsError::InvalidData(format!(
+                "application_settings notification update affected {affected} rows"
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn validate_application_settings(settings: &ApplicationSettings) -> Result<(), SettingsError> {
@@ -640,6 +662,15 @@ fn migrate(connection: &mut Connection) -> Result<(), SettingsError> {
                 owns_credential INTEGER NOT NULL CHECK(owns_credential IN (0,1))\
              );\
              PRAGMA user_version=5;",
+        )?;
+        transaction.commit()?;
+        version = 5;
+    }
+    if version == 5 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "ALTER TABLE application_settings ADD COLUMN motion_notifications_enabled INTEGER NOT NULL DEFAULT 0 CHECK(motion_notifications_enabled IN (0,1));\
+             PRAGMA user_version=6;",
         )?;
         transaction.commit()?;
     }

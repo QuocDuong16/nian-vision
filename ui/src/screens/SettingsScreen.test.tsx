@@ -19,6 +19,8 @@ function installDesktop(update: UpdateCheck) {
   Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
   vi.mocked(invoke).mockImplementation(async (command) => {
     if (command === "settings_get") return settings;
+    if (command === "notification_settings_get") return { motion_notifications_enabled: false, supported: true };
+    if (command === "notification_settings_update") return { motion_notifications_enabled: true, supported: true };
     if (command === "app_info") return { name: "Nian Vision", version: "0.1.0" };
     if (command === "update_check") return update;
     if (command === "update_install") return undefined;
@@ -37,6 +39,18 @@ afterEach(() => {
 });
 
 describe("SettingsScreen updates", () => {
+  it("persists desktop motion notification preference through the dedicated command", async () => {
+    installDesktop({ configured: false, current_version: "0.1.0", available: null });
+    render(<SettingsScreen />);
+    const toggle = await screen.findByRole("checkbox", { name: "Desktop motion notifications" });
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      expect(vi.mocked(invoke)).toHaveBeenCalledWith("notification_settings_update", {
+        motionNotificationsEnabled: true,
+      });
+    });
+  });
+
   it("shows the current version and reports an unconfigured update channel", async () => {
     installDesktop({ configured: false, current_version: "0.1.0", available: null });
     render(<SettingsScreen />);

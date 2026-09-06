@@ -25,12 +25,53 @@ fn camera(name: &str, credential_ref: &str) -> CameraConfig {
 }
 
 #[test]
-fn fresh_database_creates_schema_v5() {
+fn fresh_database_creates_schema_v6() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.sqlite3");
     let store = SettingsStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
     assert!(path.exists());
+}
+
+#[test]
+fn motion_notification_preference_defaults_off_and_persists_independently() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.sqlite3");
+    {
+        let mut store = SettingsStore::open(&path).unwrap();
+        assert!(!store.motion_notifications_enabled().unwrap());
+        store.set_motion_notifications_enabled(true).unwrap();
+        assert!(store.motion_notifications_enabled().unwrap());
+    }
+    let reopened = SettingsStore::open(&path).unwrap();
+    assert!(reopened.motion_notifications_enabled().unwrap());
+}
+
+#[test]
+fn schema_v5_migrates_notification_preference_to_off() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.sqlite3");
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE application_settings (
+                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+                storage_root TEXT NULL,
+                segment_target_secs INTEGER NOT NULL,
+                max_age_days INTEGER NULL,
+                max_storage_bytes INTEGER NULL,
+                cleanup_target_bytes INTEGER NULL,
+                launch_at_login INTEGER NOT NULL DEFAULT 0 CHECK(launch_at_login IN (0,1))
+             );
+             INSERT INTO application_settings VALUES (1, NULL, 300, NULL, NULL, NULL, 0);
+             PRAGMA user_version=5;",
+            )
+            .unwrap();
+    }
+    let store = SettingsStore::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 6);
+    assert!(!store.motion_notifications_enabled().unwrap());
 }
 
 #[test]
@@ -91,7 +132,7 @@ fn future_schema_fails_without_replacing_database() {
         error,
         SettingsError::FutureSchema {
             found: 99,
-            supported: 5
+            supported: 6
         }
     ));
     let after = fs::read(&path).unwrap();
@@ -334,17 +375,17 @@ fn schema_v1_migrates_through_v5_with_safe_lifecycle_defaults() {
     }
 
     let store = SettingsStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
     assert!(!store.application_settings().unwrap().launch_at_login);
     assert!(store.recording_enabled_cameras().unwrap().is_empty());
     drop(store);
 
     let reopened = SettingsStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 5);
+    assert_eq!(reopened.schema_version().unwrap(), 6);
 }
 
 #[test]
-fn schema_v2_migrates_to_v5_preserving_desired_camera_and_removing_unique_index() {
+fn schema_v2_migrates_to_v6_preserving_desired_camera_and_removing_unique_index() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.sqlite3");
     {
@@ -379,7 +420,7 @@ fn schema_v2_migrates_to_v5_preserving_desired_camera_and_removing_unique_index(
     }
 
     let mut store = SettingsStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
     assert_eq!(
         store.recording_enabled_cameras().unwrap(),
         vec![CameraId::parse("cam-a").unwrap()]
@@ -461,7 +502,7 @@ fn recording_intent_is_per_camera_and_persists_across_reopen() {
 }
 
 #[test]
-fn schema_v3_migrates_to_v5_without_mutating_existing_camera_rows() {
+fn schema_v3_migrates_to_v6_without_mutating_existing_camera_rows() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.sqlite3");
     {
@@ -494,7 +535,7 @@ fn schema_v3_migrates_to_v5_without_mutating_existing_camera_rows() {
             .unwrap();
     }
     let store = SettingsStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
     let saved = store
         .get_camera(&CameraId::parse("front-door").unwrap())
         .unwrap()

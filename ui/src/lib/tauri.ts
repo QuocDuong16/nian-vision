@@ -142,6 +142,27 @@ export interface EventHistory {
   received_time_utc: string;
 }
 
+export interface EventReviewRow {
+  event_id: number;
+  camera_id: string;
+  camera_display_name: string;
+  kind: EventHistoryKind;
+  device_time_utc: string | null;
+  received_time_utc: string;
+  recording_available: boolean;
+}
+
+export interface EventReviewPage {
+  rows: EventReviewRow[];
+  next_cursor: string | null;
+}
+
+export interface EventRecordingContext {
+  available: boolean;
+  camera_id: string;
+  seek_offset_ms: number | null;
+}
+
 export interface EventMutation<T> {
   value: T;
   warning: "orphan_credential_cleanup_failed" | null;
@@ -256,6 +277,16 @@ export interface PlaybackOpenDto {
   recording: RecordingDto;
   inspect: PlaybackInspectDto;
   adjacent: AdjacentRecordingsDto;
+}
+
+export interface EventPlaybackOpenDto {
+  playback: PlaybackOpenDto;
+  seek_offset_ms: number;
+}
+
+export interface NotificationSettings {
+  motion_notifications_enabled: boolean;
+  supported: boolean;
 }
 
 export const STOPPED_STATUS: RecordingStatus = {

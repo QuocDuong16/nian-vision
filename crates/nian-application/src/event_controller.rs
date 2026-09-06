@@ -11,18 +11,22 @@ use nian_domain::{
     CameraConfig, CameraId, CameraSource, CredentialRef, EventBinding, Host, OnvifScheme,
     ReconnectBackoff,
 };
-use nian_index::{EventIndex, EventInsert, EventKind};
+use nian_index::{
+    EventCursor, EventIndex, EventInsert, EventKind, EventQuery, IndexError,
+    MAX_EVENT_QUERY_CAMERAS,
+};
 use nian_onvif::{
     EventControl, MotionNotification, OnvifClient, OnvifCredentials, OnvifError,
     PullPointSubscription,
 };
 use nian_settings::SettingsStore;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
+use crate::notification::{NoopPersistedEventSink, PersistedEventSignal, PersistedEventSink};
 use crate::{CredentialStore, CredentialStoreError, PreparedEventPairing, SettingsRepositoryError};
 
 pub const MAX_ACTIVE_EVENT_SESSIONS: usize = 16;
@@ -235,7 +239,7 @@ pub struct EventStatusDto {
     pub last_error_code: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EventHistoryKind {
     MotionStarted,
@@ -250,6 +254,22 @@ pub struct EventHistoryDto {
     pub source_key: Option<String>,
     pub device_time_utc: Option<String>,
     pub received_time_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EventReviewRowDto {
+    pub event_id: u64,
+    pub camera_id: String,
+    pub camera_display_name: String,
+    pub kind: EventHistoryKind,
+    pub device_time_utc: Option<String>,
+    pub received_time_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EventReviewPageDto {
+    pub rows: Vec<EventReviewRowDto>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -284,6 +304,8 @@ pub enum EventError {
     ProtocolError,
     #[error("event persistence failed")]
     PersistenceFailed,
+    #[error("invalid event review query: {0}")]
+    InvalidQuery(String),
     #[error("event session capacity reached")]
     Capacity,
     #[error("event operation is busy")]
@@ -437,6 +459,7 @@ pub struct EventController {
     credentials: Arc<dyn CredentialStore>,
     backend: Arc<dyn EventBackend>,
     event_index: Arc<Mutex<Option<EventIndex>>>,
+    persisted_event_sink: Mutex<Arc<dyn PersistedEventSink>>,
     retention_days: Mutex<Option<u32>>,
     accepting: AtomicBool,
     lifecycle_generation: AtomicU64,
@@ -493,6 +516,7 @@ impl EventController {
             credentials,
             backend,
             event_index: Arc::new(Mutex::new(event_index)),
+            persisted_event_sink: Mutex::new(Arc::new(NoopPersistedEventSink)),
             retention_days: Mutex::new(retention_days),
             accepting: AtomicBool::new(true),
             lifecycle_generation: AtomicU64::new(0),
@@ -538,6 +562,17 @@ impl EventController {
             .lock()
             .map(|index| index.is_some())
             .unwrap_or(false)
+    }
+
+    pub fn set_persisted_event_sink(
+        &self,
+        sink: Arc<dyn PersistedEventSink>,
+    ) -> Result<(), EventError> {
+        *self
+            .persisted_event_sink
+            .lock()
+            .map_err(|_| EventError::Internal)? = sink;
+        Ok(())
     }
 
     pub fn configured(&self, camera_id: &str) -> Result<bool, EventError> {
@@ -809,6 +844,96 @@ impl EventController {
             .collect())
     }
 
+    pub fn review_query(
+        &self,
+        camera_ids: &[String],
+        kind: Option<EventHistoryKind>,
+        from_utc: DateTime<Utc>,
+        to_utc: DateTime<Utc>,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<EventReviewPageDto, EventError> {
+        if camera_ids.len() > MAX_EVENT_QUERY_CAMERAS {
+            return Err(EventError::InvalidQuery(format!(
+                "camera count exceeds {MAX_EVENT_QUERY_CAMERAS}"
+            )));
+        }
+        let camera_ids = camera_ids
+            .iter()
+            .map(|camera_id| {
+                CameraId::parse(camera_id)
+                    .map_err(|_| EventError::InvalidQuery("malformed camera id".to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let cursor = cursor
+            .map(EventCursor::decode)
+            .transpose()
+            .map_err(map_event_query_index_error)?;
+        let page = {
+            let index = self.event_index.lock().map_err(|_| EventError::Internal)?;
+            let index = index.as_ref().ok_or(EventError::PersistenceFailed)?;
+            index
+                .query(&EventQuery {
+                    camera_ids,
+                    kind: kind.map(index_kind),
+                    from_utc,
+                    to_utc,
+                    limit,
+                    cursor,
+                })
+                .map_err(map_event_query_index_error)?
+        };
+        self.review_page_dto(page)
+    }
+
+    pub fn review_get(&self, event_id: u64) -> Result<Option<EventReviewRowDto>, EventError> {
+        let row = {
+            let index = self.event_index.lock().map_err(|_| EventError::Internal)?;
+            let index = index.as_ref().ok_or(EventError::PersistenceFailed)?;
+            index
+                .get(event_id)
+                .map_err(|_| EventError::PersistenceFailed)?
+        };
+        row.map(|row| self.review_row_dto(row)).transpose()
+    }
+
+    fn review_page_dto(
+        &self,
+        page: nian_index::EventPage,
+    ) -> Result<EventReviewPageDto, EventError> {
+        let rows = page
+            .rows
+            .into_iter()
+            .map(|row| self.review_row_dto(row))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(EventReviewPageDto {
+            rows,
+            next_cursor: page.next_cursor.map(EventCursor::encode),
+        })
+    }
+
+    fn review_row_dto(
+        &self,
+        row: nian_index::EventRecord,
+    ) -> Result<EventReviewRowDto, EventError> {
+        let camera_display_name = self
+            .repository
+            .lock()
+            .map_err(|_| EventError::Internal)?
+            .get_camera(&row.camera_id)
+            .map_err(|_| EventError::Settings)?
+            .map(|camera| camera.display_name().to_owned())
+            .unwrap_or_else(|| row.camera_id.as_str().to_owned());
+        Ok(EventReviewRowDto {
+            event_id: row.event_id,
+            camera_id: row.camera_id.as_str().to_owned(),
+            camera_display_name,
+            kind: history_kind(row.kind),
+            device_time_utc: row.device_time_utc.map(|value| value.to_rfc3339()),
+            received_time_utc: row.received_time_utc.to_rfc3339(),
+        })
+    }
+
     pub fn restore_desired(&self) -> Result<(), EventError> {
         self.require_accepting()?;
         let cameras = self
@@ -1050,6 +1175,12 @@ impl EventController {
         let worker_camera = camera_id.clone();
         let worker_backend = self.backend.clone();
         let worker_index = self.event_index.clone();
+        let worker_display_name = camera.display_name().to_owned();
+        let worker_sink = self
+            .persisted_event_sink
+            .lock()
+            .map_err(|_| EventError::Internal)?
+            .clone();
         let worker_status = status.clone();
         let worker_cancel = cancel.clone();
         let worker_retention = *self
@@ -1063,10 +1194,12 @@ impl EventController {
             .spawn(move || {
                 event_worker(
                     worker_camera,
+                    worker_display_name,
                     worker_device_service,
                     worker_credentials,
                     worker_backend,
                     worker_index,
+                    worker_sink,
                     worker_status,
                     worker_cancel,
                     worker_retention,
@@ -1530,15 +1663,48 @@ fn persist_motion_transition(
     event_index: &Mutex<Option<EventIndex>>,
     insert: &EventInsert,
     retention_days: Option<u32>,
-) -> Result<(), ()> {
+) -> Result<Option<u64>, ()> {
     let mut index = event_index.lock().map_err(|_| ())?;
     let index = index.as_mut().ok_or(())?;
-    let _ = index
+    index
         .insert_and_cleanup(insert, Utc::now(), retention_days)
-        .map_err(|_| ())?;
+        .map_err(|_| ())
+}
+
+#[derive(Clone, Copy)]
+struct MotionNotificationProjection<'a> {
+    camera_display_name: &'a str,
+    persisted_event_sink: &'a dyn PersistedEventSink,
+}
+
+fn apply_motion_notification_with_sink(
+    normalizer: &mut MotionNormalizer,
+    camera_id: &CameraId,
+    notification: &MotionNotification,
+    received_time_utc: DateTime<Utc>,
+    event_index: &Mutex<Option<EventIndex>>,
+    projection: MotionNotificationProjection<'_>,
+    retention_days: Option<u32>,
+) -> Result<(), ()> {
+    let decision = normalizer.prepare(camera_id, notification, received_time_utc);
+    if let Some(insert) = decision.transition.as_ref()
+        && let Some(event_id) = persist_motion_transition(event_index, insert, retention_days)?
+    {
+        projection
+            .persisted_event_sink
+            .try_publish(PersistedEventSignal {
+                event_id,
+                camera_id: camera_id.as_str().to_owned(),
+                camera_display_name: projection.camera_display_name.to_owned(),
+                kind: history_kind(insert.kind),
+                received_time_utc: insert.received_time_utc,
+            });
+    }
+    normalizer.commit(decision);
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_motion_notification(
     normalizer: &mut MotionNormalizer,
     camera_id: &CameraId,
@@ -1547,21 +1713,29 @@ fn apply_motion_notification(
     event_index: &Mutex<Option<EventIndex>>,
     retention_days: Option<u32>,
 ) -> Result<(), ()> {
-    let decision = normalizer.prepare(camera_id, notification, received_time_utc);
-    if let Some(insert) = decision.transition.as_ref() {
-        persist_motion_transition(event_index, insert, retention_days)?;
-    }
-    normalizer.commit(decision);
-    Ok(())
+    apply_motion_notification_with_sink(
+        normalizer,
+        camera_id,
+        notification,
+        received_time_utc,
+        event_index,
+        MotionNotificationProjection {
+            camera_display_name: camera_id.as_str(),
+            persisted_event_sink: &NoopPersistedEventSink,
+        },
+        retention_days,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn event_worker(
     camera_id: CameraId,
+    camera_display_name: String,
     device_service: String,
     credentials: OnvifCredentials,
     backend: Arc<dyn EventBackend>,
     event_index: Arc<Mutex<Option<EventIndex>>>,
+    persisted_event_sink: Arc<dyn PersistedEventSink>,
     status: Arc<Mutex<RuntimeStatus>>,
     cancel: Arc<AtomicBool>,
     retention_days: Option<u32>,
@@ -1669,12 +1843,16 @@ fn event_worker(
                     let mut persistence_failed = false;
                     for notification in notifications {
                         let received = Utc::now();
-                        if apply_motion_notification(
+                        if apply_motion_notification_with_sink(
                             &mut normalizer,
                             &camera_id,
                             &notification,
                             received,
                             &event_index,
+                            MotionNotificationProjection {
+                                camera_display_name: &camera_display_name,
+                                persisted_event_sink: persisted_event_sink.as_ref(),
+                            },
                             retention_days,
                         )
                         .is_err()
@@ -1831,6 +2009,27 @@ fn parse_camera_id(camera_id: &str) -> Result<CameraId, EventError> {
     CameraId::parse(camera_id).map_err(|_| EventError::CameraNotFound)
 }
 
+fn history_kind(kind: EventKind) -> EventHistoryKind {
+    match kind {
+        EventKind::MotionStarted => EventHistoryKind::MotionStarted,
+        EventKind::MotionEnded => EventHistoryKind::MotionEnded,
+    }
+}
+
+fn index_kind(kind: EventHistoryKind) -> EventKind {
+    match kind {
+        EventHistoryKind::MotionStarted => EventKind::MotionStarted,
+        EventHistoryKind::MotionEnded => EventKind::MotionEnded,
+    }
+}
+
+fn map_event_query_index_error(error: IndexError) -> EventError {
+    match error {
+        IndexError::InvalidData(message) => EventError::InvalidQuery(message),
+        _ => EventError::PersistenceFailed,
+    }
+}
+
 fn error_code(error: &EventError) -> &'static str {
     match error {
         EventError::CameraNotFound => "camera_not_found",
@@ -1842,6 +2041,7 @@ fn error_code(error: &EventError) -> &'static str {
         EventError::PullTimeout => "pull_timeout",
         EventError::ProtocolError => "protocol_error",
         EventError::PersistenceFailed => "persistence_failed",
+        EventError::InvalidQuery(_) => "invalid_query",
         EventError::Capacity => "event_capacity",
         EventError::Busy => "event_busy",
         EventError::LifecycleCancelled => "lifecycle_cancelled",
@@ -2137,6 +2337,17 @@ mod tests {
         let transition = decision.transition.clone();
         normalizer.commit(decision);
         transition
+    }
+
+    #[derive(Default)]
+    struct RecordingEventSink {
+        signals: Mutex<Vec<PersistedEventSignal>>,
+    }
+
+    impl PersistedEventSink for RecordingEventSink {
+        fn try_publish(&self, signal: PersistedEventSignal) {
+            self.signals.lock().unwrap().push(signal);
+        }
     }
 
     fn controller_fixture(
@@ -2455,6 +2666,137 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, EventKind::MotionStarted);
+    }
+
+    #[test]
+    fn notification_signal_requires_new_successful_event_insert() {
+        let temp = tempdir().unwrap();
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let now = Utc::now();
+        let event_index = Mutex::new(Some(
+            EventIndex::open(temp.path().join("events.sqlite3")).unwrap(),
+        ));
+        let sink = RecordingEventSink::default();
+        let idle = MotionNotification {
+            active: false,
+            device_time_utc: Some(now),
+            source_key: Some("source-a".to_owned()),
+            synchronization_baseline: false,
+        };
+        let started = MotionNotification {
+            active: true,
+            ..idle.clone()
+        };
+
+        let mut normalizer = MotionNormalizer::default();
+        apply_motion_notification_with_sink(
+            &mut normalizer,
+            &camera_id,
+            &idle,
+            now,
+            &event_index,
+            MotionNotificationProjection {
+                camera_display_name: "Front Door",
+                persisted_event_sink: &sink,
+            },
+            Some(30),
+        )
+        .unwrap();
+        apply_motion_notification_with_sink(
+            &mut normalizer,
+            &camera_id,
+            &started,
+            now,
+            &event_index,
+            MotionNotificationProjection {
+                camera_display_name: "Front Door",
+                persisted_event_sink: &sink,
+            },
+            Some(30),
+        )
+        .unwrap();
+        assert_eq!(sink.signals.lock().unwrap().len(), 1);
+
+        // A fresh normalizer can rediscover the same device-time transition after
+        // restart/reconnect, but EventIndex fingerprint dedupe must suppress the
+        // notification projection because no new row was committed.
+        let mut replay = MotionNormalizer::default();
+        apply_motion_notification_with_sink(
+            &mut replay,
+            &camera_id,
+            &idle,
+            now,
+            &event_index,
+            MotionNotificationProjection {
+                camera_display_name: "Front Door",
+                persisted_event_sink: &sink,
+            },
+            Some(30),
+        )
+        .unwrap();
+        apply_motion_notification_with_sink(
+            &mut replay,
+            &camera_id,
+            &started,
+            now,
+            &event_index,
+            MotionNotificationProjection {
+                camera_display_name: "Front Door",
+                persisted_event_sink: &sink,
+            },
+            Some(30),
+        )
+        .unwrap();
+        assert_eq!(sink.signals.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn persistence_failure_never_publishes_notification_signal() {
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let now = Utc::now();
+        let event_index = Mutex::new(None);
+        let sink = RecordingEventSink::default();
+        let idle = MotionNotification {
+            active: false,
+            device_time_utc: Some(now),
+            source_key: Some("source-a".to_owned()),
+            synchronization_baseline: false,
+        };
+        let started = MotionNotification {
+            active: true,
+            ..idle.clone()
+        };
+        let mut normalizer = MotionNormalizer::default();
+        apply_motion_notification_with_sink(
+            &mut normalizer,
+            &camera_id,
+            &idle,
+            now,
+            &event_index,
+            MotionNotificationProjection {
+                camera_display_name: "Front Door",
+                persisted_event_sink: &sink,
+            },
+            Some(30),
+        )
+        .unwrap();
+        assert_eq!(
+            apply_motion_notification_with_sink(
+                &mut normalizer,
+                &camera_id,
+                &started,
+                now,
+                &event_index,
+                MotionNotificationProjection {
+                    camera_display_name: "Front Door",
+                    persisted_event_sink: &sink,
+                },
+                Some(30),
+            ),
+            Err(())
+        );
+        assert!(sink.signals.lock().unwrap().is_empty());
+        assert_eq!(normalizer.aggregate_motion(), Some(false));
     }
 
     #[test]

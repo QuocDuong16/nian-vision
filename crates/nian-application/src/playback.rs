@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Local, NaiveDateTime, Utc};
 use nian_domain::{CameraId, RetentionPolicy, StorageQuota};
 use nian_index::{IndexedRecording, RecordingKind};
 use nian_ipc::message::{Envelope, PROTOCOL_VERSION, event, method};
@@ -37,6 +37,7 @@ const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const CACHE_INSTANCE_PREFIX: &str = "instance-";
 const CACHE_INSTANCE_LOCK: &str = ".nian-playback-instance.lock";
 const CACHE_COORDINATION_LOCK: &str = ".nian-playback-cache.lock";
+pub const EVENT_PLAYBACK_PREROLL_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -145,6 +146,25 @@ pub struct PlaybackOpenDto {
     pub recording: RecordingDto,
     pub inspect: PlaybackInspectDto,
     pub adjacent: AdjacentRecordingsDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EventRecordingContextDto {
+    pub available: bool,
+    pub camera_id: String,
+    pub seek_offset_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EventPlaybackOpenDto {
+    pub playback: PlaybackOpenDto,
+    pub seek_offset_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct EventRecordingMatch {
+    recording: IndexedRecording,
+    seek_offset_ms: u64,
 }
 
 pub trait PlaybackBackend: Send + Sync {
@@ -462,6 +482,56 @@ impl PlaybackController {
             .map_err(|_| PlaybackError::Internal)
     }
 
+    pub fn event_recording_context(
+        &self,
+        camera_id: &CameraId,
+        received_time_utc: DateTime<Utc>,
+    ) -> Result<EventRecordingContextDto, PlaybackError> {
+        let matched = self.event_recording_match(camera_id, received_time_utc)?;
+        Ok(EventRecordingContextDto {
+            available: matched.is_some(),
+            camera_id: camera_id.as_str().to_owned(),
+            seek_offset_ms: matched.as_ref().map(|value| value.seek_offset_ms),
+        })
+    }
+
+    pub fn open_event_recording(
+        &mut self,
+        camera_id: &CameraId,
+        received_time_utc: DateTime<Utc>,
+    ) -> Result<Option<EventPlaybackOpenDto>, PlaybackError> {
+        let Some(matched) = self.event_recording_match(camera_id, received_time_utc)? else {
+            return Ok(None);
+        };
+        let playback = self.open(&matched.recording.relative_path)?;
+        Ok(Some(EventPlaybackOpenDto {
+            playback,
+            seek_offset_ms: matched.seek_offset_ms,
+        }))
+    }
+
+    fn event_recording_match(
+        &self,
+        camera_id: &CameraId,
+        received_time_utc: DateTime<Utc>,
+    ) -> Result<Option<EventRecordingMatch>, PlaybackError> {
+        let local_time = received_time_utc.with_timezone(&Local).naive_local();
+        let Some(storage) = self.storage.as_ref() else {
+            return Ok(None);
+        };
+        let recording = storage
+            .find_recording_at(camera_id, local_time)
+            .map_err(|_| PlaybackError::Internal)?;
+        let Some(recording) = recording else {
+            return Ok(None);
+        };
+        let seek_offset_ms = event_seek_offset_ms(recording.started_at, local_time)?;
+        Ok(Some(EventRecordingMatch {
+            recording,
+            seek_offset_ms,
+        }))
+    }
+
     pub fn adjacent(&self, recording_id: &str) -> Result<AdjacentRecordingsDto, PlaybackError> {
         let storage = self.storage.as_ref().ok_or(PlaybackError::Internal)?;
         let recording = storage
@@ -675,6 +745,17 @@ impl Drop for PlaybackController {
     fn drop(&mut self) {
         self.close_all();
     }
+}
+
+fn event_seek_offset_ms(
+    recording_started_at: NaiveDateTime,
+    event_at: NaiveDateTime,
+) -> Result<u64, PlaybackError> {
+    let offset_ms = event_at
+        .signed_duration_since(recording_started_at)
+        .num_milliseconds();
+    let offset_ms = u64::try_from(offset_ms).map_err(|_| PlaybackError::Internal)?;
+    Ok(offset_ms.saturating_sub(EVENT_PLAYBACK_PREROLL_MS))
 }
 
 fn recording_dto(recording: &IndexedRecording) -> RecordingDto {
@@ -1313,6 +1394,19 @@ mod tests {
     const CACHE_CHILD_ENV: &str = "NIAN_PLAYBACK_CACHE_TEST_CHILD";
     const CACHE_ROOT_ENV: &str = "NIAN_PLAYBACK_CACHE_TEST_ROOT";
     const RECORDING_ROOT_ENV: &str = "NIAN_PLAYBACK_CACHE_TEST_RECORDINGS";
+
+    #[test]
+    fn event_playback_preroll_is_five_seconds_and_clamped_to_segment_start() {
+        let start =
+            NaiveDateTime::parse_from_str("2026-08-29T10:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let event =
+            NaiveDateTime::parse_from_str("2026-08-29T10:02:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        assert_eq!(event_seek_offset_ms(start, event).unwrap(), 115_000);
+        assert_eq!(
+            event_seek_offset_ms(start, start + chrono::Duration::seconds(3)).unwrap(),
+            0
+        );
+    }
 
     #[test]
     #[ignore = "spawned explicitly by live_cache_instance_is_not_cleaned_by_another_process"]
