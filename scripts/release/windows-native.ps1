@@ -18,6 +18,6 @@ function Invoke-NianNative {
     & $Command
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
-        throw "required native command failed with exit code $exitCode: $Label"
+        throw ("required native command failed with exit code {0}: {1}" -f $exitCode, $Label)
     }
 }

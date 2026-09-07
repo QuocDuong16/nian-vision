@@ -16,7 +16,23 @@ test("Windows native helper has modern PowerShell and explicit exit-code fail-cl
   assert.match(helper, /PSNativeCommandUseErrorActionPreference/);
   assert.match(helper, /\$exitCode = \$LASTEXITCODE/);
   assert.match(helper, /if \(\$exitCode -ne 0\)/);
-  assert.match(helper, /throw "required native command failed with exit code \$exitCode: \$Label"/);
+  assert.equal(helper.includes("$exitCode:"), false);
+  assert.match(helper, /throw \("required native command failed with exit code \{0\}: \{1\}" -f \$exitCode, \$Label\)/);
+});
+
+test("Windows native helper parse-loads without PowerShell parser errors when PowerShell is available", (t) => {
+  const candidates = process.platform === "win32" ? ["pwsh.exe", "pwsh"] : ["pwsh"];
+  const executable = candidates.find((candidate) => {
+    const probe = spawnSync(candidate, ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"], { encoding: "utf8" });
+    return !probe.error && probe.status === 0;
+  });
+  if (!executable) {
+    t.skip("PowerShell is unavailable on this host; Windows release CI parse-loads this helper");
+    return;
+  }
+  const quotedHelper = helperPath.replaceAll("'", "''");
+  const result = spawnSync(executable, ["-NoProfile", "-Command", `. '${quotedHelper}'`], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
 });
 
 test("a failing native command cannot be masked by a later successful command when PowerShell is available", (t) => {

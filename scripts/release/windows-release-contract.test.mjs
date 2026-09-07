@@ -74,7 +74,7 @@ test("Windows release PowerShell scripts share the fail-closed native helper", (
 test("Windows release workflow routes required native tools through one fail-closed helper", () => {
   assert.match(windowsNative, /PSNativeCommandUseErrorActionPreference/);
   assert.match(windowsNative, /\$LASTEXITCODE/);
-  assert.match(windowsNative, /throw "required native command failed/);
+  assert.match(windowsNative, /throw \("required native command failed with exit code \{0\}: \{1\}" -f \$exitCode, \$Label\)/);
   for (const tool of ["git.exe", "rustup.exe", "rustc.exe", "npm.cmd", "pnpm.cmd", "cargo.exe", "node.exe"]) {
     assert.ok(workflow.includes(`Invoke-NianNative { ${tool}`), `workflow does not route ${tool} through fail-closed helper`);
   }
