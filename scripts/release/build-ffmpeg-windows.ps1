@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot "windows-native.ps1")
+. (Join-Path $PSScriptRoot "windows-bounded-process.ps1")
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 $Config = Get-Content (Join-Path $RepoRoot "scripts/release/release-config.json") -Raw | ConvertFrom-Json
@@ -51,10 +52,14 @@ $flags = @($Contract.configureFlags)
 if ($flags.Count -eq 0) { throw "Windows FFmpeg configure flag contract is empty" }
 
 Import-VsDevEnvironment
-foreach ($tool in @("cl.exe", "lib.exe", "dumpbin.exe", "node.exe", "curl.exe", "tar.exe")) { Require-Command $tool }
+foreach ($tool in @("cl.exe", "lib.exe", "dumpbin.exe", "node.exe", "curl.exe")) { Require-Command $tool }
 
 $Bash = "C:\msys64\usr\bin\bash.exe"
-if (-not (Test-Path $Bash)) { throw "MSYS2 bash is unavailable at $Bash" }
+$Tar = "C:\msys64\usr\bin\tar.exe"
+$Xz = "C:\msys64\usr\bin\xz.exe"
+foreach ($tool in @($Bash, $Tar, $Xz)) {
+    if (-not (Test-Path $tool -PathType Leaf)) { throw "required deterministic MSYS2 extraction tool is unavailable: $tool" }
+}
 
 $reportedCpuCount = [Environment]::ProcessorCount
 $buildJobs = [Math]::Max(2, [Math]::Min($reportedCpuCount, 8))
@@ -82,8 +87,34 @@ try {
     }
 
     Invoke-FfmpegPhase "extraction" {
-        Invoke-NianNative { tar.exe -xf $Tarball -C $Work }
-        if (-not (Test-Path $Source)) { throw "FFmpeg source extraction did not produce the expected source directory" }
+        $archive = Get-Item $Tarball
+        $tarVersion = ((Invoke-NianNative { & $Tar --version }) | Select-Object -First 1).Trim()
+        $xzVersion = ((Invoke-NianNative { & $Xz --version }) | Select-Object -First 1).Trim()
+        $tarballUnix = Convert-ToMsysPath $Tarball $Bash
+        $workUnix = Convert-ToMsysPath $Work $Bash
+        $tarballQuoted = "'" + $tarballUnix.Replace("'", "'\''") + "'"
+        $workQuoted = "'" + $workUnix.Replace("'", "'\''") + "'"
+        $extractCommand = "set -Eeuo pipefail; export PATH=/usr/bin; /usr/bin/xz --decompress --stdout $tarballQuoted | /usr/bin/tar --extract --file - --directory $workQuoted"
+
+        Write-Host "FFmpeg extraction tar: $Tar"
+        Write-Host "FFmpeg extraction tar version: $tarVersion"
+        Write-Host "FFmpeg extraction xz: $Xz"
+        Write-Host "FFmpeg extraction xz version: $xzVersion"
+        Write-Host "FFmpeg extraction archive: $Tarball"
+        Write-Host ("FFmpeg extraction archive size: {0} bytes" -f $archive.Length)
+        Write-Host "FFmpeg extraction destination: $Work"
+        Write-Host ("FFmpeg extraction start UTC: {0:o}" -f [DateTime]::UtcNow)
+
+        $result = Invoke-NianBoundedProcess -FilePath $Bash `
+            -ArgumentList @("--noprofile", "--norc", "-lc", $extractCommand) `
+            -TimeoutSeconds 600 `
+            -Label "FFmpeg source extraction"
+        Write-Host ("FFmpeg extraction command elapsed {0:n1}s" -f $result.ElapsedSeconds)
+
+        if (-not (Test-Path $Source -PathType Container)) { throw "FFmpeg source extraction did not produce the expected source directory" }
+        $sourceFiles = @(Get-ChildItem $Source -Recurse -File)
+        $sourceBytes = ($sourceFiles | Measure-Object -Property Length -Sum).Sum
+        Write-Host ("FFmpeg extracted source: {0} files; {1} bytes" -f $sourceFiles.Count, $sourceBytes)
     }
 
     Set-Content -Path (Join-Path $CandidateDir "FFMPEG_BUILD_FLAGS.txt") -Value ($flags -join "`n") -NoNewline

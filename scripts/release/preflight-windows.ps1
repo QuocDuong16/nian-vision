@@ -7,7 +7,7 @@ if ($env:PROCESSOR_ARCHITECTURE -notin @('AMD64', 'x86_64')) {
     throw "M8 Windows release requires an x86_64 Windows runner"
 }
 
-foreach ($tool in @('cargo.exe','rustc.exe','node.exe','pnpm.cmd','git.exe','curl.exe','tar.exe')) {
+foreach ($tool in @('cargo.exe','rustc.exe','node.exe','pnpm.cmd','git.exe','curl.exe')) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
         throw "required Windows release tool is unavailable: $tool"
     }
@@ -21,8 +21,12 @@ if ($node -ne 'v26.7.0') { throw "release Node.js mismatch: $node" }
 if ($pnpm -ne '11.22.0') { throw "release pnpm mismatch: $pnpm" }
 
 $bash = 'C:\msys64\usr\bin\bash.exe'
-if (-not (Test-Path $bash)) { throw "MSYS2 bash is unavailable at $bash" }
-Invoke-NianNative { & $bash --noprofile --norc -lc 'for tool in make cygpath awk sed grep; do command -v "$tool" >/dev/null || exit 1; done' }
+$tar = 'C:\msys64\usr\bin\tar.exe'
+$xz = 'C:\msys64\usr\bin\xz.exe'
+foreach ($tool in @($bash, $tar, $xz)) {
+    if (-not (Test-Path $tool -PathType Leaf)) { throw "required MSYS2 release tool is unavailable: $tool" }
+}
+Invoke-NianNative { & $bash --noprofile --norc -lc 'for tool in make cygpath awk sed grep; do command -v "$tool" >/dev/null || exit 1; done; test -x /usr/bin/tar; test -x /usr/bin/xz' }
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $vswhere)) { throw "vswhere.exe is unavailable" }

@@ -44,8 +44,9 @@ install -m 0644 "$ffmpeg_dir/FFMPEG_BUILD_FLAGS.txt" "$stage/FFMPEG_BUILD_FLAGS.
 install -m 0644 "$ffmpeg_dir/FFMPEG_CONFIG.h" "$stage/FFMPEG_CONFIG.h"
 node "$repo_root/scripts/release/build-metadata.mjs" --output "$stage/BUILD_METADATA.json" --target "$target"
 
-if ! readelf -d "$worker_stage" | grep -Fq '$ORIGIN/../lib/nian-vision'; then
-  echo 'staged worker is missing the installation-local FFmpeg RUNPATH' >&2
+worker_runpath="$(readelf -d "$worker_stage" | awk '/\(RUNPATH\)|\(RPATH\)/ { sub(/^.*\[/, ""); sub(/\].*$/, ""); print }')"
+if [[ "$worker_runpath" != '$ORIGIN/../lib/nian-vision' ]]; then
+  echo "staged worker has unexpected FFmpeg RUNPATH: ${worker_runpath:-<missing>}" >&2
   exit 1
 fi
 

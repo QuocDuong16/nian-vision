@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createReleaseConfig, validateEndpoint } from "./write-tauri-release-config.mjs";
+import { createAppImageRuntimeFiles, createReleaseConfig, validateEndpoint } from "./write-tauri-release-config.mjs";
 
 test("release config contains only public updater data and bundle configuration", () => {
   const privateKey = "TEST-PRIVATE-UPDATER-KEY";
@@ -36,6 +36,14 @@ test("Linux updater artifacts can be deliberately enabled for compatibility-only
     createUpdaterArtifacts: true,
   });
   assert.equal(config.bundle.createUpdaterArtifacts, true);
+});
+
+test("Linux AppImage runtime files match the worker installation-local FFmpeg RUNPATH", () => {
+  const files = createAppImageRuntimeFiles("/workspace/dist/linux-x86_64");
+  for (const name of ["libavformat.so.62", "libavcodec.so.62", "libavutil.so.60"]) {
+    assert.ok(Object.hasOwn(files, `/usr/lib/nian-vision/${name}`), `missing AppImage runtime mapping for ${name}`);
+    assert.equal(Object.hasOwn(files, `/usr/lib/${name}`), false, `legacy root /usr/lib mapping remains for ${name}`);
+  }
 });
 
 test("production updater authority must be HTTPS and non-placeholder", () => {

@@ -54,30 +54,32 @@ export function createReleaseConfig({ endpoint, pubkey, workerBase, appimageFile
   };
 }
 
+export function createAppImageRuntimeFiles(stageRoot = stage) {
+  return {
+    "/usr/share/doc/nian-vision/THIRD_PARTY_NOTICES.txt": resolve(stageRoot, "THIRD_PARTY_NOTICES.txt"),
+    "/usr/share/doc/nian-vision/FFMPEG-LGPL-2.1.txt": resolve(stageRoot, "FFMPEG-LGPL-2.1.txt"),
+    "/usr/share/doc/nian-vision/FFMPEG_BUILD_FLAGS.txt": resolve(stageRoot, "FFMPEG_BUILD_FLAGS.txt"),
+    "/usr/share/doc/nian-vision/FFMPEG_CONFIG.h": resolve(stageRoot, "FFMPEG_CONFIG.h"),
+    "/usr/share/nian-vision/BUILD_METADATA.json": resolve(stageRoot, "BUILD_METADATA.json"),
+    "/usr/lib/nian-vision/libavformat.so.62": resolve(stageRoot, "lib/nian-vision/libavformat.so.62"),
+    "/usr/lib/nian-vision/libavcodec.so.62": resolve(stageRoot, "lib/nian-vision/libavcodec.so.62"),
+    "/usr/lib/nian-vision/libavutil.so.60": resolve(stageRoot, "lib/nian-vision/libavutil.so.60"),
+  };
+}
+
 export function generateReleaseConfig() {
   const endpoint = validateEndpoint(requireEnv("NIAN_UPDATER_ENDPOINT"));
   const pubkey = requireEnv("NIAN_UPDATER_PUBLIC_KEY");
   const workerBase = resolve(stage, "tauri/nian-media-worker");
   requireFile(`${workerBase}-${target}`, "Tauri worker sidecar staging binary");
 
-  const docs = {
-    "/usr/share/doc/nian-vision/THIRD_PARTY_NOTICES.txt": resolve(stage, "THIRD_PARTY_NOTICES.txt"),
-    "/usr/share/doc/nian-vision/FFMPEG-LGPL-2.1.txt": resolve(stage, "FFMPEG-LGPL-2.1.txt"),
-    "/usr/share/doc/nian-vision/FFMPEG_BUILD_FLAGS.txt": resolve(stage, "FFMPEG_BUILD_FLAGS.txt"),
-    "/usr/share/doc/nian-vision/FFMPEG_CONFIG.h": resolve(stage, "FFMPEG_CONFIG.h"),
-    "/usr/share/nian-vision/BUILD_METADATA.json": resolve(stage, "BUILD_METADATA.json"),
-  };
-  const libraries = {
-    "/usr/lib/libavformat.so.62": resolve(stage, "lib/nian-vision/libavformat.so.62"),
-    "/usr/lib/libavcodec.so.62": resolve(stage, "lib/nian-vision/libavcodec.so.62"),
-    "/usr/lib/libavutil.so.60": resolve(stage, "lib/nian-vision/libavutil.so.60"),
-  };
-  for (const [destination, source] of Object.entries({ ...docs, ...libraries })) {
+  const runtimeFiles = createAppImageRuntimeFiles();
+  for (const [destination, source] of Object.entries(runtimeFiles)) {
     requireFile(source, destination);
   }
 
   const appimageFiles = {};
-  for (const [destination, source] of Object.entries({ ...docs, ...libraries })) {
+  for (const [destination, source] of Object.entries(runtimeFiles)) {
     appimageFiles[destination] = fromApp(source);
   }
 

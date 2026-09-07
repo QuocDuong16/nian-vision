@@ -2,11 +2,11 @@
 
 Record the exact tag, commit SHA, OS image/VM and result for every run. A checkbox is evidence only when the step was actually executed. Do not reuse a tag after changing source.
 
-Current retry candidate: `1.0.0-rc.6` / `v1.0.0-rc.6`. RC1 through RC5 remain immutable. RC5 passed the optimized Linux application build but failed during AppImage/linuxdeploy packaging after the compile, where the existing disk guard was stale and Tauri's non-verbose path hid the useful linuxdeploy child error. RC6 adds a post-build Linux disk lifecycle/diagnostic guard while preserving the accepted RC5 Windows and release-authority contracts.
+Current retry candidate: `1.0.0-rc.7` / `v1.0.0-rc.7`. RC1 through RC6 remain immutable. RC6 validated the Linux disk lifecycle fix, then exposed an AppImage FFmpeg layout mismatch (`/usr/lib` versus the worker's `/usr/lib/nian-vision` RUNPATH) and a separate Windows FFmpeg extraction stall before configure/compile. RC7 fixes only those packaging/extraction blockers while preserving accepted cache, signing and release-authority contracts.
 
 ## Pre-tag authority
 
-- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.6`.
+- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.7`.
 - [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
@@ -16,7 +16,7 @@ Current retry candidate: `1.0.0-rc.6` / `v1.0.0-rc.6`. RC1 through RC5 remain im
 
 ## GitHub RC workflow
 
-- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.6`. Never move, delete or reuse `v1.0.0-rc.1`, `v1.0.0-rc.2`, `v1.0.0-rc.3`, `v1.0.0-rc.4` or `v1.0.0-rc.5`; source/tag cross-pairing is forbidden.
+- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.7`. Never move, delete or reuse `v1.0.0-rc.1`, `v1.0.0-rc.2`, `v1.0.0-rc.3`, `v1.0.0-rc.4`, `v1.0.0-rc.5` or `v1.0.0-rc.6`; source/tag cross-pairing is forbidden.
 - [ ] GitHub tag resolves to exactly the same commit as Forgejo.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.

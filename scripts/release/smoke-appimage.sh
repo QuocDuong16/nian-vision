@@ -48,9 +48,9 @@ appdir="$work_dir/squashfs-root"
 required=(
   "$appdir/usr/bin/nian-desktop"
   "$appdir/usr/bin/nian-media-worker"
-  "$appdir/usr/lib/libavformat.so.62"
-  "$appdir/usr/lib/libavcodec.so.62"
-  "$appdir/usr/lib/libavutil.so.60"
+  "$appdir/usr/lib/nian-vision/libavformat.so.62"
+  "$appdir/usr/lib/nian-vision/libavcodec.so.62"
+  "$appdir/usr/lib/nian-vision/libavutil.so.60"
   "$appdir/usr/share/doc/nian-vision/THIRD_PARTY_NOTICES.txt"
   "$appdir/usr/share/doc/nian-vision/FFMPEG-LGPL-2.1.txt"
   "$appdir/usr/share/doc/nian-vision/FFMPEG_BUILD_FLAGS.txt"
@@ -64,10 +64,30 @@ for path in "${required[@]}"; do
   }
 done
 
-if ! readelf -d "$appdir/usr/bin/nian-media-worker" | grep -Fq '$ORIGIN/../lib'; then
-  echo "AppImage worker lost its installation-local FFmpeg RUNPATH" >&2
+for name in libavformat.so.62 libavcodec.so.62 libavutil.so.60; do
+  if [[ -e "$appdir/usr/lib/$name" ]]; then
+    echo "AppImage still contains legacy FFmpeg runtime layout: $appdir/usr/lib/$name" >&2
+    exit 1
+  fi
+done
+
+worker_runpath="$(readelf -d "$appdir/usr/bin/nian-media-worker" | awk '/\(RUNPATH\)|\(RPATH\)/ { sub(/^.*\[/, ""); sub(/\].*$/, ""); print }')"
+if [[ "$worker_runpath" != '$ORIGIN/../lib/nian-vision' ]]; then
+  echo "AppImage worker has unexpected FFmpeg RUNPATH: ${worker_runpath:-<missing>}" >&2
   exit 1
 fi
+
+worker_ldd="$(env -u LD_LIBRARY_PATH -u NIAN_FFMPEG_LIB_DIR ldd "$appdir/usr/bin/nian-media-worker")"
+for name in libavformat.so.62 libavcodec.so.62 libavutil.so.60; do
+  expected="$appdir/usr/lib/nian-vision/$name"
+  resolved="$(awk -v name="$name" '$1 == name && $2 == "=>" { print $3 }' <<<"$worker_ldd")"
+  resolved_real="$(readlink -f "$resolved" 2>/dev/null || true)"
+  expected_real="$(readlink -f "$expected")"
+  if [[ -z "$resolved_real" || "$resolved_real" != "$expected_real" ]]; then
+    echo "AppImage worker FFmpeg dependency did not resolve from installation-local runtime: $name => ${resolved:-<unresolved>} (expected $expected)" >&2
+    exit 1
+  fi
+done
 
 # Scan the actual extracted application tree after Tauri bundling. The scanner is
 # binary-safe and never prints the configured sentinel value.
