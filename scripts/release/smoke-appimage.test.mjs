@@ -22,5 +22,12 @@ test("AppImage smoke proves worker FFmpeg closure without build-time library env
   assert.match(smoke, /env -u LD_LIBRARY_PATH -u NIAN_FFMPEG_LIB_DIR ldd/);
   assert.match(smoke, /expected="\$appdir\/usr\/lib\/nian-vision\/\$name"/);
   assert.match(smoke, /resolved=.*awk -v name=/);
-  assert.match(smoke, /env -u LD_LIBRARY_PATH -u NIAN_FFMPEG_LIB_DIR \\\n+  node .*stage-runtime-smoke\.mjs/);
+  assert.ok(
+    smoke.includes(
+      [
+        "env -u LD_LIBRARY_PATH -u NIAN_FFMPEG_LIB_DIR \\",
+        '  node "$repo_root/scripts/release/stage-runtime-smoke.mjs" \\',
+      ].join("\n"),
+    ),
+  );
 });
