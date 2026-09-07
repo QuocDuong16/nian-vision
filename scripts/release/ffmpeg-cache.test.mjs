@@ -116,6 +116,22 @@ test("Windows FFmpeg cache key changes for every authoritative build-contract di
   makePackageExecutable.windowsContract.provisionedMsysPackages.make.msysExecutable = "/mingw64/bin/make";
   variants.push(makePackageExecutable);
 
+  const diffutilsPackageVersion = cloneInputs();
+  diffutilsPackageVersion.windowsContract.provisionedMsysPackages.diffutils.version = "3.11-1";
+  variants.push(diffutilsPackageVersion);
+
+  const diffutilsPackageSha = cloneInputs();
+  diffutilsPackageSha.windowsContract.provisionedMsysPackages.diffutils.sha256 = "e".repeat(64);
+  variants.push(diffutilsPackageSha);
+
+  const diffutilsPackageUrl = cloneInputs();
+  diffutilsPackageUrl.windowsContract.provisionedMsysPackages.diffutils.url = "https://mirror.msys2.org/msys/x86_64/diffutils-old.pkg.tar.zst";
+  variants.push(diffutilsPackageUrl);
+
+  const diffutilsExecutable = cloneInputs();
+  diffutilsExecutable.windowsContract.provisionedMsysPackages.diffutils.msysExecutable = "/mingw64/bin/cmp";
+  variants.push(diffutilsExecutable);
+
   const buildRevision = cloneInputs();
   buildRevision.windowsContract.buildContractVersion += 1;
   variants.push(buildRevision);
@@ -127,6 +143,15 @@ test("Windows FFmpeg cache key changes for every authoritative build-contract di
   for (const variant of variants) {
     assert.notEqual(buildContractDigest(variant.releaseConfig, variant.windowsContract), base);
   }
+});
+
+test("RC10 make-only package contract cannot share the make+diffutils cache key", () => {
+  const makeOnly = cloneInputs();
+  delete makeOnly.windowsContract.provisionedMsysPackages.diffutils;
+  assert.notEqual(
+    buildContractDigest(makeOnly.releaseConfig, makeOnly.windowsContract),
+    buildContractDigest(inputs.releaseConfig, inputs.windowsContract),
+  );
 });
 
 test("pre-RC10 Windows FFmpeg build contract cannot share the RC10 cache key", () => {

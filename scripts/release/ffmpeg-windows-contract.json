@@ -19,6 +19,7 @@
     "mkdir": "/usr/bin/mkdir",
     "rm": "/usr/bin/rm",
     "cp": "/usr/bin/cp",
+    "cmp": "/usr/bin/cmp",
     "cat": "/usr/bin/cat",
     "sort": "/usr/bin/sort",
     "expr": "/usr/bin/expr",
@@ -27,7 +28,9 @@
     "uname": "/usr/bin/uname",
     "mktemp": "/usr/bin/mktemp",
     "touch": "/usr/bin/touch",
-    "ln": "/usr/bin/ln"
+    "chmod": "/usr/bin/chmod",
+    "ln": "/usr/bin/ln",
+    "install": "/usr/bin/install"
   },
   "provisionedMsysPackages": {
     "make": {
@@ -38,6 +41,14 @@
       "installedExecutable": "C:\\msys64\\usr\\bin\\make.exe",
       "msysExecutable": "/usr/bin/make",
       "versionLine": "GNU Make 4.4.1"
+    },
+    "diffutils": {
+      "name": "diffutils",
+      "version": "3.12-1",
+      "url": "https://mirror.msys2.org/msys/x86_64/diffutils-3.12-1-x86_64.pkg.tar.zst",
+      "sha256": "7902c8ce3d4dd69a0f5e98dc9d5c83c17b23314ba486169db57ef6e2835ce3b6",
+      "installedExecutable": "C:\\msys64\\usr\\bin\\cmp.exe",
+      "msysExecutable": "/usr/bin/cmp"
     }
   },
   "configureFlags": [

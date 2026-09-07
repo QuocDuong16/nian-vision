@@ -17,30 +17,64 @@ const makePackage = {
   versionLine: "GNU Make 4.4.1",
 };
 
-test("RC10 provisions one exact official MSYS2 GNU make package", () => {
+const diffutilsPackage = {
+  name: "diffutils",
+  version: "3.12-1",
+  url: "https://mirror.msys2.org/msys/x86_64/diffutils-3.12-1-x86_64.pkg.tar.zst",
+  sha256: "7902c8ce3d4dd69a0f5e98dc9d5c83c17b23314ba486169db57ef6e2835ce3b6",
+  installedExecutable: "C:\\msys64\\usr\\bin\\cmp.exe",
+  msysExecutable: "/usr/bin/cmp",
+};
+
+test("RC10 provisions exact official MSYS2 GNU make and diffutils packages", () => {
   assert.equal(contract.buildContractVersion, 3);
-  assert.deepEqual(contract.provisionedMsysPackages, { make: makePackage });
-  for (const value of Object.values(makePackage)) assert.ok(provision.includes(value));
+  assert.deepEqual(contract.provisionedMsysPackages, {
+    make: makePackage,
+    diffutils: diffutilsPackage,
+  });
+  for (const pkg of [makePackage, diffutilsPackage]) {
+    for (const value of Object.values(pkg)) assert.ok(provision.includes(value));
+  }
   assert.match(provision, /System32\\curl\.exe/);
   assert.match(provision, /Invoke-NianBoundedProcess -FilePath \$Curl/);
-  assert.match(provision, /-TimeoutSeconds 180 -Label 'pinned MSYS2 GNU make download'/);
+  assert.match(provision, /pinned MSYS2 \$\(\$expected\.Name\) download/);
   assert.match(provision, /Get-FileHash -Algorithm SHA256/);
-  assert.match(provision, /MSYS2 GNU make package SHA-256 mismatch; installation is blocked/);
-  assert.match(provision, /pacman --noconfirm --needed/);
-  assert.match(provision, /-U /);
-  assert.doesNotMatch(provision, /pacman[^\n]*-Syu|winget upgrade|choco upgrade|rustup update|npm update/i);
+  assert.match(provision, /package SHA-256 mismatch; installation is blocked/);
+  assert.match(provision, /pacman --noconfirm --needed -U/);
+  assert.doesNotMatch(provision, /pacman[^\n]*-Syu|pacman[^\n]*-Syyu|winget upgrade|choco upgrade|rustup update|npm update/i);
   assert.match(provision, /Invoke-NianBoundedProcess -FilePath \$Bash/);
-  assert.match(provision, /Invoke-NianNative \{ & \$Pacman -Q make \}/);
+  assert.match(provision, /Invoke-NianNative \{ & \$Pacman -Q \$expected\.Name \}/);
   assert.match(provision, /GNU Make 4\.4\.1/);
+  assert.match(provision, /diffutils 3\.12-1\s+-> libiconv, libintl, sh/);
+  assert.match(provision, /foreach \(\$dependency in @\('libiconv', 'libintl'\)\)/);
+  assert.match(provision, /& \$Pacman -Q bash/);
+  assert.match(provision, /C:\\msys64\\usr\\bin\\sh\.exe/);
 });
 
-test("RC10 verifies package SHA before local package installation", () => {
-  const hashAt = provision.indexOf("Get-FileHash -Algorithm SHA256");
-  const hashPassAt = provision.indexOf("SHA-256 verification: PASS");
-  const installAt = provision.indexOf("pacman --noconfirm --needed");
-  assert.ok(hashAt >= 0 && hashAt < hashPassAt && hashPassAt < installAt);
+test("RC10 verifies each package SHA before any local package installation", () => {
+  const installLoopAt = provision.lastIndexOf("foreach ($expected in $ExpectedPackages)");
+  assert.ok(installLoopAt >= 0);
+  const loop = provision.slice(installLoopAt);
+  const downloadAt = loop.indexOf("Invoke-NianBoundedProcess -FilePath $Curl");
+  const bytesAt = loop.indexOf("downloaded byte count:");
+  const hashAt = loop.indexOf("Get-FileHash -Algorithm SHA256");
+  const mismatchAt = loop.indexOf("package SHA-256 mismatch; installation is blocked");
+  const hashPassAt = loop.indexOf("SHA-256 verification: PASS");
+  const installCommandAt = loop.indexOf("$installCommand =");
+  const installProcessAt = loop.indexOf("Invoke-NianBoundedProcess -FilePath $Bash", installCommandAt);
+  assert.ok(
+    downloadAt >= 0 &&
+      downloadAt < bytesAt &&
+      bytesAt < hashAt &&
+      hashAt < mismatchAt &&
+      mismatchAt < hashPassAt &&
+      hashPassAt < installCommandAt &&
+      installCommandAt < installProcessAt,
+  );
   const dependencyCheckAt = provision.indexOf("& $Pacman -Q $dependency");
-  assert.ok(dependencyCheckAt >= 0 && dependencyCheckAt < installAt);
+  const shProviderAt = provision.indexOf("& $Pacman -Q bash");
+  assert.ok(dependencyCheckAt >= 0 && dependencyCheckAt < installLoopAt);
+  assert.ok(shProviderAt >= 0 && shProviderAt < installLoopAt);
 });
 
 test("Windows release provisions pinned MSYS tools before preflight and quality/cache work", () => {
@@ -52,4 +86,5 @@ test("Windows release provisions pinned MSYS tools before preflight and quality/
   const contractAt = windows.indexOf("- name: Compute Windows FFmpeg build contract");
   assert.ok(pnpmAt >= 0 && pnpmAt < provisionAt && provisionAt < preflightAt && preflightAt < qualityAt && qualityAt < contractAt);
   assert.match(windows.slice(provisionAt, preflightAt), /scripts\/release\/provision-ffmpeg-msys-tools\.ps1/);
+  assert.equal([...windows.matchAll(/Provision pinned MSYS FFmpeg build tools/g)].length, 1);
 });

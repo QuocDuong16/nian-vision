@@ -39,6 +39,7 @@ const expectedTools = {
   mkdir: "/usr/bin/mkdir",
   rm: "/usr/bin/rm",
   cp: "/usr/bin/cp",
+  cmp: "/usr/bin/cmp",
   cat: "/usr/bin/cat",
   sort: "/usr/bin/sort",
   expr: "/usr/bin/expr",
@@ -47,7 +48,9 @@ const expectedTools = {
   uname: "/usr/bin/uname",
   mktemp: "/usr/bin/mktemp",
   touch: "/usr/bin/touch",
+  chmod: "/usr/bin/chmod",
   ln: "/usr/bin/ln",
+  install: "/usr/bin/install",
 };
 
 function findPowerShell() {
@@ -132,6 +135,10 @@ test("RC10 GNU make/AWK and CCDEP contracts fail closed before compile", () => {
   assert.match(source.probe, /\.RECIPEPREFIX := >/);
   assert.match(source.probe, /\/usr\/bin\/make --no-print-directory -f/);
   assert.match(source.probe, /GNU make\/AWK recipe expansion produced unexpected output/);
+  assert.match(source.probe, /\/usr\/bin\/cmp -s "\$cmp_left" "\$cmp_right"/);
+  assert.match(source.probe, /cmp_different_status != 1/);
+  assert.match(source.probe, /\/usr\/bin\/install -m 644 "\$install_source" "\$install_destination"/);
+  assert.match(source.probe, /install behavioral probe copied unexpected contents/);
   assert.match(source.validator, /ffbuild\/config\.mak/);
   assert.ok(source.validator.includes(`gsub(/\\\\/, "/")`));
   assert.match(source.validator, /requires exactly one CCDEP line/);
@@ -179,6 +186,8 @@ test("Windows FFmpeg aggregate tool, AWK, make, and synthetic CCDEP probes execu
   for (const command of ["cl.exe", "cl", "lib.exe", "link.exe", "link"]) assert.match(probeResult.stdout, new RegExp(`${command.replace(".", "\\.")}\\s+->`));
   for (const path of Object.values(expectedTools)) assert.ok(probeResult.stdout.includes(path), `aggregate report omitted ${path}`);
   assert.match(probeResult.stdout, /FFmpeg MSYS AWK backslash probe: C:\/foo\/bar\.h/);
+  assert.match(probeResult.stdout, /FFmpeg MSYS cmp behavioral probe: identical=0 different=1/);
+  assert.match(probeResult.stdout, /FFmpeg MSYS install behavioral probe: nian-install-probe/);
   assert.match(probeResult.stdout, /FFmpeg MSYS GNU make behavioral probe: C:\/foo\/bar\.h/);
   assert.match(probeResult.stdout, /FFmpeg Windows toolchain resolution: PASS/);
 

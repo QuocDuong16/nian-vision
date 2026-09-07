@@ -196,16 +196,49 @@ if (( mismatch_count > 0 )); then
   exit 1
 fi
 
-make_probe_dir="$(/usr/bin/mktemp -d -t nian-ffmpeg-make-probe.XXXXXX)"
-cleanup() { /usr/bin/rm -rf "$make_probe_dir"; }
+behavior_probe_dir="$(/usr/bin/mktemp -d -t nian-ffmpeg-msys-probe.XXXXXX)"
+cleanup() { /usr/bin/rm -rf "$behavior_probe_dir"; }
 trap cleanup EXIT
-/usr/bin/cat > "$make_probe_dir/Makefile" <<'NIAN_MAKEFILE'
+
+cmp_left="$behavior_probe_dir/cmp-left.txt"
+cmp_right="$behavior_probe_dir/cmp-right.txt"
+printf '%s\n' 'nian-cmp-probe' > "$cmp_left"
+printf '%s\n' 'nian-cmp-probe' > "$cmp_right"
+if ! /usr/bin/cmp -s "$cmp_left" "$cmp_right"; then
+  record_failure 'cmp behavioral probe rejected identical files'
+fi
+printf '%s\n' 'different' >> "$cmp_right"
+set +e
+/usr/bin/cmp -s "$cmp_left" "$cmp_right"
+cmp_different_status=$?
+set -e
+if (( cmp_different_status != 1 )); then
+  record_failure "cmp behavioral probe expected exit 1 for different files, got $cmp_different_status"
+fi
+printf 'FFmpeg MSYS cmp behavioral probe: identical=0 different=%d\n' "$cmp_different_status"
+
+install_source="$behavior_probe_dir/install-source.txt"
+install_destination="$behavior_probe_dir/install-destination.txt"
+printf '%s\n' 'nian-install-probe' > "$install_source"
+if ! /usr/bin/install -m 644 "$install_source" "$install_destination"; then
+  record_failure 'install behavioral probe exited non-zero'
+elif [[ ! -f "$install_destination" ]]; then
+  record_failure 'install behavioral probe did not create the destination file'
+else
+  install_contents="$(/usr/bin/cat "$install_destination")"
+  if [[ "$install_contents" != 'nian-install-probe' ]]; then
+    record_failure "install behavioral probe copied unexpected contents: $install_contents"
+  fi
+fi
+printf 'FFmpeg MSYS install behavioral probe: %s\n' "${install_contents:-<missing>}"
+
+/usr/bin/cat > "$behavior_probe_dir/Makefile" <<'NIAN_MAKEFILE'
 .RECIPEPREFIX := >
 .PHONY: nian-make-probe
 nian-make-probe:
 >@printf '%s\n' 'C:\foo\bar.h' | /usr/bin/awk '{ gsub(/\\/, "/"); print }'
 NIAN_MAKEFILE
-make_probe_output="$(/usr/bin/make --no-print-directory -f "$make_probe_dir/Makefile" nian-make-probe 2>&1)" || {
+make_probe_output="$(/usr/bin/make --no-print-directory -f "$behavior_probe_dir/Makefile" nian-make-probe 2>&1)" || {
   record_failure "GNU make behavioral probe exited non-zero: $make_probe_output"
   make_probe_output='<failed>'
 }
@@ -219,7 +252,7 @@ case "${make_probe_output,,}" in
 esac
 printf 'FFmpeg MSYS GNU make behavioral probe: %s\n' "$make_probe_output"
 if (( mismatch_count > 0 )); then
-  printf 'FFmpeg GNU make behavioral failures: %d\n' "$mismatch_count" >&2
+  printf 'FFmpeg MSYS behavioral failures: %d\n' "$mismatch_count" >&2
   for failure in "${failures[@]}"; do printf '%s\n' "$failure" >&2; done
   exit 1
 fi
