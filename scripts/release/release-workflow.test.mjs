@@ -9,6 +9,7 @@ const forgejoReleasePath = new URL("../../.forgejo/workflows/release.yml", impor
 const forgejoQualityPath = new URL("../../.forgejo/workflows/quality.yml", import.meta.url);
 const workflow = readNormalizedText(githubWorkflowPath);
 const viteConfig = readNormalizedText(new URL("../../ui/vite.config.ts", import.meta.url));
+const linuxAppImagePrepare = readNormalizedText(new URL("./prepare-linux-appimage.sh", import.meta.url));
 
 function jobBodyFrom(source, name) {
   const marker = `  ${name}:\n`;
@@ -188,8 +189,10 @@ test("Linux release compilation owns and disposes quality and worker intermediat
 
   const stageAt = linux.indexOf("- name: Stage and clean-smoke Linux runtime");
   const handoffAt = linux.indexOf("- name: Release Linux Cargo intermediates before desktop build");
-  const tauriAt = linux.indexOf("- name: Build unsigned AppImage bundle");
-  assert.ok(stageAt >= 0 && stageAt < handoffAt && handoffAt < tauriAt);
+  const tauriBuildAt = linux.indexOf("- name: Build unsigned Linux application");
+  const prepareAt = linux.indexOf("- name: Prepare Linux AppImage bundle disk");
+  const bundleAt = linux.indexOf("- name: Bundle unsigned AppImage");
+  assert.ok(stageAt >= 0 && stageAt < handoffAt && handoffAt < tauriBuildAt && tauriBuildAt < prepareAt && prepareAt < bundleAt);
   const handoff = stepBody("build-linux", "Release Linux Cargo intermediates before desktop build");
   assert.match(handoff, /rm -rf target\/release/);
   assert.equal(handoff.includes("rm -rf dist/linux-x86_64"), false);
@@ -201,6 +204,43 @@ test("Linux release compilation owns and disposes quality and worker intermediat
   assert.match(guard, /minimum_free_kb=\$\(\(10 \* 1024 \* 1024\)\)/);
   assert.match(guard, /available_kb/);
   assert.match(stepBody("build-linux", "Upload unsigned Linux build"), /dist\/linux-x86_64\//);
+});
+
+test("Linux AppImage bundling diagnoses, narrowly prunes, guards, then bundles the already-built executable", () => {
+  const build = stepBody("build-linux", "Build unsigned Linux application");
+  assert.match(build, /tauri build --config tauri\.release\.generated\.conf\.json --no-bundle --ci/);
+  assert.match(build, /test -x \.\.\/\.\.\/target\/release\/nian-desktop/);
+  assert.equal(build.includes("tauri bundle"), false);
+
+  const prepare = stepBody("build-linux", "Prepare Linux AppImage bundle disk");
+  assert.match(prepare, /bash scripts\/release\/prepare-linux-appimage\.sh/);
+  assert.match(linuxAppImagePrepare, /Post-Tauri-build disk diagnostics before release-target pruning:/);
+  assert.match(linuxAppImagePrepare, /df -h/);
+  assert.match(linuxAppImagePrepare, /df -Pk "\$workspace"/);
+  assert.match(linuxAppImagePrepare, /du -sh "\$target_root"/);
+  assert.match(linuxAppImagePrepare, /du -sh "\$release_dir"/);
+  assert.match(linuxAppImagePrepare, /for intermediate in deps build \.fingerprint incremental/);
+  assert.match(linuxAppImagePrepare, /rm -rf -- "\$release_dir\/\$intermediate"/);
+  assert.equal(linuxAppImagePrepare.includes("rm -rf target/release"), false);
+  assert.match(linuxAppImagePrepare, /desktop_sha_after.*desktop_sha_before/s);
+  assert.match(linuxAppImagePrepare, /minimum_free_kb=\$\(\(4 \* 1024 \* 1024\)\)/);
+  assert.match(linuxAppImagePrepare, /\[\[ "\$available_kb" =~ \^\[0-9\]\+\$ \]\]/);
+  assert.match(linuxAppImagePrepare, /below the required 4 GiB guard/);
+
+  const bundle = stepBody("build-linux", "Bundle unsigned AppImage");
+  assert.match(bundle, /NIAN_UPDATER_CONFIGURED: "1"/);
+  assert.match(bundle, /"\$tauri_cli" --version/);
+  assert.match(bundle, /APPIMAGE_EXTRACT_AND_RUN=/);
+  assert.match(bundle, /df -Pk "\$GITHUB_WORKSPACE"/);
+  assert.match(bundle, /"\$tauri_cli" bundle --config tauri\.release\.generated\.conf\.json --bundles appimage --ci --no-sign --verbose/);
+  assert.match(bundle, /bundle failed with exit code/);
+  assert.match(bundle, /bundle_finished - bundle_started/);
+
+  const post = stepBody("build-linux", "Report Linux AppImage bundle disk state");
+  assert.match(post, /if: always\(\)/);
+  assert.match(post, /df -Pk "\$GITHUB_WORKSPACE"/);
+  assert.match(post, /target\/release\/bundle\/appimage/);
+  assert.match(workflow, /APPIMAGE_EXTRACT_AND_RUN: "1"/);
 });
 
 test("generated release-only Tauri configs are disposed even after a preceding failure", () => {

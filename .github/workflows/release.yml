@@ -220,14 +220,53 @@ jobs:
             exit 1
           fi
 
-      - name: Build unsigned AppImage bundle
+      - name: Build unsigned Linux application
         env:
           NIAN_UPDATER_CONFIGURED: "1"
         run: |
           set -Eeuo pipefail
           cd apps/nian-desktop
           ../../ui/node_modules/.bin/tauri build --config tauri.release.generated.conf.json --no-bundle --ci
-          ../../ui/node_modules/.bin/tauri bundle --config tauri.release.generated.conf.json --bundles appimage --ci --no-sign
+          test -x ../../target/release/nian-desktop || { echo "Tauri no-bundle build did not produce target/release/nian-desktop" >&2; exit 1; }
+
+      - name: Prepare Linux AppImage bundle disk
+        run: bash scripts/release/prepare-linux-appimage.sh
+
+      - name: Bundle unsigned AppImage
+        env:
+          NIAN_UPDATER_CONFIGURED: "1"
+        run: |
+          set -Eeuo pipefail
+          cd apps/nian-desktop
+          tauri_cli="../../ui/node_modules/.bin/tauri"
+          echo "Starting Linux AppImage bundle phase"
+          "$tauri_cli" --version
+          echo "APPIMAGE_EXTRACT_AND_RUN=${APPIMAGE_EXTRACT_AND_RUN:-<unset>}"
+          df -Pk "$GITHUB_WORKSPACE"
+          bundle_started="$(date +%s)"
+          if "$tauri_cli" bundle --config tauri.release.generated.conf.json --bundles appimage --ci --no-sign --verbose; then
+            bundle_status=0
+          else
+            bundle_status=$?
+            bundle_finished="$(date +%s)"
+            echo "Linux AppImage bundle failed with exit code ${bundle_status} after $((bundle_finished - bundle_started)) seconds" >&2
+            df -h
+            df -Pk "$GITHUB_WORKSPACE"
+            du -sh ../../target/release ../../target/release/bundle ../../target/release/bundle/appimage 2>/dev/null || true
+            exit "$bundle_status"
+          fi
+          bundle_finished="$(date +%s)"
+          echo "Linux AppImage bundle completed with exit code ${bundle_status} after $((bundle_finished - bundle_started)) seconds"
+
+      - name: Report Linux AppImage bundle disk state
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          echo "Post-AppImage bundle disk diagnostics:"
+          df -h
+          df -Pk "$GITHUB_WORKSPACE"
+          du -sh target target/release target/release/bundle target/release/bundle/appimage dist ui/dist 2>/dev/null || true
+          du -x -k --max-depth=2 target/release/bundle 2>/dev/null | sort -nr | sed -n '1,30p' || true
 
       - name: Dispose generated Tauri release configuration
         if: always()
