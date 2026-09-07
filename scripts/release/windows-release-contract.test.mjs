@@ -13,6 +13,8 @@ const windowsFfmpegContract = JSON.parse(readNormalizedText(new URL("./ffmpeg-wi
 const windowsNative = readNormalizedText(new URL("./windows-native.ps1", import.meta.url));
 const windowsBoundedProcess = readNormalizedText(new URL("./windows-bounded-process.ps1", import.meta.url));
 const windowsMsvcToolchain = readNormalizedText(new URL("./windows-msvc-toolchain.ps1", import.meta.url));
+const windowsFfmpegMsysEnvironment = readNormalizedText(new URL("./windows-ffmpeg-msys-environment.ps1", import.meta.url));
+const windowsFfmpegProvision = readNormalizedText(new URL("./provision-ffmpeg-msys-tools.ps1", import.meta.url));
 const releaseConfig = JSON.parse(readNormalizedText(new URL("./release-config.json", import.meta.url)));
 const windowsStage = readNormalizedText(new URL("./stage-windows.ps1", import.meta.url));
 const windowsPreflight = readNormalizedText(new URL("./preflight-windows.ps1", import.meta.url));
@@ -33,6 +35,7 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   assert.equal(releaseConfig.ffmpegVersion, "8.0.3");
   assert.equal(releaseConfig.ffmpegSourceUrl, "https://ffmpeg.org/releases/ffmpeg-8.0.3.tar.xz");
   assert.equal(releaseConfig.ffmpegSourceSha256, "6136812ea6d4e68bdba27e33c2a94382711cdf4f8602ffef056ff792bd6f9818");
+  assert.equal(windowsFfmpegContract.buildContractVersion, 3);
   assert.equal(windowsFfmpegContract.toolchain, "msvc");
   assert.equal(windowsFfmpegContract.architecture, "x86_64");
   for (const flag of ["--toolchain=msvc", "--enable-shared", "--disable-static", "--disable-gpl", "--disable-nonfree", "--disable-autodetect", "--disable-everything"]) {
@@ -40,13 +43,14 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   }
   assert.match(windowsFfmpeg, /ffmpeg-windows-contract\.json/);
   assert.match(windowsFfmpeg, /Get-FileHash -Algorithm SHA256/);
-  assert.match(windowsFfmpeg, /Invoke-NianNative \{ curl\.exe/);
+  assert.match(windowsFfmpeg, /Invoke-NianNative \{ & \$Curl/);
+  assert.match(windowsFfmpeg, /System32\\curl\.exe/);
   const shaAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "SHA-256 verification"');
   const extractionAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "extraction"');
   const configureAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "configure"');
   assert.ok(shaAt >= 0 && shaAt < extractionAt && extractionAt < configureAt);
-  assert.match(windowsFfmpeg, /\$Tar = "C:\\msys64\\usr\\bin\\tar\.exe"/);
-  assert.match(windowsFfmpeg, /\$Xz = "C:\\msys64\\usr\\bin\\xz\.exe"/);
+  assert.match(windowsFfmpeg, /\$Tar = ['"]C:\\msys64\\usr\\bin\\tar\.exe['"]/);
+  assert.match(windowsFfmpeg, /\$Xz = ['"]C:\\msys64\\usr\\bin\\xz\.exe['"]/);
   assert.match(windowsFfmpeg, /\/usr\/bin\/xz --decompress --stdout/);
   assert.match(windowsFfmpeg, /\/usr\/bin\/tar --extract --file - --directory/);
   assert.equal(/Invoke-NianNative \{ tar\.exe/.test(windowsFfmpeg), false);
@@ -56,7 +60,7 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   assert.match(windowsFfmpeg, /FFmpeg extraction archive size:/);
   assert.match(windowsFfmpeg, /FFmpeg extraction start UTC:/);
   assert.match(windowsFfmpeg, /FFmpeg source extraction did not produce the expected source directory/);
-  for (const path of ["/usr/bin/make", "/usr/bin/awk", "/usr/bin/sed", "/usr/bin/grep", "/usr/bin/cygpath"]) {
+  for (const path of ["/usr/bin/make", "/usr/bin/awk", "/usr/bin/sed", "/usr/bin/grep", "/usr/bin/cygpath", "/usr/bin/tar", "/usr/bin/xz", "/usr/bin/head", "/usr/bin/tail", "/usr/bin/tr", "/usr/bin/cut", "/usr/bin/mkdir", "/usr/bin/rm", "/usr/bin/cp", "/usr/bin/cat", "/usr/bin/sort"]) {
     assert.ok(JSON.stringify(windowsFfmpegContract.msysBuildTools).includes(path));
   }
   assert.match(windowsPreflight, /test-ffmpeg-msys-escape\.ps1/);
@@ -86,6 +90,8 @@ test("Windows release PowerShell scripts share the fail-closed native helper", (
   for (const [name, source] of [
     ["preflight", windowsPreflight],
     ["FFmpeg", windowsFfmpeg],
+    ["FFmpeg MSYS provisioning", windowsFfmpegProvision],
+    ["FFmpeg MSYS environment", windowsFfmpegMsysEnvironment],
     ["FFmpeg validator", windowsFfmpegValidatorPs],
     ["staging", windowsStage],
     ["Authenticode", windowsAuthenticode],

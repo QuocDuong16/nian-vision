@@ -43,6 +43,12 @@ export function buildWindowsFfmpegContract(releaseConfig, windowsContract) {
       toolchain: windowsContract.toolchain,
     },
     msys_build_tools: { ...windowsContract.msysBuildTools },
+    provisioned_msys_packages: Object.fromEntries(
+      Object.entries(windowsContract.provisionedMsysPackages ?? {}).map(([name, pkg]) => [
+        name,
+        { ...pkg },
+      ]),
+    ),
     configure_flags: [...windowsContract.configureFlags],
     required_outputs: {
       dlls: [

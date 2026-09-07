@@ -427,6 +427,10 @@ jobs:
           Add-Content $env:GITHUB_PATH $corepackRoot
           Invoke-NianNative { & (Join-Path $corepackRoot 'pnpm.cmd') --version }
 
+      - name: Provision pinned MSYS FFmpeg build tools
+        shell: pwsh
+        run: scripts/release/provision-ffmpeg-msys-tools.ps1
+
       - name: Windows runner preflight
         shell: pwsh
         run: scripts/release/preflight-windows.ps1

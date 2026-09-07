@@ -1,5 +1,5 @@
 {
-  "buildContractVersion": 2,
+  "buildContractVersion": 3,
   "outputRuntimeContractVersion": 1,
   "toolchain": "msvc",
   "architecture": "x86_64",
@@ -9,7 +9,36 @@
     "awk": "/usr/bin/awk",
     "sed": "/usr/bin/sed",
     "grep": "/usr/bin/grep",
-    "cygpath": "/usr/bin/cygpath"
+    "cygpath": "/usr/bin/cygpath",
+    "tar": "/usr/bin/tar",
+    "xz": "/usr/bin/xz",
+    "head": "/usr/bin/head",
+    "tail": "/usr/bin/tail",
+    "tr": "/usr/bin/tr",
+    "cut": "/usr/bin/cut",
+    "mkdir": "/usr/bin/mkdir",
+    "rm": "/usr/bin/rm",
+    "cp": "/usr/bin/cp",
+    "cat": "/usr/bin/cat",
+    "sort": "/usr/bin/sort",
+    "expr": "/usr/bin/expr",
+    "dirname": "/usr/bin/dirname",
+    "basename": "/usr/bin/basename",
+    "uname": "/usr/bin/uname",
+    "mktemp": "/usr/bin/mktemp",
+    "touch": "/usr/bin/touch",
+    "ln": "/usr/bin/ln"
+  },
+  "provisionedMsysPackages": {
+    "make": {
+      "name": "make",
+      "version": "4.4.1-3",
+      "url": "https://repo.msys2.org/msys/x86_64/make-4.4.1-3-x86_64.pkg.tar.zst",
+      "sha256": "af0bdba17f06fe037f0194069adaa31a8fe45f1a11381501896aea1fae37bd5d",
+      "installedExecutable": "C:\\msys64\\usr\\bin\\make.exe",
+      "msysExecutable": "/usr/bin/make",
+      "versionLine": "GNU Make 4.4.1"
+    }
   },
   "configureFlags": [
     "--prefix=/opt/nian-vision-ffmpeg",

@@ -1,6 +1,6 @@
 param(
     [string]$VsInstall = '',
-    [string]$MsvcBinUnix = '',
+    [string]$ControlledPath = '',
     [string]$ExpectedClWindows = '',
     [string]$ExpectedLibWindows = '',
     [string]$ExpectedLinkWindows = ''
@@ -10,20 +10,14 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-native.ps1')
 . (Join-Path $PSScriptRoot 'windows-msvc-toolchain.ps1')
+. (Join-Path $PSScriptRoot 'windows-ffmpeg-msys-environment.ps1')
 
 if (-not $IsWindows) { throw 'FFmpeg MSYS build-tool probe requires Windows' }
 
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
+$Contract = Get-Content (Join-Path $RepoRoot 'scripts/release/ffmpeg-windows-contract.json') -Raw | ConvertFrom-Json
 $Bash = 'C:\msys64\usr\bin\bash.exe'
-if (-not (Test-Path $Bash -PathType Leaf)) { throw "required deterministic MSYS2 Bash is unavailable: $Bash" }
-
-function Convert-ToBashSingleQuoted([string]$Value) {
-    return "'" + $Value.Replace("'", "'\''") + "'"
-}
-
-function Convert-ToMsysPath([string]$Path) {
-    $escaped = $Path.Replace("'", "'\''")
-    return (Invoke-NianNative { & $Bash --noprofile --norc -lc "/usr/bin/cygpath -u '$escaped'" } 'probe cygpath path conversion' | Out-String).Trim()
-}
+if (-not (Test-Path -LiteralPath $Bash -PathType Leaf)) { throw "required deterministic MSYS2 Bash is unavailable: $Bash" }
 
 $providedAuthority = @(@($VsInstall, $ExpectedClWindows, $ExpectedLibWindows, $ExpectedLinkWindows) | Where-Object { $_ })
 if ($providedAuthority.Count -ne 0 -and $providedAuthority.Count -ne 4) {
@@ -41,89 +35,203 @@ else {
         -LinkPath $ExpectedLinkWindows
 }
 
-$expectedMsvcBinUnix = Convert-ToMsysPath $Msvc.MsvcBin
-if (-not $MsvcBinUnix) { $MsvcBinUnix = $expectedMsvcBinUnix }
-if ($MsvcBinUnix -ne $expectedMsvcBinUnix) {
-    throw "FFmpeg MSYS probe MSVC path authority drifted: expected $expectedMsvcBinUnix, received $MsvcBinUnix"
+$MsysEnvironment = New-NianFfmpegMsysEnvironment -MsvcBinWindows $Msvc.MsvcBin
+if ($ControlledPath -and $ControlledPath -ne $MsysEnvironment.PathText) {
+    throw 'FFmpeg MSYS probe received a controlled PATH that differs from the shared environment authority'
 }
+$ControlledPath = $MsysEnvironment.PathText
+
+Write-Host '---- FFmpeg Windows toolchain resolution ----'
+Write-Host "controlled PATH: $ControlledPath"
+if ($MsysEnvironment.Removed.Count -eq 0) {
+    Write-Host 'forbidden inherited PATH entries removed: <none>'
+}
+else {
+    foreach ($entry in $MsysEnvironment.Removed) {
+        Write-Host "forbidden inherited PATH entry removed: $entry"
+    }
+}
+
+$msysPairs = @($Contract.msysBuildTools.PSObject.Properties | ForEach-Object {
+    "$($_.Name) $([string]$_.Value)"
+}) -join "`n"
+$forbiddenRoots = @((Get-NianForbiddenMsysToolRoots) | ForEach-Object { ConvertTo-NianBashSingleQuoted $_ }) -join ' '
 
 $probe = @'
 set -Eeuo pipefail
-export PATH=__MSVC_BIN__:/usr/bin:"$PATH"
+export PATH=__CONTROLLED_PATH__
 hash -r
+mismatch_count=0
+failures=()
 
-assert_msvc_command() {
-  name="$1"
-  expected="$2"
-  resolved="$(command -v "$name")"
-  if [[ -z "$resolved" ]]; then
-    printf 'required MSVC command is not visible inside MSYS: %s\n' "$name" >&2
-    exit 1
+record_failure() {
+  mismatch_count=$((mismatch_count + 1))
+  failures+=("$1")
+}
+
+canonical_windows() {
+  local path="$1"
+  if [[ -z "$path" ]]; then
+    printf '<missing>'
+    return
   fi
-  actual_windows="$(/usr/bin/cygpath -aw "$resolved")"
+  /usr/bin/cygpath -aw "$path" 2>/dev/null || printf '<cygpath-failed>'
+}
+
+first_version_line() {
+  local name="$1"
+  local expected="$2"
+  case "$name" in
+    bash|make|awk|sed|grep|tar|xz)
+      "$expected" --version 2>&1 | /usr/bin/head -n 1 || true
+      ;;
+    *)
+      printf '<not-requested>'
+      ;;
+  esac
+}
+
+report_msvc() {
+  local logical="$1"
+  local expected="$2"
+  local resolved actual_windows actual_compare expected_compare status
+  resolved="$(command -v "$logical" 2>/dev/null || true)"
+  actual_windows="$(canonical_windows "$resolved")"
   actual_compare="${actual_windows,,}"
   expected_compare="${expected,,}"
   actual_compare="${actual_compare%.exe}"
   expected_compare="${expected_compare%.exe}"
-  printf 'FFmpeg MSVC command %s: %s -> %s\n' "$name" "$resolved" "$actual_windows"
-  if [[ "$actual_compare" != "$expected_compare" ]]; then
-    printf 'expected MSVC command %s at %s, resolved %s\n' "$name" "$expected" "$actual_windows" >&2
-    exit 1
+  status=PASS
+  if [[ -z "$resolved" || "$actual_compare" != "$expected_compare" ]]; then
+    status=FAIL
+    record_failure "MSVC $logical expected $expected, resolved $actual_windows"
   fi
+  printf '%-10s -> %-85s | %-85s | %-15s | %s\n' "$logical" "${resolved:-<missing>}" "$actual_windows" '<MSVC>' "$status"
 }
 
-assert_msvc_command cl.exe __CL__
-assert_msvc_command cl __CL__
-assert_msvc_command lib.exe __LIB__
-assert_msvc_command link.exe __LINK__
-assert_msvc_command link __LINK__
-
-for pair in \
-  make:/usr/bin/make \
-  awk:/usr/bin/awk \
-  sed:/usr/bin/sed \
-  grep:/usr/bin/grep \
-  cygpath:/usr/bin/cygpath
-do
-  name="${pair%%:*}"
-  expected="${pair#*:}"
-  actual="$(command -v "$name")"
-  printf 'FFmpeg MSYS tool %s: %s\n' "$name" "$actual"
-  if [[ "$actual" != "$expected" ]]; then
-    printf 'expected deterministic MSYS2 tool %s at %s, resolved %s\n' "$name" "$expected" "$actual" >&2
-    exit 1
+report_msys() {
+  local logical="$1"
+  local expected="$2"
+  local resolved actual_windows version status
+  resolved="$(command -v "$logical" 2>/dev/null || true)"
+  actual_windows="$(canonical_windows "$resolved")"
+  version="$(first_version_line "$logical" "$expected")"
+  status=PASS
+  if [[ "$resolved" != "$expected" ]]; then
+    status=FAIL
+    record_failure "MSYS $logical expected $expected, resolved ${resolved:-<missing>} ($actual_windows)"
   fi
+  printf '%-10s -> %-85s | %-85s | %-40s | %s\n' "$logical" "${resolved:-<missing>}" "$actual_windows" "$version" "$status"
+}
+
+is_forbidden_resolution() {
+  local resolved="$1"
+  local root
+  for root in __FORBIDDEN_ROOTS__; do
+    case "${resolved,,}" in
+      "${root,,}"|"${root,,}"/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+report_unexpected_toolchain_command() {
+  local logical="$1"
+  local resolved actual_windows status
+  resolved="$(command -v "$logical" 2>/dev/null || true)"
+  actual_windows="$(canonical_windows "$resolved")"
+  status=PASS
+  if [[ -n "$resolved" ]] && is_forbidden_resolution "$resolved"; then
+    status=FAIL
+    record_failure "unexpected $logical resolves inside forbidden toolchain: $resolved ($actual_windows)"
+  fi
+  printf '%-10s -> %-85s | %-85s | %-40s | %s\n' "$logical" "${resolved:-<absent>}" "$actual_windows" '<forbidden-root-check>' "$status"
+}
+
+report_msvc cl.exe __CL__
+report_msvc cl __CL__
+report_msvc lib.exe __LIB__
+report_msvc link.exe __LINK__
+report_msvc link __LINK__
+
+while IFS=' ' read -r logical expected; do
+  [[ -n "$logical" ]] || continue
+  report_msys "$logical" "$expected"
+done <<'NIAN_MSYS_TOOLS'
+__MSYS_PAIRS__
+NIAN_MSYS_TOOLS
+
+for name in gcc cc ld ar; do
+  report_unexpected_toolchain_command "$name"
 done
 
-printf 'FFmpeg MSYS make version: '
-/usr/bin/make --version | /usr/bin/sed -n '1p'
-
-awk_version="$(/usr/bin/awk --version 2>&1 | /usr/bin/sed -n '1p' || true)"
-if [[ -z "$awk_version" ]]; then
-  awk_version="$(/usr/bin/awk -W version 2>&1 | /usr/bin/sed -n '1p' || true)"
+make_resolved="$(command -v make 2>/dev/null || true)"
+if [[ "$make_resolved" != '/usr/bin/make' ]]; then
+  record_failure "bare make does not resolve to /usr/bin/make: ${make_resolved:-<missing>}"
 fi
-if [[ -z "$awk_version" ]]; then
-  printf 'unable to determine /usr/bin/awk version\n' >&2
+if [[ -x /usr/bin/make && -x /usr/bin/head ]]; then
+  make_version="$(/usr/bin/make --version 2>&1 | /usr/bin/head -n 1 || true)"
+  if [[ "$make_version" != '__MAKE_VERSION_LINE__' ]]; then
+    record_failure "GNU make version mismatch: $make_version"
+  fi
+fi
+
+if [[ -x /usr/bin/awk ]]; then
+  awk_actual="$(printf '%s\n' 'C:\foo\bar.h' | /usr/bin/awk '{ gsub(/\\/, "/"); print }' || true)"
+  if [[ "$awk_actual" != 'C:/foo/bar.h' ]]; then
+    record_failure "AWK backslash conversion failed: $awk_actual"
+  fi
+  printf 'FFmpeg MSYS AWK backslash probe: %s\n' "$awk_actual"
+fi
+
+printf '%s\n' '--------------------------------------------'
+if (( mismatch_count > 0 )); then
+  printf 'FFmpeg Windows toolchain resolution failures: %d\n' "$mismatch_count" >&2
+  limit=0
+  for failure in "${failures[@]}"; do
+    printf '%s\n' "$failure" >&2
+    limit=$((limit + 1))
+    if (( limit >= 40 )); then break; fi
+  done
   exit 1
 fi
-printf 'FFmpeg MSYS awk version: %s\n' "$awk_version"
 
-printf 'FFmpeg MSYS sed version: '
-/usr/bin/sed --version | /usr/bin/sed -n '1p'
-printf 'FFmpeg MSYS grep version: '
-/usr/bin/grep --version | /usr/bin/sed -n '1p'
-
-actual="$(printf '%s\n' 'C:\foo\bar.h' | /usr/bin/awk '{ gsub(/\\/, "/"); print }')"
-if [[ "$actual" != 'C:/foo/bar.h' ]]; then
-  printf 'FFmpeg MSYS AWK backslash conversion failed: %s\n' "$actual" >&2
+make_probe_dir="$(/usr/bin/mktemp -d -t nian-ffmpeg-make-probe.XXXXXX)"
+cleanup() { /usr/bin/rm -rf "$make_probe_dir"; }
+trap cleanup EXIT
+/usr/bin/cat > "$make_probe_dir/Makefile" <<'NIAN_MAKEFILE'
+.RECIPEPREFIX := >
+.PHONY: nian-make-probe
+nian-make-probe:
+>@printf '%s\n' 'C:\foo\bar.h' | /usr/bin/awk '{ gsub(/\\/, "/"); print }'
+NIAN_MAKEFILE
+make_probe_output="$(/usr/bin/make --no-print-directory -f "$make_probe_dir/Makefile" nian-make-probe 2>&1)" || {
+  record_failure "GNU make behavioral probe exited non-zero: $make_probe_output"
+  make_probe_output='<failed>'
+}
+if [[ "$make_probe_output" != 'C:/foo/bar.h' ]]; then
+  record_failure "GNU make/AWK recipe expansion produced unexpected output: $make_probe_output"
+fi
+case "${make_probe_output,,}" in
+  *mingw64*|*mingw32*|*ucrt64*|*clang64*|*clangarm64*)
+    record_failure "GNU make behavioral probe exposed a forbidden toolchain path: $make_probe_output"
+    ;;
+esac
+printf 'FFmpeg MSYS GNU make behavioral probe: %s\n' "$make_probe_output"
+if (( mismatch_count > 0 )); then
+  printf 'FFmpeg GNU make behavioral failures: %d\n' "$mismatch_count" >&2
+  for failure in "${failures[@]}"; do printf '%s\n' "$failure" >&2; done
   exit 1
 fi
-printf 'FFmpeg MSYS AWK backslash probe: %s\n' "$actual"
+printf 'FFmpeg Windows toolchain resolution: PASS\n'
 '@
 
-$probe = $probe.Replace('__MSVC_BIN__', (Convert-ToBashSingleQuoted $MsvcBinUnix))
-$probe = $probe.Replace('__CL__', (Convert-ToBashSingleQuoted $Msvc.ClPath))
-$probe = $probe.Replace('__LIB__', (Convert-ToBashSingleQuoted $Msvc.LibPath))
-$probe = $probe.Replace('__LINK__', (Convert-ToBashSingleQuoted $Msvc.LinkPath))
+$probe = $probe.Replace('__CONTROLLED_PATH__', (ConvertTo-NianBashSingleQuoted $ControlledPath))
+$probe = $probe.Replace('__FORBIDDEN_ROOTS__', $forbiddenRoots)
+$probe = $probe.Replace('__MSYS_PAIRS__', $msysPairs)
+$probe = $probe.Replace('__CL__', (ConvertTo-NianBashSingleQuoted $Msvc.ClPath))
+$probe = $probe.Replace('__LIB__', (ConvertTo-NianBashSingleQuoted $Msvc.LibPath))
+$probe = $probe.Replace('__LINK__', (ConvertTo-NianBashSingleQuoted $Msvc.LinkPath))
+$probe = $probe.Replace('__MAKE_VERSION_LINE__', [string]$Contract.provisionedMsysPackages.make.versionLine)
 
-Invoke-NianNative { & $Bash --noprofile --norc -lc $probe } 'FFmpeg MSYS build-tool, MSVC precedence, and AWK escaping probe'
+Invoke-NianNative { & $Bash --noprofile --norc -lc $probe } 'aggregate FFmpeg MSYS/MSVC toolchain and GNU make behavioral probe'

@@ -3,6 +3,7 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot "windows-native.ps1")
 . (Join-Path $PSScriptRoot "windows-bounded-process.ps1")
 . (Join-Path $PSScriptRoot "windows-msvc-toolchain.ps1")
+. (Join-Path $PSScriptRoot "windows-ffmpeg-msys-environment.ps1")
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 $Config = Get-Content (Join-Path $RepoRoot "scripts/release/release-config.json") -Raw | ConvertFrom-Json
@@ -26,34 +27,31 @@ function Require-Command([string]$Name) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) { throw "required Windows release tool is unavailable: $Name" }
 }
 
-function Convert-ToMsysPath([string]$Path, [string]$Bash) {
-    $escaped = $Path.Replace("'", "'\''")
-    return (Invoke-NianNative { & $Bash --noprofile --norc -lc "/usr/bin/cygpath -u '$escaped'" } 'cygpath path conversion' | Out-String).Trim()
-}
-
-function Convert-ToBashSingleQuoted([string]$Value) {
-    return "'" + $Value.Replace("'", "'\''") + "'"
-}
-
 if ($Config.windowsTarget -ne "x86_64-pc-windows-msvc") { throw "Windows FFmpeg release target contract drifted" }
 if ($Contract.toolchain -ne "msvc" -or $Contract.architecture -ne "x86_64") { throw "Windows FFmpeg toolchain contract drifted" }
 $flags = @($Contract.configureFlags)
 if ($flags.Count -eq 0) { throw "Windows FFmpeg configure flag contract is empty" }
 
 $Msvc = Resolve-NianMsvcToolchain
-$Bash = "C:\msys64\usr\bin\bash.exe"
-$Tar = "C:\msys64\usr\bin\tar.exe"
-$Xz = "C:\msys64\usr\bin\xz.exe"
-$Make = "C:\msys64\usr\bin\make.exe"
-$Awk = "C:\msys64\usr\bin\awk.exe"
-$Sed = "C:\msys64\usr\bin\sed.exe"
-$Grep = "C:\msys64\usr\bin\grep.exe"
-$Cygpath = "C:\msys64\usr\bin\cygpath.exe"
-foreach ($tool in @($Bash, $Tar, $Xz, $Make, $Awk, $Sed, $Grep, $Cygpath)) {
-    if (-not (Test-Path $tool -PathType Leaf)) { throw "required deterministic MSYS2 release tool is unavailable: $tool" }
-}
+$Bash = 'C:\msys64\usr\bin\bash.exe'
+$Tar = 'C:\msys64\usr\bin\tar.exe'
+$Xz = 'C:\msys64\usr\bin\xz.exe'
+$Cygpath = 'C:\msys64\usr\bin\cygpath.exe'
+$Curl = Join-Path $env:SystemRoot 'System32\curl.exe'
 
-foreach ($tool in @("dumpbin.exe", "node.exe", "curl.exe")) { Require-Command $tool }
+foreach ($property in $Contract.msysBuildTools.PSObject.Properties) {
+    $expectedUnix = "/usr/bin/$($property.Name)"
+    if ([string]$property.Value -ne $expectedUnix) {
+        throw "Windows FFmpeg MSYS build-tool contract drifted for $($property.Name): $($property.Value)"
+    }
+    $windowsTool = "C:\msys64\usr\bin\$($property.Name).exe"
+    if (-not (Test-Path -LiteralPath $windowsTool -PathType Leaf)) {
+        throw "required deterministic MSYS2 release tool is unavailable: $windowsTool"
+    }
+}
+if (-not (Test-Path -LiteralPath $Curl -PathType Leaf)) { throw "required Windows system curl is unavailable: $Curl" }
+foreach ($tool in @('dumpbin.exe', 'node.exe')) { Require-Command $tool }
+
 foreach ($entry in @(
     @{ Name = 'cl.exe'; Path = $Msvc.ClPath },
     @{ Name = 'lib.exe'; Path = $Msvc.LibPath },
@@ -61,27 +59,13 @@ foreach ($entry in @(
 )) {
     Write-Host ("FFmpeg MSVC tool {0}: {1}" -f $entry.Name, $entry.Path)
 }
-$MsvcBinUnix = Convert-ToMsysPath $Msvc.MsvcBin $Bash
-Write-Host "FFmpeg MSVC tool directory inside MSYS: $MsvcBinUnix"
 
-$expectedMsysTools = [ordered]@{
-    bash = "/usr/bin/bash"
-    make = "/usr/bin/make"
-    awk = "/usr/bin/awk"
-    sed = "/usr/bin/sed"
-    grep = "/usr/bin/grep"
-    cygpath = "/usr/bin/cygpath"
-}
-foreach ($name in $expectedMsysTools.Keys) {
-    if ($Contract.msysBuildTools.$name -ne $expectedMsysTools[$name]) {
-        throw "Windows FFmpeg MSYS build-tool contract drifted for $name"
-    }
-}
-$MsysBuildPreamble = @'
-set -Eeuo pipefail
-export PATH=__MSVC_BIN__:/usr/bin:"$PATH"
-hash -r
-'@.Replace('__MSVC_BIN__', (Convert-ToBashSingleQuoted $MsvcBinUnix))
+$MsysEnvironment = New-NianFfmpegMsysEnvironment -MsvcBinWindows $Msvc.MsvcBin -Cygpath $Cygpath
+$MsvcBinUnix = $MsysEnvironment.MsvcBinUnix
+$MsysBuildPreamble = $MsysEnvironment.BashPreamble
+Write-Host "FFmpeg MSVC tool directory inside MSYS: $MsvcBinUnix"
+Write-Host "FFmpeg controlled MSYS PATH: $($MsysEnvironment.PathText)"
+foreach ($entry in $MsysEnvironment.Removed) { Write-Host "FFmpeg forbidden inherited PATH entry removed: $entry" }
 
 # FFmpeg 8.0.3 --toolchain=msvc sets LD=$source_path/compat/windows/mslink.
 # That wrapper first resolves dirname "$(command -v cl)"/link and falls back to
@@ -89,7 +73,7 @@ hash -r
 # selected Visual Studio toolchain before configure or compile can start.
 & (Join-Path $RepoRoot "scripts/release/test-ffmpeg-msys-escape.ps1") `
     -VsInstall $Msvc.VsInstall `
-    -MsvcBinUnix $MsvcBinUnix `
+    -ControlledPath $MsysEnvironment.PathText `
     -ExpectedClWindows $Msvc.ClPath `
     -ExpectedLibWindows $Msvc.LibPath `
     -ExpectedLinkWindows $Msvc.LinkPath
@@ -109,7 +93,7 @@ $CandidateDir = Join-Path $OutputParent (".ffmpeg-windows-x86_64.candidate-" + [
 New-Item -ItemType Directory -Force $CandidateDir | Out-Null
 try {
     Invoke-FfmpegPhase "download" {
-        Invoke-NianNative { curl.exe --fail --silent --show-error --location --output $Tarball $Config.ffmpegSourceUrl }
+        Invoke-NianNative { & $Curl --fail --silent --show-error --location --output $Tarball $Config.ffmpegSourceUrl } 'FFmpeg source download'
     }
 
     Invoke-FfmpegPhase "SHA-256 verification" {
@@ -124,10 +108,10 @@ try {
         $archive = Get-Item $Tarball
         $tarVersion = ((Invoke-NianNative { & $Tar --version }) | Select-Object -First 1).Trim()
         $xzVersion = ((Invoke-NianNative { & $Xz --version }) | Select-Object -First 1).Trim()
-        $tarballUnix = Convert-ToMsysPath $Tarball $Bash
-        $workUnix = Convert-ToMsysPath $Work $Bash
-        $tarballQuoted = "'" + $tarballUnix.Replace("'", "'\''") + "'"
-        $workQuoted = "'" + $workUnix.Replace("'", "'\''") + "'"
+        $tarballUnix = ConvertTo-NianMsysPath -Path $Tarball -Cygpath $Cygpath
+        $workUnix = ConvertTo-NianMsysPath -Path $Work -Cygpath $Cygpath
+        $tarballQuoted = ConvertTo-NianBashSingleQuoted $tarballUnix
+        $workQuoted = ConvertTo-NianBashSingleQuoted $workUnix
         $extractCommand = "set -Eeuo pipefail; export PATH=/usr/bin; /usr/bin/xz --decompress --stdout $tarballQuoted | /usr/bin/tar --extract --file - --directory $workQuoted"
 
         Write-Host "FFmpeg extraction tar: $Tar"
@@ -153,25 +137,28 @@ try {
 
     Set-Content -Path (Join-Path $CandidateDir "FFMPEG_BUILD_FLAGS.txt") -Value ($flags -join "`n") -NoNewline
 
-    $sourceUnix = Convert-ToMsysPath $Source $Bash
-    $destUnix = Convert-ToMsysPath $DestRoot $Bash
-    $configureStderrUnix = Convert-ToMsysPath $ConfigureStderr $Bash
-    $flagText = ($flags | ForEach-Object { "'" + $_.Replace("'", "'\''") + "'" }) -join " "
+    $sourceUnix = ConvertTo-NianMsysPath -Path $Source -Cygpath $Cygpath
+    $destUnix = ConvertTo-NianMsysPath -Path $DestRoot -Cygpath $Cygpath
+    $configureStderrUnix = ConvertTo-NianMsysPath -Path $ConfigureStderr -Cygpath $Cygpath
+    $sourceQuoted = ConvertTo-NianBashSingleQuoted $sourceUnix
+    $destQuoted = ConvertTo-NianBashSingleQuoted $destUnix
+    $configureStderrQuoted = ConvertTo-NianBashSingleQuoted $configureStderrUnix
+    $flagText = ($flags | ForEach-Object { ConvertTo-NianBashSingleQuoted $_ }) -join " "
 
     Invoke-FfmpegPhase "configure" {
         $configureCommand = @'
 {0}
-cd '{1}'
+cd {1}
 set +e
-./configure {2} 2>'{3}'
+./configure {2} 2>{3}
 status=$?
 set -e
 if (( status != 0 )); then
   printf 'FFmpeg configure failed; bounded stderr tail follows\n' >&2
-  /usr/bin/tail -n 120 '{3}' >&2
+  /usr/bin/tail -n 120 {3} >&2
   exit "$status"
 fi
-'@ -f $MsysBuildPreamble, $sourceUnix, $flagText, $configureStderrUnix
+'@ -f $MsysBuildPreamble, $sourceQuoted, $flagText, $configureStderrQuoted
         Invoke-NianNative { & $Bash --noprofile --norc -lc $configureCommand } 'FFmpeg configure'
         $configHeader = Join-Path $Source "config.h"
         $componentHeader = Join-Path $Source "config_components.h"
@@ -198,15 +185,15 @@ fi
         & (Join-Path $RepoRoot "scripts/release/validate-ffmpeg-msys-dependency.ps1") `
             -Source $Source `
             -Bash $Bash `
-            -MsvcBinUnix $MsvcBinUnix
+            -ControlledPath $MsysEnvironment.PathText
     }
 
     Invoke-FfmpegPhase "compile" {
-        Invoke-NianNative { & $Bash --noprofile --norc -lc "$MsysBuildPreamble; cd '$sourceUnix'; /usr/bin/make -j$buildJobs" } 'FFmpeg compile with /usr/bin/make'
+        Invoke-NianNative { & $Bash --noprofile --norc -lc "$MsysBuildPreamble; cd $sourceQuoted; /usr/bin/make -j$buildJobs" } 'FFmpeg compile with /usr/bin/make'
     }
 
     Invoke-FfmpegPhase "install" {
-        Invoke-NianNative { & $Bash --noprofile --norc -lc "$MsysBuildPreamble; cd '$sourceUnix'; /usr/bin/make install DESTDIR='$destUnix'" } 'FFmpeg install with /usr/bin/make'
+        Invoke-NianNative { & $Bash --noprofile --norc -lc "$MsysBuildPreamble; cd $sourceQuoted; /usr/bin/make install DESTDIR=$destQuoted" } 'FFmpeg install with /usr/bin/make'
     }
 
     Invoke-FfmpegPhase "configuration and license validation" {

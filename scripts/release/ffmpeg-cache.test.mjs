@@ -100,6 +100,22 @@ test("Windows FFmpeg cache key changes for every authoritative build-contract di
   msysMake.windowsContract.msysBuildTools.make = "/mingw64/bin/mingw32-make";
   variants.push(msysMake);
 
+  const makePackageVersion = cloneInputs();
+  makePackageVersion.windowsContract.provisionedMsysPackages.make.version = "4.4.1-2";
+  variants.push(makePackageVersion);
+
+  const makePackageSha = cloneInputs();
+  makePackageSha.windowsContract.provisionedMsysPackages.make.sha256 = "f".repeat(64);
+  variants.push(makePackageSha);
+
+  const makePackageUrl = cloneInputs();
+  makePackageUrl.windowsContract.provisionedMsysPackages.make.url = "https://repo.msys2.org/msys/x86_64/make-old.pkg.tar.zst";
+  variants.push(makePackageUrl);
+
+  const makePackageExecutable = cloneInputs();
+  makePackageExecutable.windowsContract.provisionedMsysPackages.make.msysExecutable = "/mingw64/bin/make";
+  variants.push(makePackageExecutable);
+
   const buildRevision = cloneInputs();
   buildRevision.windowsContract.buildContractVersion += 1;
   variants.push(buildRevision);
@@ -111,6 +127,13 @@ test("Windows FFmpeg cache key changes for every authoritative build-contract di
   for (const variant of variants) {
     assert.notEqual(buildContractDigest(variant.releaseConfig, variant.windowsContract), base);
   }
+});
+
+test("pre-RC10 Windows FFmpeg build contract cannot share the RC10 cache key", () => {
+  const old = cloneInputs();
+  old.windowsContract.buildContractVersion = 2;
+  delete old.windowsContract.provisionedMsysPackages;
+  assert.notEqual(buildContractDigest(old.releaseConfig, old.windowsContract), buildContractDigest(inputs.releaseConfig, inputs.windowsContract));
 });
 
 test("Windows FFmpeg metadata validates only for the current source and build contract", () => {
