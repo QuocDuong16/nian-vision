@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Source,
-    [Parameter(Mandatory = $true)][string]$Bash
+    [Parameter(Mandatory = $true)][string]$Bash,
+    [Parameter(Mandatory = $true)][string]$MsvcBinUnix
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,6 +16,10 @@ function Convert-ToMsysPath([string]$Path) {
 function Get-BoundedText([string]$Text, [int]$Limit = 1600) {
     if ($Text.Length -le $Limit) { return $Text }
     return $Text.Substring(0, $Limit) + ' ...[truncated]'
+}
+
+function Convert-ToBashSingleQuoted([string]$Value) {
+    return "'" + $Value.Replace("'", "'\''") + "'"
 }
 
 $ConfigMak = Join-Path $Source 'ffbuild/config.mak'
@@ -40,11 +45,19 @@ $(info $(call CCDEP,CC))
 $(info NIAN_CCDEP_END)
 .PHONY: nian-dependency-probe
 nian-dependency-probe:
-	@:
 '@ | Set-Content -Path $probePath -NoNewline
 
     $probeUnix = Convert-ToMsysPath $probePath
-    $command = "set -Eeuo pipefail; export PATH=\"/usr/bin:`$PATH\"; hash -r; cd '$SourceUnix'; /usr/bin/make --no-print-directory -f '$probeUnix' -n nian-dependency-probe"
+    $command = @'
+set -Eeuo pipefail
+export PATH=__MSVC_BIN__:/usr/bin:"$PATH"
+hash -r
+cd __SOURCE__
+/usr/bin/make --no-print-directory -f __PROBE__ -n nian-dependency-probe
+'@
+    $command = $command.Replace('__MSVC_BIN__', (Convert-ToBashSingleQuoted $MsvcBinUnix))
+    $command = $command.Replace('__SOURCE__', (Convert-ToBashSingleQuoted $SourceUnix))
+    $command = $command.Replace('__PROBE__', (Convert-ToBashSingleQuoted $probeUnix))
     $expanded = (Invoke-NianNative { & $Bash --noprofile --norc -lc $command } 'FFmpeg generated dependency make-expansion probe' | Out-String).Trim()
     Write-Host ("FFmpeg CCDEP after /usr/bin/make expansion: {0}" -f (Get-BoundedText $expanded))
     if (-not $expanded.Contains($expectedAwk)) {

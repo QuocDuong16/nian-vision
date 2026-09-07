@@ -35,6 +35,7 @@ function Import-VsDevEnvironment {
             [Environment]::SetEnvironmentVariable($line.Substring(0, $split), $line.Substring($split + 1), 'Process')
         }
     }
+    return $install
 }
 
 function Require-Command([string]$Name) {
@@ -46,18 +47,16 @@ function Convert-ToMsysPath([string]$Path, [string]$Bash) {
     return (Invoke-NianNative { & $Bash --noprofile --norc -lc "/usr/bin/cygpath -u '$escaped'" } 'cygpath path conversion' | Out-String).Trim()
 }
 
+function Convert-ToBashSingleQuoted([string]$Value) {
+    return "'" + $Value.Replace("'", "'\''") + "'"
+}
+
 if ($Config.windowsTarget -ne "x86_64-pc-windows-msvc") { throw "Windows FFmpeg release target contract drifted" }
 if ($Contract.toolchain -ne "msvc" -or $Contract.architecture -ne "x86_64") { throw "Windows FFmpeg toolchain contract drifted" }
 $flags = @($Contract.configureFlags)
 if ($flags.Count -eq 0) { throw "Windows FFmpeg configure flag contract is empty" }
 
-Import-VsDevEnvironment
-foreach ($tool in @("cl.exe", "lib.exe", "link.exe", "dumpbin.exe", "node.exe", "curl.exe")) { Require-Command $tool }
-foreach ($tool in @("cl.exe", "lib.exe", "link.exe")) {
-    $resolved = (Get-Command $tool -ErrorAction Stop).Source
-    Write-Host "FFmpeg MSVC tool $tool: $resolved"
-}
-
+$VsInstall = Import-VsDevEnvironment
 $Bash = "C:\msys64\usr\bin\bash.exe"
 $Tar = "C:\msys64\usr\bin\tar.exe"
 $Xz = "C:\msys64\usr\bin\xz.exe"
@@ -69,6 +68,30 @@ $Cygpath = "C:\msys64\usr\bin\cygpath.exe"
 foreach ($tool in @($Bash, $Tar, $Xz, $Make, $Awk, $Sed, $Grep, $Cygpath)) {
     if (-not (Test-Path $tool -PathType Leaf)) { throw "required deterministic MSYS2 release tool is unavailable: $tool" }
 }
+
+foreach ($tool in @("cl.exe", "lib.exe", "link.exe", "dumpbin.exe", "node.exe", "curl.exe")) { Require-Command $tool }
+$MsvcTools = [ordered]@{}
+foreach ($tool in @("cl.exe", "lib.exe", "link.exe")) {
+    $resolved = [IO.Path]::GetFullPath((Get-Command $tool -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source)
+    $MsvcTools[$tool] = $resolved
+    Write-Host ("FFmpeg MSVC tool {0}: {1}" -f $tool, $resolved)
+}
+$MsvcBin = Split-Path -Parent $MsvcTools["cl.exe"]
+foreach ($tool in @("lib.exe", "link.exe")) {
+    if ((Split-Path -Parent $MsvcTools[$tool]) -ne $MsvcBin) {
+        throw "FFmpeg MSVC tool $tool did not resolve beside cl.exe"
+    }
+}
+$VcToolsRoot = [IO.Path]::GetFullPath((Join-Path $VsInstall "VC\Tools\MSVC"))
+$VcToolsPrefix = $VcToolsRoot.TrimEnd('\') + '\'
+if (-not $MsvcBin.StartsWith($VcToolsPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "FFmpeg MSVC tools did not resolve under the selected Visual Studio VC toolchain: $MsvcBin"
+}
+if ($MsvcBin -notmatch '(?i)[\/]bin[\/]Hostx64[\/]x64$') {
+    throw "FFmpeg MSVC tools did not resolve to the expected amd64 Hostx64/x64 tool directory: $MsvcBin"
+}
+$MsvcBinUnix = Convert-ToMsysPath $MsvcBin $Bash
+Write-Host "FFmpeg MSVC tool directory inside MSYS: $MsvcBinUnix"
 
 $expectedMsysTools = [ordered]@{
     bash = "/usr/bin/bash"
@@ -83,29 +106,21 @@ foreach ($name in $expectedMsysTools.Keys) {
         throw "Windows FFmpeg MSYS build-tool contract drifted for $name"
     }
 }
-& (Join-Path $RepoRoot "scripts/release/test-ffmpeg-msys-escape.ps1")
-
-$MsysBuildPreamble = 'set -Eeuo pipefail; export PATH="/usr/bin:$PATH"; hash -r'
-$msvcShellProbe = @'
+$MsysBuildPreamble = @'
 set -Eeuo pipefail
-export PATH="/usr/bin:$PATH"
+export PATH=__MSVC_BIN__:/usr/bin:"$PATH"
 hash -r
-for tool in cl.exe lib.exe; do
-  resolved="$(command -v "$tool")"
-  printf 'FFmpeg MSVC tool visible inside MSYS %s: %s\n' "$tool" "$resolved"
-done
-cl_path="$(command -v cl.exe)"
-link_path="$(dirname "$cl_path")/link.exe"
-if [[ ! -x "$link_path" ]]; then
-  link_path="$(dirname "$cl_path")/link"
-fi
-if [[ ! -x "$link_path" ]]; then
-  printf 'MSVC link.exe is not executable beside cl.exe: %s\n' "$cl_path" >&2
-  exit 1
-fi
-printf 'FFmpeg MSVC linker beside cl.exe: %s\n' "$link_path"
-'@
-Invoke-NianNative { & $Bash --noprofile --norc -lc $msvcShellProbe } 'MSVC tool visibility inside deterministic MSYS environment'
+'@.Replace('__MSVC_BIN__', (Convert-ToBashSingleQuoted $MsvcBinUnix))
+
+# FFmpeg 8.0.3 --toolchain=msvc sets LD=$source_path/compat/windows/mslink.
+# That wrapper first resolves dirname "$(command -v cl)"/link and falls back to
+# link.exe, so the controlled shell proves both bare and .exe spellings use the
+# selected Visual Studio toolchain before configure or compile can start.
+& (Join-Path $RepoRoot "scripts/release/test-ffmpeg-msys-escape.ps1") `
+    -MsvcBinUnix $MsvcBinUnix `
+    -ExpectedClWindows $MsvcTools["cl.exe"] `
+    -ExpectedLibWindows $MsvcTools["lib.exe"] `
+    -ExpectedLinkWindows $MsvcTools["link.exe"]
 
 $reportedCpuCount = [Environment]::ProcessorCount
 $buildJobs = [Math]::Max(2, [Math]::Min($reportedCpuCount, 8))
@@ -208,7 +223,10 @@ fi
             $syntaxFailures | Select-Object -First 20 | ForEach-Object { Write-Host $_ }
             throw "FFmpeg configure returned success but emitted sed/awk syntax errors; compile is blocked"
         }
-        & (Join-Path $RepoRoot "scripts/release/validate-ffmpeg-msys-dependency.ps1") -Source $Source -Bash $Bash
+        & (Join-Path $RepoRoot "scripts/release/validate-ffmpeg-msys-dependency.ps1") `
+            -Source $Source `
+            -Bash $Bash `
+            -MsvcBinUnix $MsvcBinUnix
     }
 
     Invoke-FfmpegPhase "compile" {
