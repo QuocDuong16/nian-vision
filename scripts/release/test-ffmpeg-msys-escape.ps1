@@ -3,7 +3,10 @@ param(
     [string]$ControlledPath = '',
     [string]$ExpectedClWindows = '',
     [string]$ExpectedLibWindows = '',
-    [string]$ExpectedLinkWindows = ''
+    [string]$ExpectedLinkWindows = '',
+    [string]$ExpectedDumpbinWindows = '',
+    [string]$ExpectedWindowsSdkBin = '',
+    [string]$ExpectedRcWindows = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,20 +22,23 @@ $Contract = Get-Content (Join-Path $RepoRoot 'scripts/release/ffmpeg-windows-con
 $Bash = 'C:\msys64\usr\bin\bash.exe'
 if (-not (Test-Path -LiteralPath $Bash -PathType Leaf)) { throw "required deterministic MSYS2 Bash is unavailable: $Bash" }
 
-$providedAuthority = @(@($VsInstall, $ExpectedClWindows, $ExpectedLibWindows, $ExpectedLinkWindows) | Where-Object { $_ })
-if ($providedAuthority.Count -ne 0 -and $providedAuthority.Count -ne 4) {
-    throw 'FFmpeg MSYS probe requires either all MSVC authority arguments or none of them'
+$providedAuthority = @(@($VsInstall, $ExpectedClWindows, $ExpectedLibWindows, $ExpectedLinkWindows, $ExpectedDumpbinWindows, $ExpectedWindowsSdkBin, $ExpectedRcWindows) | Where-Object { $_ })
+if ($providedAuthority.Count -ne 0 -and $providedAuthority.Count -ne 7) {
+    throw 'FFmpeg MSYS probe requires either all Windows tool authority arguments or none of them'
 }
 
 if ($providedAuthority.Count -eq 0) {
     $Msvc = Resolve-NianMsvcToolchain
 }
 else {
-    $Msvc = Assert-NianMsvcToolAuthority `
+    $Msvc = Assert-NianFfmpegWindowsToolAuthority `
         -VsInstall $VsInstall `
         -ClPath $ExpectedClWindows `
         -LibPath $ExpectedLibWindows `
-        -LinkPath $ExpectedLinkWindows
+        -LinkPath $ExpectedLinkWindows `
+        -DumpbinPath $ExpectedDumpbinWindows `
+        -WindowsSdkBin $ExpectedWindowsSdkBin `
+        -RcPath $ExpectedRcWindows
 }
 
 $MsysEnvironment = New-NianFfmpegMsysEnvironment -MsvcBinWindows $Msvc.MsvcBin
@@ -106,6 +112,10 @@ report_msvc() {
     status=FAIL
     record_failure "MSVC $logical expected $expected, resolved $actual_windows"
   fi
+  if [[ -n "$resolved" ]] && is_forbidden_resolution "$resolved"; then
+    status=FAIL
+    record_failure "MSVC $logical resolved inside forbidden toolchain: $resolved ($actual_windows)"
+  fi
   printf '%-10s -> %-85s | %-85s | %-15s | %s\n' "$logical" "${resolved:-<missing>}" "$actual_windows" '<MSVC>' "$status"
 }
 
@@ -122,6 +132,26 @@ report_msys() {
     record_failure "MSYS $logical expected $expected, resolved ${resolved:-<missing>} ($actual_windows)"
   fi
   printf '%-10s -> %-85s | %-85s | %-40s | %s\n' "$logical" "${resolved:-<missing>}" "$actual_windows" "$version" "$status"
+}
+
+report_windows_sdk() {
+  local logical="$1"
+  local expected="$2"
+  local resolved actual_windows actual_compare expected_compare status
+  resolved="$(command -v "$logical" 2>/dev/null || true)"
+  actual_windows="$(canonical_windows "$resolved")"
+  actual_compare="${actual_windows,,}"
+  expected_compare="${expected,,}"
+  status=PASS
+  if [[ -z "$resolved" || "$actual_compare" != "$expected_compare" ]]; then
+    status=FAIL
+    record_failure "Windows SDK $logical expected $expected, resolved $actual_windows"
+  fi
+  if [[ -n "$resolved" ]] && is_forbidden_resolution "$resolved"; then
+    status=FAIL
+    record_failure "Windows SDK $logical resolved inside forbidden toolchain: $resolved ($actual_windows)"
+  fi
+  printf '%-10s -> %-85s | %-85s | %-40s | %s\n' "$logical" "${resolved:-<missing>}" "$actual_windows" '<Windows SDK>' "$status"
 }
 
 is_forbidden_resolution() {
@@ -153,6 +183,8 @@ report_msvc cl __CL__
 report_msvc lib.exe __LIB__
 report_msvc link.exe __LINK__
 report_msvc link __LINK__
+report_msvc dumpbin.exe __DUMPBIN__
+report_windows_sdk rc.exe __RC__
 
 while IFS=' ' read -r logical expected; do
   [[ -n "$logical" ]] || continue
@@ -182,6 +214,18 @@ if [[ -x /usr/bin/awk ]]; then
     record_failure "AWK backslash conversion failed: $awk_actual"
   fi
   printf 'FFmpeg MSYS AWK backslash probe: %s\n' "$awk_actual"
+fi
+
+
+if [[ -x /usr/bin/sort && -x /usr/bin/uniq ]]; then
+  uniq_actual=''
+  if ! uniq_actual="$(printf '%s\n' a a b | /usr/bin/sort | /usr/bin/uniq)"; then
+    record_failure 'uniq behavioral probe pipeline exited non-zero'
+  elif [[ "$uniq_actual" != $'a\nb' ]]; then
+    record_failure "uniq behavioral probe produced unexpected output: $uniq_actual"
+  fi
+  uniq_report="$(printf '%s' "$uniq_actual" | /usr/bin/tr '\n' ',')"
+  printf 'FFmpeg MSYS uniq behavioral probe: %s\n' "$uniq_report"
 fi
 
 printf '%s\n' '--------------------------------------------'
@@ -265,6 +309,8 @@ $probe = $probe.Replace('__MSYS_PAIRS__', $msysPairs)
 $probe = $probe.Replace('__CL__', (ConvertTo-NianBashSingleQuoted $Msvc.ClPath))
 $probe = $probe.Replace('__LIB__', (ConvertTo-NianBashSingleQuoted $Msvc.LibPath))
 $probe = $probe.Replace('__LINK__', (ConvertTo-NianBashSingleQuoted $Msvc.LinkPath))
+$probe = $probe.Replace('__DUMPBIN__', (ConvertTo-NianBashSingleQuoted $Msvc.DumpbinPath))
+$probe = $probe.Replace('__RC__', (ConvertTo-NianBashSingleQuoted $Msvc.RcPath))
 $probe = $probe.Replace('__MAKE_VERSION_LINE__', [string]$Contract.provisionedMsysPackages.make.versionLine)
 
 Invoke-NianNative { & $Bash --noprofile --norc -lc $probe } 'aggregate FFmpeg MSYS/MSVC toolchain and GNU make behavioral probe'

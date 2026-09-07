@@ -60,7 +60,7 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   assert.match(windowsFfmpeg, /FFmpeg extraction archive size:/);
   assert.match(windowsFfmpeg, /FFmpeg extraction start UTC:/);
   assert.match(windowsFfmpeg, /FFmpeg source extraction did not produce the expected source directory/);
-  for (const path of ["/usr/bin/make", "/usr/bin/awk", "/usr/bin/sed", "/usr/bin/grep", "/usr/bin/cygpath", "/usr/bin/tar", "/usr/bin/xz", "/usr/bin/head", "/usr/bin/tail", "/usr/bin/tr", "/usr/bin/cut", "/usr/bin/mkdir", "/usr/bin/rm", "/usr/bin/cp", "/usr/bin/cmp", "/usr/bin/cat", "/usr/bin/sort", "/usr/bin/chmod", "/usr/bin/install"]) {
+  for (const path of ["/usr/bin/make", "/usr/bin/awk", "/usr/bin/sed", "/usr/bin/grep", "/usr/bin/cygpath", "/usr/bin/tar", "/usr/bin/xz", "/usr/bin/head", "/usr/bin/tail", "/usr/bin/tr", "/usr/bin/cut", "/usr/bin/mkdir", "/usr/bin/rm", "/usr/bin/cp", "/usr/bin/cmp", "/usr/bin/cat", "/usr/bin/sort", "/usr/bin/uniq", "/usr/bin/chmod", "/usr/bin/install"]) {
     assert.ok(JSON.stringify(windowsFfmpegContract.msysBuildTools).includes(path));
   }
   assert.match(windowsPreflight, /test-ffmpeg-msys-escape\.ps1/);

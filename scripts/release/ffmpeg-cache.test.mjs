@@ -100,6 +100,10 @@ test("Windows FFmpeg cache key changes for every authoritative build-contract di
   msysMake.windowsContract.msysBuildTools.make = "/mingw64/bin/mingw32-make";
   variants.push(msysMake);
 
+  const msysUniq = cloneInputs();
+  msysUniq.windowsContract.msysBuildTools.uniq = "/mingw64/bin/uniq";
+  variants.push(msysUniq);
+
   const makePackageVersion = cloneInputs();
   makePackageVersion.windowsContract.provisionedMsysPackages.make.version = "4.4.1-2";
   variants.push(makePackageVersion);
@@ -143,6 +147,22 @@ test("Windows FFmpeg cache key changes for every authoritative build-contract di
   for (const variant of variants) {
     assert.notEqual(buildContractDigest(variant.releaseConfig, variant.windowsContract), base);
   }
+});
+
+test("Windows FFmpeg portable cache contract excludes machine-specific native tool paths", () => {
+  const serialized = JSON.stringify(buildWindowsFfmpegContract(inputs.releaseConfig, inputs.windowsContract));
+  for (const forbidden of ["Visual Studio", "Windows Kits", "dumpbin.exe", "rc.exe", "HostX64"]) {
+    assert.equal(serialized.includes(forbidden), false, `portable FFmpeg cache contract leaked ${forbidden}`);
+  }
+});
+
+test("RC10 contract without deterministic uniq cannot share the current cache key", () => {
+  const withoutUniq = cloneInputs();
+  delete withoutUniq.windowsContract.msysBuildTools.uniq;
+  assert.notEqual(
+    buildContractDigest(withoutUniq.releaseConfig, withoutUniq.windowsContract),
+    buildContractDigest(inputs.releaseConfig, inputs.windowsContract),
+  );
 });
 
 test("RC10 make-only package contract cannot share the make+diffutils cache key", () => {

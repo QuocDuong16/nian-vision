@@ -62,3 +62,44 @@ if (-not $splitFailed) {
     throw 'MSVC split-directory authority fixture unexpectedly passed'
 }
 Write-Host 'MSVC tool authority fixture rejected split cl/lib/link directories as expected'
+
+$windowsSdkBin = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64'
+Assert-NianFfmpegWindowsToolAuthority `
+    -VsInstall $vs `
+    -ClPath "$validBin\cl.exe" `
+    -LibPath "$validBin\lib.exe" `
+    -LinkPath "$validBin\link.exe" `
+    -DumpbinPath "$validBin\dumpbin.exe" `
+    -WindowsSdkBin $windowsSdkBin `
+    -RcPath "$windowsSdkBin\rc.exe" | Out-Null
+Write-Host 'FFmpeg Windows tool authority fixture PASS: dumpbin shares MSVC bin and rc uses selected Windows SDK x64 bin'
+
+$dumpbinFailed = $false
+try {
+    Assert-NianFfmpegWindowsToolAuthority `
+        -VsInstall $vs `
+        -ClPath "$validBin\cl.exe" `
+        -LibPath "$validBin\lib.exe" `
+        -LinkPath "$validBin\link.exe" `
+        -DumpbinPath "$vs\VC\Tools\MSVC\$toolset\bin\HostX64\x86\dumpbin.exe" `
+        -WindowsSdkBin $windowsSdkBin `
+        -RcPath "$windowsSdkBin\rc.exe" | Out-Null
+}
+catch { $dumpbinFailed = $true }
+if (-not $dumpbinFailed) { throw 'split dumpbin authority fixture unexpectedly passed' }
+Write-Host 'FFmpeg Windows tool authority fixture rejected split dumpbin directory as expected'
+
+$rcFailed = $false
+try {
+    Assert-NianFfmpegWindowsToolAuthority `
+        -VsInstall $vs `
+        -ClPath "$validBin\cl.exe" `
+        -LibPath "$validBin\lib.exe" `
+        -LinkPath "$validBin\link.exe" `
+        -DumpbinPath "$validBin\dumpbin.exe" `
+        -WindowsSdkBin $windowsSdkBin `
+        -RcPath 'C:\msys64\mingw64\bin\rc.exe' | Out-Null
+}
+catch { $rcFailed = $true }
+if (-not $rcFailed) { throw 'foreign rc.exe authority fixture unexpectedly passed' }
+Write-Host 'FFmpeg Windows tool authority fixture rejected foreign rc.exe as expected'

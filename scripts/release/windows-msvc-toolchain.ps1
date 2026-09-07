@@ -117,6 +117,103 @@ function Assert-NianMsvcToolAuthority {
     }
 }
 
+
+function Assert-NianWindowsSdkRcAuthority {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$WindowsSdkBin,
+        [Parameter(Mandatory = $true)][string]$RcPath
+    )
+
+    $sdkBin = ConvertTo-NianNormalizedWindowsPath $WindowsSdkBin
+    $rc = ConvertTo-NianNormalizedWindowsPath $RcPath
+    $equals = [System.StringComparer]::OrdinalIgnoreCase
+
+    if (-not $equals.Equals((Get-NianWindowsPathLeaf $rc), 'rc.exe')) {
+        throw "Windows SDK resource compiler path does not end in rc.exe: $rc"
+    }
+    if (-not $equals.Equals((Get-NianWindowsPathParent $rc), $sdkBin)) {
+        throw "rc.exe must resolve from the selected Windows SDK x64 bin directory: $rc; expected parent $sdkBin"
+    }
+    if (-not $equals.Equals((Get-NianWindowsPathLeaf $sdkBin), 'x64')) {
+        throw "selected Windows SDK tool directory must target x64: $sdkBin"
+    }
+
+    $versionDir = Get-NianWindowsPathParent $sdkBin
+    $binDir = Get-NianWindowsPathParent $versionDir
+    $kitsMajorDir = Get-NianWindowsPathParent $binDir
+    $kitsRoot = Get-NianWindowsPathParent $kitsMajorDir
+    if (-not $equals.Equals((Get-NianWindowsPathLeaf $binDir), 'bin') -or
+        -not $equals.Equals((Get-NianWindowsPathLeaf $kitsMajorDir), '10') -or
+        -not $equals.Equals((Get-NianWindowsPathLeaf $kitsRoot), 'Windows Kits')) {
+        throw "selected rc.exe is outside the Windows Kits 10 SDK tool layout: $rc"
+    }
+    if ([string]::IsNullOrWhiteSpace((Get-NianWindowsPathLeaf $versionDir))) {
+        throw "selected Windows SDK version directory is empty: $sdkBin"
+    }
+
+    return $rc
+}
+
+function Assert-NianFfmpegWindowsToolAuthority {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$VsInstall,
+        [Parameter(Mandatory = $true)][string]$ClPath,
+        [Parameter(Mandatory = $true)][string]$LibPath,
+        [Parameter(Mandatory = $true)][string]$LinkPath,
+        [Parameter(Mandatory = $true)][string]$DumpbinPath,
+        [Parameter(Mandatory = $true)][string]$WindowsSdkBin,
+        [Parameter(Mandatory = $true)][string]$RcPath
+    )
+
+    $msvc = Assert-NianMsvcToolAuthority `
+        -VsInstall $VsInstall `
+        -ClPath $ClPath `
+        -LibPath $LibPath `
+        -LinkPath $LinkPath
+
+    $dumpbin = ConvertTo-NianNormalizedWindowsPath $DumpbinPath
+    $equals = [System.StringComparer]::OrdinalIgnoreCase
+    if (-not $equals.Equals((Get-NianWindowsPathLeaf $dumpbin), 'dumpbin.exe')) {
+        throw "MSVC symbol tool path does not end in dumpbin.exe: $dumpbin"
+    }
+    if (-not $equals.Equals((Get-NianWindowsPathParent $dumpbin), $msvc.MsvcBin)) {
+        throw "dumpbin.exe must resolve from the same validated MSVC directory as cl.exe/lib.exe/link.exe: $dumpbin"
+    }
+
+    $sdkBin = ConvertTo-NianNormalizedWindowsPath $WindowsSdkBin
+    $rc = Assert-NianWindowsSdkRcAuthority -WindowsSdkBin $sdkBin -RcPath $RcPath
+    return [pscustomobject]@{
+        VsInstall = $msvc.VsInstall
+        MsvcBin = $msvc.MsvcBin
+        ClPath = $msvc.ClPath
+        LibPath = $msvc.LibPath
+        LinkPath = $msvc.LinkPath
+        DumpbinPath = $dumpbin
+        WindowsSdkBin = $sdkBin
+        RcPath = $rc
+    }
+}
+
+function Get-NianSelectedWindowsSdkX64Bin {
+    [CmdletBinding()]
+    param()
+
+    if ([string]::IsNullOrWhiteSpace($env:WindowsSdkDir)) {
+        throw 'VsDevCmd did not select WindowsSdkDir'
+    }
+    if ([string]::IsNullOrWhiteSpace($env:WindowsSDKVersion)) {
+        throw 'VsDevCmd did not select WindowsSDKVersion'
+    }
+
+    $version = $env:WindowsSDKVersion.Trim().TrimEnd('\', '/')
+    if ([string]::IsNullOrWhiteSpace($version)) {
+        throw 'VsDevCmd selected an empty Windows SDK version'
+    }
+    return [IO.Path]::GetFullPath((Join-Path $env:WindowsSdkDir ("bin\\{0}\\x64" -f $version)))
+}
+
 function Import-NianVsDevEnvironment {
     [CmdletBinding()]
     param()
@@ -154,18 +251,22 @@ function Resolve-NianMsvcToolchain {
 
     $vsInstall = Import-NianVsDevEnvironment
     $tools = [ordered]@{}
-    foreach ($name in @('cl.exe', 'lib.exe', 'link.exe')) {
+    foreach ($name in @('cl.exe', 'lib.exe', 'link.exe', 'dumpbin.exe', 'rc.exe')) {
         $command = Get-Command $name -CommandType Application -ErrorAction Stop | Select-Object -First 1
         $path = [IO.Path]::GetFullPath($command.Source)
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-            throw "resolved MSVC tool does not exist: $name -> $path"
+            throw "resolved Windows release tool does not exist: $name -> $path"
         }
         $tools[$name] = $path
     }
+    $windowsSdkBin = Get-NianSelectedWindowsSdkX64Bin
 
-    return Assert-NianMsvcToolAuthority `
+    return Assert-NianFfmpegWindowsToolAuthority `
         -VsInstall $vsInstall `
         -ClPath $tools['cl.exe'] `
         -LibPath $tools['lib.exe'] `
-        -LinkPath $tools['link.exe']
+        -LinkPath $tools['link.exe'] `
+        -DumpbinPath $tools['dumpbin.exe'] `
+        -WindowsSdkBin $windowsSdkBin `
+        -RcPath $tools['rc.exe']
 }

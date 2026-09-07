@@ -42,6 +42,7 @@ const expectedTools = {
   cmp: "/usr/bin/cmp",
   cat: "/usr/bin/cat",
   sort: "/usr/bin/sort",
+  uniq: "/usr/bin/uniq",
   expr: "/usr/bin/expr",
   dirname: "/usr/bin/dirname",
   basename: "/usr/bin/basename",
@@ -99,6 +100,8 @@ test("RC10 Windows FFmpeg uses one controlled MSYS environment and aggregate dia
   assert.match(source.probe, /report_msvc cl __CL__/);
   assert.match(source.probe, /report_msvc link\.exe __LINK__/);
   assert.match(source.probe, /report_msvc link __LINK__/);
+  assert.match(source.probe, /report_msvc dumpbin\.exe __DUMPBIN__/);
+  assert.match(source.probe, /report_windows_sdk rc\.exe __RC__/);
   assert.match(source.probe, /for name in gcc cc ld ar/);
   assert.match(source.probe, /command -v "\$logical"/);
   assert.match(source.probe, /\/usr\/bin\/cygpath -aw/);
@@ -106,14 +109,29 @@ test("RC10 Windows FFmpeg uses one controlled MSYS environment and aggregate dia
   assert.ok(source.probe.indexOf("while IFS=' ' read -r logical expected") < source.probe.indexOf("if (( mismatch_count > 0 ))"));
 });
 
+test("RC10 FFmpeg compat/windows/makedef required pipeline is locked to sort + uniq + tail", () => {
+  assert.deepEqual(
+    ["sort", "uniq", "tail"].map((name) => contract.msysBuildTools[name]),
+    ["/usr/bin/sort", "/usr/bin/uniq", "/usr/bin/tail"],
+  );
+  assert.equal(expectedTools.uniq, "/usr/bin/uniq");
+  assert.match(source.probe, /while IFS=' ' read -r logical expected/);
+  assert.match(source.probe, /\/usr\/bin\/sort \| \/usr\/bin\/uniq/);
+});
+
 test("RC10 preserves semantic MSVC authority and explicit GNU make execution", () => {
   assert.match(source.msvcHelper, /function Assert-NianMsvcToolchainPath/);
   assert.match(source.msvcHelper, /function Assert-NianMsvcToolAuthority/);
   assert.match(source.msvcHelper, /function Resolve-NianMsvcToolchain/);
+  assert.match(source.msvcHelper, /function Assert-NianFfmpegWindowsToolAuthority/);
+  assert.match(source.msvcHelper, /function Assert-NianWindowsSdkRcAuthority/);
+  assert.match(source.msvcHelper, /function Get-NianSelectedWindowsSdkX64Bin/);
   assert.match(source.msvcHelper, /Get-Command \$name -CommandType Application/);
   assert.match(source.msvcHelper, /StringComparer\]::OrdinalIgnoreCase/);
   assert.match(source.msvcHelper, /Equals\(\$segments\[2\], 'HostX64'\)/);
   assert.match(source.msvcHelper, /Equals\(\$segments\[3\], 'x64'\)/);
+  assert.match(source.msvcHelper, /dumpbin\.exe must resolve from the same validated MSVC directory/);
+  assert.match(source.msvcHelper, /rc\.exe must resolve from the selected Windows SDK x64 bin directory/);
   assert.equal(source.msvcHelper.includes("-notmatch"), false);
   assert.ok(source.msvcFixture.includes("C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise"));
   assert.ok(source.msvcFixture.includes("HostX64\\x64"));
@@ -127,6 +145,15 @@ test("RC10 preserves semantic MSVC authority and explicit GNU make execution", (
   assert.doesNotMatch(source.build, /(?:^|[;\s])make -j\$buildJobs/);
   assert.match(source.build, /-ControlledPath \$MsysEnvironment\.PathText/);
   assert.match(source.preflight, /-ControlledPath \$msysEnvironment\.PathText/);
+  for (const [name, prefix] of [["build", "Msvc"], ["preflight", "msvc"]]) {
+    assert.ok(source[name].includes(`-ExpectedDumpbinWindows $${prefix}.DumpbinPath`));
+    assert.ok(source[name].includes(`-ExpectedWindowsSdkBin $${prefix}.WindowsSdkBin`));
+    assert.ok(source[name].includes(`-ExpectedRcWindows $${prefix}.RcPath`));
+  }
+  assert.match(source.msvcHelper, /foreach \(\$name in @\('cl\.exe', 'lib\.exe', 'link\.exe', 'dumpbin\.exe', 'rc\.exe'\)\)/);
+  assert.match(source.msvcHelper, /WindowsSdkDir/);
+  assert.match(source.msvcHelper, /WindowsSDKVersion/);
+  assert.equal(source.msvcHelper.includes('10.0.26100.0'), false);
 });
 
 test("RC10 GNU make/AWK and CCDEP contracts fail closed before compile", () => {
@@ -139,6 +166,8 @@ test("RC10 GNU make/AWK and CCDEP contracts fail closed before compile", () => {
   assert.match(source.probe, /cmp_different_status != 1/);
   assert.match(source.probe, /\/usr\/bin\/install -m 644 "\$install_source" "\$install_destination"/);
   assert.match(source.probe, /install behavioral probe copied unexpected contents/);
+  assert.match(source.probe, /printf '%s\\n' a a b \| \/usr\/bin\/sort \| \/usr\/bin\/uniq/);
+  assert.match(source.probe, /FFmpeg MSYS uniq behavioral probe:/);
   assert.match(source.validator, /ffbuild\/config\.mak/);
   assert.ok(source.validator.includes(`gsub(/\\\\/, "/")`));
   assert.match(source.validator, /requires exactly one CCDEP line/);
@@ -168,6 +197,9 @@ test("RC10 pure MSVC and controlled-PATH fixtures execute when PowerShell is ava
   assert.match(msvc.stdout, /MSVC path fixture PASS: exact RC8 hosted-runner path/);
   assert.match(msvc.stdout, /MSVC path fixture PASS: Community edition selected root/);
   assert.match(msvc.stdout, /rejected split cl\/lib\/link directories as expected/);
+  assert.match(msvc.stdout, /dumpbin shares MSVC bin and rc uses selected Windows SDK x64 bin/);
+  assert.match(msvc.stdout, /rejected split dumpbin directory as expected/);
+  assert.match(msvc.stdout, /rejected foreign rc\.exe as expected/);
 
   const env = spawnSync(executable, ["-NoProfile", "-NonInteractive", "-File", paths.envFixture], { encoding: "utf8", timeout: 30000 });
   assert.equal(env.status, 0, `${env.stdout}\n${env.stderr}`);
@@ -183,11 +215,12 @@ test("Windows FFmpeg aggregate tool, AWK, make, and synthetic CCDEP probes execu
   assert.ok(shell, "PowerShell is required on the Windows release host");
   const probeResult = spawnSync(shell, ["-NoProfile", "-NonInteractive", "-File", paths.probe], { encoding: "utf8", timeout: 60000 });
   assert.equal(probeResult.status, 0, `${probeResult.stdout}\n${probeResult.stderr}`);
-  for (const command of ["cl.exe", "cl", "lib.exe", "link.exe", "link"]) assert.match(probeResult.stdout, new RegExp(`${command.replace(".", "\\.")}\\s+->`));
+  for (const command of ["cl.exe", "cl", "lib.exe", "link.exe", "link", "dumpbin.exe", "rc.exe"]) assert.match(probeResult.stdout, new RegExp(`${command.replace(".", "\\.")}\\s+->`));
   for (const path of Object.values(expectedTools)) assert.ok(probeResult.stdout.includes(path), `aggregate report omitted ${path}`);
   assert.match(probeResult.stdout, /FFmpeg MSYS AWK backslash probe: C:\/foo\/bar\.h/);
   assert.match(probeResult.stdout, /FFmpeg MSYS cmp behavioral probe: identical=0 different=1/);
   assert.match(probeResult.stdout, /FFmpeg MSYS install behavioral probe: nian-install-probe/);
+  assert.match(probeResult.stdout, /FFmpeg MSYS uniq behavioral probe: a,b/);
   assert.match(probeResult.stdout, /FFmpeg MSYS GNU make behavioral probe: C:\/foo\/bar\.h/);
   assert.match(probeResult.stdout, /FFmpeg Windows toolchain resolution: PASS/);
 

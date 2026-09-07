@@ -22,6 +22,7 @@
     "cmp": "/usr/bin/cmp",
     "cat": "/usr/bin/cat",
     "sort": "/usr/bin/sort",
+    "uniq": "/usr/bin/uniq",
     "expr": "/usr/bin/expr",
     "dirname": "/usr/bin/dirname",
     "basename": "/usr/bin/basename",

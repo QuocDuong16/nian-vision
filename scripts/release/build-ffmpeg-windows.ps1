@@ -50,12 +50,14 @@ foreach ($property in $Contract.msysBuildTools.PSObject.Properties) {
     }
 }
 if (-not (Test-Path -LiteralPath $Curl -PathType Leaf)) { throw "required Windows system curl is unavailable: $Curl" }
-foreach ($tool in @('dumpbin.exe', 'node.exe')) { Require-Command $tool }
+foreach ($tool in @('node.exe')) { Require-Command $tool }
 
 foreach ($entry in @(
     @{ Name = 'cl.exe'; Path = $Msvc.ClPath },
     @{ Name = 'lib.exe'; Path = $Msvc.LibPath },
-    @{ Name = 'link.exe'; Path = $Msvc.LinkPath }
+    @{ Name = 'link.exe'; Path = $Msvc.LinkPath },
+    @{ Name = 'dumpbin.exe'; Path = $Msvc.DumpbinPath },
+    @{ Name = 'rc.exe'; Path = $Msvc.RcPath }
 )) {
     Write-Host ("FFmpeg MSVC tool {0}: {1}" -f $entry.Name, $entry.Path)
 }
@@ -76,7 +78,10 @@ foreach ($entry in $MsysEnvironment.Removed) { Write-Host "FFmpeg forbidden inhe
     -ControlledPath $MsysEnvironment.PathText `
     -ExpectedClWindows $Msvc.ClPath `
     -ExpectedLibWindows $Msvc.LibPath `
-    -ExpectedLinkWindows $Msvc.LinkPath
+    -ExpectedLinkWindows $Msvc.LinkPath `
+    -ExpectedDumpbinWindows $Msvc.DumpbinPath `
+    -ExpectedWindowsSdkBin $Msvc.WindowsSdkBin `
+    -ExpectedRcWindows $Msvc.RcPath
 
 $reportedCpuCount = [Environment]::ProcessorCount
 $buildJobs = [Math]::Max(2, [Math]::Min($reportedCpuCount, 8))

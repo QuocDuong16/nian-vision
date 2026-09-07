@@ -38,7 +38,10 @@ $msysEnvironment = New-NianFfmpegMsysEnvironment -MsvcBinWindows $msvc.MsvcBin -
     -ControlledPath $msysEnvironment.PathText `
     -ExpectedClWindows $msvc.ClPath `
     -ExpectedLibWindows $msvc.LibPath `
-    -ExpectedLinkWindows $msvc.LinkPath
+    -ExpectedLinkWindows $msvc.LinkPath `
+    -ExpectedDumpbinWindows $msvc.DumpbinPath `
+    -ExpectedWindowsSdkBin $msvc.WindowsSdkBin `
+    -ExpectedRcWindows $msvc.RcPath
 Invoke-NianNative { & $bash --noprofile --norc -lc 'set -Eeuo pipefail; export PATH=/usr/bin; test -x /usr/bin/tar; test -x /usr/bin/xz' } 'deterministic MSYS2 extraction tools'
 
 $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
