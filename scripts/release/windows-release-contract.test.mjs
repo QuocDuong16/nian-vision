@@ -12,6 +12,7 @@ const windowsFfmpegArtifactCache = readNormalizedText(new URL("./restore-ffmpeg-
 const windowsFfmpegContract = JSON.parse(readNormalizedText(new URL("./ffmpeg-windows-contract.json", import.meta.url)));
 const windowsNative = readNormalizedText(new URL("./windows-native.ps1", import.meta.url));
 const windowsBoundedProcess = readNormalizedText(new URL("./windows-bounded-process.ps1", import.meta.url));
+const windowsMsvcToolchain = readNormalizedText(new URL("./windows-msvc-toolchain.ps1", import.meta.url));
 const releaseConfig = JSON.parse(readNormalizedText(new URL("./release-config.json", import.meta.url)));
 const windowsStage = readNormalizedText(new URL("./stage-windows.ps1", import.meta.url));
 const windowsPreflight = readNormalizedText(new URL("./preflight-windows.ps1", import.meta.url));
@@ -113,7 +114,7 @@ test("Windows release workflow routes required native tools through one fail-clo
   assert.match(workflow, /Invoke-NianNative \{ cargo\.exe run --quiet -p nian-release-verifier/);
   assert.match(windowsFfmpeg, /Invoke-NianNative \{ & \$Bash[\s\S]*?\/usr\/bin\/make -j\$buildJobs/);
   assert.match(windowsFfmpeg, /Invoke-NianNative \{ & \$Bash[\s\S]*?\/usr\/bin\/make install/);
-  assert.match(windowsFfmpeg, /Invoke-NianNative \{ cmd\.exe/);
+  assert.match(windowsMsvcToolchain, /Invoke-NianNative \{ cmd\.exe/);
   const windowsJobs = workflow.slice(workflow.indexOf("  build-windows:"), workflow.indexOf("  verify-release:"));
   assert.equal(/(?:^|\n)\s+npm install --global corepack@0\.35\.0/.test(windowsJobs), false);
   const quality = workflow.slice(workflow.indexOf("- name: Release scripts and frontend quality"), workflow.indexOf("- name: Build pinned FFmpeg 8.0.3 Windows MSVC runtime"));

@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot "windows-native.ps1")
+. (Join-Path $PSScriptRoot "windows-msvc-toolchain.ps1")
 
 if (-not $IsWindows) { throw "M8 Windows release requires a Windows runner" }
 if ($env:PROCESSOR_ARCHITECTURE -notin @('AMD64', 'x86_64')) {
@@ -26,15 +27,13 @@ $xz = 'C:\msys64\usr\bin\xz.exe'
 foreach ($tool in @($bash, $tar, $xz)) {
     if (-not (Test-Path $tool -PathType Leaf)) { throw "required MSYS2 release tool is unavailable: $tool" }
 }
-& (Join-Path $PSScriptRoot 'test-ffmpeg-msys-escape.ps1')
+$msvc = Resolve-NianMsvcToolchain
+& (Join-Path $PSScriptRoot 'test-ffmpeg-msys-escape.ps1') `
+    -VsInstall $msvc.VsInstall `
+    -ExpectedClWindows $msvc.ClPath `
+    -ExpectedLibWindows $msvc.LibPath `
+    -ExpectedLinkWindows $msvc.LinkPath
 Invoke-NianNative { & $bash --noprofile --norc -lc 'test -x /usr/bin/tar; test -x /usr/bin/xz' } 'deterministic MSYS2 extraction tools'
-
-$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-if (-not (Test-Path $vswhere)) { throw "vswhere.exe is unavailable" }
-$install = (Invoke-NianNative { & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath } | Out-String).Trim()
-if (-not $install) { throw "Visual Studio 2022 C++ tools are unavailable" }
-$vsdev = Join-Path $install 'Common7\Tools\VsDevCmd.bat'
-if (-not (Test-Path $vsdev)) { throw "VsDevCmd.bat is unavailable" }
 
 $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
 $signtool = Get-ChildItem $sdkRoot -Recurse -File -Filter signtool.exe -ErrorAction SilentlyContinue |
@@ -43,4 +42,4 @@ $signtool = Get-ChildItem $sdkRoot -Recurse -File -Filter signtool.exe -ErrorAct
     Select-Object -First 1
 if (-not $signtool) { throw "Windows SDK signtool.exe is unavailable" }
 
-Write-Host "Windows release preflight passed: $rust; $node; pnpm $pnpm; $($install.Trim())"
+Write-Host "Windows release preflight passed: $rust; $node; pnpm $pnpm; $($msvc.VsInstall)"

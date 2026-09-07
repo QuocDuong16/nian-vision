@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot "windows-native.ps1")
 . (Join-Path $PSScriptRoot "windows-bounded-process.ps1")
+. (Join-Path $PSScriptRoot "windows-msvc-toolchain.ps1")
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 $Config = Get-Content (Join-Path $RepoRoot "scripts/release/release-config.json") -Raw | ConvertFrom-Json
@@ -19,23 +20,6 @@ function Invoke-FfmpegPhase([string]$Name, [scriptblock]$Action) {
         Write-Host ("FFmpeg Windows phase '{0}' elapsed {1:n1}s" -f $Name, $timer.Elapsed.TotalSeconds)
         Write-Host "::endgroup::"
     }
-}
-
-function Import-VsDevEnvironment {
-    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    if (-not (Test-Path $vswhere)) { throw "vswhere.exe is unavailable" }
-    $install = (Invoke-NianNative { & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath } | Out-String).Trim()
-    if (-not $install) { throw "Visual Studio C++ build tools are unavailable" }
-    $vsdev = Join-Path $install "Common7\Tools\VsDevCmd.bat"
-    if (-not (Test-Path $vsdev)) { throw "VsDevCmd.bat is unavailable" }
-    $lines = Invoke-NianNative { cmd.exe /d /s /c "`"$vsdev`" -arch=amd64 -host_arch=amd64 >nul && set" }
-    foreach ($line in $lines) {
-        $split = $line.IndexOf('=')
-        if ($split -gt 0) {
-            [Environment]::SetEnvironmentVariable($line.Substring(0, $split), $line.Substring($split + 1), 'Process')
-        }
-    }
-    return $install
 }
 
 function Require-Command([string]$Name) {
@@ -56,7 +40,7 @@ if ($Contract.toolchain -ne "msvc" -or $Contract.architecture -ne "x86_64") { th
 $flags = @($Contract.configureFlags)
 if ($flags.Count -eq 0) { throw "Windows FFmpeg configure flag contract is empty" }
 
-$VsInstall = Import-VsDevEnvironment
+$Msvc = Resolve-NianMsvcToolchain
 $Bash = "C:\msys64\usr\bin\bash.exe"
 $Tar = "C:\msys64\usr\bin\tar.exe"
 $Xz = "C:\msys64\usr\bin\xz.exe"
@@ -69,28 +53,15 @@ foreach ($tool in @($Bash, $Tar, $Xz, $Make, $Awk, $Sed, $Grep, $Cygpath)) {
     if (-not (Test-Path $tool -PathType Leaf)) { throw "required deterministic MSYS2 release tool is unavailable: $tool" }
 }
 
-foreach ($tool in @("cl.exe", "lib.exe", "link.exe", "dumpbin.exe", "node.exe", "curl.exe")) { Require-Command $tool }
-$MsvcTools = [ordered]@{}
-foreach ($tool in @("cl.exe", "lib.exe", "link.exe")) {
-    $resolved = [IO.Path]::GetFullPath((Get-Command $tool -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source)
-    $MsvcTools[$tool] = $resolved
-    Write-Host ("FFmpeg MSVC tool {0}: {1}" -f $tool, $resolved)
+foreach ($tool in @("dumpbin.exe", "node.exe", "curl.exe")) { Require-Command $tool }
+foreach ($entry in @(
+    @{ Name = 'cl.exe'; Path = $Msvc.ClPath },
+    @{ Name = 'lib.exe'; Path = $Msvc.LibPath },
+    @{ Name = 'link.exe'; Path = $Msvc.LinkPath }
+)) {
+    Write-Host ("FFmpeg MSVC tool {0}: {1}" -f $entry.Name, $entry.Path)
 }
-$MsvcBin = Split-Path -Parent $MsvcTools["cl.exe"]
-foreach ($tool in @("lib.exe", "link.exe")) {
-    if ((Split-Path -Parent $MsvcTools[$tool]) -ne $MsvcBin) {
-        throw "FFmpeg MSVC tool $tool did not resolve beside cl.exe"
-    }
-}
-$VcToolsRoot = [IO.Path]::GetFullPath((Join-Path $VsInstall "VC\Tools\MSVC"))
-$VcToolsPrefix = $VcToolsRoot.TrimEnd('\') + '\'
-if (-not $MsvcBin.StartsWith($VcToolsPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "FFmpeg MSVC tools did not resolve under the selected Visual Studio VC toolchain: $MsvcBin"
-}
-if ($MsvcBin -notmatch '(?i)[\/]bin[\/]Hostx64[\/]x64$') {
-    throw "FFmpeg MSVC tools did not resolve to the expected amd64 Hostx64/x64 tool directory: $MsvcBin"
-}
-$MsvcBinUnix = Convert-ToMsysPath $MsvcBin $Bash
+$MsvcBinUnix = Convert-ToMsysPath $Msvc.MsvcBin $Bash
 Write-Host "FFmpeg MSVC tool directory inside MSYS: $MsvcBinUnix"
 
 $expectedMsysTools = [ordered]@{
@@ -117,10 +88,11 @@ hash -r
 # link.exe, so the controlled shell proves both bare and .exe spellings use the
 # selected Visual Studio toolchain before configure or compile can start.
 & (Join-Path $RepoRoot "scripts/release/test-ffmpeg-msys-escape.ps1") `
+    -VsInstall $Msvc.VsInstall `
     -MsvcBinUnix $MsvcBinUnix `
-    -ExpectedClWindows $MsvcTools["cl.exe"] `
-    -ExpectedLibWindows $MsvcTools["lib.exe"] `
-    -ExpectedLinkWindows $MsvcTools["link.exe"]
+    -ExpectedClWindows $Msvc.ClPath `
+    -ExpectedLibWindows $Msvc.LibPath `
+    -ExpectedLinkWindows $Msvc.LinkPath
 
 $reportedCpuCount = [Environment]::ProcessorCount
 $buildJobs = [Math]::Max(2, [Math]::Min($reportedCpuCount, 8))

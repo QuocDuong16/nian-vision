@@ -1,7 +1,7 @@
-# Nian Vision 1.0.0-rc.8
+# Nian Vision 1.0.0-rc.9
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 
-RC1 through RC7 remain immutable historical release attempts. RC7 proved the deterministic MSYS2 tar/xz extraction path and reached the Windows FFmpeg source build, where bare `make` selection exposed the MSVC dependency-command escaping failure reproduced by Windows-native MinGW make implementations. RC8 preserves the accepted extraction/cache/signing and Linux AppImage contracts while pinning the FFmpeg build to `/usr/bin/make` plus explicit MSYS awk/sed/grep tooling, validating generated `CCDEP` escaping before compile, and failing closed on configure-time sed/awk syntax errors.
+RC1 through RC8 remain immutable historical release attempts. RC7 proved the deterministic MSYS2 tar/xz extraction path and reached the Windows FFmpeg source build, where bare `make` selection exposed the MSVC dependency-command escaping failure reproduced by Windows-native MinGW make implementations. RC8 preserved the accepted extraction/cache/signing and Linux AppImage contracts while pinning the FFmpeg build to `/usr/bin/make` plus explicit MSYS awk/sed/grep tooling and generated `CCDEP` validation, but its Windows preflight rejected the real GitHub runner `HostX64\x64` MSVC directory through a brittle representation-level path check. RC9 centralizes Visual Studio/MSVC tool authority in one semantic path helper, accepts harmless Windows path casing/slash/trailing-separator differences, still requires x64 host/x64 target and same-directory `cl.exe`/`lib.exe`/`link.exe`, and retains the RC8 Bash tool-precedence, AWK and `CCDEP` fail-closed contracts.
 
 ## Main capabilities
 

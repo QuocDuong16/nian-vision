@@ -2,11 +2,11 @@
 
 Record the exact tag, commit SHA, OS image/VM and result for every run. A checkbox is evidence only when the step was actually executed. Do not reuse a tag after changing source.
 
-Current retry candidate: `1.0.0-rc.8` / `v1.0.0-rc.8`. RC1 through RC7 remain immutable. RC7 validated deterministic Windows FFmpeg extraction and reached compile, where an uncontrolled make/tool-selection boundary corrupted the generated MSVC dependency AWK command. RC8 pins the MSYS build-tool contract, validates `CCDEP` on disk and after GNU make expansion, and fails closed on configure-time sed/awk syntax errors while preserving accepted cache, signing, Linux AppImage and release-authority contracts.
+Current retry candidate: `1.0.0-rc.9` / `v1.0.0-rc.9`. RC1 through RC8 remain immutable. RC8 failed deterministically in Windows preflight before frontend install, cache restore or FFmpeg configure because a representation-level MSVC path assertion rejected the hosted runner's valid `HostX64\x64` tool directory. RC9 uses shared semantic selected-Visual-Studio/MSVC authority validation, keeps x64 host/x64 target and same-directory compiler/linker requirements, and preserves the accepted deterministic MSYS, AWK/`CCDEP`, extraction, cache, signing, Linux AppImage and release-authority contracts.
 
 ## Pre-tag authority
 
-- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.8`.
+- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.9`.
 - [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
@@ -16,7 +16,7 @@ Current retry candidate: `1.0.0-rc.8` / `v1.0.0-rc.8`. RC1 through RC7 remain im
 
 ## GitHub RC workflow
 
-- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.8`. Never move, delete or reuse `v1.0.0-rc.1`, `v1.0.0-rc.2`, `v1.0.0-rc.3`, `v1.0.0-rc.4`, `v1.0.0-rc.5`, `v1.0.0-rc.6` or `v1.0.0-rc.7`; source/tag cross-pairing is forbidden.
+- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.9`. Never move, delete or reuse `v1.0.0-rc.1`, `v1.0.0-rc.2`, `v1.0.0-rc.3`, `v1.0.0-rc.4`, `v1.0.0-rc.5`, `v1.0.0-rc.6`, `v1.0.0-rc.7` or `v1.0.0-rc.8`; source/tag cross-pairing is forbidden.
 - [ ] GitHub tag resolves to exactly the same commit as Forgejo.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.

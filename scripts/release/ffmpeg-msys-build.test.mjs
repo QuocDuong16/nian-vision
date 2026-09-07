@@ -18,6 +18,13 @@ const probe = readNormalizedText(probeUrl);
 const validatorUrl = new URL("./validate-ffmpeg-msys-dependency.ps1", import.meta.url);
 const validatorPath = fileURLToPath(validatorUrl);
 const validator = readNormalizedText(validatorUrl);
+const msvcHelperUrl = new URL("./windows-msvc-toolchain.ps1", import.meta.url);
+const msvcHelperPath = fileURLToPath(msvcHelperUrl);
+const msvcHelper = readNormalizedText(msvcHelperUrl);
+const msvcFixtureUrl = new URL("./test-windows-msvc-toolchain-path.ps1", import.meta.url);
+const msvcFixturePath = fileURLToPath(msvcFixtureUrl);
+const msvcFixture = readNormalizedText(msvcFixtureUrl);
+const preflightPath = fileURLToPath(new URL("./preflight-windows.ps1", import.meta.url));
 const contract = JSON.parse(readNormalizedText(new URL("./ffmpeg-windows-contract.json", import.meta.url)));
 
 const expectedTools = {
@@ -74,16 +81,38 @@ test("Windows FFmpeg MSYS build tools and dependency command are deterministic b
   assert.ok(probe.includes("C:/foo/bar.h"));
   assert.match(preflight, /test-ffmpeg-msys-escape\.ps1/);
 
-  assert.match(build, /\$VsInstall = Import-VsDevEnvironment/);
-  assert.match(build, /VC\\Tools\\MSVC/);
-  assert.match(build, /Hostx64/);
-  assert.match(build, /\$MsvcBinUnix = Convert-ToMsysPath \$MsvcBin \$Bash/);
+  assert.match(build, /windows-msvc-toolchain\.ps1/);
+  assert.match(build, /\$Msvc = Resolve-NianMsvcToolchain/);
+  assert.match(build, /\$MsvcBinUnix = Convert-ToMsysPath \$Msvc\.MsvcBin \$Bash/);
   assert.match(build, /export PATH=__MSVC_BIN__:\/usr\/bin:"\$PATH"/);
   assert.equal(build.includes('export PATH="/usr/bin:$PATH"'), false);
   assert.match(build, /compat\/windows\/mslink/);
-  assert.match(build, /ExpectedClWindows \$MsvcTools\["cl\.exe"\]/);
-  assert.match(build, /ExpectedLibWindows \$MsvcTools\["lib\.exe"\]/);
-  assert.match(build, /ExpectedLinkWindows \$MsvcTools\["link\.exe"\]/);
+  assert.match(build, /-VsInstall \$Msvc\.VsInstall/);
+  assert.match(build, /ExpectedClWindows \$Msvc\.ClPath/);
+  assert.match(build, /ExpectedLibWindows \$Msvc\.LibPath/);
+  assert.match(build, /ExpectedLinkWindows \$Msvc\.LinkPath/);
+  assert.match(preflight, /windows-msvc-toolchain\.ps1/);
+  assert.match(preflight, /\$msvc = Resolve-NianMsvcToolchain/);
+  assert.match(preflight, /ExpectedClWindows \$msvc\.ClPath/);
+  assert.match(probe, /windows-msvc-toolchain\.ps1/);
+  assert.match(probe, /Assert-NianMsvcToolAuthority/);
+
+  assert.match(msvcHelper, /function Assert-NianMsvcToolchainPath/);
+  assert.match(msvcHelper, /function Assert-NianMsvcToolAuthority/);
+  assert.match(msvcHelper, /function Resolve-NianMsvcToolchain/);
+  assert.match(msvcHelper, /Get-Command \$name -CommandType Application/);
+  assert.match(msvcHelper, /Test-Path -LiteralPath \$path -PathType Leaf/);
+  assert.match(msvcHelper, /StringComparer\]::OrdinalIgnoreCase/);
+  assert.match(msvcHelper, /\$segments\.Count -ne 4/);
+  assert.match(msvcHelper, /Equals\(\$segments\[1\], 'bin'\)/);
+  assert.match(msvcHelper, /Equals\(\$segments\[2\], 'HostX64'\)/);
+  assert.match(msvcHelper, /Equals\(\$segments\[3\], 'x64'\)/);
+  assert.equal(msvcHelper.includes('-match'), false);
+  assert.equal(msvcHelper.includes('-notmatch'), false);
+  assert.equal(build.includes('Hostx64'), false);
+  assert.equal(probe.includes('Hostx64'), false);
+  assert.ok(msvcFixture.includes('C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise'));
+  assert.ok(msvcFixture.includes('HostX64\\x64'));
 
   const configureAt = build.indexOf('Invoke-FfmpegPhase "configure"');
   const validateAt = build.indexOf('Invoke-FfmpegPhase "post-configure MSYS dependency validation"');
@@ -112,15 +141,44 @@ test("Windows FFmpeg MSYS build tools and dependency command are deterministic b
   }
 });
 
-test("RC8 Windows FFmpeg PowerShell sources parse when PowerShell is available", (t) => {
+test("RC9 Windows FFmpeg PowerShell sources parse when PowerShell is available", (t) => {
   const executable = findPowerShell();
   if (!executable) {
-    t.skip("PowerShell is unavailable on this host; Windows release CI parses the RC8 FFmpeg scripts");
+    t.skip("PowerShell is unavailable on this host; Windows release CI parses the RC9 FFmpeg scripts");
     return;
   }
-  for (const path of [probePath, validatorPath, buildPath]) {
+  for (const path of [probePath, validatorPath, buildPath, msvcHelperPath, msvcFixturePath, preflightPath]) {
     assertPowerShellParses(executable, path);
   }
+});
+
+test("RC9 semantic MSVC path fixtures accept the RC8 runner path and reject wrong authorities", (t) => {
+  const executable = findPowerShell();
+  if (!executable) {
+    t.skip("PowerShell is unavailable on this host; Windows release CI executes the semantic MSVC path fixtures");
+    return;
+  }
+  const result = spawnSync(executable, ["-NoProfile", "-NonInteractive", "-File", msvcFixturePath], {
+    encoding: "utf8",
+    timeout: 30000,
+  });
+  assert.equal(result.error, undefined, result.error?.message);
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /MSVC path fixture PASS: exact RC8 hosted-runner path/);
+  assert.match(result.stdout, /MSVC path fixture PASS: Hostx64 casing variant/);
+  for (const fixture of [
+    "x86 host and target",
+    "x64 host with x86 target",
+    "x86 host with x64 target",
+    "MSYS directory",
+    "wrong compiler toolchain tree",
+    "different Visual Studio tree",
+    "missing target segment",
+    "extra segment",
+  ]) {
+    assert.ok(result.stdout.includes(`MSVC path fixture rejected as expected: ${fixture}`));
+  }
+  assert.match(result.stdout, /rejected split cl\/lib\/link directories as expected/);
 });
 
 test("Windows FFmpeg MSYS AWK, tool-precedence, and generated dependency probes execute on Windows", (t) => {
