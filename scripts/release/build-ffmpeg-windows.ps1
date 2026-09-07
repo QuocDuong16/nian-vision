@@ -43,7 +43,7 @@ function Require-Command([string]$Name) {
 
 function Convert-ToMsysPath([string]$Path, [string]$Bash) {
     $escaped = $Path.Replace("'", "'\''")
-    return (Invoke-NianNative { & $Bash --noprofile --norc -lc "cygpath -u '$escaped'" } | Out-String).Trim()
+    return (Invoke-NianNative { & $Bash --noprofile --norc -lc "/usr/bin/cygpath -u '$escaped'" } 'cygpath path conversion' | Out-String).Trim()
 }
 
 if ($Config.windowsTarget -ne "x86_64-pc-windows-msvc") { throw "Windows FFmpeg release target contract drifted" }
@@ -52,14 +52,60 @@ $flags = @($Contract.configureFlags)
 if ($flags.Count -eq 0) { throw "Windows FFmpeg configure flag contract is empty" }
 
 Import-VsDevEnvironment
-foreach ($tool in @("cl.exe", "lib.exe", "dumpbin.exe", "node.exe", "curl.exe")) { Require-Command $tool }
+foreach ($tool in @("cl.exe", "lib.exe", "link.exe", "dumpbin.exe", "node.exe", "curl.exe")) { Require-Command $tool }
+foreach ($tool in @("cl.exe", "lib.exe", "link.exe")) {
+    $resolved = (Get-Command $tool -ErrorAction Stop).Source
+    Write-Host "FFmpeg MSVC tool $tool: $resolved"
+}
 
 $Bash = "C:\msys64\usr\bin\bash.exe"
 $Tar = "C:\msys64\usr\bin\tar.exe"
 $Xz = "C:\msys64\usr\bin\xz.exe"
-foreach ($tool in @($Bash, $Tar, $Xz)) {
-    if (-not (Test-Path $tool -PathType Leaf)) { throw "required deterministic MSYS2 extraction tool is unavailable: $tool" }
+$Make = "C:\msys64\usr\bin\make.exe"
+$Awk = "C:\msys64\usr\bin\awk.exe"
+$Sed = "C:\msys64\usr\bin\sed.exe"
+$Grep = "C:\msys64\usr\bin\grep.exe"
+$Cygpath = "C:\msys64\usr\bin\cygpath.exe"
+foreach ($tool in @($Bash, $Tar, $Xz, $Make, $Awk, $Sed, $Grep, $Cygpath)) {
+    if (-not (Test-Path $tool -PathType Leaf)) { throw "required deterministic MSYS2 release tool is unavailable: $tool" }
 }
+
+$expectedMsysTools = [ordered]@{
+    bash = "/usr/bin/bash"
+    make = "/usr/bin/make"
+    awk = "/usr/bin/awk"
+    sed = "/usr/bin/sed"
+    grep = "/usr/bin/grep"
+    cygpath = "/usr/bin/cygpath"
+}
+foreach ($name in $expectedMsysTools.Keys) {
+    if ($Contract.msysBuildTools.$name -ne $expectedMsysTools[$name]) {
+        throw "Windows FFmpeg MSYS build-tool contract drifted for $name"
+    }
+}
+& (Join-Path $RepoRoot "scripts/release/test-ffmpeg-msys-escape.ps1")
+
+$MsysBuildPreamble = 'set -Eeuo pipefail; export PATH="/usr/bin:$PATH"; hash -r'
+$msvcShellProbe = @'
+set -Eeuo pipefail
+export PATH="/usr/bin:$PATH"
+hash -r
+for tool in cl.exe lib.exe; do
+  resolved="$(command -v "$tool")"
+  printf 'FFmpeg MSVC tool visible inside MSYS %s: %s\n' "$tool" "$resolved"
+done
+cl_path="$(command -v cl.exe)"
+link_path="$(dirname "$cl_path")/link.exe"
+if [[ ! -x "$link_path" ]]; then
+  link_path="$(dirname "$cl_path")/link"
+fi
+if [[ ! -x "$link_path" ]]; then
+  printf 'MSVC link.exe is not executable beside cl.exe: %s\n' "$cl_path" >&2
+  exit 1
+fi
+printf 'FFmpeg MSVC linker beside cl.exe: %s\n' "$link_path"
+'@
+Invoke-NianNative { & $Bash --noprofile --norc -lc $msvcShellProbe } 'MSVC tool visibility inside deterministic MSYS environment'
 
 $reportedCpuCount = [Environment]::ProcessorCount
 $buildJobs = [Math]::Max(2, [Math]::Min($reportedCpuCount, 8))
@@ -69,6 +115,7 @@ $Work = Join-Path $env:RUNNER_TEMP ("nian-ffmpeg-windows-" + [Guid]::NewGuid().T
 $Tarball = Join-Path $Work ("ffmpeg-{0}.tar.xz" -f $Config.ffmpegVersion)
 $Source = Join-Path $Work ("ffmpeg-{0}" -f $Config.ffmpegVersion)
 $DestRoot = Join-Path $Work "install-root"
+$ConfigureStderr = Join-Path $Work "configure.stderr.log"
 $OutputParent = Split-Path -Parent $OutputDir
 New-Item -ItemType Directory -Force $Work, $OutputParent | Out-Null
 $CandidateDir = Join-Path $OutputParent (".ffmpeg-windows-x86_64.candidate-" + [Guid]::NewGuid().ToString("N"))
@@ -121,10 +168,24 @@ try {
 
     $sourceUnix = Convert-ToMsysPath $Source $Bash
     $destUnix = Convert-ToMsysPath $DestRoot $Bash
+    $configureStderrUnix = Convert-ToMsysPath $ConfigureStderr $Bash
     $flagText = ($flags | ForEach-Object { "'" + $_.Replace("'", "'\''") + "'" }) -join " "
 
     Invoke-FfmpegPhase "configure" {
-        Invoke-NianNative { & $Bash --noprofile --norc -lc "set -Eeuo pipefail; cd '$sourceUnix'; ./configure $flagText" }
+        $configureCommand = @'
+{0}
+cd '{1}'
+set +e
+./configure {2} 2>'{3}'
+status=$?
+set -e
+if (( status != 0 )); then
+  printf 'FFmpeg configure failed; bounded stderr tail follows\n' >&2
+  /usr/bin/tail -n 120 '{3}' >&2
+  exit "$status"
+fi
+'@ -f $MsysBuildPreamble, $sourceUnix, $flagText, $configureStderrUnix
+        Invoke-NianNative { & $Bash --noprofile --norc -lc $configureCommand } 'FFmpeg configure'
         $configHeader = Join-Path $Source "config.h"
         $componentHeader = Join-Path $Source "config_components.h"
         if (-not (Test-Path $configHeader)) { throw "FFmpeg configure did not produce config.h" }
@@ -133,12 +194,29 @@ try {
         Copy-Item -Force $componentHeader (Join-Path $CandidateDir "FFMPEG_CONFIG_COMPONENTS.h")
     }
 
+    Invoke-FfmpegPhase "post-configure MSYS dependency validation" {
+        $configureDiagnostics = if (Test-Path $ConfigureStderr) { @(Get-Content $ConfigureStderr) } else { @() }
+        if ($configureDiagnostics.Count -gt 0) {
+            Write-Host "FFmpeg configure stderr (first 40 lines):"
+            $configureDiagnostics | Select-Object -First 40 | ForEach-Object { Write-Host $_ }
+        }
+        $syntaxFailures = @($configureDiagnostics | Where-Object {
+            $_ -match '(?i)(?:sed|awk):.*(?:unterminated|syntax error|expression #[0-9]+)'
+        })
+        if ($syntaxFailures.Count -gt 0) {
+            Write-Host "FFmpeg configure shell-syntax failures (bounded):"
+            $syntaxFailures | Select-Object -First 20 | ForEach-Object { Write-Host $_ }
+            throw "FFmpeg configure returned success but emitted sed/awk syntax errors; compile is blocked"
+        }
+        & (Join-Path $RepoRoot "scripts/release/validate-ffmpeg-msys-dependency.ps1") -Source $Source -Bash $Bash
+    }
+
     Invoke-FfmpegPhase "compile" {
-        Invoke-NianNative { & $Bash --noprofile --norc -lc "set -Eeuo pipefail; cd '$sourceUnix'; make -j$buildJobs" }
+        Invoke-NianNative { & $Bash --noprofile --norc -lc "$MsysBuildPreamble; cd '$sourceUnix'; /usr/bin/make -j$buildJobs" } 'FFmpeg compile with /usr/bin/make'
     }
 
     Invoke-FfmpegPhase "install" {
-        Invoke-NianNative { & $Bash --noprofile --norc -lc "set -Eeuo pipefail; cd '$sourceUnix'; make install DESTDIR='$destUnix'" }
+        Invoke-NianNative { & $Bash --noprofile --norc -lc "$MsysBuildPreamble; cd '$sourceUnix'; /usr/bin/make install DESTDIR='$destUnix'" } 'FFmpeg install with /usr/bin/make'
     }
 
     Invoke-FfmpegPhase "configuration and license validation" {

@@ -96,6 +96,10 @@ test("Windows FFmpeg cache key changes for every authoritative build-contract di
   toolchain.windowsContract.toolchain = "clang-cl";
   variants.push(toolchain);
 
+  const msysMake = cloneInputs();
+  msysMake.windowsContract.msysBuildTools.make = "/mingw64/bin/mingw32-make";
+  variants.push(msysMake);
+
   const buildRevision = cloneInputs();
   buildRevision.windowsContract.buildContractVersion += 1;
   variants.push(buildRevision);

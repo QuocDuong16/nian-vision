@@ -26,7 +26,8 @@ $xz = 'C:\msys64\usr\bin\xz.exe'
 foreach ($tool in @($bash, $tar, $xz)) {
     if (-not (Test-Path $tool -PathType Leaf)) { throw "required MSYS2 release tool is unavailable: $tool" }
 }
-Invoke-NianNative { & $bash --noprofile --norc -lc 'for tool in make cygpath awk sed grep; do command -v "$tool" >/dev/null || exit 1; done; test -x /usr/bin/tar; test -x /usr/bin/xz' }
+& (Join-Path $PSScriptRoot 'test-ffmpeg-msys-escape.ps1')
+Invoke-NianNative { & $bash --noprofile --norc -lc 'test -x /usr/bin/tar; test -x /usr/bin/xz' } 'deterministic MSYS2 extraction tools'
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $vswhere)) { throw "vswhere.exe is unavailable" }

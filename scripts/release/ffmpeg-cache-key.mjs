@@ -42,6 +42,7 @@ export function buildWindowsFfmpegContract(releaseConfig, windowsContract) {
       architecture: windowsContract.architecture,
       toolchain: windowsContract.toolchain,
     },
+    msys_build_tools: { ...windowsContract.msysBuildTools },
     configure_flags: [...windowsContract.configureFlags],
     required_outputs: {
       dlls: [

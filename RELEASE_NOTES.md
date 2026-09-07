@@ -1,7 +1,7 @@
-# Nian Vision 1.0.0-rc.7
+# Nian Vision 1.0.0-rc.8
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 
-RC1 through RC6 remain immutable historical release attempts. RC6 proved the Linux AppImage host still had about 10.7 GiB free before bundling and exposed the real blocker: the worker expects FFmpeg under `/usr/lib/nian-vision` while the generated AppImage mapping installed those libraries directly under `/usr/lib`. The same RC6 run also stalled path-selected Windows `tar.exe` extraction for roughly 48 minutes. RC7 keeps the accepted disk/cache/signing contracts, aligns the AppImage runtime layout with the existing worker RUNPATH, and makes Windows FFmpeg extraction use explicit MSYS2 tar/xz with bounded timeout and diagnostics.
+RC1 through RC7 remain immutable historical release attempts. RC7 proved the deterministic MSYS2 tar/xz extraction path and reached the Windows FFmpeg source build, where bare `make` selection exposed the MSVC dependency-command escaping failure reproduced by Windows-native MinGW make implementations. RC8 preserves the accepted extraction/cache/signing and Linux AppImage contracts while pinning the FFmpeg build to `/usr/bin/make` plus explicit MSYS awk/sed/grep tooling, validating generated `CCDEP` escaping before compile, and failing closed on configure-time sed/awk syntax errors.
 
 ## Main capabilities
 

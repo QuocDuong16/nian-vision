@@ -1,8 +1,16 @@
 {
-  "buildContractVersion": 1,
+  "buildContractVersion": 2,
   "outputRuntimeContractVersion": 1,
   "toolchain": "msvc",
   "architecture": "x86_64",
+  "msysBuildTools": {
+    "bash": "/usr/bin/bash",
+    "make": "/usr/bin/make",
+    "awk": "/usr/bin/awk",
+    "sed": "/usr/bin/sed",
+    "grep": "/usr/bin/grep",
+    "cygpath": "/usr/bin/cygpath"
+  },
   "configureFlags": [
     "--prefix=/opt/nian-vision-ffmpeg",
     "--toolchain=msvc",

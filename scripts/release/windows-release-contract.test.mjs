@@ -55,15 +55,23 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   assert.match(windowsFfmpeg, /FFmpeg extraction archive size:/);
   assert.match(windowsFfmpeg, /FFmpeg extraction start UTC:/);
   assert.match(windowsFfmpeg, /FFmpeg source extraction did not produce the expected source directory/);
+  for (const path of ["/usr/bin/make", "/usr/bin/awk", "/usr/bin/sed", "/usr/bin/grep", "/usr/bin/cygpath"]) {
+    assert.ok(JSON.stringify(windowsFfmpegContract.msysBuildTools).includes(path));
+  }
+  assert.match(windowsPreflight, /test-ffmpeg-msys-escape\.ps1/);
+  assert.match(windowsFfmpeg, /post-configure MSYS dependency validation/);
+  const postConfigureAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "post-configure MSYS dependency validation"');
+  assert.ok(configureAt < postConfigureAt && postConfigureAt < windowsFfmpeg.indexOf('Invoke-FfmpegPhase "compile"'));
+  assert.match(windowsFfmpeg, /configure returned success but emitted sed\/awk syntax errors; compile is blocked/);
   assert.match(windowsBoundedProcess, /\.Kill\(\$true\)/);
   assert.match(windowsBoundedProcess, /timed out after \{1\}s; process-tree termination was requested/);
   assert.match(windowsPreflight, /C:\\msys64\\usr\\bin\\tar\.exe/);
   assert.match(windowsPreflight, /C:\\msys64\\usr\\bin\\xz\.exe/);
   assert.match(windowsFfmpeg, /\[Environment\]::ProcessorCount/);
   assert.match(windowsFfmpeg, /\[Math\]::Max\(2, \[Math\]::Min\(\$reportedCpuCount, 8\)\)/);
-  assert.match(windowsFfmpeg, /make -j\$buildJobs/);
+  assert.match(windowsFfmpeg, /\/usr\/bin\/make -j\$buildJobs/);
   assert.equal(windowsFfmpeg.includes("make -j2"), false);
-  for (const phase of ["download", "SHA-256 verification", "extraction", "configure", "compile", "install", "configuration and license validation", "runtime staging and validation", "publish validated output"]) {
+  for (const phase of ["download", "SHA-256 verification", "extraction", "configure", "post-configure MSYS dependency validation", "compile", "install", "configuration and license validation", "runtime staging and validation", "publish validated output"]) {
     assert.ok(windowsFfmpeg.includes(`Invoke-FfmpegPhase "${phase}"`), `missing FFmpeg phase timing for ${phase}`);
   }
   for (const name of ["avformat.lib", "avcodec.lib", "avutil.lib"]) assert.match(windowsFfmpeg, new RegExp(name.replace(".", "\\.")));
@@ -103,8 +111,8 @@ test("Windows release workflow routes required native tools through one fail-clo
   assert.match(workflow, /Invoke-NianNative \{ cargo\.exe tauri bundle/);
   assert.match(workflow, /Invoke-NianNative \{ cargo\.exe tauri signer sign/);
   assert.match(workflow, /Invoke-NianNative \{ cargo\.exe run --quiet -p nian-release-verifier/);
-  assert.match(windowsFfmpeg, /Invoke-NianNative \{ & \$Bash[\s\S]*?make -j\$buildJobs/);
-  assert.match(windowsFfmpeg, /Invoke-NianNative \{ & \$Bash[\s\S]*?make install/);
+  assert.match(windowsFfmpeg, /Invoke-NianNative \{ & \$Bash[\s\S]*?\/usr\/bin\/make -j\$buildJobs/);
+  assert.match(windowsFfmpeg, /Invoke-NianNative \{ & \$Bash[\s\S]*?\/usr\/bin\/make install/);
   assert.match(windowsFfmpeg, /Invoke-NianNative \{ cmd\.exe/);
   const windowsJobs = workflow.slice(workflow.indexOf("  build-windows:"), workflow.indexOf("  verify-release:"));
   assert.equal(/(?:^|\n)\s+npm install --global corepack@0\.35\.0/.test(windowsJobs), false);
