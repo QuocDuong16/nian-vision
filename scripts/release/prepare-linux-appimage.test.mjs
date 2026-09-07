@@ -44,7 +44,12 @@ function runFixture(fx) {
   });
 }
 
-test("Linux AppImage preparation prunes only proven compilation intermediates and preserves the desktop binary", () => {
+test("Linux AppImage preparation prunes only proven compilation intermediates and preserves the desktop binary", (t) => {
+  if (process.platform === "win32") {
+    t.skip("Linux AppImage behavior is validated on the Linux release host");
+    return;
+  }
+
   const fx = fixture(5 * 1024 * 1024);
   try {
     const before = readFileSync(fx.desktop);
@@ -64,7 +69,12 @@ test("Linux AppImage preparation prunes only proven compilation intermediates an
   }
 });
 
-test("Linux AppImage preparation fails closed below the post-prune 4 GiB guard", () => {
+test("Linux AppImage preparation fails closed below the post-prune 4 GiB guard", (t) => {
+  if (process.platform === "win32") {
+    t.skip("Linux AppImage behavior is validated on the Linux release host");
+    return;
+  }
+
   const fx = fixture(4 * 1024 * 1024 - 1);
   try {
     const result = runFixture(fx);
@@ -75,7 +85,12 @@ test("Linux AppImage preparation fails closed below the post-prune 4 GiB guard",
   }
 });
 
-test("Linux AppImage preparation fails closed when df reports non-numeric available space", () => {
+test("Linux AppImage preparation fails closed when df reports non-numeric available space", (t) => {
+  if (process.platform === "win32") {
+    t.skip("Linux AppImage behavior is validated on the Linux release host");
+    return;
+  }
+
   const fx = fixture("not-a-number");
   try {
     const result = runFixture(fx);
