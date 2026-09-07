@@ -489,6 +489,14 @@ jobs:
         shell: pwsh
         run: scripts/release/validate-ffmpeg-windows.ps1
 
+      - name: Validate Windows FFmpeg media integration
+        shell: pwsh
+        run: |
+          . scripts/release/windows-native.ps1
+          $env:NIAN_FFMPEG_LIB_DIR = Join-Path $pwd 'dist\ffmpeg-windows-x86_64\lib'
+          $env:PATH = "$(Join-Path $pwd 'dist\ffmpeg-windows-x86_64\bin');$env:PATH"
+          Invoke-NianNative { cargo.exe test -p nian-media-ffmpeg --test media_integration }
+
       - name: Save validated Windows FFmpeg build cache
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -504,13 +512,12 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: Validate Windows release FFmpeg and Rust runtime
+      - name: Run remaining Windows Rust quality and release worker build
         shell: pwsh
         run: |
           . scripts/release/windows-native.ps1
           $env:NIAN_FFMPEG_LIB_DIR = Join-Path $pwd 'dist\ffmpeg-windows-x86_64\lib'
           $env:PATH = "$(Join-Path $pwd 'dist\ffmpeg-windows-x86_64\bin');$env:PATH"
-          Invoke-NianNative { cargo.exe test -p nian-media-ffmpeg --test media_integration }
           Invoke-NianNative { cargo.exe fmt --all --check }
           Invoke-NianNative { cargo.exe clippy --all-targets -- -D warnings }
           Invoke-NianNative { cargo.exe test --workspace }

@@ -102,10 +102,11 @@ test("Windows FFmpeg cache is exact, validated, bounded, and source-build backed
   const validateAt = windows.indexOf("- name: Validate restored Windows FFmpeg cache");
   const buildAt = windows.indexOf("- name: Build pinned FFmpeg 8.0.3 Windows MSVC runtime");
   const resolvedAt = windows.indexOf("- name: Validate resolved Windows FFmpeg runtime");
+  const mediaIntegrationAt = windows.indexOf("- name: Validate Windows FFmpeg media integration");
   const saveAt = windows.indexOf("- name: Save validated Windows FFmpeg build cache");
   const artifactUploadAt = windows.indexOf("- name: Upload validated Windows FFmpeg cross-tag cache artifact");
-  const rustAt = windows.indexOf("- name: Validate Windows release FFmpeg and Rust runtime");
-  assert.ok(computeAt >= 0 && computeAt < restoreAt && restoreAt < validateAt && validateAt < buildAt && buildAt < resolvedAt && resolvedAt < saveAt && saveAt < artifactUploadAt && artifactUploadAt < rustAt);
+  const rustAt = windows.indexOf("- name: Run remaining Windows Rust quality and release worker build");
+  assert.ok(computeAt >= 0 && computeAt < restoreAt && restoreAt < validateAt && validateAt < buildAt && buildAt < resolvedAt && resolvedAt < mediaIntegrationAt && mediaIntegrationAt < saveAt && saveAt < artifactUploadAt && artifactUploadAt < rustAt);
 
   assert.match(windows, /actions\/cache\/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4\.3\.0/);
   assert.match(windows, /actions\/cache\/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4\.3\.0/);
@@ -122,6 +123,14 @@ test("Windows FFmpeg cache is exact, validated, bounded, and source-build backed
   assert.match(windows, /Remove-Item -Recurse -Force .*ffmpeg-windows-x86_64/);
   assert.match(windows, /if: steps\.ffmpeg-cache-state\.outputs\.source-build-required == 'true'/);
   assert.match(windows, /Build pinned FFmpeg 8\.0\.3 Windows MSVC runtime[\s\S]*?timeout-minutes: 150/);
+  const mediaIntegration = windows.slice(mediaIntegrationAt, saveAt);
+  assert.match(mediaIntegration, /\$env:NIAN_FFMPEG_LIB_DIR = Join-Path \$pwd 'dist\\ffmpeg-windows-x86_64\\lib'/);
+  assert.match(mediaIntegration, /\$env:PATH = "\$\(Join-Path \$pwd 'dist\\ffmpeg-windows-x86_64\\bin'\);\$env:PATH"/);
+  assert.match(mediaIntegration, /Invoke-NianNative \{ cargo\.exe test -p nian-media-ffmpeg --test media_integration \}/);
+  const remainingRust = windows.slice(rustAt);
+  assert.equal(remainingRust.includes("cargo.exe test -p nian-media-ffmpeg --test media_integration"), false);
+  assert.match(remainingRust, /Invoke-NianNative \{ cargo\.exe fmt --all --check \}/);
+  assert.match(remainingRust, /Invoke-NianNative \{ cargo\.exe build -p nian-media-worker --target x86_64-pc-windows-msvc --release \}/);
   assert.match(windows, /^    timeout-minutes: 240$/m);
   assert.match(windows, /permissions:\n      contents: read\n      actions: read/);
   assert.equal(windows.includes("actions: write"), false);
