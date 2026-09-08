@@ -179,6 +179,26 @@ test("release helper contains no runtime network patch fetch", () => {
   }
 });
 
+test("Windows and Linux use the corrected RC15 RTSP component contract", () => {
+  const windowsContract = JSON.parse(
+    readFileSync(new URL("./ffmpeg-windows-contract.json", import.meta.url), "utf8"),
+  );
+  const linuxRelease = readNormalizedText(new URL("./build-ffmpeg-linux.sh", import.meta.url));
+  const linuxCi = readNormalizedText(new URL("../ci-install-ffmpeg.sh", import.meta.url));
+
+  assert.ok(windowsContract.configureFlags.includes("--enable-protocol=file,tcp,rtp,udp"));
+  assert.ok(windowsContract.configureFlags.includes("--enable-demuxer=matroska,mov,rtsp"));
+  assert.equal(
+    windowsContract.configureFlags.some((flag) => flag === "--enable-protocol=file,tcp,rtsp,rtp,udp"),
+    false,
+  );
+  for (const linux of [linuxRelease, linuxCi]) {
+    assert.match(linux, /--enable-protocol=file,tcp,rtp,udp/);
+    assert.match(linux, /--enable-demuxer=matroska,mov,rtsp/);
+    assert.doesNotMatch(linux, /--enable-protocol=file,tcp,rtsp,rtp,udp/);
+  }
+});
+
 test("Windows and Linux invoke the same patch helper after verified extraction and validate CBS before compile", () => {
   const windows = readNormalizedText(new URL("./build-ffmpeg-windows.ps1", import.meta.url));
   const linux = readNormalizedText(new URL("./build-ffmpeg-linux.sh", import.meta.url));
@@ -187,13 +207,17 @@ test("Windows and Linux invoke the same patch helper after verified extraction a
   const windowsExtract = windows.indexOf('Invoke-FfmpegPhase "extraction"');
   const windowsPatch = windows.indexOf('Invoke-FfmpegPhase "apply upstream CBS lavf backport"');
   const windowsConfigure = windows.indexOf('Invoke-FfmpegPhase "configure"');
+  const windowsGlobalValidate = windows.indexOf('Invoke-FfmpegPhase "post-configure global validation"');
+  const windowsComponentValidate = windows.indexOf('Invoke-FfmpegPhase "post-configure component validation"');
   const windowsCbsValidate = windows.indexOf('Invoke-FfmpegPhase "post-configure CBS lavf validation"');
   const windowsCompile = windows.indexOf('Invoke-FfmpegPhase "compile"');
   assert.ok(
     windowsSha < windowsExtract &&
       windowsExtract < windowsPatch &&
       windowsPatch < windowsConfigure &&
-      windowsConfigure < windowsCbsValidate &&
+      windowsConfigure < windowsGlobalValidate &&
+      windowsGlobalValidate < windowsComponentValidate &&
+      windowsComponentValidate < windowsCbsValidate &&
       windowsCbsValidate < windowsCompile,
   );
   assert.match(windows, /apply-ffmpeg-upstream-patches\.mjs/);
@@ -202,13 +226,17 @@ test("Windows and Linux invoke the same patch helper after verified extraction a
   const linuxExtract = linux.indexOf('tar -xJf "$tarball"');
   const linuxPatch = linux.indexOf("apply-ffmpeg-upstream-patches.mjs");
   const linuxConfigure = linux.indexOf('./configure "${configure_flags[@]}"');
-  const linuxCbsValidate = linux.indexOf("validate-ffmpeg-config.mjs");
+  const linuxGlobalValidate = linux.indexOf("--scope global");
+  const linuxComponentValidate = linux.indexOf("validate-ffmpeg-components.mjs");
+  const linuxCbsValidate = linux.indexOf("--scope cbs");
   const linuxCompile = linux.indexOf('make -j"$(nproc)"');
   assert.ok(
     linuxSha < linuxExtract &&
       linuxExtract < linuxPatch &&
       linuxPatch < linuxConfigure &&
-      linuxConfigure < linuxCbsValidate &&
+      linuxConfigure < linuxGlobalValidate &&
+      linuxGlobalValidate < linuxComponentValidate &&
+      linuxComponentValidate < linuxCbsValidate &&
       linuxCbsValidate < linuxCompile,
   );
 });

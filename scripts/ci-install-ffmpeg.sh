@@ -32,7 +32,7 @@ cd "$work_dir/ffmpeg-$FFMPEG_VERSION"
   --disable-everything \
   --disable-x86asm \
   --enable-network \
-  --enable-protocol=file,tcp,rtsp,rtp,udp \
+  --enable-protocol=file,tcp,rtp,udp \
   --enable-demuxer=matroska,mov,rtsp \
   --enable-muxer=matroska,mov,mp4 \
   --enable-parser=h264,mpeg4video,mpegaudio,aac \

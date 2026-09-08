@@ -42,6 +42,9 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   for (const flag of ["--toolchain=msvc", "--enable-shared", "--disable-static", "--disable-gpl", "--disable-nonfree", "--disable-autodetect", "--disable-everything"]) {
     assert.ok(windowsFfmpegContract.configureFlags.includes(flag), `missing authoritative FFmpeg configure flag ${flag}`);
   }
+  assert.ok(windowsFfmpegContract.configureFlags.includes("--enable-protocol=file,tcp,rtp,udp"));
+  assert.equal(windowsFfmpegContract.configureFlags.some((flag) => flag.includes("--enable-protocol=") && flag.split("=")[1].split(",").includes("rtsp")), false);
+  assert.ok(windowsFfmpegContract.configureFlags.includes("--enable-demuxer=matroska,mov,rtsp"));
   assert.match(windowsFfmpeg, /ffmpeg-windows-contract\.json/);
   assert.match(windowsFfmpeg, /Get-FileHash -Algorithm SHA256/);
   assert.match(windowsFfmpeg, /Invoke-NianNative \{ & \$Curl/);
@@ -68,11 +71,21 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   }
   assert.match(windowsPreflight, /test-ffmpeg-msys-escape\.ps1/);
   assert.match(windowsFfmpeg, /post-configure MSYS dependency validation/);
+  const globalConfigAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "post-configure global validation"');
+  const componentConfigAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "post-configure component validation"');
   const cbsConfigAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "post-configure CBS lavf validation"');
   const postConfigureAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "post-configure MSYS dependency validation"');
   const cbsCompileAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "CBS lavf regression compile"');
   const fullCompileAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "compile"');
-  assert.ok(configureAt < cbsConfigAt && cbsConfigAt < postConfigureAt && postConfigureAt < cbsCompileAt && cbsCompileAt < fullCompileAt);
+  assert.ok(
+    configureAt < globalConfigAt &&
+      globalConfigAt < componentConfigAt &&
+      componentConfigAt < cbsConfigAt &&
+      cbsConfigAt < postConfigureAt &&
+      postConfigureAt < cbsCompileAt &&
+      cbsCompileAt < fullCompileAt,
+  );
+  assert.match(windowsFfmpeg, /validate-ffmpeg-components\.mjs/);
   assert.match(windowsFfmpeg, /\/usr\/bin\/make -j1 libavformat\/cbs\.o/);
   assert.equal(windowsFfmpeg.includes("/Od"), false);
   assert.match(windowsFfmpeg, /configure returned success but emitted sed\/awk syntax errors; compile is blocked/);
@@ -84,7 +97,7 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   assert.match(windowsFfmpeg, /\[Math\]::Max\(2, \[Math\]::Min\(\$reportedCpuCount, 8\)\)/);
   assert.match(windowsFfmpeg, /\/usr\/bin\/make -j\$buildJobs/);
   assert.equal(windowsFfmpeg.includes("make -j2"), false);
-  for (const phase of ["download", "SHA-256 verification", "extraction", "apply upstream CBS lavf backport", "configure", "post-configure CBS lavf validation", "post-configure MSYS dependency validation", "CBS lavf regression compile", "compile", "install", "configuration and license validation", "runtime staging and validation", "publish validated output"]) {
+  for (const phase of ["download", "SHA-256 verification", "extraction", "apply upstream CBS lavf backport", "configure", "post-configure global validation", "post-configure component validation", "post-configure CBS lavf validation", "post-configure MSYS dependency validation", "CBS lavf regression compile", "compile", "install", "configuration and license validation", "runtime staging and validation", "publish validated output"]) {
     assert.ok(windowsFfmpeg.includes(`Invoke-FfmpegPhase "${phase}"`), `missing FFmpeg phase timing for ${phase}`);
   }
   for (const name of ["avformat.lib", "avcodec.lib", "avutil.lib"]) assert.match(windowsFfmpeg, new RegExp(name.replace(".", "\\.")));

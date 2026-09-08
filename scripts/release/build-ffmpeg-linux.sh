@@ -45,7 +45,7 @@ configure_flags=(
   --disable-swresample
   --disable-swscale
   --enable-network
-  --enable-protocol=file,tcp,rtsp,rtp,udp
+  --enable-protocol=file,tcp,rtp,udp
   --enable-demuxer=matroska,mov,rtsp
   --enable-muxer=matroska,mov,mp4
   --enable-parser=h264,mpeg4video,mpegaudio,aac
@@ -57,7 +57,15 @@ printf '%s\n' "${configure_flags[@]}" > "$output_dir/FFMPEG_BUILD_FLAGS.txt"
 cp config.h "$output_dir/FFMPEG_CONFIG.h"
 node "$repo_root/scripts/release/validate-ffmpeg-config.mjs" \
   --config-header "$output_dir/FFMPEG_CONFIG.h" \
+  --flags "$output_dir/FFMPEG_BUILD_FLAGS.txt" \
+  --scope global
+node "$repo_root/scripts/release/validate-ffmpeg-components.mjs" \
+  --component-header "$source_dir/config_components.h" \
   --flags "$output_dir/FFMPEG_BUILD_FLAGS.txt"
+node "$repo_root/scripts/release/validate-ffmpeg-config.mjs" \
+  --config-header "$output_dir/FFMPEG_CONFIG.h" \
+  --flags "$output_dir/FFMPEG_BUILD_FLAGS.txt" \
+  --scope cbs
 
 make -j"$(nproc)"
 make install DESTDIR="$destdir"

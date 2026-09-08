@@ -185,10 +185,24 @@ fi
         Copy-Item -Force $componentHeader (Join-Path $CandidateDir "FFMPEG_CONFIG_COMPONENTS.h")
     }
 
+    Invoke-FfmpegPhase "post-configure global validation" {
+        Invoke-NianNative { node.exe (Join-Path $RepoRoot "scripts/release/validate-ffmpeg-config.mjs") `
+            --config-header (Join-Path $Source "config.h") `
+            --flags (Join-Path $CandidateDir "FFMPEG_BUILD_FLAGS.txt") `
+            --scope global }
+    }
+
+    Invoke-FfmpegPhase "post-configure component validation" {
+        Invoke-NianNative { node.exe (Join-Path $RepoRoot "scripts/release/validate-ffmpeg-components.mjs") `
+            --component-header (Join-Path $Source "config_components.h") `
+            --flags (Join-Path $CandidateDir "FFMPEG_BUILD_FLAGS.txt") }
+    }
+
     Invoke-FfmpegPhase "post-configure CBS lavf validation" {
         Invoke-NianNative { node.exe (Join-Path $RepoRoot "scripts/release/validate-ffmpeg-config.mjs") `
             --config-header (Join-Path $Source "config.h") `
-            --flags (Join-Path $CandidateDir "FFMPEG_BUILD_FLAGS.txt") }
+            --flags (Join-Path $CandidateDir "FFMPEG_BUILD_FLAGS.txt") `
+            --scope cbs }
     }
 
     Invoke-FfmpegPhase "post-configure MSYS dependency validation" {

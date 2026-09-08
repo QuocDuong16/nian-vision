@@ -141,13 +141,17 @@ test("RC10 preserves semantic MSVC authority and explicit GNU make execution", (
   assert.ok(source.msvcFixture.includes("HostX64\\x64"));
 
   const configureAt = source.build.indexOf('Invoke-FfmpegPhase "configure"');
+  const globalValidateAt = source.build.indexOf('Invoke-FfmpegPhase "post-configure global validation"');
+  const componentValidateAt = source.build.indexOf('Invoke-FfmpegPhase "post-configure component validation"');
   const cbsValidateAt = source.build.indexOf('Invoke-FfmpegPhase "post-configure CBS lavf validation"');
   const validateAt = source.build.indexOf('Invoke-FfmpegPhase "post-configure MSYS dependency validation"');
   const cbsCompileAt = source.build.indexOf('Invoke-FfmpegPhase "CBS lavf regression compile"');
   const compileAt = source.build.indexOf('Invoke-FfmpegPhase "compile"');
   assert.ok(
     configureAt >= 0 &&
-      configureAt < cbsValidateAt &&
+      configureAt < globalValidateAt &&
+      globalValidateAt < componentValidateAt &&
+      componentValidateAt < cbsValidateAt &&
       cbsValidateAt < validateAt &&
       validateAt < cbsCompileAt &&
       cbsCompileAt < compileAt,

@@ -45,7 +45,13 @@ function createValidOutput(t) {
     "#define CONFIG_CBS_APV_LAVF 1",
     "#define CONFIG_CBS_AV1_LAVF 1",
   ];
-  const componentLines = requiredComponentMacros(windowsContract.configureFlags).map((macro) => `#define ${macro} 1`);
+  const componentLines = [
+    ...requiredComponentMacros(windowsContract.configureFlags).map((macro) => `#define ${macro} 1`),
+    "#define CONFIG_HTTP_PROTOCOL 1",
+    "#define CONFIG_ASF_DEMUXER 1",
+    "#define CONFIG_RM_DEMUXER 1",
+    "#define CONFIG_MPEGTS_DEMUXER 1",
+  ];
   writeFileSync(join(root, "FFMPEG_CONFIG.h"), `${configLines.join("\n")}\n`, "utf8");
   writeFileSync(join(root, "FFMPEG_CONFIG_COMPONENTS.h"), `${componentLines.join("\n")}\n`, "utf8");
   writeFileSync(join(root, "FFMPEG_BUILD_FLAGS.txt"), windowsContract.configureFlags.join("\n"), "utf8");
@@ -204,10 +210,11 @@ test("Windows FFmpeg metadata validates only for the current source and build co
 test("Windows FFmpeg component ownership excludes global network and preserves required families", () => {
   const macros = new Set(requiredComponentMacros(inputs.windowsContract.configureFlags));
   assert.equal(macros.has("CONFIG_NETWORK"), false);
+  assert.equal(macros.has("CONFIG_RTSP_PROTOCOL"), false);
+  assert.equal(macros.has("CONFIG_RTSP_DEMUXER"), true);
   for (const macro of [
     "CONFIG_FILE_PROTOCOL",
     "CONFIG_TCP_PROTOCOL",
-    "CONFIG_RTSP_PROTOCOL",
     "CONFIG_RTP_PROTOCOL",
     "CONFIG_UDP_PROTOCOL",
     "CONFIG_MATROSKA_DEMUXER",
@@ -233,6 +240,9 @@ test("realistic Windows FFmpeg headers validate with CONFIG_NETWORK only in conf
   const components = readFileSync(join(root, "FFMPEG_CONFIG_COMPONENTS.h"), "utf8");
   assert.match(config, /^#define CONFIG_NETWORK 1$/m);
   assert.doesNotMatch(components, /CONFIG_NETWORK/);
+  assert.doesNotMatch(components, /CONFIG_RTSP_PROTOCOL/);
+  assert.match(components, /^#define CONFIG_RTSP_DEMUXER 1$/m);
+  assert.match(components, /^#define CONFIG_HTTP_PROTOCOL 1$/m);
   assert.equal(validateWindowsFfmpegOutput(root), true);
 });
 
@@ -287,7 +297,7 @@ test("Windows FFmpeg cached runtime rejects altered configure flags", (t) => {
 
 test("Windows FFmpeg cached runtime still enforces every required component family", (t) => {
   for (const macro of [
-    "CONFIG_RTSP_PROTOCOL",
+    "CONFIG_TCP_PROTOCOL",
     "CONFIG_MATROSKA_DEMUXER",
     "CONFIG_MP4_MUXER",
     "CONFIG_H264_PARSER",
@@ -297,7 +307,7 @@ test("Windows FFmpeg cached runtime still enforces every required component fami
     const configPath = join(root, "FFMPEG_CONFIG_COMPONENTS.h");
     const config = readFileSync(configPath, "utf8").replace(`${macro} 1`, `${macro} 0`);
     writeFileSync(configPath, config, "utf8");
-    assert.throws(() => validateWindowsFfmpegOutput(root), /required FFmpeg component/, macro);
+    assert.throws(() => validateWindowsFfmpegOutput(root), /requested FFmpeg component/, macro);
   }
 });
 
@@ -326,14 +336,30 @@ test("Windows FFmpeg cached runtime rejects duplicated required DLL", (t) => {
   assert.throws(() => validateWindowsFfmpegOutput(root), /runtime DLL missing, duplicated, or misplaced/);
 });
 
-test("RC12 pristine FFmpeg contract cannot share the RC13 patched cache key", () => {
+test("RC12 pristine FFmpeg contract cannot share the current patched cache key", () => {
   const rc12 = cloneInputs();
   rc12.windowsContract.buildContractVersion = 3;
+  rc12.windowsContract.configureFlags = rc12.windowsContract.configureFlags.map((flag) =>
+    flag === "--enable-protocol=file,tcp,rtp,udp" ? "--enable-protocol=file,tcp,rtsp,rtp,udp" : flag,
+  );
   delete rc12.releaseConfig.ffmpegUpstreamPatch;
   const rc12Digest = buildContractDigest(rc12.releaseConfig, rc12.windowsContract);
-  const rc13Digest = buildContractDigest(inputs.releaseConfig, inputs.windowsContract);
+  const currentDigest = buildContractDigest(inputs.releaseConfig, inputs.windowsContract);
   assert.equal(rc12Digest, "0d15adba7b6429e6b48a49d70d1635a6ae5d659080d55e38c7bd9ae4bd4ec438");
-  assert.notEqual(rc13Digest, rc12Digest);
+  assert.notEqual(currentDigest, rc12Digest);
+});
+
+test("RC15 corrected protocol text cannot share the RC14 Windows FFmpeg cache digest", () => {
+  const rc14 = cloneInputs();
+  rc14.windowsContract.configureFlags = rc14.windowsContract.configureFlags.map((flag) =>
+    flag === "--enable-protocol=file,tcp,rtp,udp" ? "--enable-protocol=file,tcp,rtsp,rtp,udp" : flag,
+  );
+  assert.equal(rc14.windowsContract.buildContractVersion, 4);
+  assert.equal(inputs.windowsContract.buildContractVersion, 4);
+  assert.notEqual(
+    buildContractDigest(rc14.releaseConfig, rc14.windowsContract),
+    buildContractDigest(inputs.releaseConfig, inputs.windowsContract),
+  );
 });
 
 test("RC13 Windows FFmpeg cache digest changes with upstream patch commit", () => {

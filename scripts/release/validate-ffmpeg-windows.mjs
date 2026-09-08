@@ -7,7 +7,10 @@ import {
   validateWindowsFfmpegFlags,
   validateWindowsFfmpegMetadata,
 } from "./ffmpeg-cache-key.mjs";
+import { validateRequestedComponents } from "./validate-ffmpeg-components.mjs";
 import { validateFfmpegConfiguration } from "./validate-ffmpeg-config.mjs";
+
+export { requiredComponentMacros } from "./validate-ffmpeg-components.mjs";
 
 function normalizeRelative(path) {
   return path.split(sep).join("/");
@@ -27,35 +30,6 @@ function walkFiles(root, current = root, files = []) {
 function requireRegularFile(path, label) {
   const stat = lstatSync(path);
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${label} is not a regular file`);
-}
-
-function macrosFromConfig(configHeader) {
-  const macros = new Map();
-  for (const line of configHeader.replace(/\r\n?/g, "\n").split("\n")) {
-    const match = line.match(/^#define\s+(CONFIG_[A-Z0-9_]+)\s+([01])$/);
-    if (match) macros.set(match[1], match[2]);
-  }
-  return macros;
-}
-
-export function requiredComponentMacros(configureFlags) {
-  const result = new Set();
-  const families = new Map([
-    ["--enable-protocol=", "PROTOCOL"],
-    ["--enable-demuxer=", "DEMUXER"],
-    ["--enable-muxer=", "MUXER"],
-    ["--enable-parser=", "PARSER"],
-    ["--enable-decoder=", "DECODER"],
-  ]);
-  for (const flag of configureFlags) {
-    for (const [prefix, suffix] of families) {
-      if (!flag.startsWith(prefix)) continue;
-      for (const component of flag.slice(prefix.length).split(",")) {
-        result.add(`CONFIG_${component.toUpperCase().replaceAll("-", "_")}_${suffix}`);
-      }
-    }
-  }
-  return [...result].sort();
 }
 
 function assertNoPrivatePathLeak(evidencePaths) {
@@ -93,10 +67,7 @@ export function validateWindowsFfmpegOutput(outputDir, inputs = loadWindowsFfmpe
     windowsContract,
   );
 
-  const macros = macrosFromConfig(componentHeader);
-  for (const macro of requiredComponentMacros(windowsContract.configureFlags)) {
-    if (macros.get(macro) !== "1") throw new Error(`required FFmpeg component is not enabled: ${macro}`);
-  }
+  validateRequestedComponents(componentHeader, windowsContract.configureFlags);
 
   const files = walkFiles(root);
   const normalizedFiles = files.map((path) => ({
