@@ -136,9 +136,24 @@ impl AppConfigBuilder {
 mod tests {
     use super::*;
 
+    fn absolute_test_storage_root() -> PathBuf {
+        std::env::temp_dir().join("nian-vision-test-storage")
+    }
+
+    fn filesystem_root() -> PathBuf {
+        std::env::current_dir()
+            .expect("current directory should be available in tests")
+            .ancestors()
+            .last()
+            .expect("an absolute current directory should have a filesystem root")
+            .to_path_buf()
+    }
+
     #[test]
     fn defaults_are_sensible() {
-        let config = AppConfig::builder("/var/lib/nian-vision").build().unwrap();
+        let config = AppConfig::builder(absolute_test_storage_root())
+            .build()
+            .unwrap();
         assert_eq!(
             config.segment_target_duration(),
             SegmentTargetDuration::DEFAULT
@@ -149,7 +164,7 @@ mod tests {
     #[test]
     fn rejects_relative_and_root_storage_paths() {
         assert!(AppConfig::builder("relative/path").build().is_err());
-        assert!(AppConfig::builder("/").build().is_err());
+        assert!(AppConfig::builder(filesystem_root()).build().is_err());
     }
 
     #[test]
@@ -162,7 +177,7 @@ mod tests {
 
     #[test]
     fn invalid_retention_is_rejected_at_build_time() {
-        let result = AppConfig::builder("/tmp/nian-test").retention(RetentionPolicy {
+        let result = AppConfig::builder(absolute_test_storage_root()).retention(RetentionPolicy {
             max_age_days: Some(0),
             max_storage_bytes: None,
         });

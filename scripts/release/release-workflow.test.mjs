@@ -296,6 +296,18 @@ test("Linux signing is isolated from its compiler and dependency build", () => {
   assert.match(stepBody("sign-linux", "Upload Linux release candidate"), /name: linux-release-candidate/);
 });
 
+test("Linux signing restores executable mode lost across the artifact boundary", () => {
+  const restore = stepBody("sign-linux", "Restore downloaded Linux AppImage executable mode");
+  assert.match(restore, /find target\/release\/bundle\/appimage/);
+  assert.match(restore, /-name '\*\.AppImage'/);
+  assert.match(restore, /chmod 0755 "\$\{images\[0\]\}"/);
+  assert.match(restore, /\[\[ -x "\$\{images\[0\]\}" \]\]/);
+  assert.ok(
+    jobBody("sign-linux").indexOf("Restore downloaded Linux AppImage executable mode") <
+      jobBody("sign-linux").indexOf("Sign Linux updater artifact"),
+  );
+});
+
 test("GitHub release uses stable latest metadata and exact tagged asset assembly", () => {
   for (const job of ["build-linux", "build-windows"]) {
     const name = job === "build-linux" ? "Generate release-only Tauri configuration" : "Generate public-only Windows Tauri configuration";
