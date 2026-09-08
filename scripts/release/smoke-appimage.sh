@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 bundle_dir="$repo_root/target/release/bundle/appimage"
+source "$repo_root/scripts/release/linux-runtime-contract.sh"
 mapfile -t images < <(find "$bundle_dir" -maxdepth 1 -type f -name '*.AppImage' -print | sort)
 if [[ "${#images[@]}" -ne 1 ]]; then
   echo "expected exactly one AppImage in $bundle_dir, found ${#images[@]}" >&2
@@ -44,13 +45,14 @@ appimage="${images[0]}"
   "$appimage" --appimage-extract >/dev/null
 )
 appdir="$work_dir/squashfs-root"
+private_lib_dir="$appdir/usr/lib/nian-vision"
 
 required=(
   "$appdir/usr/bin/nian-desktop"
   "$appdir/usr/bin/nian-media-worker"
-  "$appdir/usr/lib/nian-vision/libavformat.so.62"
-  "$appdir/usr/lib/nian-vision/libavcodec.so.62"
-  "$appdir/usr/lib/nian-vision/libavutil.so.60"
+  "$private_lib_dir/libavformat.so.62"
+  "$private_lib_dir/libavcodec.so.62"
+  "$private_lib_dir/libavutil.so.60"
   "$appdir/usr/share/doc/nian-vision/THIRD_PARTY_NOTICES.txt"
   "$appdir/usr/share/doc/nian-vision/FFMPEG-LGPL-2.1.txt"
   "$appdir/usr/share/doc/nian-vision/FFMPEG_BUILD_FLAGS.txt"
@@ -64,6 +66,13 @@ for path in "${required[@]}"; do
   }
 done
 
+expected_private_ffmpeg=(libavcodec.so.62 libavformat.so.62 libavutil.so.60)
+mapfile -t actual_private_ffmpeg < <(find "$private_lib_dir" -maxdepth 1 \( -type f -o -type l \) -name 'libav*.so*' -printf '%f\n' | sort)
+if [[ "${actual_private_ffmpeg[*]}" != "${expected_private_ffmpeg[*]}" ]]; then
+  echo "AppImage private FFmpeg runtime has unexpected files: expected=${expected_private_ffmpeg[*]} actual=${actual_private_ffmpeg[*]:-<none>}" >&2
+  exit 1
+fi
+
 for name in libavformat.so.62 libavcodec.so.62 libavutil.so.60; do
   if [[ -e "$appdir/usr/lib/$name" ]]; then
     echo "AppImage still contains legacy FFmpeg runtime layout: $appdir/usr/lib/$name" >&2
@@ -71,15 +80,25 @@ for name in libavformat.so.62 libavcodec.so.62 libavutil.so.60; do
   fi
 done
 
-worker_runpath="$(readelf -d "$appdir/usr/bin/nian-media-worker" | awk '/\(RUNPATH\)|\(RPATH\)/ { sub(/^.*\[/, ""); sub(/\].*$/, ""); print }')"
-if [[ "$worker_runpath" != '$ORIGIN/../lib/nian-vision' ]]; then
-  echo "AppImage worker has unexpected FFmpeg RUNPATH: ${worker_runpath:-<missing>}" >&2
+for name in libavformat.so.62 libavcodec.so.62 libavutil.so.60; do
+  object="$private_lib_dir/$name"
+  require_exact_runpath "$object" '$ORIGIN'
+  require_private_ffmpeg_closure "$object" "$private_lib_dir"
+done
+
+require_exact_runpath "$appdir/usr/bin/nian-media-worker" '$ORIGIN/../lib/nian-vision'
+
+if ! worker_ldd="$(clean_ldd "$appdir/usr/bin/nian-media-worker" 2>&1)"; then
+  printf '%s\n' "$worker_ldd" >&2
+  echo "ldd failed for AppImage worker dependency closure" >&2
   exit 1
 fi
-
-worker_ldd="$(env -u LD_LIBRARY_PATH -u NIAN_FFMPEG_LIB_DIR ldd "$appdir/usr/bin/nian-media-worker")"
+if grep -q 'not found' <<<"$worker_ldd"; then
+  echo "AppImage worker dependency closure is incomplete" >&2
+  exit 1
+fi
 for name in libavformat.so.62 libavcodec.so.62 libavutil.so.60; do
-  expected="$appdir/usr/lib/nian-vision/$name"
+  expected="$private_lib_dir/$name"
   resolved="$(awk -v name="$name" '$1 == name && $2 == "=>" { print $3 }' <<<"$worker_ldd")"
   resolved_real="$(readlink -f "$resolved" 2>/dev/null || true)"
   expected_real="$(readlink -f "$expected")"

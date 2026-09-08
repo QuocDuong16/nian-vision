@@ -8,6 +8,7 @@ target="x86_64-unknown-linux-gnu"
 worker_source="$repo_root/target/release/nian-media-worker"
 worker_stage="$stage/bin/nian-media-worker"
 lib_stage="$stage/lib/nian-vision"
+source "$repo_root/scripts/release/linux-runtime-contract.sh"
 
 required=(
   "$worker_source"
@@ -38,19 +39,24 @@ for soname in libavformat.so.62 libavcodec.so.62 libavutil.so.60; do
   cp -L "$ffmpeg_dir/lib/$soname" "$lib_stage/$soname"
   chmod 0644 "$lib_stage/$soname"
 done
+for soname in libavformat.so.62 libavcodec.so.62 libavutil.so.60; do
+  object="$lib_stage/$soname"
+  patchelf --set-rpath '$ORIGIN' "$object"
+  require_exact_runpath "$object" '$ORIGIN'
+done
 install -m 0644 "$repo_root/THIRD_PARTY_NOTICES.txt" "$stage/THIRD_PARTY_NOTICES.txt"
 install -m 0644 "$ffmpeg_dir/FFMPEG-LGPL-2.1.txt" "$stage/FFMPEG-LGPL-2.1.txt"
 install -m 0644 "$ffmpeg_dir/FFMPEG_BUILD_FLAGS.txt" "$stage/FFMPEG_BUILD_FLAGS.txt"
 install -m 0644 "$ffmpeg_dir/FFMPEG_CONFIG.h" "$stage/FFMPEG_CONFIG.h"
 node "$repo_root/scripts/release/build-metadata.mjs" --output "$stage/BUILD_METADATA.json" --target "$target"
 
-worker_runpath="$(readelf -d "$worker_stage" | awk '/\(RUNPATH\)|\(RPATH\)/ { sub(/^.*\[/, ""); sub(/\].*$/, ""); print }')"
-if [[ "$worker_runpath" != '$ORIGIN/../lib/nian-vision' ]]; then
-  echo "staged worker has unexpected FFmpeg RUNPATH: ${worker_runpath:-<missing>}" >&2
+require_exact_runpath "$worker_stage" '$ORIGIN/../lib/nian-vision'
+
+if ! worker_closure="$(clean_ldd "$worker_stage" 2>&1)"; then
+  printf '%s\n' "$worker_closure" >&2
+  echo "ldd failed for staged worker dependency closure: $worker_stage" >&2
   exit 1
 fi
-
-worker_closure="$(env -u LD_LIBRARY_PATH -u NIAN_FFMPEG_LIB_DIR ldd "$worker_stage")"
 printf '%s\n' "$worker_closure"
 if grep -q 'not found' <<<"$worker_closure"; then
   echo "runtime dependency closure is incomplete for $worker_stage" >&2
@@ -58,16 +64,7 @@ if grep -q 'not found' <<<"$worker_closure"; then
 fi
 
 for object in "$lib_stage/libavformat.so.62" "$lib_stage/libavcodec.so.62" "$lib_stage/libavutil.so.60"; do
-  closure="$(env -u NIAN_FFMPEG_LIB_DIR LD_LIBRARY_PATH="$lib_stage" ldd "$object")"
-  printf '%s\n' "$closure"
-  if grep -q 'not found' <<<"$closure"; then
-    echo "runtime dependency closure is incomplete for $object" >&2
-    exit 1
-  fi
-  if grep -E 'lib(avdevice|avfilter|postproc|swresample|swscale)\.so' <<<"$closure"; then
-    echo "staged FFmpeg runtime unexpectedly depends on a disabled FFmpeg component" >&2
-    exit 1
-  fi
+  require_private_ffmpeg_closure "$object" "$lib_stage"
 done
 
 for soname in libavformat.so.62 libavcodec.so.62 libavutil.so.60; do
