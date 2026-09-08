@@ -10,6 +10,7 @@ const forgejoQualityPath = new URL("../../.forgejo/workflows/quality.yml", impor
 const workflow = readNormalizedText(githubWorkflowPath);
 const viteConfig = readNormalizedText(new URL("../../ui/vite.config.ts", import.meta.url));
 const linuxAppImagePrepare = readNormalizedText(new URL("./prepare-linux-appimage.sh", import.meta.url));
+const linuxAppImageNormalize = readNormalizedText(new URL("./normalize-appimage-ffmpeg.sh", import.meta.url));
 
 function jobBodyFrom(source, name) {
   const marker = `  ${name}:\n`;
@@ -206,7 +207,9 @@ test("Linux release compilation owns and disposes quality and worker intermediat
   const tauriBuildAt = linux.indexOf("- name: Build unsigned Linux application");
   const prepareAt = linux.indexOf("- name: Prepare Linux AppImage bundle disk");
   const bundleAt = linux.indexOf("- name: Bundle unsigned AppImage");
-  assert.ok(stageAt >= 0 && stageAt < handoffAt && handoffAt < tauriBuildAt && tauriBuildAt < prepareAt && prepareAt < bundleAt);
+  const normalizeAt = linux.indexOf("- name: Normalize AppImage FFmpeg runtime layout");
+  const smokeAt = linux.indexOf("- name: Smoke normalized AppImage runtime and desktop startup");
+  assert.ok(stageAt >= 0 && stageAt < handoffAt && handoffAt < tauriBuildAt && tauriBuildAt < prepareAt && prepareAt < bundleAt && bundleAt < normalizeAt && normalizeAt < smokeAt);
   const handoff = stepBody("build-linux", "Release Linux Cargo intermediates before desktop build");
   assert.match(handoff, /rm -rf target\/release/);
   assert.equal(handoff.includes("rm -rf dist/linux-x86_64"), false);
@@ -249,6 +252,13 @@ test("Linux AppImage bundling diagnoses, narrowly prunes, guards, then bundles t
   assert.match(bundle, /"\$tauri_cli" bundle --config tauri\.release\.generated\.conf\.json --bundles appimage --ci --no-sign --verbose/);
   assert.match(bundle, /bundle failed with exit code/);
   assert.match(bundle, /bundle_finished - bundle_started/);
+
+  const normalize = stepBody("build-linux", "Normalize AppImage FFmpeg runtime layout");
+  assert.match(normalize, /scripts\/release\/normalize-appimage-ffmpeg\.sh/);
+  assert.match(linuxAppImageNormalize, /linuxdeploy-plugin-appimage\*\.AppImage/);
+  assert.match(linuxAppImageNormalize, /--runtime-file "\$normalize_work_dir\/runtime"/);
+  assert.match(linuxAppImageNormalize, /cmp --silent "\$private_real" "\$legacy_real"/);
+  assert.equal(/\bcurl\b|\bwget\b/.test(linuxAppImageNormalize), false);
 
   const post = stepBody("build-linux", "Report Linux AppImage bundle disk state");
   assert.match(post, /if: always\(\)/);

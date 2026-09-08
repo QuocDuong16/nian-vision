@@ -267,6 +267,10 @@ jobs:
           bundle_finished="$(date +%s)"
           echo "Linux AppImage bundle completed with exit code ${bundle_status} after $((bundle_finished - bundle_started)) seconds"
 
+      - name: Normalize AppImage FFmpeg runtime layout
+        run: |
+          scripts/release/normalize-appimage-ffmpeg.sh
+
       - name: Report Linux AppImage bundle disk state
         if: always()
         run: |
@@ -281,7 +285,7 @@ jobs:
         if: always()
         run: rm -f apps/nian-desktop/tauri.release.generated.conf.json
 
-      - name: Smoke actual AppImage runtime and desktop startup
+      - name: Smoke normalized AppImage runtime and desktop startup
         run: scripts/release/smoke-appimage.sh
 
       - name: Upload unsigned Linux build
