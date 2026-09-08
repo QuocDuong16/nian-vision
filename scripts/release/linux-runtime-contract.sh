@@ -46,7 +46,13 @@ clean_ldd() {
 require_private_ffmpeg_closure() {
   local object="$1"
   local private_dir="$2"
-  local closure name arrow resolved expected resolved_real expected_real
+  local closure name arrow resolved expected private_real resolved_real expected_real
+
+  private_real="$(readlink -f "$private_dir" 2>/dev/null || true)"
+  if [[ -z "$private_real" || ! -d "$private_real" ]]; then
+    echo "private FFmpeg runtime directory is unavailable: object=$object private root=$private_dir canonical private root=${private_real:-<missing>}" >&2
+    return 1
+  fi
 
   if ! closure="$(clean_ldd "$object" 2>&1)"; then
     printf '%s\n' "$closure" >&2
@@ -87,8 +93,16 @@ require_private_ffmpeg_closure() {
     expected="$private_dir/$name"
     resolved_real="$(readlink -f "$resolved" 2>/dev/null || true)"
     expected_real="$(readlink -f "$expected" 2>/dev/null || true)"
-    if [[ -z "$resolved_real" || -z "$expected_real" || "$resolved_real" != "$expected_real" ]]; then
-      echo "FFmpeg dependency escaped the private runtime: object=$object dependency=$name resolved=${resolved:-<unresolved>} expected=$expected" >&2
+    if [[ -z "$expected_real" || "$expected_real" != "$private_real/"* ]]; then
+      echo "expected FFmpeg dependency escaped the private runtime: object=$object dependency=$name private root=$private_real expected=$expected canonical expected=${expected_real:-<missing>}" >&2
+      return 1
+    fi
+    if [[ -z "$resolved_real" || "$resolved_real" != "$private_real/"* ]]; then
+      echo "resolved FFmpeg dependency escaped the private runtime: object=$object dependency=$name private root=$private_real resolved=${resolved:-<unresolved>} canonical resolved=${resolved_real:-<missing>}" >&2
+      return 1
+    fi
+    if [[ "$resolved_real" != "$expected_real" ]]; then
+      echo "FFmpeg dependency did not resolve to the expected private file: object=$object dependency=$name private root=$private_real resolved=$resolved_real expected=$expected_real" >&2
       return 1
     fi
   done <<<"$closure"

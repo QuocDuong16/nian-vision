@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -20,10 +20,14 @@ test(
     try {
       const utilSource = join(root, "avutil.c");
       const codecSource = join(root, "avcodec.c");
-      const util = join(root, "libavutil.so.60");
-      const codec = join(root, "libavcodec.so.62");
+      const privateDir = join(root, "private");
+      const privateEvilDir = join(root, "private-evil");
+      const util = join(privateDir, "libavutil.so.60");
+      const codec = join(privateDir, "libavcodec.so.62");
       const wrongDir = join(root, "host-ffmpeg");
 
+      mkdirSync(privateDir);
+      mkdirSync(privateEvilDir);
       writeFileSync(utilSource, "int nian_avutil(void) { return 60; }\n");
       writeFileSync(
         codecSource,
@@ -37,7 +41,7 @@ test(
         "-o",
         codec,
         codecSource,
-        `-L${root}`,
+        `-L${privateDir}`,
         "-Wl,-l:libavutil.so.60",
       ]);
       execFileSync("patchelf", ["--set-rpath", "$ORIGIN", util]);
@@ -60,7 +64,7 @@ test(
           runtimeContractPath,
           codec,
           "$ORIGIN",
-          root,
+          privateDir,
         ],
         { env: hostileEnv, stdio: "pipe" },
       );
@@ -72,6 +76,20 @@ test(
           { stdio: "pipe" },
         ),
       );
+
+      const escapedUtil = join(privateEvilDir, "libavutil.so.60");
+      cpSync(util, escapedUtil);
+      rmSync(util);
+      symlinkSync(escapedUtil, util);
+      const escaped = spawnSync(
+        "bash",
+        ["-c", 'source "$1"; require_private_ffmpeg_closure "$2" "$3"', "_", runtimeContractPath, codec, privateDir],
+        { encoding: "utf8" },
+      );
+      assert.notEqual(escaped.status, 0, "symlink escape must fail private FFmpeg closure validation");
+      assert.match(escaped.stderr, /expected FFmpeg dependency escaped the private runtime/);
+      assert.ok(escaped.stderr.includes(`private root=${privateDir}`));
+      assert.ok(escaped.stderr.includes(`canonical expected=${escapedUtil}`));
 
       execFileSync("patchelf", ["--set-rpath", "$ORIGIN:/usr/lib", codec]);
       assert.throws(() =>

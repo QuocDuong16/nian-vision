@@ -82,6 +82,10 @@ done
 
 for name in libavformat.so.62 libavcodec.so.62 libavutil.so.60; do
   object="$private_lib_dir/$name"
+  if [[ ! -f "$object" || -L "$object" ]]; then
+    echo "AppImage private FFmpeg runtime entry must be a regular non-symlink file: $object" >&2
+    exit 1
+  fi
   require_exact_runpath "$object" '$ORIGIN'
   require_private_ffmpeg_closure "$object" "$private_lib_dir"
 done

@@ -41,6 +41,10 @@ for soname in libavformat.so.62 libavcodec.so.62 libavutil.so.60; do
 done
 for soname in libavformat.so.62 libavcodec.so.62 libavutil.so.60; do
   object="$lib_stage/$soname"
+  if [[ ! -f "$object" || -L "$object" ]]; then
+    echo "staged private FFmpeg runtime entry must be a regular non-symlink file: $object" >&2
+    exit 1
+  fi
   patchelf --set-rpath '$ORIGIN' "$object"
   require_exact_runpath "$object" '$ORIGIN'
 done
