@@ -39,7 +39,7 @@ function macrosFromConfig(configHeader) {
 }
 
 export function requiredComponentMacros(configureFlags) {
-  const result = new Set(["CONFIG_NETWORK"]);
+  const result = new Set();
   const families = new Map([
     ["--enable-protocol=", "PROTOCOL"],
     ["--enable-demuxer=", "DEMUXER"],

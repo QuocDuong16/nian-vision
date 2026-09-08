@@ -2,11 +2,11 @@
 
 Record the exact tag, commit SHA, OS image/VM and result for every run. A checkbox is evidence only when the step was actually executed. Do not reuse a tag after changing source.
 
-Current retry candidate: `1.0.0-rc.13` / `v1.0.0-rc.13`. RC1 through RC12 remain immutable. RC10 preserved the pinned MSYS2 GNU make/diffutils and selected MSVC/Windows SDK authority, then exposed the generated-Bash `bash -lc` transport failure. RC11 preserved those protections with file-backed UTF-8/LF generated Bash plus mandatory `bash -n`, passed Windows FFmpeg download, source SHA-256 verification, extraction and configure, then exposed the post-configure PowerShell collection-cardinality bug. RC12 preserved RC10/RC11 hardening and passed Windows preflight, source SHA-256 verification, extraction, configure, collection diagnostics, CCDEP on-disk validation and GNU make CCDEP expansion; it then began real MSVC compilation and failed at `libavformat/cbs.o` with the authoritative root failure `fatal error C1001: Internal compiler error`. The later GNU make Error 127 was consequential, not causal. FFmpeg upstream commit `6a59c847b50c6bc30630df7fca56ccd6cd8a5a8c` identifies the empty CBS-in-lavf configuration as illegal C that may trigger MSVC ICE. RC13 backports that exact upstream fix while keeping FFmpeg 8.0.3 and the original source tarball SHA-256 authority.
+Current retry candidate: `1.0.0-rc.14` / `v1.0.0-rc.14`. RC1 through RC13 remain immutable. RC10 preserved the pinned MSYS2 GNU make/diffutils and selected MSVC/Windows SDK authority, then exposed the generated-Bash `bash -lc` transport failure. RC11 preserved those protections with file-backed UTF-8/LF generated Bash plus mandatory `bash -n`, passed Windows FFmpeg download, source SHA-256 verification, extraction and configure, then exposed the post-configure PowerShell collection-cardinality bug. RC12 preserved RC10/RC11 hardening and passed Windows preflight, source SHA-256 verification, extraction, configure, collection diagnostics, CCDEP on-disk validation and GNU make CCDEP expansion; it then began real MSVC compilation and failed at `libavformat/cbs.o` with the authoritative root failure `fatal error C1001: Internal compiler error`. The later GNU make Error 127 was consequential, not causal. FFmpeg upstream commit `6a59c847b50c6bc30630df7fca56ccd6cd8a5a8c` identifies the empty CBS-in-lavf configuration as illegal C that may trigger MSVC ICE. RC13 successfully applied that exact backport, passed the targeted `libavformat/cbs.o` MSVC regression compile, full Windows FFmpeg compilation and install, then failed only because post-install validation incorrectly looked for global `CONFIG_NETWORK` in `config_components.h` instead of `config.h`; this did not show networking was disabled. RC14 corrects that config-header ownership without changing the FFmpeg build contract.
 
 ## Pre-tag authority
 
-- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.13`.
+- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.14`.
 - [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
@@ -16,7 +16,7 @@ Current retry candidate: `1.0.0-rc.13` / `v1.0.0-rc.13`. RC1 through RC12 remain
 
 ## GitHub RC workflow
 
-- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.13`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.12`; source/tag cross-pairing is forbidden.
+- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.14`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.13`; source/tag cross-pairing is forbidden.
 - [ ] GitHub tag resolves to exactly the same commit as Forgejo.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.

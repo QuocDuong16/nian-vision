@@ -41,6 +41,7 @@ function createValidOutput(t) {
     "#define CONFIG_GPL 0",
     "#define CONFIG_NONFREE 0",
     "#define CONFIG_SHARED 1",
+    "#define CONFIG_NETWORK 1",
     "#define CONFIG_CBS_APV_LAVF 1",
     "#define CONFIG_CBS_AV1_LAVF 1",
   ];
@@ -200,9 +201,51 @@ test("Windows FFmpeg metadata validates only for the current source and build co
   );
 });
 
-test("valid Windows FFmpeg cached runtime passes the shared validator", (t) => {
+test("Windows FFmpeg component ownership excludes global network and preserves required families", () => {
+  const macros = new Set(requiredComponentMacros(inputs.windowsContract.configureFlags));
+  assert.equal(macros.has("CONFIG_NETWORK"), false);
+  for (const macro of [
+    "CONFIG_FILE_PROTOCOL",
+    "CONFIG_TCP_PROTOCOL",
+    "CONFIG_RTSP_PROTOCOL",
+    "CONFIG_RTP_PROTOCOL",
+    "CONFIG_UDP_PROTOCOL",
+    "CONFIG_MATROSKA_DEMUXER",
+    "CONFIG_MOV_DEMUXER",
+    "CONFIG_RTSP_DEMUXER",
+    "CONFIG_MATROSKA_MUXER",
+    "CONFIG_MOV_MUXER",
+    "CONFIG_MP4_MUXER",
+    "CONFIG_H264_PARSER",
+    "CONFIG_MPEG4VIDEO_PARSER",
+    "CONFIG_MPEGAUDIO_PARSER",
+    "CONFIG_AAC_PARSER",
+    "CONFIG_MPEG4_DECODER",
+    "CONFIG_AAC_DECODER",
+  ]) {
+    assert.equal(macros.has(macro), true, `missing required component macro ${macro}`);
+  }
+});
+
+test("realistic Windows FFmpeg headers validate with CONFIG_NETWORK only in config.h", (t) => {
   const root = createValidOutput(t);
+  const config = readFileSync(join(root, "FFMPEG_CONFIG.h"), "utf8");
+  const components = readFileSync(join(root, "FFMPEG_CONFIG_COMPONENTS.h"), "utf8");
+  assert.match(config, /^#define CONFIG_NETWORK 1$/m);
+  assert.doesNotMatch(components, /CONFIG_NETWORK/);
   assert.equal(validateWindowsFfmpegOutput(root), true);
+});
+
+test("Windows FFmpeg cached runtime rejects missing or disabled CONFIG_NETWORK in config.h", (t) => {
+  for (const mutate of [
+    (config) => config.replace("#define CONFIG_NETWORK 1\n", ""),
+    (config) => config.replace("CONFIG_NETWORK 1", "CONFIG_NETWORK 0"),
+  ]) {
+    const root = createValidOutput(t);
+    const configPath = join(root, "FFMPEG_CONFIG.h");
+    writeFileSync(configPath, mutate(readFileSync(configPath, "utf8")), "utf8");
+    assert.throws(() => validateWindowsFfmpegOutput(root), /CONFIG_NETWORK/);
+  }
 });
 
 test("Windows FFmpeg cached runtime rejects wrong source metadata", (t) => {
@@ -242,12 +285,20 @@ test("Windows FFmpeg cached runtime rejects altered configure flags", (t) => {
   assert.throws(() => validateWindowsFfmpegOutput(root), /configure flags do not exactly match/);
 });
 
-test("Windows FFmpeg cached runtime rejects disabled required component", (t) => {
-  const root = createValidOutput(t);
-  const configPath = join(root, "FFMPEG_CONFIG_COMPONENTS.h");
-  const config = readFileSync(configPath, "utf8").replace("CONFIG_RTSP_PROTOCOL 1", "CONFIG_RTSP_PROTOCOL 0");
-  writeFileSync(configPath, config, "utf8");
-  assert.throws(() => validateWindowsFfmpegOutput(root), /required FFmpeg component/);
+test("Windows FFmpeg cached runtime still enforces every required component family", (t) => {
+  for (const macro of [
+    "CONFIG_RTSP_PROTOCOL",
+    "CONFIG_MATROSKA_DEMUXER",
+    "CONFIG_MP4_MUXER",
+    "CONFIG_H264_PARSER",
+    "CONFIG_AAC_DECODER",
+  ]) {
+    const root = createValidOutput(t);
+    const configPath = join(root, "FFMPEG_CONFIG_COMPONENTS.h");
+    const config = readFileSync(configPath, "utf8").replace(`${macro} 1`, `${macro} 0`);
+    writeFileSync(configPath, config, "utf8");
+    assert.throws(() => validateWindowsFfmpegOutput(root), /required FFmpeg component/, macro);
+  }
 });
 
 test("Windows FFmpeg cached runtime rejects forbidden CLI programs", (t) => {

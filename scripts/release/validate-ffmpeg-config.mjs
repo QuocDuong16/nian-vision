@@ -1,9 +1,15 @@
 import { readFileSync } from "node:fs";
 
 export function validateFfmpegConfiguration(configHeader, configureFlags) {
+  const configuredFlags = new Set(
+    configureFlags
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean),
+  );
   const forbiddenFlags = ["--enable-gpl", "--enable-nonfree"];
   for (const flag of forbiddenFlags) {
-    if (configureFlags.split(/\r?\n/).some((line) => line.trim() === flag)) {
+    if (configuredFlags.has(flag)) {
       throw new Error(`forbidden FFmpeg license mode requested: ${flag}`);
     }
   }
@@ -15,7 +21,7 @@ export function validateFfmpegConfiguration(configHeader, configureFlags) {
     "--disable-nonfree",
   ];
   for (const flag of requiredFlags) {
-    if (!configureFlags.split(/\r?\n/).some((line) => line.trim() === flag)) {
+    if (!configuredFlags.has(flag)) {
       throw new Error(`required FFmpeg release flag is missing: ${flag}`);
     }
   }
@@ -34,6 +40,9 @@ export function validateFfmpegConfiguration(configHeader, configureFlags) {
     if (macros.get(macro) !== "1") {
       throw new Error(`${macro} must be enabled in the shipped FFmpeg build`);
     }
+  }
+  if (configuredFlags.has("--enable-network") && macros.get("CONFIG_NETWORK") !== "1") {
+    throw new Error("CONFIG_NETWORK must be enabled when --enable-network is requested");
   }
   for (const macro of ["CONFIG_CBS_APV_LAVF", "CONFIG_CBS_AV1_LAVF"]) {
     if (macros.get(macro) !== "1") {

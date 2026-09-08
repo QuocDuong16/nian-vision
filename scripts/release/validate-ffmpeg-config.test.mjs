@@ -7,6 +7,7 @@ const config = [
   "#define CONFIG_GPL 0",
   "#define CONFIG_NONFREE 0",
   "#define CONFIG_SHARED 1",
+  "#define CONFIG_NETWORK 1",
   "#define CONFIG_CBS_APV_LAVF 1",
   "#define CONFIG_CBS_AV1_LAVF 1",
   "",
@@ -16,6 +17,7 @@ const flags = [
   "--disable-static",
   "--disable-gpl",
   "--disable-nonfree",
+  "--enable-network",
 ].join("\n");
 
 test("LGPL shared configuration passes", () => {
@@ -43,6 +45,27 @@ test("static-only drift fails", () => {
   );
 });
 
+
+test("network is required from config.h when --enable-network is requested", () => {
+  assert.throws(
+    () => validateFfmpegConfiguration(config.replace("#define CONFIG_NETWORK 1\n", ""), flags),
+    /CONFIG_NETWORK/,
+  );
+  assert.throws(
+    () => validateFfmpegConfiguration(config.replace("CONFIG_NETWORK 1", "CONFIG_NETWORK 0"), flags),
+    /CONFIG_NETWORK/,
+  );
+});
+
+test("network macro is not required when --enable-network is absent", () => {
+  assert.equal(
+    validateFfmpegConfiguration(
+      config.replace("#define CONFIG_NETWORK 1\n", ""),
+      flags.replace("--enable-network", ""),
+    ),
+    true,
+  );
+});
 
 test("CBS lavf dependency macros are mandatory", () => {
   for (const macro of ["CONFIG_CBS_APV_LAVF", "CONFIG_CBS_AV1_LAVF"]) {
