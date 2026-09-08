@@ -11,5 +11,16 @@
   "ffmpegSourceUrl": "https://ffmpeg.org/releases/ffmpeg-8.0.3.tar.xz",
   "libavformatMajor": 62,
   "libavcodecMajor": 62,
-  "libavutilMajor": 60
+  "libavutilMajor": 60,
+  "ffmpegUpstreamPatch": {
+    "contractVersion": 1,
+    "repository": "FFmpeg/FFmpeg",
+    "commit": "6a59c847b50c6bc30630df7fca56ccd6cd8a5a8c",
+    "subject": "configure: Redo enabling cbs in lavf",
+    "files": [
+      "configure",
+      "libavformat/Makefile",
+      "libavformat/cbs.h"
+    ]
+  }
 }

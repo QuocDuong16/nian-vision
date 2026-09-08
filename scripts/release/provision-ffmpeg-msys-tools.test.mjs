@@ -27,7 +27,7 @@ const diffutilsPackage = {
 };
 
 test("RC10 provisions exact official MSYS2 GNU make and diffutils packages", () => {
-  assert.equal(contract.buildContractVersion, 3);
+  assert.equal(contract.buildContractVersion, 4);
   assert.deepEqual(contract.provisionedMsysPackages, {
     make: makePackage,
     diffutils: diffutilsPackage,

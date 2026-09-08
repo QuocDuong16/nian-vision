@@ -36,7 +36,7 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   assert.equal(releaseConfig.ffmpegVersion, "8.0.3");
   assert.equal(releaseConfig.ffmpegSourceUrl, "https://ffmpeg.org/releases/ffmpeg-8.0.3.tar.xz");
   assert.equal(releaseConfig.ffmpegSourceSha256, "6136812ea6d4e68bdba27e33c2a94382711cdf4f8602ffef056ff792bd6f9818");
-  assert.equal(windowsFfmpegContract.buildContractVersion, 3);
+  assert.equal(windowsFfmpegContract.buildContractVersion, 4);
   assert.equal(windowsFfmpegContract.toolchain, "msvc");
   assert.equal(windowsFfmpegContract.architecture, "x86_64");
   for (const flag of ["--toolchain=msvc", "--enable-shared", "--disable-static", "--disable-gpl", "--disable-nonfree", "--disable-autodetect", "--disable-everything"]) {
@@ -48,8 +48,9 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   assert.match(windowsFfmpeg, /System32\\curl\.exe/);
   const shaAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "SHA-256 verification"');
   const extractionAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "extraction"');
+  const patchAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "apply upstream CBS lavf backport"');
   const configureAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "configure"');
-  assert.ok(shaAt >= 0 && shaAt < extractionAt && extractionAt < configureAt);
+  assert.ok(shaAt >= 0 && shaAt < extractionAt && extractionAt < patchAt && patchAt < configureAt);
   assert.match(windowsFfmpeg, /\$Tar = ['"]C:\\msys64\\usr\\bin\\tar\.exe['"]/);
   assert.match(windowsFfmpeg, /\$Xz = ['"]C:\\msys64\\usr\\bin\\xz\.exe['"]/);
   assert.match(windowsFfmpeg, /\/usr\/bin\/xz --decompress --stdout/);
@@ -67,8 +68,13 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   }
   assert.match(windowsPreflight, /test-ffmpeg-msys-escape\.ps1/);
   assert.match(windowsFfmpeg, /post-configure MSYS dependency validation/);
+  const cbsConfigAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "post-configure CBS lavf validation"');
   const postConfigureAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "post-configure MSYS dependency validation"');
-  assert.ok(configureAt < postConfigureAt && postConfigureAt < windowsFfmpeg.indexOf('Invoke-FfmpegPhase "compile"'));
+  const cbsCompileAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "CBS lavf regression compile"');
+  const fullCompileAt = windowsFfmpeg.indexOf('Invoke-FfmpegPhase "compile"');
+  assert.ok(configureAt < cbsConfigAt && cbsConfigAt < postConfigureAt && postConfigureAt < cbsCompileAt && cbsCompileAt < fullCompileAt);
+  assert.match(windowsFfmpeg, /\/usr\/bin\/make -j1 libavformat\/cbs\.o/);
+  assert.equal(windowsFfmpeg.includes("/Od"), false);
   assert.match(windowsFfmpeg, /configure returned success but emitted sed\/awk syntax errors; compile is blocked/);
   assert.match(windowsBoundedProcess, /\.Kill\(\$true\)/);
   assert.match(windowsBoundedProcess, /timed out after \{1\}s; process-tree termination was requested/);
@@ -78,7 +84,7 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   assert.match(windowsFfmpeg, /\[Math\]::Max\(2, \[Math\]::Min\(\$reportedCpuCount, 8\)\)/);
   assert.match(windowsFfmpeg, /\/usr\/bin\/make -j\$buildJobs/);
   assert.equal(windowsFfmpeg.includes("make -j2"), false);
-  for (const phase of ["download", "SHA-256 verification", "extraction", "configure", "post-configure MSYS dependency validation", "compile", "install", "configuration and license validation", "runtime staging and validation", "publish validated output"]) {
+  for (const phase of ["download", "SHA-256 verification", "extraction", "apply upstream CBS lavf backport", "configure", "post-configure CBS lavf validation", "post-configure MSYS dependency validation", "CBS lavf regression compile", "compile", "install", "configuration and license validation", "runtime staging and validation", "publish validated output"]) {
     assert.ok(windowsFfmpeg.includes(`Invoke-FfmpegPhase "${phase}"`), `missing FFmpeg phase timing for ${phase}`);
   }
   for (const name of ["avformat.lib", "avcodec.lib", "avutil.lib"]) assert.match(windowsFfmpeg, new RegExp(name.replace(".", "\\.")));

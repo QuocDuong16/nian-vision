@@ -41,6 +41,8 @@ function createValidOutput(t) {
     "#define CONFIG_GPL 0",
     "#define CONFIG_NONFREE 0",
     "#define CONFIG_SHARED 1",
+    "#define CONFIG_CBS_APV_LAVF 1",
+    "#define CONFIG_CBS_AV1_LAVF 1",
   ];
   const componentLines = requiredComponentMacros(windowsContract.configureFlags).map((macro) => `#define ${macro} 1`);
   writeFileSync(join(root, "FFMPEG_CONFIG.h"), `${configLines.join("\n")}\n`, "utf8");
@@ -271,4 +273,64 @@ test("Windows FFmpeg cached runtime rejects duplicated required DLL", (t) => {
   const root = createValidOutput(t);
   writeFileSync(join(root, "lib", "avutil-60.dll"), "duplicate dll fixture");
   assert.throws(() => validateWindowsFfmpegOutput(root), /runtime DLL missing, duplicated, or misplaced/);
+});
+
+test("RC12 pristine FFmpeg contract cannot share the RC13 patched cache key", () => {
+  const rc12 = cloneInputs();
+  rc12.windowsContract.buildContractVersion = 3;
+  delete rc12.releaseConfig.ffmpegUpstreamPatch;
+  const rc12Digest = buildContractDigest(rc12.releaseConfig, rc12.windowsContract);
+  const rc13Digest = buildContractDigest(inputs.releaseConfig, inputs.windowsContract);
+  assert.equal(rc12Digest, "0d15adba7b6429e6b48a49d70d1635a6ae5d659080d55e38c7bd9ae4bd4ec438");
+  assert.notEqual(rc13Digest, rc12Digest);
+});
+
+test("RC13 Windows FFmpeg cache digest changes with upstream patch commit", () => {
+  const changed = cloneInputs();
+  changed.releaseConfig.ffmpegUpstreamPatch.commit = "7".repeat(40);
+  assert.notEqual(
+    buildContractDigest(changed.releaseConfig, changed.windowsContract),
+    buildContractDigest(inputs.releaseConfig, inputs.windowsContract),
+  );
+});
+
+test("RC13 Windows FFmpeg build contract fails closed without patch metadata", () => {
+  const missing = cloneInputs();
+  delete missing.releaseConfig.ffmpegUpstreamPatch;
+  assert.throws(
+    () => buildContractDigest(missing.releaseConfig, missing.windowsContract),
+    /requires complete upstream patch provenance/,
+  );
+});
+
+test("RC13 Windows FFmpeg metadata records exact upstream patch identity", () => {
+  const metadata = expectedWindowsFfmpegMetadata(inputs.releaseConfig, inputs.windowsContract);
+  assert.equal(metadata.build_contract_version, 4);
+  assert.equal(metadata.upstream_patch_contract_version, 1);
+  assert.equal(metadata.upstream_patch_repository, "FFmpeg/FFmpeg");
+  assert.equal(metadata.upstream_patch_commit, "6a59c847b50c6bc30630df7fca56ccd6cd8a5a8c");
+  assert.equal(metadata.upstream_patch_subject, "configure: Redo enabling cbs in lavf");
+  assert.deepEqual(metadata.upstream_patch_files, ["configure", "libavformat/Makefile", "libavformat/cbs.h"]);
+});
+
+test("RC13 cached runtime rejects missing wrong or pristine RC12 patch metadata", (t) => {
+  for (const mutate of [
+    (metadata) => { delete metadata.upstream_patch_commit; },
+    (metadata) => { metadata.upstream_patch_commit = "7".repeat(40); },
+    (metadata) => {
+      metadata.build_contract_version = 3;
+      delete metadata.upstream_patch_contract_version;
+      delete metadata.upstream_patch_repository;
+      delete metadata.upstream_patch_commit;
+      delete metadata.upstream_patch_subject;
+      delete metadata.upstream_patch_files;
+    },
+  ]) {
+    const root = createValidOutput(t);
+    const metadataPath = join(root, "FFMPEG_BUILD_METADATA.json");
+    const metadata = JSON.parse(readFileSync(metadataPath, "utf8"));
+    mutate(metadata);
+    writeFileSync(metadataPath, JSON.stringify(metadata));
+    assert.throws(() => validateWindowsFfmpegOutput(root), /metadata does not match/);
+  }
 });

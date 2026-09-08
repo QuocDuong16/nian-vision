@@ -23,19 +23,47 @@ export function sha256Hex(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+function normalizedUpstreamPatch(releaseConfig, windowsContract) {
+  if (windowsContract.buildContractVersion < 4) return null;
+  const patch = releaseConfig.ffmpegUpstreamPatch;
+  if (
+    !patch ||
+    !Number.isInteger(patch.contractVersion) ||
+    patch.contractVersion < 1 ||
+    typeof patch.repository !== "string" ||
+    !/^[0-9a-f]{40}$/.test(patch.commit ?? "") ||
+    typeof patch.subject !== "string" ||
+    !Array.isArray(patch.files) ||
+    patch.files.length === 0 ||
+    patch.files.some((file) => typeof file !== "string" || file.length === 0)
+  ) {
+    throw new Error("Windows FFmpeg build contract v4 requires complete upstream patch provenance");
+  }
+  return {
+    contract_version: patch.contractVersion,
+    repository: patch.repository,
+    commit: patch.commit,
+    subject: patch.subject,
+    files: [...patch.files],
+  };
+}
+
 export function buildWindowsFfmpegContract(releaseConfig, windowsContract) {
+  const upstreamPatch = normalizedUpstreamPatch(releaseConfig, windowsContract);
+  const ffmpeg = {
+    version: releaseConfig.ffmpegVersion,
+    source_sha256: releaseConfig.ffmpegSourceSha256,
+    source_url: releaseConfig.ffmpegSourceUrl,
+    libavformat_major: releaseConfig.libavformatMajor,
+    libavcodec_major: releaseConfig.libavcodecMajor,
+    libavutil_major: releaseConfig.libavutilMajor,
+  };
+  if (upstreamPatch) ffmpeg.source_derivation = { upstream_patch: upstreamPatch };
   return {
     schema: "nian-vision.windows-ffmpeg-build-contract.v1",
     build_contract_version: windowsContract.buildContractVersion,
     output_runtime_contract_version: windowsContract.outputRuntimeContractVersion,
-    ffmpeg: {
-      version: releaseConfig.ffmpegVersion,
-      source_sha256: releaseConfig.ffmpegSourceSha256,
-      source_url: releaseConfig.ffmpegSourceUrl,
-      libavformat_major: releaseConfig.libavformatMajor,
-      libavcodec_major: releaseConfig.libavcodecMajor,
-      libavutil_major: releaseConfig.libavutilMajor,
-    },
+    ffmpeg,
     target: {
       triple: releaseConfig.windowsTarget,
       platform: releaseConfig.windowsPlatform,
@@ -79,6 +107,7 @@ export function buildContractDigest(releaseConfig, windowsContract) {
 
 export function expectedWindowsFfmpegMetadata(releaseConfig, windowsContract) {
   const contract = buildWindowsFfmpegContract(releaseConfig, windowsContract);
+  const upstreamPatch = normalizedUpstreamPatch(releaseConfig, windowsContract);
   return {
     ffmpeg_version: releaseConfig.ffmpegVersion,
     source_sha256: releaseConfig.ffmpegSourceSha256,
@@ -89,6 +118,11 @@ export function expectedWindowsFfmpegMetadata(releaseConfig, windowsContract) {
     build_contract_sha256: sha256Hex(canonicalJson(contract)),
     build_contract_version: windowsContract.buildContractVersion,
     output_runtime_contract_version: windowsContract.outputRuntimeContractVersion,
+    upstream_patch_contract_version: upstreamPatch?.contract_version ?? null,
+    upstream_patch_repository: upstreamPatch?.repository ?? null,
+    upstream_patch_commit: upstreamPatch?.commit ?? null,
+    upstream_patch_subject: upstreamPatch?.subject ?? null,
+    upstream_patch_files: upstreamPatch?.files ?? [],
   };
 }
 

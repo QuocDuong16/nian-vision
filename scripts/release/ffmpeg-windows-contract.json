@@ -1,5 +1,5 @@
 {
-  "buildContractVersion": 3,
+  "buildContractVersion": 4,
   "outputRuntimeContractVersion": 1,
   "toolchain": "msvc",
   "architecture": "x86_64",

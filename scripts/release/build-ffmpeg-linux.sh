@@ -26,6 +26,7 @@ mkdir -p "$output_dir"
 curl --fail --silent --show-error --location --output "$tarball" "$ffmpeg_url"
 printf '%s  %s\n' "$ffmpeg_sha256" "$tarball" | sha256sum --check --strict -
 tar -xJf "$tarball" -C "$work_dir"
+node "$repo_root/scripts/release/apply-ffmpeg-upstream-patches.mjs" --source-dir "$source_dir"
 cd "$source_dir"
 
 configure_flags=(

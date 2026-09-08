@@ -35,6 +35,11 @@ export function validateFfmpegConfiguration(configHeader, configureFlags) {
       throw new Error(`${macro} must be enabled in the shipped FFmpeg build`);
     }
   }
+  for (const macro of ["CONFIG_CBS_APV_LAVF", "CONFIG_CBS_AV1_LAVF"]) {
+    if (macros.get(macro) !== "1") {
+      throw new Error(`${macro} must be enabled by the pinned FFmpeg CBS-in-lavf backport`);
+    }
+  }
   return true;
 }
 

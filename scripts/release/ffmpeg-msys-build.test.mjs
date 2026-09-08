@@ -83,7 +83,7 @@ function quotePs(value) {
 }
 
 test("RC10 Windows FFmpeg uses one controlled MSYS environment and aggregate diagnostics", () => {
-  assert.equal(contract.buildContractVersion, 3);
+  assert.equal(contract.buildContractVersion, 4);
   assert.deepEqual(contract.msysBuildTools, expectedTools);
   for (const name of ["build", "preflight", "probe", "validator"]) {
     assert.match(source[name], /windows-ffmpeg-msys-environment\.ps1/);
@@ -141,10 +141,22 @@ test("RC10 preserves semantic MSVC authority and explicit GNU make execution", (
   assert.ok(source.msvcFixture.includes("HostX64\\x64"));
 
   const configureAt = source.build.indexOf('Invoke-FfmpegPhase "configure"');
+  const cbsValidateAt = source.build.indexOf('Invoke-FfmpegPhase "post-configure CBS lavf validation"');
   const validateAt = source.build.indexOf('Invoke-FfmpegPhase "post-configure MSYS dependency validation"');
+  const cbsCompileAt = source.build.indexOf('Invoke-FfmpegPhase "CBS lavf regression compile"');
   const compileAt = source.build.indexOf('Invoke-FfmpegPhase "compile"');
-  assert.ok(configureAt >= 0 && configureAt < validateAt && validateAt < compileAt);
+  assert.ok(
+    configureAt >= 0 &&
+      configureAt < cbsValidateAt &&
+      cbsValidateAt < validateAt &&
+      validateAt < cbsCompileAt &&
+      cbsCompileAt < compileAt,
+  );
+  assert.match(source.build, /\/usr\/bin\/make -j1 libavformat\/cbs\.o/);
+  assert.match(source.build, /FFmpeg CBS lavf regression compile: PASS/);
   assert.match(source.build, /\/usr\/bin\/make -j\$buildJobs/);
+  assert.equal(source.build.includes("/Od"), false);
+  assert.equal(source.build.includes("clang-cl"), false);
   assert.match(source.build, /\/usr\/bin\/make install DESTDIR=/);
   assert.doesNotMatch(source.build, /(?:^|[;\s])make -j\$buildJobs/);
   assert.match(source.build, /-ControlledPath \$MsysEnvironment\.PathText/);

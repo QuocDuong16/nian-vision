@@ -144,6 +144,10 @@ try {
         Write-Host ("FFmpeg extracted source: {0} files; {1} bytes" -f $sourceFiles.Count, $sourceBytes)
     }
 
+    Invoke-FfmpegPhase "apply upstream CBS lavf backport" {
+        Invoke-NianNative { node.exe (Join-Path $RepoRoot "scripts/release/apply-ffmpeg-upstream-patches.mjs") --source-dir $Source }
+    }
+
     Set-Content -Path (Join-Path $CandidateDir "FFMPEG_BUILD_FLAGS.txt") -Value ($flags -join "`n") -NoNewline
 
     $sourceUnix = ConvertTo-NianMsysPath -Path $Source -Cygpath $Cygpath
@@ -181,6 +185,12 @@ fi
         Copy-Item -Force $componentHeader (Join-Path $CandidateDir "FFMPEG_CONFIG_COMPONENTS.h")
     }
 
+    Invoke-FfmpegPhase "post-configure CBS lavf validation" {
+        Invoke-NianNative { node.exe (Join-Path $RepoRoot "scripts/release/validate-ffmpeg-config.mjs") `
+            --config-header (Join-Path $Source "config.h") `
+            --flags (Join-Path $CandidateDir "FFMPEG_BUILD_FLAGS.txt") }
+    }
+
     Invoke-FfmpegPhase "post-configure MSYS dependency validation" {
         [string[]]$configureDiagnostics = @(
             Get-NianConfigureDiagnostics -LiteralPath $ConfigureStderr
@@ -201,6 +211,16 @@ fi
             -Source $Source `
             -Bash $Bash `
             -ControlledPath $MsysEnvironment.PathText
+    }
+
+    Invoke-FfmpegPhase "CBS lavf regression compile" {
+        $cbsCompileScript = "$MsysBuildPreamble`ncd $sourceQuoted`n/usr/bin/make -j1 libavformat/cbs.o"
+        Invoke-NianBashScript `
+            -Bash $Bash `
+            -Script $cbsCompileScript `
+            -FileName 'nian-ffmpeg-cbs-lavf-regression-compile.sh' `
+            -Label 'FFmpeg CBS lavf regression compile with /usr/bin/make' | Out-Host
+        Write-Host "FFmpeg CBS lavf regression compile: PASS"
     }
 
     Invoke-FfmpegPhase "compile" {
