@@ -5,6 +5,7 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot "windows-msvc-toolchain.ps1")
 . (Join-Path $PSScriptRoot "windows-ffmpeg-msys-environment.ps1")
 . (Join-Path $PSScriptRoot "windows-bash-script.ps1")
+. (Join-Path $PSScriptRoot "windows-configure-diagnostics.ps1")
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 $Config = Get-Content (Join-Path $RepoRoot "scripts/release/release-config.json") -Raw | ConvertFrom-Json
@@ -181,14 +182,16 @@ fi
     }
 
     Invoke-FfmpegPhase "post-configure MSYS dependency validation" {
-        $configureDiagnostics = if (Test-Path $ConfigureStderr) { @(Get-Content $ConfigureStderr) } else { @() }
+        [string[]]$configureDiagnostics = @(
+            Get-NianConfigureDiagnostics -LiteralPath $ConfigureStderr
+        )
         if ($configureDiagnostics.Count -gt 0) {
             Write-Host "FFmpeg configure stderr (first 40 lines):"
             $configureDiagnostics | Select-Object -First 40 | ForEach-Object { Write-Host $_ }
         }
-        $syntaxFailures = @($configureDiagnostics | Where-Object {
-            $_ -match '(?i)(?:sed|awk):.*(?:unterminated|syntax error|expression #[0-9]+)'
-        })
+        [string[]]$syntaxFailures = @(
+            Get-NianConfigureSyntaxFailures -Diagnostics $configureDiagnostics
+        )
         if ($syntaxFailures.Count -gt 0) {
             Write-Host "FFmpeg configure shell-syntax failures (bounded):"
             $syntaxFailures | Select-Object -First 20 | ForEach-Object { Write-Host $_ }

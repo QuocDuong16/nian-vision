@@ -20,6 +20,8 @@ const urls = {
   provision: new URL("./provision-ffmpeg-msys-tools.ps1", import.meta.url),
   bashHelper: new URL("./windows-bash-script.ps1", import.meta.url),
   bashFixture: new URL("./test-windows-bash-script.ps1", import.meta.url),
+  configureDiagnosticsHelper: new URL("./windows-configure-diagnostics.ps1", import.meta.url),
+  configureDiagnosticsFixture: new URL("./test-windows-configure-diagnostics.ps1", import.meta.url),
 };
 const paths = Object.fromEntries(Object.entries(urls).map(([name, url]) => [name, fileURLToPath(url)]));
 const source = Object.fromEntries(Object.entries(urls).map(([name, url]) => [name, readNormalizedText(url)]));
