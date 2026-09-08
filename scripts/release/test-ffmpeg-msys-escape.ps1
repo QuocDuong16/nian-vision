@@ -14,6 +14,7 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-native.ps1')
 . (Join-Path $PSScriptRoot 'windows-msvc-toolchain.ps1')
 . (Join-Path $PSScriptRoot 'windows-ffmpeg-msys-environment.ps1')
+. (Join-Path $PSScriptRoot 'windows-bash-script.ps1')
 
 if (-not $IsWindows) { throw 'FFmpeg MSYS build-tool probe requires Windows' }
 
@@ -313,4 +314,8 @@ $probe = $probe.Replace('__DUMPBIN__', (ConvertTo-NianBashSingleQuoted $Msvc.Dum
 $probe = $probe.Replace('__RC__', (ConvertTo-NianBashSingleQuoted $Msvc.RcPath))
 $probe = $probe.Replace('__MAKE_VERSION_LINE__', [string]$Contract.provisionedMsysPackages.make.versionLine)
 
-Invoke-NianNative { & $Bash --noprofile --norc -lc $probe } 'aggregate FFmpeg MSYS/MSVC toolchain and GNU make behavioral probe'
+Invoke-NianBashScript `
+    -Bash $Bash `
+    -Script $probe `
+    -FileName 'nian-ffmpeg-msys-toolchain-probe.sh' `
+    -Label 'aggregate FFmpeg MSYS/MSVC toolchain and GNU make behavioral probe' | Out-Host

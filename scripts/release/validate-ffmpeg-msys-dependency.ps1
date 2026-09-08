@@ -8,6 +8,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-native.ps1')
 . (Join-Path $PSScriptRoot 'windows-ffmpeg-msys-environment.ps1')
+. (Join-Path $PSScriptRoot 'windows-bash-script.ps1')
 
 function Get-BoundedText([string]$Text, [int]$Limit = 1600) {
     if ($Text.Length -le $Limit) { return $Text }
@@ -58,7 +59,11 @@ cd __SOURCE__
     $command = $command.Replace('__CONTROLLED_PATH__', (ConvertTo-NianBashSingleQuoted $ControlledPath))
     $command = $command.Replace('__SOURCE__', (ConvertTo-NianBashSingleQuoted $SourceUnix))
     $command = $command.Replace('__PROBE__', (ConvertTo-NianBashSingleQuoted $probeUnix))
-    $expanded = (Invoke-NianNative { & $Bash --noprofile --norc -lc $command } 'FFmpeg generated dependency make-expansion probe' | Out-String).Trim()
+    $expanded = (Invoke-NianBashScript `
+        -Bash $Bash `
+        -Script $command `
+        -FileName 'nian-ffmpeg-ccdep-probe.sh' `
+        -Label 'FFmpeg generated dependency make-expansion probe' | Out-String).Trim()
     Write-Host ("FFmpeg CCDEP after /usr/bin/make expansion: {0}" -f (Get-BoundedText $expanded))
     if (-not $expanded.Contains($expectedAwk)) {
         throw 'FFmpeg CCDEP is correct on disk but is corrupted during GNU make expansion; compile is blocked'

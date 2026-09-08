@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot "windows-bounded-process.ps1")
 . (Join-Path $PSScriptRoot "windows-msvc-toolchain.ps1")
 . (Join-Path $PSScriptRoot "windows-ffmpeg-msys-environment.ps1")
+. (Join-Path $PSScriptRoot "windows-bash-script.ps1")
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 $Config = Get-Content (Join-Path $RepoRoot "scripts/release/release-config.json") -Raw | ConvertFrom-Json
@@ -128,10 +129,12 @@ try {
         Write-Host "FFmpeg extraction destination: $Work"
         Write-Host ("FFmpeg extraction start UTC: {0:o}" -f [DateTime]::UtcNow)
 
-        $result = Invoke-NianBoundedProcess -FilePath $Bash `
-            -ArgumentList @("--noprofile", "--norc", "-lc", $extractCommand) `
-            -TimeoutSeconds 600 `
-            -Label "FFmpeg source extraction"
+        $result = Invoke-NianBashScript `
+            -Bash $Bash `
+            -Script $extractCommand `
+            -FileName 'nian-ffmpeg-extract.sh' `
+            -Label "FFmpeg source extraction" `
+            -TimeoutSeconds 600
         Write-Host ("FFmpeg extraction command elapsed {0:n1}s" -f $result.ElapsedSeconds)
 
         if (-not (Test-Path $Source -PathType Container)) { throw "FFmpeg source extraction did not produce the expected source directory" }
@@ -164,7 +167,11 @@ if (( status != 0 )); then
   exit "$status"
 fi
 '@ -f $MsysBuildPreamble, $sourceQuoted, $flagText, $configureStderrQuoted
-        Invoke-NianNative { & $Bash --noprofile --norc -lc $configureCommand } 'FFmpeg configure'
+        Invoke-NianBashScript `
+            -Bash $Bash `
+            -Script $configureCommand `
+            -FileName 'nian-ffmpeg-configure.sh' `
+            -Label 'FFmpeg configure' | Out-Host
         $configHeader = Join-Path $Source "config.h"
         $componentHeader = Join-Path $Source "config_components.h"
         if (-not (Test-Path $configHeader)) { throw "FFmpeg configure did not produce config.h" }
@@ -194,11 +201,21 @@ fi
     }
 
     Invoke-FfmpegPhase "compile" {
-        Invoke-NianNative { & $Bash --noprofile --norc -lc "$MsysBuildPreamble; cd $sourceQuoted; /usr/bin/make -j$buildJobs" } 'FFmpeg compile with /usr/bin/make'
+        $compileScript = "$MsysBuildPreamble`ncd $sourceQuoted`n/usr/bin/make -j$buildJobs"
+        Invoke-NianBashScript `
+            -Bash $Bash `
+            -Script $compileScript `
+            -FileName 'nian-ffmpeg-compile.sh' `
+            -Label 'FFmpeg compile with /usr/bin/make' | Out-Host
     }
 
     Invoke-FfmpegPhase "install" {
-        Invoke-NianNative { & $Bash --noprofile --norc -lc "$MsysBuildPreamble; cd $sourceQuoted; /usr/bin/make install DESTDIR=$destQuoted" } 'FFmpeg install with /usr/bin/make'
+        $installScript = "$MsysBuildPreamble`ncd $sourceQuoted`n/usr/bin/make install DESTDIR=$destQuoted"
+        Invoke-NianBashScript `
+            -Bash $Bash `
+            -Script $installScript `
+            -FileName 'nian-ffmpeg-install.sh' `
+            -Label 'FFmpeg install with /usr/bin/make' | Out-Host
     }
 
     Invoke-FfmpegPhase "configuration and license validation" {

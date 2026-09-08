@@ -18,6 +18,8 @@ const urls = {
   envHelper: new URL("./windows-ffmpeg-msys-environment.ps1", import.meta.url),
   envFixture: new URL("./test-windows-ffmpeg-msys-path.ps1", import.meta.url),
   provision: new URL("./provision-ffmpeg-msys-tools.ps1", import.meta.url),
+  bashHelper: new URL("./windows-bash-script.ps1", import.meta.url),
+  bashFixture: new URL("./test-windows-bash-script.ps1", import.meta.url),
 };
 const paths = Object.fromEntries(Object.entries(urls).map(([name, url]) => [name, fileURLToPath(url)]));
 const source = Object.fromEntries(Object.entries(urls).map(([name, url]) => [name, readNormalizedText(url)]));

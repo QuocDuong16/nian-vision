@@ -12,6 +12,7 @@ const windowsFfmpegArtifactCache = readNormalizedText(new URL("./restore-ffmpeg-
 const windowsFfmpegContract = JSON.parse(readNormalizedText(new URL("./ffmpeg-windows-contract.json", import.meta.url)));
 const windowsNative = readNormalizedText(new URL("./windows-native.ps1", import.meta.url));
 const windowsBoundedProcess = readNormalizedText(new URL("./windows-bounded-process.ps1", import.meta.url));
+const windowsBashScript = readNormalizedText(new URL("./windows-bash-script.ps1", import.meta.url));
 const windowsMsvcToolchain = readNormalizedText(new URL("./windows-msvc-toolchain.ps1", import.meta.url));
 const windowsFfmpegMsysEnvironment = readNormalizedText(new URL("./windows-ffmpeg-msys-environment.ps1", import.meta.url));
 const windowsFfmpegProvision = readNormalizedText(new URL("./provision-ffmpeg-msys-tools.ps1", import.meta.url));
@@ -54,7 +55,8 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   assert.match(windowsFfmpeg, /\/usr\/bin\/xz --decompress --stdout/);
   assert.match(windowsFfmpeg, /\/usr\/bin\/tar --extract --file - --directory/);
   assert.equal(/Invoke-NianNative \{ tar\.exe/.test(windowsFfmpeg), false);
-  assert.match(windowsFfmpeg, /Invoke-NianBoundedProcess -FilePath \$Bash/);
+  assert.match(windowsFfmpeg, /Invoke-NianBashScript/);
+  assert.match(windowsBashScript, /Invoke-NianBoundedProcess -FilePath \$Bash/);
   assert.match(windowsFfmpeg, /-TimeoutSeconds 600/);
   assert.match(windowsFfmpeg, /FFmpeg extraction tar version:/);
   assert.match(windowsFfmpeg, /FFmpeg extraction archive size:/);
@@ -92,6 +94,7 @@ test("Windows release PowerShell scripts share the fail-closed native helper", (
     ["FFmpeg", windowsFfmpeg],
     ["FFmpeg MSYS provisioning", windowsFfmpegProvision],
     ["FFmpeg MSYS environment", windowsFfmpegMsysEnvironment],
+    ["generated Bash execution", windowsBashScript],
     ["FFmpeg validator", windowsFfmpegValidatorPs],
     ["staging", windowsStage],
     ["Authenticode", windowsAuthenticode],
@@ -118,8 +121,11 @@ test("Windows release workflow routes required native tools through one fail-clo
   assert.match(workflow, /Invoke-NianNative \{ cargo\.exe tauri bundle/);
   assert.match(workflow, /Invoke-NianNative \{ cargo\.exe tauri signer sign/);
   assert.match(workflow, /Invoke-NianNative \{ cargo\.exe run --quiet -p nian-release-verifier/);
-  assert.match(windowsFfmpeg, /Invoke-NianNative \{ & \$Bash[\s\S]*?\/usr\/bin\/make -j\$buildJobs/);
-  assert.match(windowsFfmpeg, /Invoke-NianNative \{ & \$Bash[\s\S]*?\/usr\/bin\/make install/);
+  assert.match(windowsFfmpeg, /\$compileScript = [^\n]*\/usr\/bin\/make -j\$buildJobs/);
+  assert.match(windowsFfmpeg, /Invoke-NianBashScript[\s\S]*?-Script \$compileScript/);
+  assert.match(windowsFfmpeg, /\$installScript = [^\n]*\/usr\/bin\/make install DESTDIR=/);
+  assert.match(windowsFfmpeg, /Invoke-NianBashScript[\s\S]*?-Script \$installScript/);
+  assert.match(windowsBashScript, /Invoke-NianNative \{ & \$Bash --noprofile --norc \$scriptInvocationPath \}/);
   assert.match(windowsMsvcToolchain, /Invoke-NianNative \{ cmd\.exe/);
   const windowsJobs = workflow.slice(workflow.indexOf("  build-windows:"), workflow.indexOf("  verify-release:"));
   assert.equal(/(?:^|\n)\s+npm install --global corepack@0\.35\.0/.test(windowsJobs), false);
