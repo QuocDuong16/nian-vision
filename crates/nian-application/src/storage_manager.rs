@@ -1300,7 +1300,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{NaiveDate, NaiveDateTime};
+    use chrono::NaiveDateTime;
 
     #[cfg(unix)]
     #[test]
@@ -1310,7 +1310,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let layout = RecordingsLayout::new(temp.path().join("recordings")).unwrap();
         let camera = CameraId::parse("cam-a").unwrap();
-        let day = layout.day_dir(&camera, NaiveDate::from_ymd_opt(2026, 8, 20).unwrap());
+        let day = layout.day_dir(
+            &camera,
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 20).unwrap(),
+        );
         std::fs::create_dir_all(&day).unwrap();
         let media = day.join("08-30-00.mkv");
         std::fs::write(&media, b"planned footage").unwrap();

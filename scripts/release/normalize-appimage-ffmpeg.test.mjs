@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,6 +28,14 @@ function normalize(appdir) {
   return spawnSync(
     "bash",
     ["-c", 'source "$1"; normalize_legacy_ffmpeg_layout "$2"', "bash", scriptPath, appdir],
+    { encoding: "utf8" },
+  );
+}
+
+function normalizeWorkerRunpath(appdir) {
+  return spawnSync(
+    "bash",
+    ["-c", 'source "$1"; normalize_worker_runpath "$2"', "bash", scriptPath, appdir],
     { encoding: "utf8" },
   );
 }
@@ -71,6 +79,49 @@ test("AppImage normalizer fails closed when the private FFmpeg runtime is incomp
   }
 });
 
+test("AppImage normalizer restores the private worker RUNPATH after linuxdeploy normalization", {
+  skip: process.platform !== "linux" ? "ELF RUNPATH fixture requires Linux" : false,
+}, () => {
+  const { root, appdir } = fixture();
+  try {
+    const worker = join(appdir, "usr/bin/nian-media-worker");
+    mkdirSync(join(appdir, "usr/bin"), { recursive: true });
+    copyFileSync("/bin/true", worker);
+    chmodSync(worker, 0o755);
+    const setResult = spawnSync("patchelf", ["--set-rpath", "$ORIGIN/../lib", worker], { encoding: "utf8" });
+    assert.equal(setResult.status, 0, setResult.stderr);
+
+    const result = normalizeWorkerRunpath(appdir);
+    assert.equal(result.status, 0, result.stderr);
+
+    const printResult = spawnSync("patchelf", ["--print-rpath", worker], { encoding: "utf8" });
+    assert.equal(printResult.status, 0, printResult.stderr);
+    assert.equal(printResult.stdout.trim(), "$ORIGIN/../lib/nian-vision");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("AppImage normalizer refuses an unexpected worker RUNPATH", {
+  skip: process.platform !== "linux" ? "ELF RUNPATH fixture requires Linux" : false,
+}, () => {
+  const { root, appdir } = fixture();
+  try {
+    const worker = join(appdir, "usr/bin/nian-media-worker");
+    mkdirSync(join(appdir, "usr/bin"), { recursive: true });
+    copyFileSync("/bin/true", worker);
+    chmodSync(worker, 0o755);
+    const setResult = spawnSync("patchelf", ["--set-rpath", "$ORIGIN/unexpected", worker], { encoding: "utf8" });
+    assert.equal(setResult.status, 0, setResult.stderr);
+
+    const result = normalizeWorkerRunpath(appdir);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Refusing to rewrite unexpected AppImage worker RUNPATH/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("AppImage repack preserves the existing runtime and reuses Tauri's cached output plugin", () => {
   assert.match(script, /--appimage-offset/);
   assert.match(script, /dd if="\$appimage" of="\$normalize_work_dir\/runtime"/);
@@ -84,4 +135,13 @@ test("AppImage repack keeps the no-legacy-layout contract explicit", () => {
   assert.match(script, /cmp --silent "\$private_real" "\$legacy_real"/);
   assert.match(script, /rm -f -- "\$legacy_object"/);
   assert.match(script, /Failed to remove legacy FFmpeg runtime entry/);
+});
+
+
+test("AppImage repack restores the private worker RUNPATH before smoke validation", () => {
+  assert.match(script, /normalize_worker_runpath "\$appdir"/);
+  assert.match(script, /patchelf --set-rpath "\$expected" "\$worker"/);
+  assert.match(script, /require_exact_runpath "\$worker" "\$expected"/);
+  assert.ok(script.includes("$ORIGIN/../lib/nian-vision"));
+  assert.ok(script.includes("$ORIGIN/../lib"));
 });

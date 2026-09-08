@@ -38,10 +38,11 @@ existing recording/recovery/probe/playback contract rather than expanding into
 transcoding merely for packaging. No FFmpeg CLI runtime is shipped.
 
 On Linux, the worker resolves `libavformat.so.62`, `libavcodec.so.62` and
-`libavutil.so.60` from application-owned files. Pre-bundle staging uses
-`$ORIGIN/../lib/nian-vision`; Tauri normalizes the packaged worker RUNPATH to
-`$ORIGIN/../lib` inside the AppImage, where the required SONAMEs live in private
-`/usr/lib`.
+`libavutil.so.60` from application-owned files under `/usr/lib/nian-vision`.
+Pre-bundle staging uses `$ORIGIN/../lib/nian-vision`. Tauri/linuxdeploy may rewrite
+the packaged worker RUNPATH to `$ORIGIN/../lib` and duplicate those SONAMEs into
+legacy `/usr/lib`, so release normalization restores the exact private RUNPATH and
+removes only byte-identical legacy copies before the final AppImage smoke contract.
 
 On Windows, FFmpeg is configured with `--toolchain=msvc`. The build must emit the
 MSVC import libraries `avformat.lib`, `avcodec.lib` and `avutil.lib` for the Rust

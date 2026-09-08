@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 default_bundle_dir="$repo_root/target/release/bundle/appimage"
 ffmpeg_sonames=(libavformat.so.62 libavcodec.so.62 libavutil.so.60)
 normalize_work_dir=""
+source "$repo_root/scripts/release/linux-runtime-contract.sh"
 
 cleanup_normalize_work_dir() {
   if [[ -n "${normalize_work_dir:-}" ]]; then
@@ -54,6 +55,30 @@ normalize_legacy_ffmpeg_layout() {
       return 1
     fi
   done
+}
+
+normalize_worker_runpath() {
+  local appdir="$1"
+  local worker="$appdir/usr/bin/nian-media-worker"
+  local expected='$ORIGIN/../lib/nian-vision'
+  local linuxdeploy_normalized='$ORIGIN/../lib'
+
+  [[ -f "$worker" && ! -L "$worker" ]] || {
+    echo "AppImage worker is missing, non-regular, or symlinked: $worker" >&2
+    return 1
+  }
+
+  if require_exact_runpath "$worker" "$expected" 2>/dev/null; then
+    return 0
+  fi
+
+  if ! require_exact_runpath "$worker" "$linuxdeploy_normalized"; then
+    echo "Refusing to rewrite unexpected AppImage worker RUNPATH: $worker" >&2
+    return 1
+  fi
+
+  patchelf --set-rpath "$expected" "$worker"
+  require_exact_runpath "$worker" "$expected"
 }
 
 find_tauri_appimage_output_plugin() {
@@ -116,6 +141,8 @@ main() {
   (cd "$normalize_work_dir/image" && "$appimage" --appimage-extract >/dev/null)
   local appdir="$normalize_work_dir/image/squashfs-root"
   normalize_legacy_ffmpeg_layout "$appdir"
+  normalize_worker_runpath "$appdir"
+  require_private_ffmpeg_closure "$appdir/usr/bin/nian-media-worker" "$appdir/usr/lib/nian-vision"
 
   (cd "$normalize_work_dir/plugin" && "$plugin" --appimage-extract >/dev/null)
   local appimagetool="$normalize_work_dir/plugin/squashfs-root/usr/bin/appimagetool"

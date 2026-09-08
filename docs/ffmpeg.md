@@ -45,13 +45,16 @@ that candidate runtime. Staging copies only the ABI libraries used by the worker
 
 The pre-bundle release worker contains `$ORIGIN/../lib/nian-vision` RUNPATH, so
 staging resolves those libraries from its application-owned runtime rather than
-through `LD_LIBRARY_PATH` or a developer package manager. Tauri normalizes the
-worker RUNPATH to `$ORIGIN/../lib` while assembling the AppImage; release resources
-therefore place the same three SONAME libraries in the AppImage-private `/usr/lib`.
-Staging verifies the dynamic dependency closure with development overrides removed
-and exercises HELLO, fixture probe and `playback.prepare` through the staged worker.
-The AppImage is extracted and smoke-tested again after packaging. Exact flags, LGPL text and third-party
-notices are shipped with the release.
+through `LD_LIBRARY_PATH` or a developer package manager. Tauri/linuxdeploy may
+rewrite the packaged worker RUNPATH to `$ORIGIN/../lib` and may copy byte-identical
+FFmpeg SONAMEs into legacy `/usr/lib`. The release normalizer operates on the completed
+AppImage before smoke validation: it removes only byte-identical legacy FFmpeg copies,
+restores the worker RUNPATH to `$ORIGIN/../lib/nian-vision`, revalidates the private
+FFmpeg closure under `/usr/lib/nian-vision`, and repacks with the original AppImage
+runtime. Staging verifies the dynamic dependency closure with development overrides
+removed and exercises HELLO, fixture probe and `playback.prepare` through the staged
+worker. The AppImage is extracted and smoke-tested again after packaging. Exact flags,
+LGPL text and third-party notices are shipped with the release.
 
 ## Windows release runtime
 

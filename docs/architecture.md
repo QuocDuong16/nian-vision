@@ -463,11 +463,14 @@ target; Windows is implemented in the release graph but is not marked validated
 until the hosted Windows tag path completes successfully. macOS remains deferred.
 
 The Linux AppImage contains the desktop host, a sibling `nian-media-worker`, and an
-application-owned FFmpeg 8.0.3 shared runtime. The pre-bundle worker is linked with
-relative RUNPATH `$ORIGIN/../lib/nian-vision`; Tauri normalizes it to
-`$ORIGIN/../lib` inside the image, where the required FFmpeg SONAMEs are installed
-in private `/usr/lib`. Staging and extracted-AppImage smoke prove ABI 62/62/60 and
-media fixture behavior with development overrides removed.
+application-owned FFmpeg 8.0.3 shared runtime under `/usr/lib/nian-vision`. The
+pre-bundle worker is linked with relative RUNPATH `$ORIGIN/../lib/nian-vision`. Because
+Tauri/linuxdeploy may rewrite that RUNPATH to `$ORIGIN/../lib` and copy duplicate
+FFmpeg SONAMEs into legacy `/usr/lib`, release normalization inspects the completed
+AppImage, removes only byte-identical legacy copies, restores the exact private
+RUNPATH, revalidates the private FFmpeg closure, and repacks before smoke validation.
+Staging and extracted-AppImage smoke prove ABI 62/62/60 and media fixture behavior
+with development overrides removed.
 
 The Windows runtime is built from the same SHA-256-pinned FFmpeg 8.0.3 archive with
 `--toolchain=msvc`, shared libraries enabled and GPL/nonfree/static output disabled.

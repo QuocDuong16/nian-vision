@@ -26,6 +26,13 @@ const windowsInstallerSmoke = readNormalizedText(new URL("./smoke-windows-instal
 const windowsNsisHooks = readNormalizedText(new URL("../../apps/nian-desktop/windows/nsis-hooks.nsh", import.meta.url));
 const desktop = readNormalizedText(new URL("../../apps/nian-desktop/src/lib.rs", import.meta.url));
 const worker = readNormalizedText(new URL("../../apps/nian-media-worker/src/main.rs", import.meta.url));
+const storageManager = readNormalizedText(new URL("../../crates/nian-application/src/storage_manager.rs", import.meta.url));
+
+test("Windows all-target Clippy does not import Unix-only NaiveDate into the shared test module", () => {
+  assert.equal(storageManager.includes("use chrono::{NaiveDate, NaiveDateTime};"), false);
+  assert.match(storageManager, /use chrono::NaiveDateTime;/);
+  assert.match(storageManager, /chrono::NaiveDate::from_ymd_opt/);
+});
 
 test("Windows release contract text normalization is identical for LF and CRLF", () => {
   const crlf = workflow.replace(/\n/g, "\r\n");
