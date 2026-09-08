@@ -149,6 +149,20 @@ test("Linux container build explicitly executes run steps with Bash", () => {
   assert.equal(jobBody("build-windows").includes("defaults:\n      run:\n        shell: bash"), false);
 });
 
+test("Linux release image explicitly provisions missing rustfmt and clippy before release work", () => {
+  const linux = jobBody("build-linux");
+  const provisionAt = linux.indexOf("- name: Provision Rust quality components");
+  const frontendAt = linux.indexOf("- name: Install frontend dependencies");
+  const ffmpegAt = linux.indexOf("- name: Build pinned FFmpeg 8.0.3 Linux runtime");
+  assert.ok(provisionAt >= 0 && provisionAt < frontendAt && provisionAt < ffmpegAt);
+  const provision = stepBody("build-linux", "Provision Rust quality components");
+  assert.match(provision, /rustup component add rustfmt clippy/);
+  assert.match(provision, /rustc --version/);
+  assert.match(provision, /cargo --version/);
+  assert.match(provision, /cargo fmt --version/);
+  assert.match(provision, /cargo clippy --version/);
+});
+
 test("Linux container trusts only the exact checkout before repository Git operations", () => {
   const linux = jobBody("build-linux");
   const checkoutMarker = "      - name: Check out exact release source\n";

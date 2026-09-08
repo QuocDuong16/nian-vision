@@ -98,6 +98,15 @@ jobs:
           [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]] || { echo "build checkout differs from GITHUB_SHA" >&2; exit 1; }
           [[ "$(git rev-parse "${GITHUB_REF}^{commit}")" == "$GITHUB_SHA" ]] || { echo "build tag differs from GITHUB_SHA" >&2; exit 1; }
 
+      - name: Provision Rust quality components
+        run: |
+          set -Eeuo pipefail
+          rustup component add rustfmt clippy
+          rustc --version
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
+
       - name: Install pinned Node.js
         run: |
           set -Eeuo pipefail
@@ -395,9 +404,12 @@ jobs:
         shell: pwsh
         run: |
           . scripts/release/windows-native.ps1
-          Invoke-NianNative { rustup.exe toolchain install 1.98.0-x86_64-pc-windows-msvc --profile minimal }
+          Invoke-NianNative { rustup.exe toolchain install 1.98.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt --component clippy }
           Invoke-NianNative { rustup.exe override set 1.98.0 }
           Invoke-NianNative { rustc.exe --version }
+          Invoke-NianNative { cargo.exe --version }
+          Invoke-NianNative { cargo.exe fmt --version }
+          Invoke-NianNative { cargo.exe clippy --version }
 
       - name: Install pinned Node.js 26.7.0
         shell: pwsh

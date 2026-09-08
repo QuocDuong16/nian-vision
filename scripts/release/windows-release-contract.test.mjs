@@ -154,6 +154,44 @@ test("Windows release workflow routes required native tools through one fail-clo
   }
 });
 
+test("Windows build provisions and preflights pinned Rust quality components before expensive work", () => {
+  const windows = workflow.slice(workflow.indexOf("  build-windows:"), workflow.indexOf("  sign-windows:"));
+  const signing = workflow.slice(workflow.indexOf("  sign-windows:"), workflow.indexOf("  verify-release:"));
+  const rustInstallAt = windows.indexOf("- name: Install pinned Rust 1.98.0 MSVC toolchain");
+  const frontendInstallAt = windows.indexOf("- name: Install frontend dependencies");
+  const ffmpegBuildAt = windows.indexOf("- name: Build pinned FFmpeg 8.0.3 Windows MSVC runtime");
+  const rustQualityAt = windows.indexOf("- name: Run remaining Windows Rust quality and release worker build");
+
+  assert.ok(
+    rustInstallAt >= 0 && rustInstallAt < frontendInstallAt && rustInstallAt < ffmpegBuildAt && rustInstallAt < rustQualityAt,
+  );
+  assert.match(
+    windows,
+    /Invoke-NianNative \{ rustup\.exe toolchain install 1\.98\.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt --component clippy \}/,
+  );
+  assert.match(windows, /Invoke-NianNative \{ rustup\.exe override set 1\.98\.0 \}/);
+  for (const command of [
+    "rustc.exe --version",
+    "cargo.exe --version",
+    "cargo.exe fmt --version",
+    "cargo.exe clippy --version",
+  ]) {
+    assert.ok(windows.includes(`Invoke-NianNative { ${command} }`), `missing Rust preflight: ${command}`);
+  }
+  assert.match(windows, /Invoke-NianNative \{ cargo\.exe fmt --all --check \}/);
+  assert.match(windows, /Invoke-NianNative \{ cargo\.exe clippy --all-targets -- -D warnings \}/);
+  assert.equal(/rustup\.exe (?:toolchain install|override set) (?:stable|latest|default)(?:\s|})/.test(windows), false);
+
+  assert.match(
+    signing,
+    /Invoke-NianNative \{ rustup\.exe toolchain install 1\.98\.0-x86_64-pc-windows-msvc --profile minimal \}/,
+  );
+  assert.equal(signing.includes("--component rustfmt"), false);
+  assert.equal(signing.includes("--component clippy"), false);
+  assert.equal(signing.includes("cargo.exe fmt"), false);
+  assert.equal(signing.includes("cargo.exe clippy"), false);
+});
+
 test("Windows FFmpeg cache is exact, validated, bounded, and source-build backed", () => {
   const windows = workflow.slice(workflow.indexOf("  build-windows:"), workflow.indexOf("  sign-windows:"));
   const computeAt = windows.indexOf("- name: Compute Windows FFmpeg build contract");
