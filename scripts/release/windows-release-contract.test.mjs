@@ -27,11 +27,29 @@ const windowsNsisHooks = readNormalizedText(new URL("../../apps/nian-desktop/win
 const desktop = readNormalizedText(new URL("../../apps/nian-desktop/src/lib.rs", import.meta.url));
 const worker = readNormalizedText(new URL("../../apps/nian-media-worker/src/main.rs", import.meta.url));
 const storageManager = readNormalizedText(new URL("../../crates/nian-application/src/storage_manager.rs", import.meta.url));
+const cameraServiceIntegration = readNormalizedText(new URL("../../crates/nian-application/tests/camera_service.rs", import.meta.url));
+const recordingControllerIntegration = readNormalizedText(new URL("../../crates/nian-application/tests/recording_controller.rs", import.meta.url));
+const recordingController = readNormalizedText(new URL("../../crates/nian-application/src/recording_controller.rs", import.meta.url));
+const workerSupervisorStubs = readNormalizedText(new URL("../../crates/nian-application/tests/worker_supervisor_stubs.rs", import.meta.url));
+const workerLive = readNormalizedText(new URL("../../apps/nian-media-worker/src/live.rs", import.meta.url));
 
 test("Windows all-target Clippy does not import Unix-only NaiveDate into the shared test module", () => {
   assert.equal(storageManager.includes("use chrono::{NaiveDate, NaiveDateTime};"), false);
   assert.match(storageManager, /use chrono::NaiveDateTime;/);
   assert.match(storageManager, /chrono::NaiveDate::from_ymd_opt/);
+});
+
+test("Windows test fixtures do not hard-code Unix-only storage or live-output paths", () => {
+  for (const [name, source] of [
+    ["camera service integration", cameraServiceIntegration],
+    ["recording controller integration", recordingControllerIntegration],
+    ["recording controller unit tests", recordingController],
+    ["worker supervisor stubs", workerSupervisorStubs],
+  ]) {
+    assert.equal(/storage_root:\s*(?:Some\(PathBuf::from\()?"\//.test(source), false, `${name} hard-codes a Unix-only storage_root fixture`);
+  }
+  assert.equal(/"output_dir":\s*"\/tmp\//.test(workerLive), false);
+  assert.equal(/"path":\s*"\/tmp\//.test(workerLive), false);
 });
 
 test("Windows release contract text normalization is identical for LF and CRLF", () => {

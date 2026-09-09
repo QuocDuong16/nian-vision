@@ -821,7 +821,10 @@ mod tests {
     fn desired(camera: &str) -> DesiredRecording {
         DesiredRecording {
             camera: camera.to_owned(),
-            storage_root: "/tmp/nian-controller-test".to_owned(),
+            storage_root: std::env::temp_dir()
+                .join("nian-controller-test")
+                .to_string_lossy()
+                .into_owned(),
             source_json: serde_json::json!({"kind":"file","path":"fixture.mkv"}),
             segment_target_secs: 300,
             copy_audio: true,

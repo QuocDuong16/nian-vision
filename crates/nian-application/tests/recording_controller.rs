@@ -146,7 +146,10 @@ impl RecordingThreadSpawner for FailFirstSpawner {
 fn desired(camera: &str) -> DesiredRecording {
     DesiredRecording {
         camera: camera.to_owned(),
-        storage_root: "/tmp/nian-controller-test".to_owned(),
+        storage_root: std::env::temp_dir()
+            .join("nian-controller-test")
+            .to_string_lossy()
+            .into_owned(),
         source_json: serde_json::json!({"kind":"rtsp","url":"rtsp://admin:SENTINEL@cam.local/stream"}),
         segment_target_secs: 300,
         copy_audio: true,

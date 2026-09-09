@@ -121,7 +121,7 @@ impl SettingsRepository for FakeRepo {
     }
     fn application_settings(&self) -> Result<ApplicationSettings, SettingsRepositoryError> {
         Ok(ApplicationSettings {
-            storage_root: Some(PathBuf::from("/tmp/nian-camera-service-test")),
+            storage_root: Some(std::env::temp_dir().join("nian-camera-service-test")),
             segment_target_secs: 300,
             retention: RetentionPolicy::default(),
             quota: None,

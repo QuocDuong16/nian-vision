@@ -57,3 +57,9 @@ test("AppImage smoke proves worker FFmpeg closure without build-time library env
     ),
   );
 });
+
+test("AppImage desktop smoke requires system EGL instead of injecting a bundled graphics loader", () => {
+  assert.match(smoke, /host_libraries="\$\(ldconfig -p 2>\/dev\/null \|\| true\)"/);
+  assert.match(smoke, /missing required system graphics library: libEGL\.so\.1/);
+  assert.doesNotMatch(smoke, /LD_LIBRARY_PATH=.*libEGL/);
+});

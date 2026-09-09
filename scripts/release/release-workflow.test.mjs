@@ -164,6 +164,21 @@ test("Linux release image explicitly provisions missing rustfmt and clippy befor
   assert.match(provision, /cargo clippy --version/);
 });
 
+test("Linux AppImage desktop smoke explicitly provisions the host EGL loader", () => {
+  const buildPrerequisites = stepBody("build-linux", "Install Linux release prerequisites");
+  assert.match(buildPrerequisites, /\blibegl1\b/);
+
+  const signPrerequisites = stepBody("sign-linux", "Install Linux AppImage smoke runtime prerequisites");
+  for (const dependency of ["dbus-x11", "fuse3", "libegl1", "xauth", "xvfb"]) {
+    assert.match(signPrerequisites, new RegExp(`\\b${dependency}\\b`));
+  }
+  assert.match(signPrerequisites, /ldconfig -p \| grep -F 'libEGL\.so\.1'/);
+  assert.ok(
+    jobBody("sign-linux").indexOf("Install Linux AppImage smoke runtime prerequisites") <
+      jobBody("sign-linux").indexOf("Smoke signed Linux AppImage boundary"),
+  );
+});
+
 test("Linux container trusts only the exact checkout before repository Git operations", () => {
   const linux = jobBody("build-linux");
   const checkoutMarker = "      - name: Check out exact release source\n";

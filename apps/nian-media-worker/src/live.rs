@@ -669,9 +669,11 @@ mod tests {
     #[test]
     fn live_spec_accepts_only_rtsp_absolute_directory_and_bounded_fragment_policy() {
         let absolute = std::env::temp_dir();
+        let absolute_live = absolute.join("nian-live-test");
+        let absolute_source = absolute.join("nian-live-source.mkv");
         let valid = LiveSpec::from_params(&serde_json::json!({
             "source": {"kind": "rtsp", "url": "rtsp://user:secret@127.0.0.1:9/stream1"},
-            "output_dir": absolute,
+            "output_dir": absolute.clone(),
             "fragment_target_ms": 2_000,
             "max_fragment_bytes": 16 * 1024 * 1024_u64,
             "max_fragment_count": 8,
@@ -684,8 +686,8 @@ mod tests {
 
         assert!(
             LiveSpec::from_params(&serde_json::json!({
-                "source": {"kind": "file", "path": "/tmp/source.mkv"},
-                "output_dir": "/tmp/live",
+                "source": {"kind": "file", "path": absolute_source},
+                "output_dir": absolute_live.clone(),
                 "fragment_target_ms": 2_000,
                 "max_fragment_bytes": 16 * 1024 * 1024_u64,
                 "max_fragment_count": 8,
@@ -695,7 +697,7 @@ mod tests {
         assert!(
             LiveSpec::from_params(&serde_json::json!({
                 "source": {"kind": "rtsp", "url": "http://camera/stream"},
-                "output_dir": "/tmp/live",
+                "output_dir": absolute_live.clone(),
                 "fragment_target_ms": 2_000,
                 "max_fragment_bytes": 16 * 1024 * 1024_u64,
                 "max_fragment_count": 8,
@@ -715,7 +717,7 @@ mod tests {
         assert!(
             LiveSpec::from_params(&serde_json::json!({
                 "source": {"kind": "rtsp", "url": "rtsp://camera/stream"},
-                "output_dir": "/tmp/live",
+                "output_dir": absolute_live.clone(),
                 "fragment_target_ms": 50,
                 "max_fragment_bytes": 16 * 1024 * 1024_u64,
                 "max_fragment_count": 8,
@@ -725,7 +727,7 @@ mod tests {
         assert!(
             LiveSpec::from_params(&serde_json::json!({
                 "source": {"kind": "rtsp", "url": "rtsp://camera/stream"},
-                "output_dir": "/tmp/live",
+                "output_dir": absolute_live,
                 "fragment_target_ms": 2_000,
                 "max_fragment_bytes": 16 * 1024 * 1024_u64,
                 "max_fragment_count": MAX_FRAGMENT_COUNT + 1,

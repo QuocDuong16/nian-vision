@@ -126,7 +126,7 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
             build-essential binutils curl dbus-x11 file fuse3 git \
-            libayatana-appindicator3-dev libfuse2 librsvg2-dev libssl-dev \
+            libayatana-appindicator3-dev libegl1 libfuse2 librsvg2-dev libssl-dev \
             libwebkit2gtk-4.1-dev patchelf pkg-config xauth xvfb xz-utils
 
       - name: Install pinned pnpm
@@ -328,6 +328,14 @@ jobs:
           rustup toolchain install 1.98.0 --profile minimal
           rustup override set 1.98.0
           cargo install tauri-cli --version 2.11.4 --locked
+
+      - name: Install Linux AppImage smoke runtime prerequisites
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            dbus-x11 fuse3 libegl1 xauth xvfb
+          ldconfig -p | grep -F 'libEGL.so.1'
 
       - name: Download unsigned Linux build
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0

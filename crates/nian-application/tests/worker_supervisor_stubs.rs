@@ -126,8 +126,14 @@ fn response(id: u64, result_json: &str) -> String {
 fn desired(camera: &str) -> DesiredRecording {
     DesiredRecording {
         camera: camera.to_owned(),
-        storage_root: "/tmp".to_owned(),
-        source_json: serde_json::json!({"kind": "file", "path": "/dev/null"}),
+        storage_root: std::env::temp_dir()
+            .join("nian-worker-supervisor-test")
+            .to_string_lossy()
+            .into_owned(),
+        source_json: serde_json::json!({
+            "kind": "file",
+            "path": std::env::temp_dir().join("nian-worker-supervisor-fixture.mkv")
+        }),
         segment_target_secs: 300,
         copy_audio: true,
     }
