@@ -52,10 +52,13 @@ test("Windows test fixtures do not hard-code Unix-only storage or live-output pa
   assert.equal(/"path":\s*"\/tmp\//.test(workerLive), false);
 });
 
-test("Windows worker supervisor bash fixtures execute script files without shell-parsing native paths", () => {
-  assert.match(workerSupervisorStubs, /Command::new\("bash"\)\s*\.arg\(&self\.program\)/s);
-  assert.equal(/Command::new\("bash"\)\s*\.arg\("-c"\)/s.test(workerSupervisorStubs), false);
-  assert.ok(workerSupervisorStubs.includes("path.to_string_lossy().replace('\\\\', \"/\")"));
+test("Windows worker supervisor bash fixtures use the preflighted MSYS2 interpreter and cygpath contract", () => {
+  assert.match(workerSupervisorStubs, /WINDOWS_BASH:\s*&str\s*=\s*r"C:\\msys64\\usr\\bin\\bash\.exe"/);
+  assert.match(workerSupervisorStubs, /WINDOWS_CYGPATH:\s*&str\s*=\s*r"C:\\msys64\\usr\\bin\\cygpath\.exe"/);
+  assert.match(workerSupervisorStubs, /Command::new\(WINDOWS_CYGPATH\)[\s\S]*?\.arg\("-u"\)[\s\S]*?\.arg\(&path\)/);
+  assert.match(workerSupervisorStubs, /bash_command\(\)\s*\.args\(\["--noprofile", "--norc"\]\)\s*\.arg\(&self\.program\)/s);
+  assert.equal(/\.arg\("-c"\)/.test(workerSupervisorStubs), false);
+  assert.match(workerSupervisorStubs, /unsupported ipc protocol version: 99/);
 });
 
 test("Windows release contract text normalization is identical for LF and CRLF", () => {

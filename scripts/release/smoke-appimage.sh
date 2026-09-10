@@ -120,14 +120,16 @@ env -u LD_LIBRARY_PATH -u NIAN_FFMPEG_LIB_DIR \
   node "$repo_root/scripts/release/stage-runtime-smoke.mjs" \
   "$appdir/usr/bin/nian-media-worker" "$work_dir/runtime-smoke"
 
-# libEGL is intentionally a host graphics-stack dependency. AppImage/linuxdeploy
-# exclude graphics-driver ABI libraries such as libEGL rather than risking a
-# bundled loader that conflicts with the user's Mesa/proprietary driver stack.
+# EGL/GLES dispatch libraries are intentionally host graphics-stack dependencies.
+# Keep them paired with the host Mesa/proprietary driver stack instead of injecting
+# release-local loaders through the AppImage or LD_LIBRARY_PATH.
 host_libraries="$(ldconfig -p 2>/dev/null || true)"
-if ! grep -Fq 'libEGL.so.1' <<<"$host_libraries"; then
-  echo "desktop AppImage smoke host is missing required system graphics library: libEGL.so.1" >&2
-  exit 1
-fi
+for library in libEGL.so.1 libGLESv2.so.2; do
+  if ! grep -Fq "$library" <<<"$host_libraries"; then
+    echo "desktop AppImage smoke host is missing required system graphics library: $library" >&2
+    exit 1
+  fi
+done
 
 # Launch the real AppImage under an isolated X11 + D-Bus session. Readiness is a
 # backend marker emitted only after Tauri setup has completed. Polling is bounded;

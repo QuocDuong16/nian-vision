@@ -44,8 +44,10 @@ test("Linux AppImage runtime files match the worker installation-local FFmpeg RU
     assert.ok(Object.hasOwn(files, `/usr/lib/nian-vision/${name}`), `missing AppImage runtime mapping for ${name}`);
     assert.equal(Object.hasOwn(files, `/usr/lib/${name}`), false, `legacy root /usr/lib mapping remains for ${name}`);
   }
-  assert.equal(Object.hasOwn(files, "/usr/lib/libEGL.so.1"), false);
-  assert.equal(Object.values(files).some((source) => source.endsWith("/libEGL.so.1")), false);
+  for (const graphicsLoader of ["libEGL.so.1", "libGLESv2.so.2"]) {
+    assert.equal(Object.hasOwn(files, `/usr/lib/${graphicsLoader}`), false);
+    assert.equal(Object.values(files).some((source) => source.endsWith(`/${graphicsLoader}`)), false);
+  }
 });
 
 test("production updater authority must be HTTPS and non-placeholder", () => {

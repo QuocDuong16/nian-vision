@@ -164,15 +164,18 @@ test("Linux release image explicitly provisions missing rustfmt and clippy befor
   assert.match(provision, /cargo clippy --version/);
 });
 
-test("Linux AppImage desktop smoke explicitly provisions the host EGL loader", () => {
+test("Linux AppImage desktop smoke explicitly provisions the host EGL/GLES loaders", () => {
   const buildPrerequisites = stepBody("build-linux", "Install Linux release prerequisites");
-  assert.match(buildPrerequisites, /\blibegl1\b/);
+  for (const dependency of ["libegl1", "libgles2"]) {
+    assert.match(buildPrerequisites, new RegExp(`\\b${dependency}\\b`));
+  }
 
   const signPrerequisites = stepBody("sign-linux", "Install Linux AppImage smoke runtime prerequisites");
-  for (const dependency of ["dbus-x11", "fuse3", "libegl1", "xauth", "xvfb"]) {
+  for (const dependency of ["dbus-x11", "fuse3", "libegl1", "libgles2", "xauth", "xvfb"]) {
     assert.match(signPrerequisites, new RegExp(`\\b${dependency}\\b`));
   }
   assert.match(signPrerequisites, /ldconfig -p \| grep -F 'libEGL\.so\.1'/);
+  assert.match(signPrerequisites, /ldconfig -p \| grep -F 'libGLESv2\.so\.2'/);
   assert.ok(
     jobBody("sign-linux").indexOf("Install Linux AppImage smoke runtime prerequisites") <
       jobBody("sign-linux").indexOf("Smoke signed Linux AppImage boundary"),

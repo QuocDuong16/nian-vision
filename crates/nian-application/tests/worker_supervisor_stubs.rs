@@ -22,6 +22,11 @@ use nian_application::{
     WorkerLauncher, WorkerSupervisor,
 };
 
+#[cfg(windows)]
+const WINDOWS_BASH: &str = r"C:\msys64\usr\bin\bash.exe";
+#[cfg(windows)]
+const WINDOWS_CYGPATH: &str = r"C:\msys64\usr\bin\cygpath.exe";
+
 fn test_deadlines() -> SupervisorDeadlines {
     SupervisorDeadlines {
         hello: Duration::from_millis(300),
@@ -62,7 +67,35 @@ fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
         std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
         std::fs::set_permissions(&path, permissions).unwrap();
     }
-    path.to_string_lossy().replace('\\', "/")
+    #[cfg(windows)]
+    {
+        let converted = Command::new(WINDOWS_CYGPATH)
+            .arg("-u")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            converted.status.success(),
+            "cygpath failed to convert worker supervisor fixture path"
+        );
+        return String::from_utf8(converted.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+    }
+
+    #[cfg(not(windows))]
+    path.to_string_lossy().into_owned()
+}
+
+#[cfg(windows)]
+fn bash_command() -> Command {
+    Command::new(WINDOWS_BASH)
+}
+
+#[cfg(not(windows))]
+fn bash_command() -> Command {
+    Command::new("bash")
 }
 
 struct ScriptLauncher {
@@ -71,7 +104,8 @@ struct ScriptLauncher {
 
 impl WorkerLauncher for ScriptLauncher {
     fn spawn(&mut self) -> std::io::Result<Child> {
-        Command::new("bash")
+        bash_command()
+            .args(["--noprofile", "--norc"])
             .arg(&self.program)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -177,7 +211,12 @@ fn protocol_version_mismatch_is_permanent() {
     let mut supervisor =
         WorkerSupervisor::with_deadlines(ScriptLauncher { program: prog }, test_deadlines());
     match supervisor.run_one_episode(&|| false) {
-        Err(ApplicationError::WorkerProtocol(_)) => {}
+        Err(ApplicationError::WorkerProtocol(message)) => {
+            assert!(
+                message.contains("unsupported ipc protocol version: 99"),
+                "version mismatch test must reach the version validator, got: {message}"
+            );
+        }
         other => panic!("expected permanent protocol error, got {other:?}"),
     }
 }
