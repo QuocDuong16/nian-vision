@@ -164,16 +164,17 @@ test("Linux release image explicitly provisions missing rustfmt and clippy befor
   assert.match(provision, /cargo clippy --version/);
 });
 
-test("Linux AppImage desktop smoke explicitly provisions the host EGL/GLES loaders", () => {
+test("Linux AppImage desktop smoke explicitly provisions host indicator and EGL/GLES loaders", () => {
   const buildPrerequisites = stepBody("build-linux", "Install Linux release prerequisites");
-  for (const dependency of ["libegl1", "libgles2"]) {
+  for (const dependency of ["libayatana-appindicator3-1", "libegl1", "libgles2"]) {
     assert.match(buildPrerequisites, new RegExp(`\\b${dependency}\\b`));
   }
 
   const signPrerequisites = stepBody("sign-linux", "Install Linux AppImage smoke runtime prerequisites");
-  for (const dependency of ["dbus-x11", "fuse3", "libegl1", "libgles2", "xauth", "xvfb"]) {
+  for (const dependency of ["dbus-x11", "fuse3", "libayatana-appindicator3-1", "libegl1", "libgles2", "xauth", "xvfb"]) {
     assert.match(signPrerequisites, new RegExp(`\\b${dependency}\\b`));
   }
+  assert.match(signPrerequisites, /ldconfig -p \| grep -E 'lib\(ayatana-\)\?appindicator3\\\.so\\\.1'/);
   assert.match(signPrerequisites, /ldconfig -p \| grep -F 'libEGL\.so\.1'/);
   assert.match(signPrerequisites, /ldconfig -p \| grep -F 'libGLESv2\.so\.2'/);
   assert.ok(

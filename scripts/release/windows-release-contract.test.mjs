@@ -4,6 +4,7 @@ import test from "node:test";
 import { normalizeNewlines, readNormalizedText } from "./test-text.mjs";
 
 const workflow = readNormalizedText(new URL("../../.github/workflows/release.yml", import.meta.url));
+const gitAttributes = readNormalizedText(new URL("../../.gitattributes", import.meta.url));
 const windowsConfigWriter = readNormalizedText(new URL("./write-tauri-windows-release-config.mjs", import.meta.url));
 const windowsFfmpeg = readNormalizedText(new URL("./build-ffmpeg-windows.ps1", import.meta.url));
 const windowsFfmpegValidator = readNormalizedText(new URL("./validate-ffmpeg-windows.mjs", import.meta.url));
@@ -68,6 +69,10 @@ test("retention pre-delete race fixture is manager-local and cannot block siblin
   assert.match(storageManager, /retention_pre_delete_gate:\s*Option<RetentionTestGate>/);
   assert.match(storageManager, /self\.retention_pre_delete_gate\.take\(\)/);
   assert.match(storageManager, /manager\.retention_pre_delete_gate\s*=\s*Some\(RetentionTestGate/);
+});
+
+test("release verifier signed artifact fixture is checkout-byte-stable on Windows", () => {
+  assert.match(gitAttributes, /^tools\/nian-release-verifier\/tests\/fixtures\/artifact\.bin binary$/m);
 });
 
 test("Windows release contract text normalization is identical for LF and CRLF", () => {

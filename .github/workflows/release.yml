@@ -126,7 +126,7 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
             build-essential binutils curl dbus-x11 file fuse3 git \
-            libayatana-appindicator3-dev libegl1 libfuse2 libgles2 librsvg2-dev libssl-dev \
+            libayatana-appindicator3-1 libayatana-appindicator3-dev libegl1 libfuse2 libgles2 librsvg2-dev libssl-dev \
             libwebkit2gtk-4.1-dev patchelf pkg-config xauth xvfb xz-utils
 
       - name: Install pinned pnpm
@@ -334,7 +334,8 @@ jobs:
           set -Eeuo pipefail
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-            dbus-x11 fuse3 libegl1 libgles2 xauth xvfb
+            dbus-x11 fuse3 libayatana-appindicator3-1 libegl1 libgles2 xauth xvfb
+          ldconfig -p | grep -E 'lib(ayatana-)?appindicator3\.so\.1'
           ldconfig -p | grep -F 'libEGL.so.1'
           ldconfig -p | grep -F 'libGLESv2.so.2'
 
