@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "bindgen-gen"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "bindgen",
 ]
@@ -2620,7 +2620,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nian-application"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "chrono",
  "nian-domain",
@@ -2642,7 +2642,7 @@ dependencies = [
 
 [[package]]
 name = "nian-desktop"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "chrono",
  "keyring",
@@ -2669,7 +2669,7 @@ dependencies = [
 
 [[package]]
 name = "nian-domain"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -2677,11 +2677,11 @@ dependencies = [
 
 [[package]]
 name = "nian-ffmpeg-sys"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 
 [[package]]
 name = "nian-index"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "chrono",
  "nian-domain",
@@ -2693,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "nian-ipc"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "serde",
  "serde_json",
@@ -2703,7 +2703,7 @@ dependencies = [
 
 [[package]]
 name = "nian-media"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "nian-domain",
  "thiserror 2.0.20",
@@ -2711,7 +2711,7 @@ dependencies = [
 
 [[package]]
 name = "nian-media-ffmpeg"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "nian-domain",
  "nian-ffmpeg-sys",
@@ -2723,7 +2723,7 @@ dependencies = [
 
 [[package]]
 name = "nian-media-worker"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "chrono",
  "ctrlc",
@@ -2743,7 +2743,7 @@ dependencies = [
 
 [[package]]
 name = "nian-onvif"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2761,7 +2761,7 @@ dependencies = [
 
 [[package]]
 name = "nian-platform-windows"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "thiserror 2.0.20",
  "windows-sys 0.61.2",
@@ -2769,7 +2769,7 @@ dependencies = [
 
 [[package]]
 name = "nian-recorder"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "chrono",
  "nian-domain",
@@ -2782,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "nian-release-verifier"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "base64 0.22.1",
  "minisign-verify",
@@ -2790,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "nian-settings"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "nian-domain",
  "rusqlite",
@@ -2800,7 +2800,7 @@ dependencies = [
 
 [[package]]
 name = "nian-settings-fixture"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "nian-domain",
  "nian-settings",
@@ -2809,7 +2809,7 @@ dependencies = [
 
 [[package]]
 name = "nian-storage"
-version = "1.0.0-rc.20"
+version = "1.0.0-rc.21"
 dependencies = [
  "chrono",
  "nian-domain",

@@ -53,16 +53,16 @@ fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
     let path = dir.join(format!("{name}.sh"));
     let mut file = std::fs::File::create(&path).unwrap();
     file.write_all(body.as_bytes()).unwrap();
-    // Executable-bit setup is POSIX-only; these bash-stub tests are never
-    // RUN on Windows, but the target must still compile (`cargo check
-    // --all-targets --target x86_64-pc-windows-msvc`).
+    // Executable-bit setup is POSIX-only. Windows executes the fixture by
+    // passing the script file to bash explicitly, so no executable bit is
+    // required there.
     #[cfg(unix)]
     {
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
         std::fs::set_permissions(&path, permissions).unwrap();
     }
-    path.to_string_lossy().into_owned()
+    path.to_string_lossy().replace('\\', "/")
 }
 
 struct ScriptLauncher {
@@ -72,7 +72,6 @@ struct ScriptLauncher {
 impl WorkerLauncher for ScriptLauncher {
     fn spawn(&mut self) -> std::io::Result<Child> {
         Command::new("bash")
-            .arg("-c")
             .arg(&self.program)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

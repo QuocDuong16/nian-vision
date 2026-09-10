@@ -52,6 +52,12 @@ test("Windows test fixtures do not hard-code Unix-only storage or live-output pa
   assert.equal(/"path":\s*"\/tmp\//.test(workerLive), false);
 });
 
+test("Windows worker supervisor bash fixtures execute script files without shell-parsing native paths", () => {
+  assert.match(workerSupervisorStubs, /Command::new\("bash"\)\s*\.arg\(&self\.program\)/s);
+  assert.equal(/Command::new\("bash"\)\s*\.arg\("-c"\)/s.test(workerSupervisorStubs), false);
+  assert.ok(workerSupervisorStubs.includes("path.to_string_lossy().replace('\\\\', \"/\")"));
+});
+
 test("Windows release contract text normalization is identical for LF and CRLF", () => {
   const crlf = workflow.replace(/\n/g, "\r\n");
   assert.equal(normalizeNewlines(crlf), workflow);
