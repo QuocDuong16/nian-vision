@@ -410,6 +410,15 @@ test("Windows installer smoke proves disposable install and exact bundled bytes"
   assert.match(windowsInstallerSmoke, /stage-runtime-smoke\.mjs/);
 });
 
+test("Windows installed desktop falls back to isolated absolute APPDATA when Known Folder resolution fails", () => {
+  assert.match(desktop, /fn resolve_app_data_dir\(app: &tauri::App\)/);
+  assert.match(desktop, /app\.path\(\)\.app_data_dir\(\)/);
+  assert.match(desktop, /std::env::var_os\("APPDATA"\)/);
+  assert.match(desktop, /root\.is_absolute\(\)\.then\(\|\| root\.join\(identifier\)\)/);
+  assert.match(windowsInstallerSmoke, /\$AppData = Join-Path \$Isolation "appdata"/);
+  assert.match(windowsInstallerSmoke, /\$info\.Environment\['APPDATA'\] = \$AppData/);
+});
+
 test("Windows desktop smoke proves native power subscription and Job Object hard-death containment", () => {
   assert.match(desktop, /NIAN_DESKTOP_POWER_SMOKE_FILE/);
   assert.match(desktop, /windows_power_subscription_ready/);

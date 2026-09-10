@@ -3420,6 +3420,39 @@ fn emit_startup_smoke_marker() -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+fn absolute_app_data_fallback(
+    root: Option<std::ffi::OsString>,
+    identifier: &str,
+) -> Option<PathBuf> {
+    let root = PathBuf::from(root?);
+    root.is_absolute().then(|| root.join(identifier))
+}
+
+fn resolve_app_data_dir(app: &tauri::App) -> tauri::Result<PathBuf> {
+    let primary = app.path().app_data_dir();
+
+    #[cfg(windows)]
+    {
+        primary.or_else(|error| {
+            let Some(path) =
+                absolute_app_data_fallback(std::env::var_os("APPDATA"), &app.config().identifier)
+            else {
+                return Err(error);
+            };
+            tracing::warn!(
+                "Windows known-folder app data lookup failed; using absolute APPDATA fallback"
+            );
+            Ok(path)
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        primary
+    }
+}
+
 #[cfg(windows)]
 fn emit_power_subscription_smoke_marker() -> std::io::Result<()> {
     if let Some(path) = std::env::var_os("NIAN_DESKTOP_POWER_SMOKE_FILE") {
@@ -3512,7 +3545,7 @@ pub fn run() {
             nian_platform_windows::initialize_worker_process_containment().map_err(|_| {
                 std::io::Error::other("media worker process containment could not be initialized")
             })?;
-            let app_data = app.path().app_data_dir()?;
+            let app_data = resolve_app_data_dir(app)?;
             let settings_path = app_data.join("settings.sqlite3");
             let settings = SettingsStore::open(settings_path.clone())?;
             let ptz_settings = SettingsStore::open(settings_path.clone())?;
@@ -3794,6 +3827,24 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn app_data_fallback_accepts_only_absolute_roaming_root() {
+        let root = std::env::temp_dir();
+        let expected = root.join("io.nian.vision");
+        assert_eq!(
+            absolute_app_data_fallback(Some(root.into_os_string()), "io.nian.vision"),
+            Some(expected)
+        );
+        assert_eq!(
+            absolute_app_data_fallback(
+                Some(std::ffi::OsString::from("relative-appdata")),
+                "io.nian.vision"
+            ),
+            None
+        );
+        assert_eq!(absolute_app_data_fallback(None, "io.nian.vision"), None);
+    }
 
     #[derive(Debug)]
     struct TestDesktopNotifier;
