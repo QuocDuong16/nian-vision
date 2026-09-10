@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { resolve } from "node:path";
 import test from "node:test";
 
 import { createAppImageRuntimeFiles, createReleaseConfig, validateEndpoint } from "./write-tauri-release-config.mjs";
@@ -11,7 +12,7 @@ test("release config contains only public updater data and bundle configuration"
   const config = createReleaseConfig({
     endpoint,
     pubkey,
-    workerBase: "/workspace/dist/linux-x86_64/tauri/nian-media-worker",
+    workerBase: resolve("dist/linux-x86_64/tauri/nian-media-worker"),
     appimageFiles: { "/usr/share/nian-vision/BUILD_METADATA.json": "../../dist/BUILD_METADATA.json" },
   });
   const serialized = JSON.stringify(config);
@@ -31,7 +32,7 @@ test("Linux updater artifacts can be deliberately enabled for compatibility-only
   const config = createReleaseConfig({
     endpoint: "https://updates.niand.io.vn/latest.json",
     pubkey: "PUBLIC-UPDATER-KEY",
-    workerBase: "/workspace/dist/linux-x86_64/tauri/nian-media-worker",
+    workerBase: resolve("dist/linux-x86_64/tauri/nian-media-worker"),
     appimageFiles: {},
     createUpdaterArtifacts: true,
   });
@@ -39,10 +40,11 @@ test("Linux updater artifacts can be deliberately enabled for compatibility-only
 });
 
 test("Linux AppImage runtime files match the worker FFmpeg RUNPATH and seed the tray runtime", () => {
-  const files = createAppImageRuntimeFiles("/workspace/dist/linux-x86_64");
+  const stageRoot = resolve("dist/linux-x86_64");
+  const files = createAppImageRuntimeFiles(stageRoot);
   assert.equal(
     files["/usr/lib/libayatana-appindicator3.so.1"],
-    "/workspace/dist/linux-x86_64/lib/appimage/libayatana-appindicator3.so.1",
+    resolve(stageRoot, "lib/appimage/libayatana-appindicator3.so.1"),
   );
   for (const name of ["libavformat.so.62", "libavcodec.so.62", "libavutil.so.60"]) {
     assert.ok(Object.hasOwn(files, `/usr/lib/nian-vision/${name}`), `missing AppImage runtime mapping for ${name}`);

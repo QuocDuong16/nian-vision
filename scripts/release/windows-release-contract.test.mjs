@@ -34,6 +34,7 @@ const recordingControllerIntegration = readNormalizedText(new URL("../../crates/
 const recordingController = readNormalizedText(new URL("../../crates/nian-application/src/recording_controller.rs", import.meta.url));
 const workerSupervisorStubs = readNormalizedText(new URL("../../crates/nian-application/tests/worker_supervisor_stubs.rs", import.meta.url));
 const workerLive = readNormalizedText(new URL("../../apps/nian-media-worker/src/live.rs", import.meta.url));
+const linuxReleaseConfigTest = readNormalizedText(new URL("./write-tauri-release-config.test.mjs", import.meta.url));
 
 test("Windows all-target Clippy does not import Unix-only NaiveDate into the shared test module", () => {
   assert.equal(storageManager.includes("use chrono::{NaiveDate, NaiveDateTime};"), false);
@@ -59,6 +60,14 @@ test("Windows storage layout examples use a platform-native absolute root", () =
   assert.ok(storagePaths.includes('PathBuf::from(r"C:\\srv\\nian-vision\\recordings")'));
   assert.equal(storagePaths.includes('RecordingsLayout::new("/srv/nian-vision/recordings")'), false);
   assert.ok(storagePaths.includes('RecordingsLayout::new(r"C:\\")'));
+});
+
+
+test("release-config path fixtures are platform-native on Windows", () => {
+  assert.equal(linuxReleaseConfigTest.includes('"/workspace/dist/linux-x86_64'), false);
+  assert.match(linuxReleaseConfigTest, /import \{ resolve \} from "node:path"/);
+  assert.match(linuxReleaseConfigTest, /const stageRoot = resolve\("dist\/linux-x86_64"\)/);
+  assert.match(linuxReleaseConfigTest, /resolve\(stageRoot, "lib\/appimage\/libayatana-appindicator3\.so\.1"\)/);
 });
 
 test("Windows worker supervisor bash fixtures use the preflighted MSYS2 interpreter and cygpath contract", () => {
