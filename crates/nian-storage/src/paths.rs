@@ -917,29 +917,40 @@ mod tests {
             .unwrap()
     }
 
+    fn spec_root() -> PathBuf {
+        #[cfg(windows)]
+        {
+            PathBuf::from(r"C:\srv\nian-vision\recordings")
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from("/srv/nian-vision/recordings")
+        }
+    }
+
     fn touch(path: &Path) {
         std::fs::File::create(path).unwrap();
     }
 
     #[test]
     fn layout_matches_spec_example() {
-        let layout = RecordingsLayout::new("/srv/nian-vision/recordings").unwrap();
+        let root = spec_root();
+        let layout = RecordingsLayout::new(&root).unwrap();
         let camera = CameraId::parse("cam-1").unwrap();
         let path = layout
             .allocate_segment(&camera, sample_start())
             .unwrap()
             .final_path;
-        // Nothing exists yet, so the bare spec name is allocated…
-        let rendered = path.to_string_lossy().replace('\\', "/");
-        assert_eq!(
-            rendered,
-            "/srv/nian-vision/recordings/cam-1/2026/08/26/08-30-00.mkv"
-        );
+        // Nothing exists yet, so the bare spec name is allocated.
+        assert_eq!(path, root.join("cam-1/2026/08/26/08-30-00.mkv"));
     }
 
     #[test]
     fn rejects_relative_and_root_storage_roots() {
         assert!(RecordingsLayout::new("relative/path").is_err());
+        #[cfg(windows)]
+        assert!(RecordingsLayout::new(r"C:\").is_err());
+        #[cfg(not(windows))]
         assert!(RecordingsLayout::new("/").is_err());
     }
 

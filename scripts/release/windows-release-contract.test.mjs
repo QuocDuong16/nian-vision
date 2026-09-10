@@ -28,6 +28,7 @@ const windowsNsisHooks = readNormalizedText(new URL("../../apps/nian-desktop/win
 const desktop = readNormalizedText(new URL("../../apps/nian-desktop/src/lib.rs", import.meta.url));
 const worker = readNormalizedText(new URL("../../apps/nian-media-worker/src/main.rs", import.meta.url));
 const storageManager = readNormalizedText(new URL("../../crates/nian-application/src/storage_manager.rs", import.meta.url));
+const storagePaths = readNormalizedText(new URL("../../crates/nian-storage/src/paths.rs", import.meta.url));
 const cameraServiceIntegration = readNormalizedText(new URL("../../crates/nian-application/tests/camera_service.rs", import.meta.url));
 const recordingControllerIntegration = readNormalizedText(new URL("../../crates/nian-application/tests/recording_controller.rs", import.meta.url));
 const recordingController = readNormalizedText(new URL("../../crates/nian-application/src/recording_controller.rs", import.meta.url));
@@ -51,6 +52,13 @@ test("Windows test fixtures do not hard-code Unix-only storage or live-output pa
   }
   assert.equal(/"output_dir":\s*"\/tmp\//.test(workerLive), false);
   assert.equal(/"path":\s*"\/tmp\//.test(workerLive), false);
+});
+
+test("Windows storage layout examples use a platform-native absolute root", () => {
+  assert.match(storagePaths, /fn spec_root\(\) -> PathBuf/);
+  assert.ok(storagePaths.includes('PathBuf::from(r"C:\\srv\\nian-vision\\recordings")'));
+  assert.equal(storagePaths.includes('RecordingsLayout::new("/srv/nian-vision/recordings")'), false);
+  assert.ok(storagePaths.includes('RecordingsLayout::new(r"C:\\")'));
 });
 
 test("Windows worker supervisor bash fixtures use the preflighted MSYS2 interpreter and cygpath contract", () => {

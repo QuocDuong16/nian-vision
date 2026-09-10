@@ -61,6 +61,11 @@ export function createAppImageRuntimeFiles(stageRoot = stage) {
     "/usr/share/doc/nian-vision/FFMPEG_BUILD_FLAGS.txt": resolve(stageRoot, "FFMPEG_BUILD_FLAGS.txt"),
     "/usr/share/doc/nian-vision/FFMPEG_CONFIG.h": resolve(stageRoot, "FFMPEG_CONFIG.h"),
     "/usr/share/nian-vision/BUILD_METADATA.json": resolve(stageRoot, "BUILD_METADATA.json"),
+    // libappindicator-sys loads the tray library with dlopen, so linuxdeploy cannot
+    // discover it from the desktop binary. Seed the Bookworm-built tray library
+    // into AppDir explicitly; linuxdeploy then deploys its matching dependency
+    // closure alongside the GTK/GLib runtime already bundled into the AppImage.
+    "/usr/lib/libayatana-appindicator3.so.1": resolve(stageRoot, "lib/appimage/libayatana-appindicator3.so.1"),
     "/usr/lib/nian-vision/libavformat.so.62": resolve(stageRoot, "lib/nian-vision/libavformat.so.62"),
     "/usr/lib/nian-vision/libavcodec.so.62": resolve(stageRoot, "lib/nian-vision/libavcodec.so.62"),
     "/usr/lib/nian-vision/libavutil.so.60": resolve(stageRoot, "lib/nian-vision/libavutil.so.60"),

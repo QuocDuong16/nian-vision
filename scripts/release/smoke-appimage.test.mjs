@@ -58,6 +58,23 @@ test("AppImage smoke proves worker FFmpeg closure without build-time library env
   );
 });
 
+
+test("AppImage carries the Ayatana tray runtime closure instead of borrowing the host copy", () => {
+  assert.ok(stage.includes('tray_source="/usr/lib/x86_64-linux-gnu/libayatana-appindicator3.so.1"'));
+  assert.ok(stage.includes('tray_stage="$stage/lib/appimage/libayatana-appindicator3.so.1"'));
+  assert.ok(stage.includes("Library soname: [libayatana-appindicator3.so.1]"));
+  assert.match(smoke, /tray_library="\$appdir\/usr\/lib\/libayatana-appindicator3\.so\.1"/);
+  for (const dependency of [
+    "libayatana-indicator3.so.7",
+    "libayatana-ido3-0.4.so.0",
+    "libdbusmenu-gtk3.so.4",
+    "libdbusmenu-glib.so.4",
+  ]) {
+    assert.ok(smoke.includes(dependency), `missing bundled tray closure check for ${dependency}`);
+  }
+  assert.match(smoke, /AppImage tray runtime escaped the bundle/);
+});
+
 test("AppImage desktop smoke requires system EGL/GLES instead of injecting bundled graphics loaders", () => {
   assert.match(smoke, /host_libraries="\$\(ldconfig -p 2>\/dev\/null \|\| true\)"/);
   assert.match(smoke, /for library in libEGL\.so\.1 libGLESv2\.so\.2/);

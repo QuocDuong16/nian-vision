@@ -334,8 +334,7 @@ jobs:
           set -Eeuo pipefail
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-            dbus-x11 fuse3 libayatana-appindicator3-1 libegl1 libgles2 xauth xvfb
-          ldconfig -p | grep -E 'lib(ayatana-)?appindicator3\.so\.1'
+            dbus-x11 fuse3 libegl1 libgles2 xauth xvfb
           ldconfig -p | grep -F 'libEGL.so.1'
           ldconfig -p | grep -F 'libGLESv2.so.2'
 

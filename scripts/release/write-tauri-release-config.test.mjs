@@ -38,8 +38,12 @@ test("Linux updater artifacts can be deliberately enabled for compatibility-only
   assert.equal(config.bundle.createUpdaterArtifacts, true);
 });
 
-test("Linux AppImage runtime files match the worker installation-local FFmpeg RUNPATH", () => {
+test("Linux AppImage runtime files match the worker FFmpeg RUNPATH and seed the tray runtime", () => {
   const files = createAppImageRuntimeFiles("/workspace/dist/linux-x86_64");
+  assert.equal(
+    files["/usr/lib/libayatana-appindicator3.so.1"],
+    "/workspace/dist/linux-x86_64/lib/appimage/libayatana-appindicator3.so.1",
+  );
   for (const name of ["libavformat.so.62", "libavcodec.so.62", "libavutil.so.60"]) {
     assert.ok(Object.hasOwn(files, `/usr/lib/nian-vision/${name}`), `missing AppImage runtime mapping for ${name}`);
     assert.equal(Object.hasOwn(files, `/usr/lib/${name}`), false, `legacy root /usr/lib mapping remains for ${name}`);

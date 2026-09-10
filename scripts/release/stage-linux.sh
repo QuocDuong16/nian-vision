@@ -8,10 +8,13 @@ target="x86_64-unknown-linux-gnu"
 worker_source="$repo_root/target/release/nian-media-worker"
 worker_stage="$stage/bin/nian-media-worker"
 lib_stage="$stage/lib/nian-vision"
+tray_source="/usr/lib/x86_64-linux-gnu/libayatana-appindicator3.so.1"
+tray_stage="$stage/lib/appimage/libayatana-appindicator3.so.1"
 source "$repo_root/scripts/release/linux-runtime-contract.sh"
 
 required=(
   "$worker_source"
+  "$tray_source"
   "$ffmpeg_dir/lib/libavformat.so.62"
   "$ffmpeg_dir/lib/libavcodec.so.62"
   "$ffmpeg_dir/lib/libavutil.so.60"
@@ -32,8 +35,17 @@ node "$repo_root/scripts/release/validate-ffmpeg-config.mjs" \
   --flags "$ffmpeg_dir/FFMPEG_BUILD_FLAGS.txt"
 
 rm -rf "$stage"
-mkdir -p "$stage/bin" "$stage/tauri" "$lib_stage"
+mkdir -p "$stage/bin" "$stage/tauri" "$lib_stage" "$(dirname "$tray_stage")"
 install -m 0755 "$worker_source" "$worker_stage"
+install -m 0644 "$(readlink -f "$tray_source")" "$tray_stage"
+if [[ ! -f "$tray_stage" || -L "$tray_stage" ]]; then
+  echo "staged AppImage tray runtime must be a regular non-symlink file: $tray_stage" >&2
+  exit 1
+fi
+if ! readelf -d "$tray_stage" | grep -Fq 'Library soname: [libayatana-appindicator3.so.1]'; then
+  echo "staged AppImage tray runtime has unexpected SONAME: $tray_stage" >&2
+  exit 1
+fi
 install -m 0755 "$worker_source" "$stage/tauri/nian-media-worker-$target"
 for soname in libavformat.so.62 libavcodec.so.62 libavutil.so.60; do
   cp -L "$ffmpeg_dir/lib/$soname" "$lib_stage/$soname"

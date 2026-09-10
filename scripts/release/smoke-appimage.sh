@@ -120,6 +120,32 @@ env -u LD_LIBRARY_PATH -u NIAN_FFMPEG_LIB_DIR \
   node "$repo_root/scripts/release/stage-runtime-smoke.mjs" \
   "$appdir/usr/bin/nian-media-worker" "$work_dir/runtime-smoke"
 
+# libappindicator-sys loads the tray implementation with dlopen, so the tray
+# runtime must be carried inside the AppImage with the same GTK/GLib generation
+# used at bundle time. Otherwise a newer host Ayatana library can bind against
+# the older bundled GLib and fail with an undefined symbol before Tauri setup.
+tray_library="$appdir/usr/lib/libayatana-appindicator3.so.1"
+if [[ ! -f "$tray_library" || -L "$tray_library" ]]; then
+  echo "AppImage is missing the bundled Ayatana tray runtime: $tray_library" >&2
+  exit 1
+fi
+for tray_dependency in \
+  libayatana-indicator3.so.7 \
+  libayatana-ido3-0.4.so.0 \
+  libdbusmenu-gtk3.so.4 \
+  libdbusmenu-glib.so.4; do
+  dependency_path="$(find "$appdir/usr/lib" \( -type f -o -type l \) -name "$tray_dependency" -print -quit)"
+  if [[ -z "$dependency_path" ]]; then
+    echo "AppImage tray runtime closure is missing: $tray_dependency" >&2
+    exit 1
+  fi
+  dependency_real="$(readlink -f "$dependency_path")"
+  if [[ "$dependency_real" != "$appdir/"* ]]; then
+    echo "AppImage tray runtime escaped the bundle: $tray_dependency => $dependency_real" >&2
+    exit 1
+  fi
+done
+
 # EGL/GLES dispatch libraries are intentionally host graphics-stack dependencies.
 # Keep them paired with the host Mesa/proprietary driver stack instead of injecting
 # release-local loaders through the AppImage or LD_LIBRARY_PATH.
