@@ -131,6 +131,24 @@ test("Windows Authenticode private material is confined to Windows signing steps
   assert.equal(outside.includes("WINDOWS_SIGNING_PFX_PASSWORD"), false);
 });
 
+test("Windows NSIS bundle type is patched before Authenticode signing and preserved through no-sign bundling", () => {
+  const windows = jobBody("sign-windows");
+  const patchAt = windows.indexOf("- name: Patch Windows desktop NSIS bundle type before Authenticode signing");
+  const signAt = windows.indexOf("- name: Authenticode-sign Windows application binaries when configured");
+  const bundleAt = windows.indexOf("- name: Build NSIS installer from exact signed-or-explicitly-unsigned inputs");
+  const installerSignAt = windows.indexOf("- name: Authenticode-sign and verify final NSIS installer when configured");
+  const smokeAt = windows.indexOf("- name: Smoke actual Windows NSIS install upgrade containment and uninstall");
+  assert.ok(
+    patchAt >= 0 && patchAt < signAt && signAt < bundleAt && bundleAt < installerSignAt && installerSignAt < smokeAt,
+    "Windows bundle-type patch/sign/bundle/install-smoke ordering regressed",
+  );
+
+  const patch = stepBody("sign-windows", "Patch Windows desktop NSIS bundle type before Authenticode signing");
+  assert.match(patch, /patch-tauri-bundle-type\.mjs target\/x86_64-pc-windows-msvc\/release\/nian-desktop\.exe nsis/);
+  const bundle = stepBody("sign-windows", "Build NSIS installer from exact signed-or-explicitly-unsigned inputs");
+  assert.match(bundle, /cargo\.exe tauri bundle[\s\S]*--bundles nsis --ci --no-sign/);
+});
+
 test("release trust contract proves mirrored tag version SHA actor and default-branch reachability", () => {
   const preflight = jobBody("release-preflight");
   assert.match(preflight, /refs\/tags\/v\*/);

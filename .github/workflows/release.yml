@@ -703,6 +703,12 @@ jobs:
           . scripts/release/windows-native.ps1
           Invoke-NianNative { node.exe scripts/release/write-tauri-windows-release-config.mjs }
 
+      - name: Patch Windows desktop NSIS bundle type before Authenticode signing
+        shell: pwsh
+        run: |
+          . scripts/release/windows-native.ps1
+          Invoke-NianNative { node.exe scripts/release/patch-tauri-bundle-type.mjs target/x86_64-pc-windows-msvc/release/nian-desktop.exe nsis }
+
       - name: Authenticode-sign Windows application binaries when configured
         shell: pwsh
         env:

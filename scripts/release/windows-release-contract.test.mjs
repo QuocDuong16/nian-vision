@@ -24,6 +24,7 @@ const windowsAuthenticode = readNormalizedText(new URL("./sign-authenticode-wind
 const windowsRuntimeClosure = readNormalizedText(new URL("./windows-runtime-closure.ps1", import.meta.url));
 const windowsRuntimeClassifierTest = readNormalizedText(new URL("./test-windows-runtime-classifier.ps1", import.meta.url));
 const windowsInstallerSmoke = readNormalizedText(new URL("./smoke-windows-installer.ps1", import.meta.url));
+const windowsBundleTypePatcher = readNormalizedText(new URL("./patch-tauri-bundle-type.mjs", import.meta.url));
 const windowsNsisHooks = readNormalizedText(new URL("../../apps/nian-desktop/windows/nsis-hooks.nsh", import.meta.url));
 const desktop = readNormalizedText(new URL("../../apps/nian-desktop/src/lib.rs", import.meta.url));
 const worker = readNormalizedText(new URL("../../apps/nian-media-worker/src/main.rs", import.meta.url));
@@ -389,6 +390,15 @@ test("Windows private signing material appears only in sign-windows", () => {
 test("only publish-release retains contents write authority", () => {
   assert.equal([...workflow.matchAll(/contents: write/g)].length, 1);
   assert.match(workflow, /publish-release:[\s\S]*?permissions:\n      contents: write/);
+});
+
+test("Windows NSIS main binary is patched before signing instead of invalidating Authenticode inside the installer", () => {
+  assert.match(windowsBundleTypePatcher, /__TAURI_BUNDLE_TYPE_VAR_UNK/);
+  assert.match(windowsBundleTypePatcher, /__TAURI_BUNDLE_TYPE_VAR_NSS/);
+  assert.match(windowsBundleTypePatcher, /occurrences !== 1/);
+  assert.match(windowsBundleTypePatcher, /Tauri bundle type patch verification failed/);
+  assert.match(workflow, /Patch Windows desktop NSIS bundle type before Authenticode signing/);
+  assert.match(workflow, /patch-tauri-bundle-type\.mjs target\/x86_64-pc-windows-msvc\/release\/nian-desktop\.exe nsis/);
 });
 
 test("Windows installer smoke proves disposable install and exact bundled bytes", () => {
