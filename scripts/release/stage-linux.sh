@@ -64,7 +64,8 @@ install -m 0644 "$repo_root/THIRD_PARTY_NOTICES.txt" "$stage/THIRD_PARTY_NOTICES
 install -m 0644 "$ffmpeg_dir/FFMPEG-LGPL-2.1.txt" "$stage/FFMPEG-LGPL-2.1.txt"
 install -m 0644 "$ffmpeg_dir/FFMPEG_BUILD_FLAGS.txt" "$stage/FFMPEG_BUILD_FLAGS.txt"
 install -m 0644 "$ffmpeg_dir/FFMPEG_CONFIG.h" "$stage/FFMPEG_CONFIG.h"
-node "$repo_root/scripts/release/build-metadata.mjs" --output "$stage/BUILD_METADATA.json" --target "$target"
+pnpm_version="$(pnpm --version)"
+node "$repo_root/scripts/release/build-metadata.mjs" --output "$stage/BUILD_METADATA.json" --target "$target" --pnpm-version "$pnpm_version"
 
 require_exact_runpath "$worker_stage" '$ORIGIN/../lib/nian-vision'
 

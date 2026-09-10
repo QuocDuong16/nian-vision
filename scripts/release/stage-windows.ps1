@@ -10,6 +10,8 @@ $Runtime = Join-Path $Stage "runtime"
 $Tauri = Join-Path $Stage "tauri"
 $Target = $Config.windowsTarget
 $Node = (Get-Command node.exe).Source
+$Pnpm = (Get-Command pnpm.cmd -ErrorAction Stop).Source
+$PnpmVersion = (Invoke-NianNative { & $Pnpm --version } | Out-String).Trim()
 $WorkerSource = Join-Path $RepoRoot "target/$Target/release/nian-media-worker.exe"
 $DesktopSource = Join-Path $RepoRoot "target/$Target/release/nian-desktop.exe"
 $System32 = Join-Path $env:SystemRoot "System32"
@@ -89,7 +91,7 @@ foreach ($name in @("THIRD_PARTY_NOTICES.txt", "FFMPEG-LGPL-2.1.txt", "FFMPEG_BU
 }
 
 Invoke-NianNative { & $Node (Join-Path $RepoRoot "scripts/release/build-metadata.mjs") `
-    --output (Join-Path $Stage "BUILD_METADATA.json") --target $Target }
+    --output (Join-Path $Stage "BUILD_METADATA.json") --target $Target --pnpm-version $PnpmVersion }
 
 $closureRoots = @(
     (Join-Path $Runtime "nian-media-worker.exe"),

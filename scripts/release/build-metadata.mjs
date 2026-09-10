@@ -32,6 +32,15 @@ function rejectUnsafeStrings(value) {
   }
 }
 
+function validatePnpmVersion(version) {
+  if (!version) throw new Error("--pnpm-version is required");
+  const packageJson = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
+  const expected = /^pnpm@(.+)$/.exec(packageJson.packageManager ?? "")?.[1];
+  if (!expected) throw new Error("package.json packageManager must pin pnpm@<version>");
+  if (version !== expected) throw new Error(`pnpm version ${version} does not match package.json ${expected}`);
+  return version;
+}
+
 try {
   const argv = process.argv.slice(2);
   const output = argValue(argv, "--output", resolve(root, "dist/linux-x86_64/BUILD_METADATA.json"));
@@ -40,6 +49,7 @@ try {
   const releaseConfig = JSON.parse(
     readFileSync(resolve(root, "scripts/release/release-config.json"), "utf8"),
   );
+  const pnpmVersion = validatePnpmVersion(argValue(argv, "--pnpm-version"));
   const version = validateVersions(collectVersions());
   const metadata = {
     product: "Nian Vision",
@@ -47,7 +57,7 @@ try {
     commit: command("git", ["rev-parse", "HEAD"]),
     rust: command("rustc", ["--version"]),
     node: command("node", ["--version"]),
-    pnpm: command("pnpm", ["--version"]),
+    pnpm: pnpmVersion,
     ffmpeg_version: releaseConfig.ffmpegVersion,
     ffmpeg_source_sha256: releaseConfig.ffmpegSourceSha256,
     target,
