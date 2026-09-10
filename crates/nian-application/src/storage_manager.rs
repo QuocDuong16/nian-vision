@@ -17,13 +17,11 @@ use nian_storage::{
 };
 
 #[cfg(test)]
+#[derive(Debug)]
 struct RetentionTestGate {
     reached: std::sync::mpsc::Sender<()>,
     resume: std::sync::mpsc::Receiver<()>,
 }
-
-#[cfg(test)]
-static RETENTION_PRE_DELETE_GATE: Mutex<Option<RetentionTestGate>> = Mutex::new(None);
 
 const MAX_RECORDING_INDEX_CORRUPT_BACKUPS: usize = 4;
 
@@ -207,6 +205,8 @@ pub struct StorageManager {
     reconciled: bool,
     rebuilt_after_corruption: bool,
     playback_pins: PlaybackPins,
+    #[cfg(test)]
+    retention_pre_delete_gate: Option<RetentionTestGate>,
 }
 
 impl StorageManager {
@@ -243,6 +243,8 @@ impl StorageManager {
                 reconciled: false,
                 rebuilt_after_corruption: false,
                 playback_pins,
+                #[cfg(test)]
+                retention_pre_delete_gate: None,
             }),
             Err(error) if error.is_corruption() => {
                 quarantine_corrupt_index(&index_path)?;
@@ -255,6 +257,8 @@ impl StorageManager {
                     reconciled: false,
                     rebuilt_after_corruption: true,
                     playback_pins,
+                    #[cfg(test)]
+                    retention_pre_delete_gate: None,
                 };
                 manager.rebuild()?;
                 Ok(manager)
@@ -698,9 +702,7 @@ impl StorageManager {
             }
 
             #[cfg(test)]
-            if let Ok(gate) = RETENTION_PRE_DELETE_GATE.lock()
-                && let Some(gate) = gate.as_ref()
-            {
+            if let Some(gate) = self.retention_pre_delete_gate.take() {
                 let _ = gate.reached.send(());
                 let _ = gate.resume.recv();
             }
@@ -1677,7 +1679,7 @@ mod tests {
 
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        *RETENTION_PRE_DELETE_GATE.lock().unwrap() = Some(RetentionTestGate {
+        manager.retention_pre_delete_gate = Some(RetentionTestGate {
             reached: reached_tx,
             resume: resume_rx,
         });
@@ -1694,7 +1696,6 @@ mod tests {
         let pin = pins.pin(relative);
         resume_tx.send(()).unwrap();
         let (mut manager, report) = worker.join().unwrap();
-        *RETENTION_PRE_DELETE_GATE.lock().unwrap() = None;
 
         assert_eq!(report.deleted, 0);
         assert_eq!(report.skipped_playback, 1);

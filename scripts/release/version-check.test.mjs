@@ -13,21 +13,21 @@ function versions(version) {
 }
 
 test("valid RC source and matching RC tag pass", () => {
-  assert.equal(validateVersions(versions("1.0.0-rc.22"), "v1.0.0-rc.22"), "1.0.0-rc.22");
+  assert.equal(validateVersions(versions("1.0.0-rc.23"), "v1.0.0-rc.23"), "1.0.0-rc.23");
 });
 
 test("previous RC tag cannot be reused for current RC source", () => {
-  for (const previous of [21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]) {
-    assert.throws(() => validateVersions(versions("1.0.0-rc.22"), `v1.0.0-rc.${previous}`), /does not match/);
+  for (const previous of [22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]) {
+    assert.throws(() => validateVersions(versions("1.0.0-rc.23"), `v1.0.0-rc.${previous}`), /does not match/);
   }
 });
 
 test("RC tag against final source is rejected", () => {
-  assert.throws(() => validateVersions(versions("1.0.0"), "v1.0.0-rc.22"), /does not match/);
+  assert.throws(() => validateVersions(versions("1.0.0"), "v1.0.0-rc.23"), /does not match/);
 });
 
 test("final tag against RC source is rejected", () => {
-  assert.throws(() => validateVersions(versions("1.0.0-rc.22"), "v1.0.0"), /does not match/);
+  assert.throws(() => validateVersions(versions("1.0.0-rc.23"), "v1.0.0"), /does not match/);
 });
 
 test("valid final source and matching final tag pass", () => {
@@ -36,14 +36,14 @@ test("valid final source and matching final tag pass", () => {
 
 test("surface version drift fails", () => {
   assert.throws(
-    () => validateVersions({ ...versions("1.0.0-rc.22"), ui: "1.0.0" }),
+    () => validateVersions({ ...versions("1.0.0-rc.23"), ui: "1.0.0" }),
     /release version drift/,
   );
 });
 
 test("malformed SemVer fails", () => {
   assert.throws(
-    () => validateVersions({ ...versions("1.0.0-rc.22"), package: "01.2.3" }),
+    () => validateVersions({ ...versions("1.0.0-rc.23"), package: "01.2.3" }),
     /not valid SemVer/,
   );
 });

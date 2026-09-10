@@ -55,10 +55,19 @@ test("Windows test fixtures do not hard-code Unix-only storage or live-output pa
 test("Windows worker supervisor bash fixtures use the preflighted MSYS2 interpreter and cygpath contract", () => {
   assert.match(workerSupervisorStubs, /WINDOWS_BASH:\s*&str\s*=\s*r"C:\\msys64\\usr\\bin\\bash\.exe"/);
   assert.match(workerSupervisorStubs, /WINDOWS_CYGPATH:\s*&str\s*=\s*r"C:\\msys64\\usr\\bin\\cygpath\.exe"/);
-  assert.match(workerSupervisorStubs, /Command::new\(WINDOWS_CYGPATH\)[\s\S]*?\.arg\("-u"\)[\s\S]*?\.arg\(&path\)/);
+  assert.match(workerSupervisorStubs, /fn script_program_path\(path: &std::path::Path\) -> String/);
+  assert.match(workerSupervisorStubs, /Command::new\(WINDOWS_CYGPATH\)[\s\S]*?\.arg\("-u"\)[\s\S]*?\.arg\(path\)/);
   assert.match(workerSupervisorStubs, /bash_command\(\)\s*\.args\(\["--noprofile", "--norc"\]\)\s*\.arg\(&self\.program\)/s);
   assert.equal(/\.arg\("-c"\)/.test(workerSupervisorStubs), false);
+  assert.equal(/return\s+String::from_utf8\(converted\.stdout\)/.test(workerSupervisorStubs), false);
   assert.match(workerSupervisorStubs, /unsupported ipc protocol version: 99/);
+});
+
+test("retention pre-delete race fixture is manager-local and cannot block sibling tests", () => {
+  assert.equal(/static\s+RETENTION_PRE_DELETE_GATE/.test(storageManager), false);
+  assert.match(storageManager, /retention_pre_delete_gate:\s*Option<RetentionTestGate>/);
+  assert.match(storageManager, /self\.retention_pre_delete_gate\.take\(\)/);
+  assert.match(storageManager, /manager\.retention_pre_delete_gate\s*=\s*Some\(RetentionTestGate/);
 });
 
 test("Windows release contract text normalization is identical for LF and CRLF", () => {

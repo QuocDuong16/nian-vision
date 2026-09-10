@@ -54,6 +54,28 @@ fn fixture_deadlines() -> SupervisorDeadlines {
     }
 }
 
+#[cfg(windows)]
+fn script_program_path(path: &std::path::Path) -> String {
+    let converted = Command::new(WINDOWS_CYGPATH)
+        .arg("-u")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        converted.status.success(),
+        "cygpath failed to convert worker supervisor fixture path"
+    );
+    String::from_utf8(converted.stdout)
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
+#[cfg(not(windows))]
+fn script_program_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
     let path = dir.join(format!("{name}.sh"));
     let mut file = std::fs::File::create(&path).unwrap();
@@ -67,25 +89,7 @@ fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
         std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
         std::fs::set_permissions(&path, permissions).unwrap();
     }
-    #[cfg(windows)]
-    {
-        let converted = Command::new(WINDOWS_CYGPATH)
-            .arg("-u")
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(
-            converted.status.success(),
-            "cygpath failed to convert worker supervisor fixture path"
-        );
-        return String::from_utf8(converted.stdout)
-            .unwrap()
-            .trim()
-            .to_owned();
-    }
-
-    #[cfg(not(windows))]
-    path.to_string_lossy().into_owned()
+    script_program_path(&path)
 }
 
 #[cfg(windows)]
