@@ -430,6 +430,10 @@ test("Windows desktop smoke proves native power subscription and Job Object hard
   assert.match(worker, /Deliberately independent of stdin and IPC/);
   assert.match(windowsInstallerSmoke, /\[void\]\$info\.Environment\.Remove\('NIAN_FFMPEG_LIB_DIR'\)/);
   assert.match(windowsInstallerSmoke, /\[void\]\$info\.Environment\.Remove\('LD_LIBRARY_PATH'\)/);
+  assert.match(windowsInstallerSmoke, /\$WebViewData = Join-Path \$LocalAppData "webview2"/);
+  assert.match(windowsInstallerSmoke, /\$info\.Environment\['WEBVIEW2_USER_DATA_FOLDER'\] = \$WebViewData/);
+  assert.match(windowsInstallerSmoke, /AddSeconds\(45\)/);
+  assert.match(windowsInstallerSmoke, /startup=\$startupReady, power=\$powerReady, containment=\$containmentReady/);
   assert.match(windowsInstallerSmoke, /Windows Job Object did not reap the installed media worker/);
   assert.match(windowsInstallerSmoke, /did not prove the native Windows power subscription/);
 });

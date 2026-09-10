@@ -12,9 +12,10 @@ $Isolation = Join-Path $env:RUNNER_TEMP ("nian-windows-install-smoke-" + [Guid]:
 $InstallRoot = Join-Path $Isolation "install"
 $AppData = Join-Path $Isolation "appdata"
 $LocalAppData = Join-Path $Isolation "localappdata"
+$WebViewData = Join-Path $LocalAppData "webview2"
 $Footage = Join-Path $Isolation "recordings"
 $Node = (Get-Command node.exe).Source
-New-Item -ItemType Directory -Force $AppData, $LocalAppData, $Footage | Out-Null
+New-Item -ItemType Directory -Force $AppData, $LocalAppData, $WebViewData, $Footage | Out-Null
 
 function Wait-Exit([Diagnostics.Process]$Process, [int]$Seconds, [string]$Label) {
     if (-not $Process.WaitForExit($Seconds * 1000)) {
@@ -47,18 +48,25 @@ function Start-DesktopContainmentSmoke([string]$Desktop) {
     $info.Environment['APPDATA'] = $AppData
     $info.Environment['LOCALAPPDATA'] = $LocalAppData
     $info.Environment['USERPROFILE'] = $Isolation
+    $info.Environment['WEBVIEW2_USER_DATA_FOLDER'] = $WebViewData
     $info.Environment['NIAN_DESKTOP_STARTUP_SMOKE_FILE'] = $marker
     $info.Environment['NIAN_DESKTOP_CONTAINMENT_SMOKE_FILE'] = $containment
     $info.Environment['NIAN_DESKTOP_POWER_SMOKE_FILE'] = $power
     [void]$info.Environment.Remove('NIAN_FFMPEG_LIB_DIR')
     [void]$info.Environment.Remove('LD_LIBRARY_PATH')
     $process = [Diagnostics.Process]::Start($info)
-    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    # Hosted Windows can cold-start the evergreen WebView2 runtime substantially
+    # slower than a warm developer machine. Keep the smoke bounded, but do not
+    # make release correctness depend on an unrealistically tight 15 second race.
+    $deadline = [DateTime]::UtcNow.AddSeconds(45)
     while (-not (Test-Path $marker) -or -not (Test-Path $containment) -or -not (Test-Path $power)) {
         if ($process.HasExited) { throw "installed desktop exited before startup readiness (code $($process.ExitCode))" }
         if ([DateTime]::UtcNow -ge $deadline) {
+            $startupReady = Test-Path $marker
+            $containmentReady = Test-Path $containment
+            $powerReady = Test-Path $power
             try { $process.Kill($true) } catch {}
-            throw "installed desktop startup readiness timed out"
+            throw "installed desktop startup readiness timed out after 45s (startup=$startupReady, power=$powerReady, containment=$containmentReady)"
         }
         Start-Sleep -Milliseconds 100
     }
