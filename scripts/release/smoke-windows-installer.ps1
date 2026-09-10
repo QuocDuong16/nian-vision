@@ -50,8 +50,8 @@ function Start-DesktopContainmentSmoke([string]$Desktop) {
     $info.Environment['NIAN_DESKTOP_STARTUP_SMOKE_FILE'] = $marker
     $info.Environment['NIAN_DESKTOP_CONTAINMENT_SMOKE_FILE'] = $containment
     $info.Environment['NIAN_DESKTOP_POWER_SMOKE_FILE'] = $power
-    $info.Environment.Remove('NIAN_FFMPEG_LIB_DIR')
-    $info.Environment.Remove('LD_LIBRARY_PATH')
+    [void]$info.Environment.Remove('NIAN_FFMPEG_LIB_DIR')
+    [void]$info.Environment.Remove('LD_LIBRARY_PATH')
     $process = [Diagnostics.Process]::Start($info)
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
     while (-not (Test-Path $marker) -or -not (Test-Path $containment) -or -not (Test-Path $power)) {

@@ -428,6 +428,8 @@ test("Windows desktop smoke proves native power subscription and Job Object hard
   assert.match(worker, /Some\("__containment-smoke"\)/);
   assert.match(worker, /NIAN_WORKER_CONTAINMENT_SMOKE/);
   assert.match(worker, /Deliberately independent of stdin and IPC/);
+  assert.match(windowsInstallerSmoke, /\[void\]\$info\.Environment\.Remove\('NIAN_FFMPEG_LIB_DIR'\)/);
+  assert.match(windowsInstallerSmoke, /\[void\]\$info\.Environment\.Remove\('LD_LIBRARY_PATH'\)/);
   assert.match(windowsInstallerSmoke, /Windows Job Object did not reap the installed media worker/);
   assert.match(windowsInstallerSmoke, /did not prove the native Windows power subscription/);
 });
