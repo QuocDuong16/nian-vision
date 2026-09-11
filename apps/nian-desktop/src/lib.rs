@@ -2624,14 +2624,23 @@ fn reconcile_autostart(
     service: &dyn AutostartService,
     persisted_enabled: bool,
 ) -> Result<(), DesktopErrorDto> {
+    if persisted_enabled {
+        return service.set_enabled(true).map_err(|_| {
+            DesktopErrorDto::new(
+                "autostart_failed",
+                "launch-at-login registration could not be reconciled",
+            )
+        });
+    }
+
     let actual = service.is_enabled().map_err(|_| {
         DesktopErrorDto::new(
             "autostart_failed",
             "launch-at-login state could not be inspected",
         )
     })?;
-    if actual != persisted_enabled {
-        service.set_enabled(persisted_enabled).map_err(|_| {
+    if actual {
+        service.set_enabled(false).map_err(|_| {
             DesktopErrorDto::new(
                 "autostart_failed",
                 "launch-at-login registration could not be reconciled",
@@ -6706,6 +6715,17 @@ mod tests {
 
         assert!(!*autostart.enabled.lock().unwrap());
         assert_eq!(*autostart.calls.lock().unwrap(), vec![false]);
+    }
+
+    #[test]
+    fn startup_autostart_reconciliation_refreshes_enabled_registration() {
+        let autostart = FakeAutostart::default();
+        *autostart.enabled.lock().unwrap() = true;
+
+        reconcile_autostart(&autostart, true).unwrap();
+
+        assert!(*autostart.enabled.lock().unwrap());
+        assert_eq!(*autostart.calls.lock().unwrap(), vec![true]);
     }
 
     #[test]
