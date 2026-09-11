@@ -340,18 +340,18 @@ fn run_live(
                 break;
             }
             let should_rotate = active.as_ref().is_some_and(|fragment| {
-                fragment.packets > 0
-                    && metadata.keyframe
-                    && (fragment_target_reached(
+                fragment_rotation_due(
+                    fragment.packets,
+                    fragment_target_reached(
                         fragment,
                         metadata.dts.or(metadata.pts),
                         time_base,
                         spec.fragment_target,
-                    ) || fragment
-                        .payload_bytes
-                        .saturating_add(packet_bytes)
-                        .saturating_add(FRAGMENT_OVERHEAD_RESERVE)
-                        > spec.max_fragment_bytes)
+                    ),
+                    fragment.payload_bytes,
+                    packet_bytes,
+                    spec.max_fragment_bytes,
+                )
             });
             if should_rotate {
                 let Some(fragment) = active.take() else {
@@ -516,6 +516,21 @@ fn discard_fragment(fragment: Option<ActiveFragment>) {
         drop(fragment);
         let _ = std::fs::remove_file(path);
     }
+}
+
+fn fragment_rotation_due(
+    packets: u64,
+    target_reached: bool,
+    payload_bytes: u64,
+    packet_bytes: u64,
+    max_fragment_bytes: u64,
+) -> bool {
+    packets > 0
+        && (target_reached
+            || payload_bytes
+                .saturating_add(packet_bytes)
+                .saturating_add(FRAGMENT_OVERHEAD_RESERVE)
+                > max_fragment_bytes)
 }
 
 fn fragment_target_reached(
@@ -734,6 +749,26 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn live_rotation_is_target_driven_after_the_initial_keyframe() {
+        assert!(fragment_rotation_due(1, true, 1024, 512, 16 * 1024 * 1024));
+        assert!(!fragment_rotation_due(
+            1,
+            false,
+            1024,
+            512,
+            16 * 1024 * 1024
+        ));
+        assert!(!fragment_rotation_due(0, true, 0, 512, 16 * 1024 * 1024));
+        assert!(fragment_rotation_due(
+            1,
+            false,
+            15 * 1024 * 1024,
+            1024 * 1024,
+            16 * 1024 * 1024
+        ));
     }
 
     #[test]

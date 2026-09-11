@@ -487,6 +487,70 @@ fn fragmented_mp4_packet_copy_preserves_h264_aac_and_random_access_index() {
 }
 
 #[test]
+fn live_followup_fragment_can_start_with_a_dependent_h264_packet() {
+    let interrupt = InterruptHandle::new();
+    let mut input = MediaInput::open(&playback_fixture_source(), &interrupt).unwrap();
+    let video_index = input
+        .streams()
+        .into_iter()
+        .find(|stream| stream.media_type == MediaType::Video)
+        .unwrap()
+        .stream_index;
+    let output_dir = tempfile::tempdir().unwrap();
+
+    let first_path = output_dir.path().join("live-first.mp4");
+    let mut first = MatroskaMuxer::create_live_fragmented_mp4_with_selection(
+        &mut input,
+        &first_path,
+        &interrupt,
+        |stream| stream.stream_index == video_index,
+    )
+    .unwrap();
+    let mut first_packets = 0_usize;
+    while first_packets < 5 {
+        let packet = input.next_packet().unwrap().unwrap();
+        if packet.metadata().stream_index != video_index {
+            continue;
+        }
+        if first_packets == 0 {
+            assert!(packet.metadata().keyframe);
+        }
+        first.write_packet(&packet).unwrap();
+        first_packets += 1;
+    }
+    first.finalize().unwrap();
+
+    let followup_path = output_dir.path().join("live-followup.mp4");
+    let mut followup = MatroskaMuxer::create_live_fragmented_mp4_with_selection(
+        &mut input,
+        &followup_path,
+        &interrupt,
+        |stream| stream.stream_index == video_index,
+    )
+    .unwrap();
+    let mut followup_packets = 0_usize;
+    while followup_packets < 5 {
+        let packet = input.next_packet().unwrap().unwrap();
+        if packet.metadata().stream_index != video_index {
+            continue;
+        }
+        if followup_packets == 0 {
+            assert!(
+                !packet.metadata().keyframe,
+                "fixture must exercise a dependent-frame chunk boundary"
+            );
+        }
+        followup.write_packet(&packet).unwrap();
+        followup_packets += 1;
+    }
+    followup.finalize().unwrap();
+
+    let bytes = std::fs::read(&followup_path).unwrap();
+    assert!(bytes.windows(4).any(|window| window == b"moof"));
+    assert!(bytes.windows(4).any(|window| window == b"mdat"));
+}
+
+#[test]
 fn live_fragmented_mp4_packet_copy_is_probeable() {
     let interrupt = InterruptHandle::new();
     let mut input = MediaInput::open(&playback_fixture_source(), &interrupt).unwrap();

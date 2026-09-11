@@ -20,6 +20,9 @@ const MAX_LIVE_VIEWS = 4;
 const STATUS_POLL_MS = 1_000;
 const EVENT_STATUS_POLL_MS = 5_000;
 const KEEPALIVE_MS = 30_000;
+const MAX_LIVE_LATENCY_SECONDS = 2.5;
+const LIVE_EDGE_OFFSET_SECONDS = 0.75;
+const LIVE_BUFFER_HISTORY_SECONDS = 12;
 
 const ACTIVE_RECORDING_STATES = new Set<RecordingState>([
   "starting",
@@ -119,6 +122,8 @@ function LiveMedia({
     let sourceBuffer: SourceBuffer | null = null;
     let lastAppendedSequence = -1;
     let initializationAppended = false;
+    let nextMovieFragmentSequence = 1;
+    let nextTimestampOffset = 0;
 
     video.src = objectUrl;
 
@@ -131,11 +136,13 @@ function LiveMedia({
         cache: "no-store",
         signal: abort.signal,
       });
-      if (response.status === 404 || response.status === 410) return;
+      if (response.status === 404 || response.status === 410) {
+        throw new Error("live fragment expired before it could be appended");
+      }
       if (!response.ok) throw new Error(`live fragment failed: ${response.status}`);
       const bytes = new Uint8Array(await response.arrayBuffer());
       if (!bytes.length || disposed || abort.signal.aborted) return;
-      const mseParts = splitLiveMp4ForMse(bytes);
+      const mseParts = splitLiveMp4ForMse(bytes, nextMovieFragmentSequence);
       if (!mseParts) {
         throw new Error("live fragmented MP4 is not a valid MSE byte stream");
       }
@@ -146,7 +153,7 @@ function LiveMedia({
           throw new Error("live H.264 MediaSource type is unsupported");
         }
         sourceBuffer = mediaSource.addSourceBuffer(mime);
-        sourceBuffer.mode = "sequence";
+        sourceBuffer.mode = "segments";
       }
       if (!initializationAppended) {
         await waitForSourceBuffer(sourceBuffer);
@@ -155,14 +162,22 @@ function LiveMedia({
         initializationAppended = true;
       }
       await waitForSourceBuffer(sourceBuffer);
+      sourceBuffer.timestampOffset = nextTimestampOffset;
       sourceBuffer.appendBuffer(Uint8Array.from(mseParts.media).buffer);
       await waitForSourceBuffer(sourceBuffer);
+      nextMovieFragmentSequence += mseParts.movieFragmentCount;
       lastAppendedSequence = Math.max(lastAppendedSequence, sequence);
 
-      if (video.buffered.length > 0) {
-        const end = video.buffered.end(video.buffered.length - 1);
-        if (end - video.currentTime > 8) video.currentTime = Math.max(0, end - 3);
-        const removeBefore = Math.max(0, end - 20);
+      if (sourceBuffer.buffered.length > 0) {
+        const range = sourceBuffer.buffered.length - 1;
+        const start = sourceBuffer.buffered.start(range);
+        const end = sourceBuffer.buffered.end(range);
+        nextTimestampOffset = end;
+        const latency = end - video.currentTime;
+        if (video.currentTime < start || latency > MAX_LIVE_LATENCY_SECONDS) {
+          video.currentTime = Math.max(start, end - LIVE_EDGE_OFFSET_SECONDS);
+        }
+        const removeBefore = Math.max(0, video.currentTime - LIVE_BUFFER_HISTORY_SECONDS);
         if (removeBefore > 0 && !sourceBuffer.updating) {
           sourceBuffer.remove(0, removeBefore);
           await waitForSourceBuffer(sourceBuffer);
@@ -183,7 +198,13 @@ function LiveMedia({
           throw new Error("live manifest identity mismatch");
         }
         for (const sequence of manifest.fragments) {
-          if (!Number.isSafeInteger(sequence) || sequence < 0 || sequence <= lastAppendedSequence) continue;
+          if (!Number.isSafeInteger(sequence) || sequence < 0) {
+            throw new Error("live manifest contains an invalid fragment sequence");
+          }
+          if (sequence <= lastAppendedSequence) continue;
+          if (sequence !== lastAppendedSequence + 1) {
+            throw new Error("live fragment continuity was lost; a fresh session is required");
+          }
           await appendFragment(sequence);
         }
         if (!disposed) timer = window.setTimeout(() => void pump(), 500);
