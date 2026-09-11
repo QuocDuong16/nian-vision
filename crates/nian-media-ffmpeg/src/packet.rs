@@ -97,6 +97,19 @@ impl FfmpegPacket {
     pub(crate) fn as_raw(&self) -> *const sys::AVPacket {
         self.packet
     }
+
+    /// Test-only seam for reproducing RTSP cameras that omit one timestamp.
+    /// Production callers never mutate demuxed packets; normalization happens
+    /// on the muxer's private packet reference.
+    #[cfg(test)]
+    pub(crate) fn set_timestamps_for_test(&self, dts: Option<i64>, pts: Option<i64>) {
+        // SAFETY: tests own this packet exclusively for the duration of the
+        // mutation and only edit scalar timestamp fields.
+        unsafe {
+            (*self.packet).dts = dts.unwrap_or(sys::NIAN_AV_NOPTS_VALUE);
+            (*self.packet).pts = pts.unwrap_or(sys::NIAN_AV_NOPTS_VALUE);
+        }
+    }
 }
 
 impl Drop for FfmpegPacket {

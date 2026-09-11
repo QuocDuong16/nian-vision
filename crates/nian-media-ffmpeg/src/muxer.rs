@@ -53,6 +53,13 @@ use crate::input::MediaInput;
 use crate::interrupt::InterruptHandle;
 use crate::packet::FfmpegPacket;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimestampPolicy {
+    Preserve,
+    Repair,
+    RebaseAndRepair,
+}
+
 /// Translation table entry for one copied stream, ordered by output index.
 #[derive(Debug, Clone)]
 struct StreamMapping {
@@ -61,25 +68,40 @@ struct StreamMapping {
     input_stream_index: u32,
     /// Time base packets of the source stream arrive in.
     input_time_base: MediaRational,
-    /// First live-fragment timestamp after rescaling into the output time base.
-    /// `None` for ordinary recording/playback muxing.
+    /// First segment timestamp after rescaling into the output time base.
+    /// `None` when timestamp rebasing is disabled.
     timestamp_origin: Option<i64>,
-    /// Last normalized live DTS written for this output stream.
+    /// Last normalized segment DTS written for this output stream.
     last_dts: Option<i64>,
 }
 
-fn normalize_live_timestamp_pair(
+fn normalize_segment_timestamp_pair(
     mapping: &mut StreamMapping,
     dts: Option<i64>,
     pts: Option<i64>,
+    rebase: bool,
 ) -> (Option<i64>, Option<i64>) {
-    let anchor = dts.or(pts);
-    if mapping.timestamp_origin.is_none() {
-        mapping.timestamp_origin = anchor;
-    }
-    let origin = mapping.timestamp_origin.unwrap_or(0);
-    let mut dts = dts.map(|value| value.saturating_sub(origin));
+    let origin = if rebase {
+        let anchor = dts.or(pts);
+        if mapping.timestamp_origin.is_none() {
+            mapping.timestamp_origin = anchor;
+        }
+        mapping.timestamp_origin.unwrap_or(0)
+    } else {
+        0
+    };
     let mut pts = pts.map(|value| value.saturating_sub(origin));
+    let mut dts = dts.map(|value| value.saturating_sub(origin));
+
+    // RTSP cameras may expose only one timestamp. Segment muxers still need
+    // a complete decode/presentation timeline; forwarding AV_NOPTS_VALUE here
+    // makes otherwise healthy H.264 packet-copy streams fail at the muxer.
+    // When both timestamps exist their composition offset stays untouched.
+    match (dts, pts) {
+        (None, Some(value)) => dts = Some(value),
+        (Some(value), None) => pts = Some(value),
+        _ => {}
+    }
 
     if let Some(current_dts) = dts {
         if let Some(last_dts) = mapping.last_dts
@@ -107,7 +129,7 @@ pub struct MatroskaMuxer {
     interrupt: InterruptHandle,
     /// `output index -> mapping`; lookup by `input_stream_index`.
     stream_map: Vec<StreamMapping>,
-    normalize_live_timestamps: bool,
+    timestamp_policy: TimestampPolicy,
     output_path: PathBuf,
     finalized: bool,
 }
@@ -145,7 +167,32 @@ impl MatroskaMuxer {
             output_path,
             interrupt,
             false,
+            TimestampPolicy::Preserve,
+            selector,
+        )
+    }
+
+    /// Creates an independently playable Matroska recording segment and
+    /// normalizes RTSP-style timestamps without changing compressed payloads.
+    ///
+    /// Recorder rotation uses the input-side media clock. Recording output
+    /// therefore preserves the source epoch while repairing missing, duplicate,
+    /// or backwards DTS that would poison an otherwise healthy packet copy.
+    pub fn create_recording_segment_with_selection<F>(
+        input: &mut MediaInput,
+        output_path: &Path,
+        interrupt: &InterruptHandle,
+        selector: F,
+    ) -> Result<Self, MediaError>
+    where
+        F: FnMut(&nian_domain::MediaStreamInfo) -> bool,
+    {
+        Self::create_with_selection_for_format(
+            input,
+            output_path,
+            interrupt,
             false,
+            TimestampPolicy::Repair,
             selector,
         )
     }
@@ -161,7 +208,14 @@ impl MatroskaMuxer {
     where
         F: FnMut(&nian_domain::MediaStreamInfo) -> bool,
     {
-        Self::create_with_selection_for_format(input, output_path, interrupt, true, false, selector)
+        Self::create_with_selection_for_format(
+            input,
+            output_path,
+            interrupt,
+            true,
+            TimestampPolicy::Preserve,
+            selector,
+        )
     }
 
     /// Creates a fragmented MP4 for live RTSP and normalizes timestamps to a
@@ -180,7 +234,14 @@ impl MatroskaMuxer {
     where
         F: FnMut(&nian_domain::MediaStreamInfo) -> bool,
     {
-        Self::create_with_selection_for_format(input, output_path, interrupt, true, true, selector)
+        Self::create_with_selection_for_format(
+            input,
+            output_path,
+            interrupt,
+            true,
+            TimestampPolicy::RebaseAndRepair,
+            selector,
+        )
     }
 
     fn create_with_selection_for_format<F>(
@@ -188,7 +249,7 @@ impl MatroskaMuxer {
         output_path: &Path,
         interrupt: &InterruptHandle,
         fragmented_mp4: bool,
-        normalize_live_timestamps: bool,
+        timestamp_policy: TimestampPolicy,
         mut selector: F,
     ) -> Result<Self, MediaError>
     where
@@ -391,7 +452,7 @@ impl MatroskaMuxer {
             scratch,
             interrupt: interrupt.clone(),
             stream_map,
-            normalize_live_timestamps,
+            timestamp_policy,
             output_path: output_path.to_path_buf(),
             finalized: false,
         })
@@ -486,7 +547,7 @@ impl MatroskaMuxer {
             sys::av_packet_rescale_ts(self.scratch, input_time_base, out_time_base);
         }
 
-        if self.normalize_live_timestamps {
+        if self.timestamp_policy != TimestampPolicy::Preserve {
             let mapping = &mut self.stream_map[output_index];
             // SAFETY: scratch is our private packet reference. Timestamp edits
             // happen only after rescaling and never mutate the caller packet.
@@ -495,7 +556,12 @@ impl MatroskaMuxer {
                     .then_some((*self.scratch).dts);
                 let pts = ((*self.scratch).pts != sys::NIAN_AV_NOPTS_VALUE)
                     .then_some((*self.scratch).pts);
-                let (dts, pts) = normalize_live_timestamp_pair(mapping, dts, pts);
+                let (dts, pts) = normalize_segment_timestamp_pair(
+                    mapping,
+                    dts,
+                    pts,
+                    self.timestamp_policy == TimestampPolicy::RebaseAndRepair,
+                );
                 (*self.scratch).dts = dts.unwrap_or(sys::NIAN_AV_NOPTS_VALUE);
                 (*self.scratch).pts = pts.unwrap_or(sys::NIAN_AV_NOPTS_VALUE);
             }
@@ -625,11 +691,11 @@ mod tests {
     fn live_timestamp_normalization_rebases_large_epoch_and_preserves_composition_offset() {
         let mut mapping = mapping();
         assert_eq!(
-            normalize_live_timestamp_pair(&mut mapping, Some(9_000_000), Some(9_003_000)),
+            normalize_segment_timestamp_pair(&mut mapping, Some(9_000_000), Some(9_003_000), true),
             (Some(0), Some(3_000))
         );
         assert_eq!(
-            normalize_live_timestamp_pair(&mut mapping, Some(9_006_000), Some(9_009_000)),
+            normalize_segment_timestamp_pair(&mut mapping, Some(9_006_000), Some(9_009_000), true),
             (Some(6_000), Some(9_000))
         );
     }
@@ -638,29 +704,132 @@ mod tests {
     fn live_timestamp_normalization_repairs_duplicate_and_backwards_dts_without_losing_pts_delta() {
         let mut mapping = mapping();
         assert_eq!(
-            normalize_live_timestamp_pair(&mut mapping, Some(100), Some(104)),
+            normalize_segment_timestamp_pair(&mut mapping, Some(100), Some(104), true),
             (Some(0), Some(4))
         );
         assert_eq!(
-            normalize_live_timestamp_pair(&mut mapping, Some(100), Some(104)),
+            normalize_segment_timestamp_pair(&mut mapping, Some(100), Some(104), true),
             (Some(1), Some(5))
         );
         assert_eq!(
-            normalize_live_timestamp_pair(&mut mapping, Some(99), Some(103)),
+            normalize_segment_timestamp_pair(&mut mapping, Some(99), Some(103), true),
             (Some(2), Some(6))
         );
     }
 
     #[test]
-    fn live_timestamp_normalization_keeps_missing_dts_missing() {
+    fn segment_timestamp_normalization_synthesizes_missing_timestamp_and_keeps_dts_monotonic() {
         let mut mapping = mapping();
         assert_eq!(
-            normalize_live_timestamp_pair(&mut mapping, None, Some(50_000)),
-            (None, Some(0))
+            normalize_segment_timestamp_pair(&mut mapping, None, Some(50_000), true),
+            (Some(0), Some(0))
         );
         assert_eq!(
-            normalize_live_timestamp_pair(&mut mapping, None, Some(53_000)),
-            (None, Some(3_000))
+            normalize_segment_timestamp_pair(&mut mapping, None, Some(53_000), true),
+            (Some(3_000), Some(3_000))
         );
+        assert_eq!(
+            normalize_segment_timestamp_pair(&mut mapping, Some(54_000), None, true),
+            (Some(4_000), Some(4_000))
+        );
+    }
+
+    #[test]
+    fn recording_timestamp_repair_preserves_epoch_while_repairing_missing_and_backwards_dts() {
+        let mut mapping = mapping();
+        assert_eq!(
+            normalize_segment_timestamp_pair(&mut mapping, None, Some(50_000), false),
+            (Some(50_000), Some(50_000))
+        );
+        assert_eq!(
+            normalize_segment_timestamp_pair(&mut mapping, Some(49_000), Some(49_004), false),
+            (Some(50_001), Some(50_005))
+        );
+    }
+
+    fn h264_fixture_input(interrupt: &InterruptHandle) -> MediaInput {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("playback_h264.mkv");
+        MediaInput::open(&nian_media::MediaSource::file(path), interrupt).unwrap()
+    }
+
+    fn copy_video_with_missing_dts(
+        input: &mut MediaInput,
+        muxer: &mut MatroskaMuxer,
+        video_index: u32,
+    ) -> usize {
+        let mut written = 0_usize;
+        while let Some(packet) = input.next_packet().unwrap() {
+            if packet.metadata().stream_index != video_index {
+                continue;
+            }
+            let pts = packet.metadata().pts.expect("fixture video packet has pts");
+            packet.set_timestamps_for_test(None, Some(pts));
+            muxer.write_packet(&packet).unwrap();
+            written += 1;
+        }
+        written
+    }
+
+    #[test]
+    fn live_fragmented_mp4_accepts_video_packets_with_missing_dts() {
+        use nian_media::Probe as _;
+
+        let interrupt = InterruptHandle::new();
+        let mut input = h264_fixture_input(&interrupt);
+        let video_index = input
+            .streams()
+            .into_iter()
+            .find(|stream| stream.media_type == nian_domain::MediaType::Video)
+            .unwrap()
+            .stream_index;
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("missing-dts-live.mp4");
+        let mut muxer = MatroskaMuxer::create_live_fragmented_mp4_with_selection(
+            &mut input,
+            &output,
+            &interrupt,
+            |stream| stream.stream_index == video_index,
+        )
+        .unwrap();
+        assert!(copy_video_with_missing_dts(&mut input, &mut muxer, video_index) > 20);
+        muxer.finalize().unwrap();
+        let report = crate::backend::FfmpegBackend::new()
+            .unwrap()
+            .probe(&nian_media::MediaSource::file(&output))
+            .unwrap();
+        assert_eq!(report.video_stream().unwrap().codec_name, "h264");
+    }
+
+    #[test]
+    fn recording_segment_accepts_video_packets_with_missing_dts() {
+        use nian_media::Probe as _;
+
+        let interrupt = InterruptHandle::new();
+        let mut input = h264_fixture_input(&interrupt);
+        let video_index = input
+            .streams()
+            .into_iter()
+            .find(|stream| stream.media_type == nian_domain::MediaType::Video)
+            .unwrap()
+            .stream_index;
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("missing-dts-recording.mkv");
+        let mut muxer = MatroskaMuxer::create_recording_segment_with_selection(
+            &mut input,
+            &output,
+            &interrupt,
+            |stream| stream.stream_index == video_index,
+        )
+        .unwrap();
+        assert!(copy_video_with_missing_dts(&mut input, &mut muxer, video_index) > 20);
+        muxer.finalize().unwrap();
+        let report = crate::backend::FfmpegBackend::new()
+            .unwrap()
+            .probe(&nian_media::MediaSource::file(&output))
+            .unwrap();
+        assert_eq!(report.video_stream().unwrap().codec_name, "h264");
     }
 }

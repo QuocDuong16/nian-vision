@@ -73,6 +73,9 @@ export type LiveFailureCategory =
   | "media_read_failed"
   | "media_fragment_create_failed"
   | "media_fragment_write_failed"
+  | "media_packet_too_large"
+  | "media_fragment_limit_exceeded"
+  | "media_mux_write_failed"
   | "media_fragment_finalize_failed"
   | "media_fragment_capacity_failed"
   | "lifecycle_cancelled";

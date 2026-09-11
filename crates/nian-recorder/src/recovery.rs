@@ -1352,31 +1352,35 @@ fn salvage_media(
     };
     #[cfg(not(any(test, feature = "test-hooks")))]
     let muxer_target = scratch.clone();
-    let mut muxer =
-        match MatroskaMuxer::create_with_selection(&mut input, &muxer_target, interrupt, |info| {
+    let mut muxer = match MatroskaMuxer::create_recording_segment_with_selection(
+        &mut input,
+        &muxer_target,
+        interrupt,
+        |info| {
             selection
                 .iter()
                 .any(|s| s.stream_index == info.stream_index)
-        }) {
-            Ok(muxer) => muxer,
-            Err(error) => {
-                // Output-side failure on THIS attempt's own scratch (final
-                // safety remediation §5): never evidence about the
-                // original's content — a typed ARTIFACT failure. Only this
-                // attempt's scratch is removed; nothing publishes; the
-                // original stays untouched.
-                let _ = std::fs::remove_file(&scratch);
-                return Err(RecoveryError::Artifact {
-                    operation: "open the recovery output",
-                    source: StorageError::Io {
-                        path: scratch,
-                        source: std::io::Error::other(format!(
-                            "salvage output could not be opened: {error}"
-                        )),
-                    },
-                });
-            }
-        };
+        },
+    ) {
+        Ok(muxer) => muxer,
+        Err(error) => {
+            // Output-side failure on THIS attempt's own scratch (final
+            // safety remediation §5): never evidence about the
+            // original's content — a typed ARTIFACT failure. Only this
+            // attempt's scratch is removed; nothing publishes; the
+            // original stays untouched.
+            let _ = std::fs::remove_file(&scratch);
+            return Err(RecoveryError::Artifact {
+                operation: "open the recovery output",
+                source: StorageError::Io {
+                    path: scratch,
+                    source: std::io::Error::other(format!(
+                        "salvage output could not be opened: {error}"
+                    )),
+                },
+            });
+        }
+    };
 
     // ---- 6. Copy loop with POISON-on-write-failure + stop gates ------------
     let mut aligned = false;

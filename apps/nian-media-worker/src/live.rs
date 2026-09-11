@@ -336,7 +336,7 @@ fn run_live(
 
             let packet_bytes = packet.data().len() as u64;
             if packet_bytes > MAX_PACKET_BYTES {
-                retry_failure = "media_fragment_write_failed";
+                retry_failure = "media_packet_too_large";
                 break;
             }
             let should_rotate = active.as_ref().is_some_and(|fragment| {
@@ -400,11 +400,11 @@ fn run_live(
                 .saturating_add(FRAGMENT_OVERHEAD_RESERVE)
                 > spec.max_fragment_bytes
             {
-                retry_failure = "media_fragment_write_failed";
+                retry_failure = "media_fragment_limit_exceeded";
                 break;
             }
             if fragment.muxer.write_packet(&packet).is_err() {
-                retry_failure = "media_fragment_write_failed";
+                retry_failure = "media_mux_write_failed";
                 break;
             }
             fragment.payload_bytes = fragment.payload_bytes.saturating_add(packet_bytes);
@@ -413,7 +413,7 @@ fn run_live(
                 .map(|metadata| metadata.len() > spec.max_fragment_bytes)
                 .unwrap_or(false)
             {
-                retry_failure = "media_fragment_write_failed";
+                retry_failure = "media_fragment_limit_exceeded";
                 break;
             }
         }

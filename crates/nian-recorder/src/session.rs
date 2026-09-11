@@ -733,7 +733,7 @@ impl RecordingSession {
             .claim_segment(&self.config.camera, started_wall)?;
 
         let selection = self.plan.selection.clone();
-        let opened = MatroskaMuxer::create_with_selection(
+        let opened = MatroskaMuxer::create_recording_segment_with_selection(
             &mut self.input,
             claim.partial_path(),
             &self.interrupt,
