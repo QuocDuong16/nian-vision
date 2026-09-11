@@ -275,7 +275,7 @@ fn run_live(
         set_status(&status, "live", None, attempt);
 
         let mut active: Option<ActiveFragment> = None;
-        let mut retry_failure = "media_failed";
+        let mut retry_failure = "media_read_failed";
         loop {
             if stop.load(Ordering::Acquire) {
                 interrupt.cancel();
@@ -294,7 +294,7 @@ fn run_live(
                     return;
                 }
                 Err(_) => {
-                    retry_failure = "media_failed";
+                    retry_failure = "media_read_failed";
                     break;
                 }
             };
@@ -314,7 +314,7 @@ fn run_live(
                         return;
                     }
                     Err(()) => {
-                        retry_failure = "media_failed";
+                        retry_failure = "media_fragment_capacity_failed";
                         break;
                     }
                 }
@@ -328,7 +328,7 @@ fn run_live(
                 ) {
                     Ok(fragment) => active = Some(fragment),
                     Err(_) => {
-                        retry_failure = "media_failed";
+                        retry_failure = "media_fragment_create_failed";
                         break;
                     }
                 }
@@ -336,7 +336,7 @@ fn run_live(
 
             let packet_bytes = packet.data().len() as u64;
             if packet_bytes > MAX_PACKET_BYTES {
-                retry_failure = "media_failed";
+                retry_failure = "media_fragment_write_failed";
                 break;
             }
             let should_rotate = active.as_ref().is_some_and(|fragment| {
@@ -355,11 +355,11 @@ fn run_live(
             });
             if should_rotate {
                 let Some(fragment) = active.take() else {
-                    retry_failure = "media_failed";
+                    retry_failure = "media_fragment_finalize_failed";
                     break;
                 };
                 if finish_fragment(fragment, spec.max_fragment_bytes).is_err() {
-                    retry_failure = "media_failed";
+                    retry_failure = "media_fragment_finalize_failed";
                     break;
                 }
                 next_fragment = next_fragment.saturating_add(1);
@@ -371,7 +371,7 @@ fn run_live(
                         return;
                     }
                     Err(()) => {
-                        retry_failure = "media_failed";
+                        retry_failure = "media_fragment_capacity_failed";
                         break;
                     }
                 }
@@ -385,7 +385,7 @@ fn run_live(
                 ) {
                     Ok(fragment) => active = Some(fragment),
                     Err(_) => {
-                        retry_failure = "media_failed";
+                        retry_failure = "media_fragment_create_failed";
                         break;
                     }
                 }
@@ -400,11 +400,11 @@ fn run_live(
                 .saturating_add(FRAGMENT_OVERHEAD_RESERVE)
                 > spec.max_fragment_bytes
             {
-                retry_failure = "media_failed";
+                retry_failure = "media_fragment_write_failed";
                 break;
             }
             if fragment.muxer.write_packet(&packet).is_err() {
-                retry_failure = "media_failed";
+                retry_failure = "media_fragment_write_failed";
                 break;
             }
             fragment.payload_bytes = fragment.payload_bytes.saturating_add(packet_bytes);
@@ -413,7 +413,7 @@ fn run_live(
                 .map(|metadata| metadata.len() > spec.max_fragment_bytes)
                 .unwrap_or(false)
             {
-                retry_failure = "media_failed";
+                retry_failure = "media_fragment_write_failed";
                 break;
             }
         }
@@ -426,7 +426,7 @@ fn run_live(
             {
                 next_fragment = next_fragment.saturating_add(1);
             } else {
-                retry_failure = "media_failed";
+                retry_failure = "media_fragment_finalize_failed";
             }
         }
         clear_interrupt(&current_interrupt);
@@ -460,7 +460,7 @@ fn create_fragment(
         .open(&partial_path)
         .map_err(|_| ())?;
     drop(claim);
-    let muxer = MatroskaMuxer::create_fragmented_mp4_with_selection(
+    let muxer = MatroskaMuxer::create_live_fragmented_mp4_with_selection(
         input,
         &partial_path,
         interrupt,

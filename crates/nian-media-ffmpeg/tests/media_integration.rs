@@ -485,3 +485,42 @@ fn fragmented_mp4_packet_copy_preserves_h264_aac_and_random_access_index() {
     let duration = report.duration.unwrap();
     assert!(Duration::from_millis(3_500) <= duration && duration <= Duration::from_millis(4_500));
 }
+
+#[test]
+fn live_fragmented_mp4_packet_copy_is_probeable() {
+    let interrupt = InterruptHandle::new();
+    let mut input = MediaInput::open(&playback_fixture_source(), &interrupt).unwrap();
+    let video_index = input
+        .streams()
+        .into_iter()
+        .find(|stream| stream.media_type == MediaType::Video)
+        .unwrap()
+        .stream_index;
+    let output_dir = tempfile::tempdir().unwrap();
+    let output_path = output_dir.path().join("live-fragment.mp4");
+    let mut muxer = MatroskaMuxer::create_live_fragmented_mp4_with_selection(
+        &mut input,
+        &output_path,
+        &interrupt,
+        |stream| stream.stream_index == video_index,
+    )
+    .unwrap();
+
+    let mut fed = 0_usize;
+    while let Some(packet) = input.next_packet().unwrap() {
+        if packet.metadata().stream_index != video_index {
+            continue;
+        }
+        muxer.write_packet(&packet).unwrap();
+        fed += 1;
+    }
+    assert!(fed > 20);
+    muxer.finalize().unwrap();
+
+    let report = FfmpegBackend::new()
+        .unwrap()
+        .probe(&MediaSource::file(&output_path))
+        .unwrap();
+    assert!(report.format_name.contains("mp4"));
+    assert_eq!(report.video_stream().unwrap().codec_name, "h264");
+}

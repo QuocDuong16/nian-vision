@@ -61,6 +61,38 @@ struct StreamMapping {
     input_stream_index: u32,
     /// Time base packets of the source stream arrive in.
     input_time_base: MediaRational,
+    /// First live-fragment timestamp after rescaling into the output time base.
+    /// `None` for ordinary recording/playback muxing.
+    timestamp_origin: Option<i64>,
+    /// Last normalized live DTS written for this output stream.
+    last_dts: Option<i64>,
+}
+
+fn normalize_live_timestamp_pair(
+    mapping: &mut StreamMapping,
+    dts: Option<i64>,
+    pts: Option<i64>,
+) -> (Option<i64>, Option<i64>) {
+    let anchor = dts.or(pts);
+    if mapping.timestamp_origin.is_none() {
+        mapping.timestamp_origin = anchor;
+    }
+    let origin = mapping.timestamp_origin.unwrap_or(0);
+    let mut dts = dts.map(|value| value.saturating_sub(origin));
+    let mut pts = pts.map(|value| value.saturating_sub(origin));
+
+    if let Some(current_dts) = dts {
+        if let Some(last_dts) = mapping.last_dts
+            && current_dts <= last_dts
+        {
+            let shift = last_dts.saturating_add(1).saturating_sub(current_dts);
+            dts = Some(current_dts.saturating_add(shift));
+            pts = pts.map(|value| value.saturating_add(shift));
+        }
+        mapping.last_dts = dts;
+    }
+
+    (dts, pts)
 }
 
 /// Writes a Matroska file by copying packets from an open [`MediaInput`].
@@ -75,6 +107,7 @@ pub struct MatroskaMuxer {
     interrupt: InterruptHandle,
     /// `output index -> mapping`; lookup by `input_stream_index`.
     stream_map: Vec<StreamMapping>,
+    normalize_live_timestamps: bool,
     output_path: PathBuf,
     finalized: bool,
 }
@@ -107,7 +140,14 @@ impl MatroskaMuxer {
     where
         F: FnMut(&nian_domain::MediaStreamInfo) -> bool,
     {
-        Self::create_with_selection_for_format(input, output_path, interrupt, false, selector)
+        Self::create_with_selection_for_format(
+            input,
+            output_path,
+            interrupt,
+            false,
+            false,
+            selector,
+        )
     }
 
     /// Creates a fragmented MP4 suitable for HTML `<video>` playback while
@@ -121,7 +161,26 @@ impl MatroskaMuxer {
     where
         F: FnMut(&nian_domain::MediaStreamInfo) -> bool,
     {
-        Self::create_with_selection_for_format(input, output_path, interrupt, true, selector)
+        Self::create_with_selection_for_format(input, output_path, interrupt, true, false, selector)
+    }
+
+    /// Creates a fragmented MP4 for live RTSP and normalizes timestamps to a
+    /// zero-based, strictly increasing DTS timeline without changing payloads.
+    ///
+    /// Some cameras expose RTP-derived epochs, duplicate DTS values, or small
+    /// backwards DTS steps that Matroska accepts but MP4 rejects. Every live
+    /// fragment is independent, so rebasing each fragment is safe and keeps
+    /// the browser-facing timeline bounded while preserving PTS-DTS offsets.
+    pub fn create_live_fragmented_mp4_with_selection<F>(
+        input: &mut MediaInput,
+        output_path: &Path,
+        interrupt: &InterruptHandle,
+        selector: F,
+    ) -> Result<Self, MediaError>
+    where
+        F: FnMut(&nian_domain::MediaStreamInfo) -> bool,
+    {
+        Self::create_with_selection_for_format(input, output_path, interrupt, true, true, selector)
     }
 
     fn create_with_selection_for_format<F>(
@@ -129,6 +188,7 @@ impl MatroskaMuxer {
         output_path: &Path,
         interrupt: &InterruptHandle,
         fragmented_mp4: bool,
+        normalize_live_timestamps: bool,
         mut selector: F,
     ) -> Result<Self, MediaError>
     where
@@ -165,6 +225,8 @@ impl MatroskaMuxer {
             stream_map.push(StreamMapping {
                 input_stream_index: info.stream_index,
                 input_time_base: time_base,
+                timestamp_origin: None,
+                last_dts: None,
             });
         }
 
@@ -329,6 +391,7 @@ impl MatroskaMuxer {
             scratch,
             interrupt: interrupt.clone(),
             stream_map,
+            normalize_live_timestamps,
             output_path: output_path.to_path_buf(),
             finalized: false,
         })
@@ -421,6 +484,21 @@ impl MatroskaMuxer {
         unsafe {
             (*self.scratch).stream_index = output_index as c_int;
             sys::av_packet_rescale_ts(self.scratch, input_time_base, out_time_base);
+        }
+
+        if self.normalize_live_timestamps {
+            let mapping = &mut self.stream_map[output_index];
+            // SAFETY: scratch is our private packet reference. Timestamp edits
+            // happen only after rescaling and never mutate the caller packet.
+            unsafe {
+                let dts = ((*self.scratch).dts != sys::NIAN_AV_NOPTS_VALUE)
+                    .then_some((*self.scratch).dts);
+                let pts = ((*self.scratch).pts != sys::NIAN_AV_NOPTS_VALUE)
+                    .then_some((*self.scratch).pts);
+                let (dts, pts) = normalize_live_timestamp_pair(mapping, dts, pts);
+                (*self.scratch).dts = dts.unwrap_or(sys::NIAN_AV_NOPTS_VALUE);
+                (*self.scratch).pts = pts.unwrap_or(sys::NIAN_AV_NOPTS_VALUE);
+            }
         }
 
         // SAFETY: context + scratch are valid. The call consumes the scratch
@@ -527,5 +605,62 @@ impl std::fmt::Debug for MatroskaMuxer {
             .field("streams", &self.mapped_input_stream_indices())
             .field("finalized", &self.finalized)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mapping() -> StreamMapping {
+        StreamMapping {
+            input_stream_index: 0,
+            input_time_base: MediaRational::new(1, 90_000).unwrap(),
+            timestamp_origin: None,
+            last_dts: None,
+        }
+    }
+
+    #[test]
+    fn live_timestamp_normalization_rebases_large_epoch_and_preserves_composition_offset() {
+        let mut mapping = mapping();
+        assert_eq!(
+            normalize_live_timestamp_pair(&mut mapping, Some(9_000_000), Some(9_003_000)),
+            (Some(0), Some(3_000))
+        );
+        assert_eq!(
+            normalize_live_timestamp_pair(&mut mapping, Some(9_006_000), Some(9_009_000)),
+            (Some(6_000), Some(9_000))
+        );
+    }
+
+    #[test]
+    fn live_timestamp_normalization_repairs_duplicate_and_backwards_dts_without_losing_pts_delta() {
+        let mut mapping = mapping();
+        assert_eq!(
+            normalize_live_timestamp_pair(&mut mapping, Some(100), Some(104)),
+            (Some(0), Some(4))
+        );
+        assert_eq!(
+            normalize_live_timestamp_pair(&mut mapping, Some(100), Some(104)),
+            (Some(1), Some(5))
+        );
+        assert_eq!(
+            normalize_live_timestamp_pair(&mut mapping, Some(99), Some(103)),
+            (Some(2), Some(6))
+        );
+    }
+
+    #[test]
+    fn live_timestamp_normalization_keeps_missing_dts_missing() {
+        let mut mapping = mapping();
+        assert_eq!(
+            normalize_live_timestamp_pair(&mut mapping, None, Some(50_000)),
+            (None, Some(0))
+        );
+        assert_eq!(
+            normalize_live_timestamp_pair(&mut mapping, None, Some(53_000)),
+            (None, Some(3_000))
+        );
     }
 }

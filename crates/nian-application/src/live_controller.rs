@@ -55,6 +55,11 @@ pub enum LiveFailureCategory {
     UnsupportedCodec,
     WorkerUnavailable,
     MediaFailed,
+    MediaReadFailed,
+    MediaFragmentCreateFailed,
+    MediaFragmentWriteFailed,
+    MediaFragmentFinalizeFailed,
+    MediaFragmentCapacityFailed,
     LifecycleCancelled,
 }
 

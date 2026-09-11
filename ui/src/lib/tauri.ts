@@ -70,6 +70,11 @@ export type LiveFailureCategory =
   | "unsupported_codec"
   | "worker_unavailable"
   | "media_failed"
+  | "media_read_failed"
+  | "media_fragment_create_failed"
+  | "media_fragment_write_failed"
+  | "media_fragment_finalize_failed"
+  | "media_fragment_capacity_failed"
   | "lifecycle_cancelled";
 
 export interface LiveOpenDto {
