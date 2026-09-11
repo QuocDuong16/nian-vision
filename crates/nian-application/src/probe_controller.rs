@@ -27,6 +27,10 @@ pub struct ProbeResult {
 pub enum ProbeError {
     #[error("another camera probe is already running")]
     Busy,
+    #[error("media worker could not be started")]
+    WorkerStartFailed,
+    #[error("media worker startup handshake failed")]
+    WorkerHandshakeFailed,
     #[error("media worker is unavailable")]
     WorkerUnavailable,
     #[error("camera source could not be opened")]
@@ -283,15 +287,16 @@ fn run_worker_probe_with<S: ProbeSetup>(
     cancel: Arc<AtomicBool>,
     setup: &S,
 ) -> Result<ProbeResult, ProbeError> {
-    let child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .arg("run")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| ProbeError::WorkerUnavailable)?;
-    let child = crate::worker_process::contain_spawned_worker(child)
-        .map_err(|_| ProbeError::WorkerUnavailable)?;
+        .stderr(Stdio::null());
+    let child = crate::worker_process::spawn_worker(&mut command).map_err(|error| {
+        tracing::warn!(error = %error, "media worker process could not be started for camera probe");
+        ProbeError::WorkerStartFailed
+    })?;
     // From this point onward the guard is authoritative for bounded child
     // cleanup/reap on every return path, including setup/send failures.
     let mut worker = ProbeChildGuard::new(child, setup);
@@ -304,7 +309,20 @@ fn run_worker_probe_with<S: ProbeSetup>(
 
     let hello_deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match recv_with_cancel(&rx, hello_deadline, &cancel, ProbeError::WorkerUnavailable)? {
+        let message = recv_with_cancel(
+            &rx,
+            hello_deadline,
+            &cancel,
+            ProbeError::WorkerHandshakeFailed,
+        )
+        .map_err(|error| {
+            if error == ProbeError::WorkerUnavailable {
+                ProbeError::WorkerHandshakeFailed
+            } else {
+                error
+            }
+        })?;
+        match message {
             ReaderMessage::Frame(Envelope::Event { v, name, data }) if name == event::HELLO => {
                 if v != PROTOCOL_VERSION || nian_ipc::validate_worker_hello(&data).is_err() {
                     return Err(ProbeError::Protocol);
@@ -313,7 +331,11 @@ fn run_worker_probe_with<S: ProbeSetup>(
             }
             ReaderMessage::Frame(_) => {}
             ReaderMessage::Eof | ReaderMessage::Error => {
-                return Err(ProbeError::WorkerUnavailable);
+                tracing::warn!(
+                    status = ?worker.child.try_wait().ok().flatten(),
+                    "media worker exited before camera probe startup handshake completed"
+                );
+                return Err(ProbeError::WorkerHandshakeFailed);
             }
         }
     }
@@ -598,6 +620,72 @@ mod tests {
                 &setup
             ),
             Err(ProbeError::WorkerUnavailable)
+        );
+        assert_eq!(reaped.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_worker_probes_spawn_handshake_and_reap_cleanly() {
+        let _process_guard = PROCESS_TEST_LOCK.lock().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe-success-worker.sh");
+        let response = r#"{"type":"response","v":1,"id":1,"ok":true,"result":{"reachable":true,"video_stream_found":true,"codec":"h264","width":1920,"height":1080,"audio_stream_count":1}}"#;
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' '{HELLO_OK}'\nIFS= read -r _request\nprintf '%s\\n' '{response}'\ncat >/dev/null\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let program = path.to_string_lossy().into_owned();
+        let reaped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let setup = TestSetup {
+            fail_reader: false,
+            fail_send: false,
+            reaped: Arc::clone(&reaped),
+        };
+
+        for _ in 0..2 {
+            let result = run_worker_probe_with(
+                &program,
+                request(),
+                Arc::new(AtomicBool::new(false)),
+                &setup,
+            )
+            .unwrap();
+            assert!(result.reachable);
+            assert_eq!(result.codec.as_deref(), Some("h264"));
+        }
+        assert_eq!(reaped.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_exit_before_hello_is_reported_as_handshake_failure() {
+        let _process_guard = PROCESS_TEST_LOCK.lock().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe-exit-worker.sh");
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let program = path.to_string_lossy().into_owned();
+        let reaped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let setup = TestSetup {
+            fail_reader: false,
+            fail_send: false,
+            reaped: Arc::clone(&reaped),
+        };
+
+        assert_eq!(
+            run_worker_probe_with(
+                &program,
+                request(),
+                Arc::new(AtomicBool::new(false)),
+                &setup,
+            ),
+            Err(ProbeError::WorkerHandshakeFailed)
         );
         assert_eq!(reaped.load(std::sync::atomic::Ordering::SeqCst), 1);
     }

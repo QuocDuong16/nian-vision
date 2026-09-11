@@ -4,7 +4,7 @@
 //! prohibition. All Win32 pointers, callback lifetime handling, job-object
 //! ownership, and FFI calls stay here; callers receive only safe Rust APIs.
 
-use std::process::Child;
+use std::process::{Child, Command};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerEvent {
@@ -25,6 +25,7 @@ mod imp {
     use std::ffi::c_void;
     use std::io;
     use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::OnceLock;
 
@@ -38,7 +39,7 @@ mod imp {
         DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS, HPOWERNOTIFY, PowerRegisterSuspendResumeNotification,
         PowerUnregisterSuspendResumeNotification,
     };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, GetCurrentProcess};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DEVICE_NOTIFY_CALLBACK, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
     };
@@ -114,6 +115,12 @@ mod imp {
             .as_ref()
             .map(|_| ())
             .map_err(|code| io::Error::from_raw_os_error(*code))
+    }
+
+    pub fn configure_worker_command(command: &mut std::process::Command) {
+        // Media workers are background sidecars. Never create a visible console
+        // window when the GUI host launches them on Windows.
+        command.creation_flags(CREATE_NO_WINDOW);
     }
 
     pub fn contain_worker(child: &std::process::Child) -> io::Result<()> {
@@ -255,6 +262,8 @@ mod imp {
         Ok(())
     }
 
+    pub fn configure_worker_command(_command: &mut std::process::Command) {}
+
     pub fn contain_worker(_child: &std::process::Child) -> io::Result<()> {
         Ok(())
     }
@@ -274,6 +283,12 @@ where
 /// This is a no-op on non-Windows targets.
 pub fn initialize_worker_process_containment() -> std::io::Result<()> {
     imp::initialize_worker_containment()
+}
+
+/// Configures a media-worker child process for background execution. On Windows
+/// this suppresses the transient console window; other platforms are unchanged.
+pub fn configure_worker_command(command: &mut Command) {
+    imp::configure_worker_command(command);
 }
 
 /// Assigns a media-worker child to a process-wide Windows Job Object whose

@@ -1,15 +1,17 @@
-//! Media-worker process containment shared by recording, probe, and playback.
+//! Media-worker process spawning shared by recording, probe, live, and playback.
 
-use std::process::Child;
+use std::process::{Child, Command};
 
-/// Applies the platform hard-termination containment contract immediately
-/// after spawn. Failure is fail-closed: an uncontained worker is killed and
-/// reaped before the error is returned to its caller.
-pub(crate) fn contain_spawned_worker(mut child: Child) -> std::io::Result<Child> {
-    if let Err(error) = nian_platform_windows::contain_worker_process(&child) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
-    Ok(child)
+/// Initializes the process-wide containment boundary before spawn, applies
+/// platform background-process flags, and then creates the worker.
+///
+/// On Windows the desktop process joins the kill-on-close Job Object first, so
+/// ordinary children inherit containment atomically. There is deliberately no
+/// post-spawn AssignProcessToJobObject call: that second assignment was
+/// redundant and introduced a machine-dependent failure point after a healthy
+/// worker had already started.
+pub(crate) fn spawn_worker(command: &mut Command) -> std::io::Result<Child> {
+    nian_platform_windows::initialize_worker_process_containment()?;
+    nian_platform_windows::configure_worker_command(command);
+    command.spawn()
 }

@@ -51,6 +51,7 @@ pub enum PlaybackErrorCode {
     MediaUnreadable,
     PlaybackSessionExpired,
     PlaybackBusy,
+    StorageUnavailable,
     WorkerUnavailable,
     LifecycleBlocked,
     Internal,
@@ -76,6 +77,8 @@ pub enum PlaybackError {
     PlaybackSessionExpired,
     #[error("too many playback sessions are active")]
     PlaybackBusy,
+    #[error("recording storage is not configured or unavailable")]
+    StorageUnavailable,
     #[error("media worker is unavailable")]
     WorkerUnavailable,
     #[error("playback admission is blocked by desktop lifecycle")]
@@ -96,6 +99,7 @@ impl PlaybackError {
             Self::MediaUnreadable => PlaybackErrorCode::MediaUnreadable,
             Self::PlaybackSessionExpired => PlaybackErrorCode::PlaybackSessionExpired,
             Self::PlaybackBusy => PlaybackErrorCode::PlaybackBusy,
+            Self::StorageUnavailable => PlaybackErrorCode::StorageUnavailable,
             Self::WorkerUnavailable => PlaybackErrorCode::WorkerUnavailable,
             Self::LifecycleBlocked => PlaybackErrorCode::LifecycleBlocked,
             Self::Internal => PlaybackErrorCode::Internal,
@@ -424,15 +428,18 @@ impl PlaybackController {
         let Some(storage_root) = storage_root else {
             return Ok(PreparedPlaybackStorage { storage: None });
         };
-        let layout = RecordingsLayout::new(storage_root).map_err(|_| PlaybackError::Internal)?;
+        let layout =
+            RecordingsLayout::new(storage_root).map_err(|_| PlaybackError::StorageUnavailable)?;
         let mut storage = StorageManager::open_with_playback_pins(
             layout,
             retention_policy,
             storage_quota,
             self.pins.clone(),
         )
-        .map_err(|_| PlaybackError::Internal)?;
-        storage.reconcile().map_err(|_| PlaybackError::Internal)?;
+        .map_err(|_| PlaybackError::StorageUnavailable)?;
+        storage
+            .reconcile()
+            .map_err(|_| PlaybackError::StorageUnavailable)?;
         Ok(PreparedPlaybackStorage {
             storage: Some(storage),
         })
@@ -444,8 +451,13 @@ impl PlaybackController {
     }
 
     pub fn refresh_index(&mut self) -> Result<(), PlaybackError> {
-        let storage = self.storage.as_mut().ok_or(PlaybackError::Internal)?;
-        storage.reconcile().map_err(|_| PlaybackError::Internal)?;
+        let storage = self
+            .storage
+            .as_mut()
+            .ok_or(PlaybackError::StorageUnavailable)?;
+        storage
+            .reconcile()
+            .map_err(|_| PlaybackError::StorageUnavailable)?;
         Ok(())
     }
 
@@ -454,7 +466,10 @@ impl PlaybackController {
     }
 
     pub fn recording_days(&self, camera_id: &CameraId) -> Result<Vec<String>, PlaybackError> {
-        let storage = self.storage.as_ref().ok_or(PlaybackError::Internal)?;
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or(PlaybackError::StorageUnavailable)?;
         storage
             .available_recording_days(camera_id)
             .map(|days| {
@@ -476,7 +491,7 @@ impl PlaybackController {
         }
         self.storage
             .as_ref()
-            .ok_or(PlaybackError::Internal)?
+            .ok_or(PlaybackError::StorageUnavailable)?
             .query_time_range(camera_id, start, end)
             .map(|rows| rows.iter().map(recording_dto).collect())
             .map_err(|_| PlaybackError::Internal)
@@ -533,7 +548,10 @@ impl PlaybackController {
     }
 
     pub fn adjacent(&self, recording_id: &str) -> Result<AdjacentRecordingsDto, PlaybackError> {
-        let storage = self.storage.as_ref().ok_or(PlaybackError::Internal)?;
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or(PlaybackError::StorageUnavailable)?;
         let recording = storage
             .recording_by_id(recording_id)
             .map_err(|_| PlaybackError::Internal)?
@@ -559,7 +577,10 @@ impl PlaybackController {
             return Err(PlaybackError::PlaybackBusy);
         }
 
-        let storage = self.storage.as_mut().ok_or(PlaybackError::Internal)?;
+        let storage = self
+            .storage
+            .as_mut()
+            .ok_or(PlaybackError::StorageUnavailable)?;
         let validated = match storage.validate_recording_for_playback(recording_id) {
             Ok(validated) => validated,
             Err(error) => {
@@ -1207,14 +1228,13 @@ fn run_worker_prepare(
     source_path: &Path,
     output_path: &Path,
 ) -> Result<PlaybackInspectDto, PlaybackError> {
-    let child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .arg("run")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| PlaybackError::WorkerUnavailable)?;
-    let child = crate::worker_process::contain_spawned_worker(child)
+        .stderr(Stdio::null());
+    let child = crate::worker_process::spawn_worker(&mut command)
         .map_err(|_| PlaybackError::WorkerUnavailable)?;
     let mut worker = WorkerGuard {
         child,
@@ -1818,6 +1838,26 @@ mod tests {
         drop(session_lease);
         cleanup_stale_cache(&cache_root).unwrap();
         assert!(!instance_path.exists());
+    }
+
+    #[test]
+    fn unconfigured_storage_reports_storage_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut controller = PlaybackController::new(
+            "unused-worker".to_owned(),
+            temp.path().join("playback-cache"),
+        )
+        .unwrap();
+        let camera = CameraId::parse("cam-a").unwrap();
+
+        assert!(matches!(
+            controller.refresh_index(),
+            Err(PlaybackError::StorageUnavailable)
+        ));
+        assert!(matches!(
+            controller.recording_days(&camera),
+            Err(PlaybackError::StorageUnavailable)
+        ));
     }
 
     #[test]

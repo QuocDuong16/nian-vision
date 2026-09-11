@@ -1562,14 +1562,13 @@ struct WorkerLiveRunner {
 
 impl WorkerLiveRunner {
     fn spawn(program: &str) -> Result<Self, LiveError> {
-        let child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .arg("run")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| LiveError::WorkerUnavailable)?;
-        let child = crate::worker_process::contain_spawned_worker(child)
+            .stderr(Stdio::null());
+        let child = crate::worker_process::spawn_worker(&mut command)
             .map_err(|_| LiveError::WorkerUnavailable)?;
         Self::from_child(child)
     }

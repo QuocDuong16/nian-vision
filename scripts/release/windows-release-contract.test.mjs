@@ -33,6 +33,8 @@ const storagePaths = readNormalizedText(new URL("../../crates/nian-storage/src/p
 const cameraServiceIntegration = readNormalizedText(new URL("../../crates/nian-application/tests/camera_service.rs", import.meta.url));
 const recordingControllerIntegration = readNormalizedText(new URL("../../crates/nian-application/tests/recording_controller.rs", import.meta.url));
 const recordingController = readNormalizedText(new URL("../../crates/nian-application/src/recording_controller.rs", import.meta.url));
+const workerProcess = readNormalizedText(new URL("../../crates/nian-application/src/worker_process.rs", import.meta.url));
+const platformWindows = readNormalizedText(new URL("../../crates/nian-platform-windows/src/lib.rs", import.meta.url));
 const workerSupervisorStubs = readNormalizedText(new URL("../../crates/nian-application/tests/worker_supervisor_stubs.rs", import.meta.url));
 const workerLive = readNormalizedText(new URL("../../apps/nian-media-worker/src/live.rs", import.meta.url));
 const linuxReleaseConfigTest = readNormalizedText(new URL("./write-tauri-release-config.test.mjs", import.meta.url));
@@ -423,7 +425,9 @@ test("Windows desktop smoke proves native power subscription and Job Object hard
   assert.match(desktop, /NIAN_DESKTOP_POWER_SMOKE_FILE/);
   assert.match(desktop, /windows_power_subscription_ready/);
   assert.match(desktop, /NIAN_DESKTOP_CONTAINMENT_SMOKE_FILE/);
-  assert.match(desktop, /contain_worker_process/);
+  assert.match(desktop, /initialize_worker_process_containment/);
+  assert.match(desktop, /configure_worker_command/);
+  assert.equal(desktop.includes("contain_worker_process(&child)"), false);
   assert.match(desktop, /__containment-smoke/);
   assert.match(worker, /Some\("__containment-smoke"\)/);
   assert.match(worker, /NIAN_WORKER_CONTAINMENT_SMOKE/);
@@ -436,6 +440,16 @@ test("Windows desktop smoke proves native power subscription and Job Object hard
   assert.match(windowsInstallerSmoke, /startup=\$startupReady, power=\$powerReady, containment=\$containmentReady/);
   assert.match(windowsInstallerSmoke, /Windows Job Object did not reap the installed media worker/);
   assert.match(windowsInstallerSmoke, /did not prove the native Windows power subscription/);
+});
+
+test("Windows media workers inherit containment at spawn and never open console windows", () => {
+  assert.match(workerProcess, /initialize_worker_process_containment\(\)\?/);
+  assert.match(workerProcess, /configure_worker_command\(command\)/);
+  assert.match(workerProcess, /command\.spawn\(\)/);
+  assert.equal(workerProcess.includes("contain_worker_process"), false);
+  assert.match(platformWindows, /CREATE_NO_WINDOW/);
+  assert.match(platformWindows, /command\.creation_flags\(CREATE_NO_WINDOW\)/);
+  assert.match(platformWindows, /ordinary child processes inherit this job membership automatically/);
 });
 
 test("Windows installer upgrade relies on desktop ownership instead of global worker-name killing", () => {

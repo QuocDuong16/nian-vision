@@ -759,11 +759,35 @@ fn handoff_verified_update(
     Ok(())
 }
 
-fn map_update_error(_error: tauri_plugin_updater::Error) -> DesktopErrorDto {
-    DesktopErrorDto::new(
-        "update_failed",
-        "cryptographically verified update operation failed",
-    )
+fn map_update_error(error: tauri_plugin_updater::Error) -> DesktopErrorDto {
+    use tauri_plugin_updater::Error;
+
+    match error {
+        Error::EmptyEndpoints => DesktopErrorDto::new(
+            "update_unconfigured",
+            "application updater is not configured",
+        ),
+        Error::ReleaseNotFound | Error::Reqwest(_) | Error::Network(_) => DesktopErrorDto::new(
+            "update_metadata_unavailable",
+            "update metadata could not be fetched",
+        ),
+        Error::TargetNotFound(_)
+        | Error::TargetsNotFound(_)
+        | Error::UnsupportedArch
+        | Error::UnsupportedOs => DesktopErrorDto::new(
+            "update_unsupported",
+            "no updater package is available for this platform",
+        ),
+        Error::Minisign(_) | Error::Base64(_) | Error::SignatureUtf8(_) => DesktopErrorDto::new(
+            "update_verification_failed",
+            "update signature verification failed",
+        ),
+        Error::InsecureTransportProtocol => DesktopErrorDto::new(
+            "update_insecure_endpoint",
+            "update endpoint must use a secure HTTPS transport",
+        ),
+        _ => DesktopErrorDto::new("update_failed", "application update operation failed"),
+    }
 }
 
 fn map_lifecycle_error(error: DesktopLifecycleError) -> DesktopErrorDto {
@@ -2495,6 +2519,10 @@ fn map_playback_error(error: PlaybackError) -> DesktopErrorDto {
         PlaybackError::PlaybackBusy => {
             DesktopErrorDto::new("playback_busy", "too many playback sessions are active")
         }
+        PlaybackError::StorageUnavailable => DesktopErrorDto::new(
+            "playback_storage_unavailable",
+            "recording storage is not configured or unavailable",
+        ),
         PlaybackError::WorkerUnavailable => {
             DesktopErrorDto::new("worker_unavailable", "media worker is unavailable")
         }
@@ -2511,6 +2539,14 @@ fn map_probe_error(error: ProbeError) -> DesktopErrorDto {
         ProbeError::Busy => DesktopErrorDto::new(
             "camera_busy",
             "another camera connection test is already running",
+        ),
+        ProbeError::WorkerStartFailed => DesktopErrorDto::new(
+            "worker_start_failed",
+            "media worker process could not be started",
+        ),
+        ProbeError::WorkerHandshakeFailed => DesktopErrorDto::new(
+            "worker_handshake_failed",
+            "media worker did not complete its startup handshake",
         ),
         ProbeError::WorkerUnavailable => {
             DesktopErrorDto::new("worker_unavailable", "media worker is unavailable")
@@ -3476,18 +3512,16 @@ fn start_containment_smoke_worker() -> std::io::Result<()> {
         return Ok(());
     };
     let worker = std::env::current_exe()?.with_file_name("nian-media-worker.exe");
-    let mut child = Command::new(worker)
+    nian_platform_windows::initialize_worker_process_containment()?;
+    let mut command = Command::new(worker);
+    command
         .arg("__containment-smoke")
         .env("NIAN_WORKER_CONTAINMENT_SMOKE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    if let Err(error) = nian_platform_windows::contain_worker_process(&child) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
+        .stderr(Stdio::null());
+    nian_platform_windows::configure_worker_command(&mut command);
+    let child = command.spawn()?;
     let pid = child.id();
     // This child ignores stdin, so hard-death disappearance proves containment.
     std::fs::write(marker, format!("{pid}\n"))?;
@@ -4782,6 +4816,22 @@ mod tests {
             state.lifecycle.state().unwrap(),
             DesktopLifecycleState::Running
         );
+    }
+
+    #[test]
+    fn updater_errors_preserve_failure_class_without_claiming_crypto_for_network_errors() {
+        let unconfigured = map_update_error(tauri_plugin_updater::Error::EmptyEndpoints);
+        assert_eq!(unconfigured.code, "update_unconfigured");
+
+        let metadata = map_update_error(tauri_plugin_updater::Error::ReleaseNotFound);
+        assert_eq!(metadata.code, "update_metadata_unavailable");
+        assert_eq!(metadata.message, "update metadata could not be fetched");
+
+        let unsupported = map_update_error(tauri_plugin_updater::Error::UnsupportedOs);
+        assert_eq!(unsupported.code, "update_unsupported");
+
+        let insecure = map_update_error(tauri_plugin_updater::Error::InsecureTransportProtocol);
+        assert_eq!(insecure.code, "update_insecure_endpoint");
     }
 
     #[test]
@@ -6318,7 +6368,7 @@ mod tests {
         let error =
             handle_power_event(&state, nian_platform_windows::PowerEvent::Resume).unwrap_err();
 
-        assert_eq!(error.code, "internal");
+        assert_eq!(error.code, "playback_storage_unavailable");
         wait_for_starts(&runner.starts, 2);
         assert_eq!(
             state.lifecycle.state().unwrap(),
@@ -6330,7 +6380,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .open("missing-recording"),
-            Err(PlaybackError::Internal)
+            Err(PlaybackError::StorageUnavailable)
         ));
         state
             .probe_controller
