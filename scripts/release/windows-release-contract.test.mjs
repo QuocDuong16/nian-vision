@@ -459,6 +459,11 @@ test("Windows in-app updater policy supports NSIS without APPIMAGE and avoids a 
 test("Windows install upgrade and uninstall preserve authoritative user data", () => {
   assert.match(windowsInstallerSmoke, /nian-settings-fixture -- create/);
   assert.match(windowsInstallerSmoke, /nian-settings-fixture -- verify/);
+  assert.match(windowsInstallerSmoke, /function Get-OptionalRegistryValue/);
+  assert.match(windowsInstallerSmoke, /\$properties\.PSObject\.Properties\[\$Name\]/);
+  assert.equal(windowsInstallerSmoke.includes("Get-ItemPropertyValue"), false);
+  assert.match(windowsInstallerSmoke, /\$freshRun = Get-OptionalRegistryValue/);
+  assert.match(windowsInstallerSmoke, /\$staleRun = Get-OptionalRegistryValue/);
   assert.match(windowsInstallerSmoke, /fresh install unexpectedly enabled launch-at-login/);
   assert.match(windowsInstallerSmoke, /M7 launch-at-login reconciliation did not repair the executable path/);
   assert.match(windowsInstallerSmoke, /uninstall deleted authoritative settings\.sqlite3/);

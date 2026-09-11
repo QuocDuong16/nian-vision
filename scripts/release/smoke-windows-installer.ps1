@@ -37,6 +37,14 @@ function Wait-ProcessGone([int]$ProcessId, [int]$Seconds, [string]$Label) {
         Start-Sleep -Milliseconds 100
     }
 }
+function Get-OptionalRegistryValue([string]$Path, [string]$Name) {
+    if (-not (Test-Path $Path)) { return $null }
+    $properties = Get-ItemProperty -Path $Path -ErrorAction Stop
+    $property = $properties.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
 
 function Start-DesktopContainmentSmoke([string]$Desktop) {
     $marker = Join-Path $Isolation ("desktop-ready-" + [Guid]::NewGuid().ToString("N") + ".txt")
@@ -168,7 +176,7 @@ try {
     }
 
     Run-DesktopSmoke (Join-Path $InstallRoot "nian-desktop.exe")
-    $freshRun = Get-ItemPropertyValue -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'Nian Vision' -ErrorAction SilentlyContinue
+    $freshRun = Get-OptionalRegistryValue -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'Nian Vision'
     if ($freshRun) { throw "fresh install unexpectedly enabled launch-at-login" }
 
     $settings = Find-SettingsDatabase
@@ -195,9 +203,9 @@ try {
     Run-DesktopSmoke (Join-Path $InstallRoot "nian-desktop.exe")
     Invoke-NianNative { cargo.exe run --quiet -p nian-settings-fixture -- verify $settings $Footage }
 
-    $runValue = Get-ItemPropertyValue `
+    $runValue = Get-OptionalRegistryValue `
         -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
-        -Name 'Nian Vision' -ErrorAction SilentlyContinue
+        -Name 'Nian Vision'
     if (-not $runValue) { throw "M7 launch-at-login reconciliation did not restore the Windows Run entry" }
     $desktopPath = Join-Path $InstallRoot "nian-desktop.exe"
     if ($runValue -notmatch [Regex]::Escape($desktopPath) -or $runValue -match 'stale-nian-vision') {
@@ -214,9 +222,9 @@ try {
     }
     if (-not (Test-Path $settings)) { throw "uninstall deleted authoritative settings.sqlite3" }
     if (-not (Test-Path (Join-Path $Footage "preserve-me.mkv"))) { throw "uninstall deleted recording footage" }
-    $staleRun = Get-ItemPropertyValue `
+    $staleRun = Get-OptionalRegistryValue `
         -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
-        -Name 'Nian Vision' -ErrorAction SilentlyContinue
+        -Name 'Nian Vision'
     if ($staleRun) { throw "uninstall left stale Nian Vision launch-at-login registration" }
     Write-Host "Windows NSIS install/upgrade/uninstall smoke passed for $ExpectedVersion"
 }
