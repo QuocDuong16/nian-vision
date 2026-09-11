@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EmptyState } from "../components/EmptyState";
 import { PtzControls } from "../components/PtzControls";
+import { splitLiveMp4ForMse } from "../lib/liveMp4";
 import { desktopError, invokeDesktop, isTauri } from "../lib/tauri";
 import type {
   CameraSummary,
@@ -117,6 +118,7 @@ function LiveMedia({
     let timer: number | null = null;
     let sourceBuffer: SourceBuffer | null = null;
     let lastAppendedSequence = -1;
+    let initializationAppended = false;
 
     video.src = objectUrl;
 
@@ -133,6 +135,10 @@ function LiveMedia({
       if (!response.ok) throw new Error(`live fragment failed: ${response.status}`);
       const bytes = new Uint8Array(await response.arrayBuffer());
       if (!bytes.length || disposed || abort.signal.aborted) return;
+      const mseParts = splitLiveMp4ForMse(bytes);
+      if (!mseParts) {
+        throw new Error("live fragmented MP4 is not a valid MSE byte stream");
+      }
 
       if (!sourceBuffer) {
         const mime = detectAvcMime(bytes);
@@ -142,8 +148,14 @@ function LiveMedia({
         sourceBuffer = mediaSource.addSourceBuffer(mime);
         sourceBuffer.mode = "sequence";
       }
+      if (!initializationAppended) {
+        await waitForSourceBuffer(sourceBuffer);
+        sourceBuffer.appendBuffer(Uint8Array.from(mseParts.initialization).buffer);
+        await waitForSourceBuffer(sourceBuffer);
+        initializationAppended = true;
+      }
       await waitForSourceBuffer(sourceBuffer);
-      sourceBuffer.appendBuffer(bytes);
+      sourceBuffer.appendBuffer(Uint8Array.from(mseParts.media).buffer);
       await waitForSourceBuffer(sourceBuffer);
       lastAppendedSequence = Math.max(lastAppendedSequence, sequence);
 
