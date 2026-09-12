@@ -24,6 +24,9 @@ const MAX_LIVE_LATENCY_SECONDS = 2.5;
 const LIVE_EDGE_OFFSET_SECONDS = 0.75;
 const LIVE_BUFFER_HISTORY_SECONDS = 12;
 const LIVE_MANIFEST_POLL_MS = 250;
+const LIVE_STABLE_RESET_MS = 10_000;
+const MAX_LIVE_AUTO_RECOVERY_ATTEMPTS = 3;
+const LIVE_RECOVERY_BACKOFF_MS = [250, 750, 1_500] as const;
 
 const ACTIVE_RECORDING_STATES = new Set<RecordingState>([
   "starting",
@@ -55,6 +58,19 @@ function fragmentName(sequence: number): string {
   return `fragment-${String(sequence).padStart(12, "0")}.mp4`;
 }
 
+class LivePipelineError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message);
+    this.name = "LivePipelineError";
+  }
+}
+
+function livePipelineFailure(cause: unknown): DesktopError {
+  if (cause instanceof LivePipelineError) return { code: cause.code, message: cause.message };
+  if (cause instanceof Error) return { code: "live_pipeline_failed", message: cause.message };
+  return { code: "live_pipeline_failed", message: "The live media pipeline failed." };
+}
+
 function detectAvcMime(bytes: Uint8Array): string | null {
   for (let index = 0; index + 8 < bytes.length; index += 1) {
     if (
@@ -84,7 +100,7 @@ function waitForSourceBuffer(sourceBuffer: SourceBuffer): Promise<void> {
     };
     const onError = () => {
       cleanup();
-      reject(new Error("live source buffer failed"));
+      reject(new LivePipelineError("source_buffer_failed", "The live SourceBuffer reported an append/remove failure."));
     };
     const cleanup = () => {
       sourceBuffer.removeEventListener("updateend", onEnd);
@@ -99,17 +115,24 @@ function LiveMedia({
   session,
   reconnectAttempt,
   onError,
+  onStable,
 }: {
   session: LiveOpenDto;
   reconnectAttempt: number;
-  onError: () => void;
+  onError: (failure: DesktopError) => void;
+  onStable: () => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const onErrorRef = useRef(onError);
+  const onStableRef = useRef(onStable);
 
   useEffect(() => {
     onErrorRef.current = onError;
   }, [onError]);
+
+  useEffect(() => {
+    onStableRef.current = onStable;
+  }, [onStable]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -125,33 +148,56 @@ function LiveMedia({
     let initializationAppended = false;
     let nextMovieFragmentSequence = 1;
     let nextTimestampOffset = 0;
+    let stableReported = false;
+    const startedAt = performance.now();
 
     video.src = objectUrl;
 
-    const fail = () => {
-      if (!disposed && !abort.signal.aborted) onErrorRef.current();
+    const fail = (cause: unknown) => {
+      if (!disposed && !abort.signal.aborted) onErrorRef.current(livePipelineFailure(cause));
+    };
+
+    const reportStable = () => {
+      if (stableReported || performance.now() - startedAt < LIVE_STABLE_RESET_MS) return;
+      stableReported = true;
+      onStableRef.current();
+    };
+
+    const requestLiveResource = async (url: string, code: string, label: string) => {
+      try {
+        return await fetch(url, { cache: "no-store", signal: abort.signal });
+      } catch (cause) {
+        if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
+        throw new LivePipelineError(code, `${label} request could not reach the local live session.`);
+      }
     };
 
     const appendFragment = async (sequence: number) => {
-      const response = await fetch(`${session.url}/fragment/${fragmentName(sequence)}`, {
-        cache: "no-store",
-        signal: abort.signal,
-      });
+      const response = await requestLiveResource(
+        `${session.url}/fragment/${fragmentName(sequence)}`,
+        "fragment_fetch_failed",
+        "Live fragment",
+      );
       if (response.status === 404 || response.status === 410) {
-        throw new Error("live fragment expired before it could be appended");
+        throw new LivePipelineError("fragment_expired", "A live fragment expired before WebView could append it.");
       }
-      if (!response.ok) throw new Error(`live fragment failed: ${response.status}`);
-      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (!response.ok) throw new LivePipelineError("fragment_fetch_failed", `Live fragment request failed with HTTP ${response.status}.`);
+      let bytes: Uint8Array;
+      try {
+        bytes = new Uint8Array(await response.arrayBuffer());
+      } catch {
+        throw new LivePipelineError("fragment_fetch_failed", "The live fragment response ended before it could be read.");
+      }
       if (!bytes.length || disposed || abort.signal.aborted) return;
       const mseParts = splitLiveMp4ForMse(bytes, nextMovieFragmentSequence);
       if (!mseParts) {
-        throw new Error("live fragmented MP4 is not a valid MSE byte stream");
+        throw new LivePipelineError("fragment_invalid", "A live fragment was not a valid fragmented MP4 stream.");
       }
 
       if (!sourceBuffer) {
         const mime = detectAvcMime(bytes);
         if (!mime || !MediaSource.isTypeSupported(mime)) {
-          throw new Error("live H.264 MediaSource type is unsupported");
+          throw new LivePipelineError("unsupported_codec", "This H.264 stream is not supported by the WebView MediaSource decoder.");
         }
         sourceBuffer = mediaSource.addSourceBuffer(mime);
         sourceBuffer.mode = "segments";
@@ -185,33 +231,40 @@ function LiveMedia({
         }
       }
       void video.play().catch(() => undefined);
+      reportStable();
     };
 
     const pump = async () => {
       try {
-        const response = await fetch(`${session.url}/manifest`, {
-          cache: "no-store",
-          signal: abort.signal,
-        });
-        if (!response.ok) throw new Error(`live manifest failed: ${response.status}`);
-        const manifest = (await response.json()) as LiveManifest;
+        const response = await requestLiveResource(
+          `${session.url}/manifest`,
+          "manifest_fetch_failed",
+          "Live manifest",
+        );
+        if (!response.ok) throw new LivePipelineError("manifest_fetch_failed", `Live manifest request failed with HTTP ${response.status}.`);
+        let manifest: LiveManifest;
+        try {
+          manifest = (await response.json()) as LiveManifest;
+        } catch {
+          throw new LivePipelineError("manifest_invalid", "The live manifest was not valid JSON.");
+        }
         if (manifest.session_id !== session.session_id || !Array.isArray(manifest.fragments)) {
-          throw new Error("live manifest identity mismatch");
+          throw new LivePipelineError("manifest_invalid", "The live manifest did not match the active session.");
         }
         for (const sequence of manifest.fragments) {
           if (!Number.isSafeInteger(sequence) || sequence < 0) {
-            throw new Error("live manifest contains an invalid fragment sequence");
+            throw new LivePipelineError("manifest_invalid", "The live manifest contained an invalid fragment sequence.");
           }
           if (sequence <= lastAppendedSequence) continue;
           if (sequence !== lastAppendedSequence + 1) {
-            throw new Error("live fragment continuity was lost; a fresh session is required");
+            throw new LivePipelineError("fragment_gap", "Live fragment continuity was lost before WebView could append the next fragment.");
           }
           await appendFragment(sequence);
         }
         if (!disposed) timer = window.setTimeout(() => void pump(), LIVE_MANIFEST_POLL_MS);
       } catch (cause) {
         if (cause instanceof DOMException && cause.name === "AbortError") return;
-        fail();
+        fail(cause);
       }
     };
 
@@ -238,7 +291,10 @@ function LiveMedia({
       autoPlay
       muted
       playsInline
-      onError={() => onErrorRef.current()}
+      onError={() => onErrorRef.current({
+        code: "media_element_failed",
+        message: "The live video element reported a decode or playback failure.",
+      })}
     />
   );
 }
@@ -264,6 +320,8 @@ export function LiveViewScreen() {
   const mountedRef = useRef(true);
   const generationRef = useRef<Map<string, number>>(new Map());
   const pendingOpenRef = useRef<Map<string, number>>(new Map());
+  const recoveryAttemptsRef = useRef<Map<string, number>>(new Map());
+  const recoveryTimersRef = useRef<Map<string, number>>(new Map());
   const refreshInFlightRef = useRef(false);
   const eventStatusInFlightRef = useRef(false);
 
@@ -429,6 +487,8 @@ export function LiveViewScreen() {
 
   useEffect(() => {
     return () => {
+      for (const timer of recoveryTimersRef.current.values()) window.clearTimeout(timer);
+      recoveryTimersRef.current.clear();
       if (!isTauri()) return;
       for (const session of sessionsRef.current.values()) {
         void invokeDesktop<void>("live_close", { sessionId: session.session_id }).catch(() => undefined);
@@ -530,6 +590,15 @@ export function LiveViewScreen() {
   }
 
   async function removeCamera(cameraId: string) {
+    const recoveryTimer = recoveryTimersRef.current.get(cameraId);
+    if (recoveryTimer !== undefined) window.clearTimeout(recoveryTimer);
+    recoveryTimersRef.current.delete(cameraId);
+    recoveryAttemptsRef.current.delete(cameraId);
+    setOpening((current) => {
+      const next = new Set(current);
+      next.delete(cameraId);
+      return next;
+    });
     const nextSelected = new Set(selectedRef.current);
     nextSelected.delete(cameraId);
     selectedRef.current = nextSelected;
@@ -558,6 +627,10 @@ export function LiveViewScreen() {
   }
 
   async function retryCamera(cameraId: string) {
+    const recoveryTimer = recoveryTimersRef.current.get(cameraId);
+    if (recoveryTimer !== undefined) window.clearTimeout(recoveryTimer);
+    recoveryTimersRef.current.delete(cameraId);
+    recoveryAttemptsRef.current.delete(cameraId);
     const session = sessionsRef.current.get(cameraId);
     nextGeneration(cameraId);
     setSessionForCamera(cameraId, null);
@@ -567,20 +640,56 @@ export function LiveViewScreen() {
     requestOpen(cameraId);
   }
 
-  async function handleMediaError(cameraId: string) {
+  function markLiveStable(cameraId: string) {
+    recoveryAttemptsRef.current.delete(cameraId);
+  }
+
+  async function handleMediaError(cameraId: string, failure: DesktopError) {
+    if (recoveryTimersRef.current.has(cameraId)) return;
     const session = sessionsRef.current.get(cameraId);
-    nextGeneration(cameraId);
+    const generation = nextGeneration(cameraId);
     setSessionForCamera(cameraId, null);
     if (session && isTauri()) {
       await invokeDesktop<void>("live_close", { sessionId: session.session_id }).catch(() => undefined);
     }
     if (!mountedRef.current || !selectedRef.current.has(cameraId)) return;
-    setTileErrors((current) =>
-      new Map(current).set(cameraId, {
-        code: "media_failed",
-        message: "The live media element failed. Retry to create a fresh session.",
-      }),
-    );
+
+    const attempt = (recoveryAttemptsRef.current.get(cameraId) ?? 0) + 1;
+    if (attempt > MAX_LIVE_AUTO_RECOVERY_ATTEMPTS) {
+      recoveryAttemptsRef.current.set(cameraId, MAX_LIVE_AUTO_RECOVERY_ATTEMPTS);
+      setOpening((current) => {
+        const next = new Set(current);
+        next.delete(cameraId);
+        return next;
+      });
+      setTileErrors((current) => new Map(current).set(cameraId, {
+        code: failure.code,
+        message: `${failure.message} Automatic recovery stopped after ${MAX_LIVE_AUTO_RECOVERY_ATTEMPTS} attempts. Retry live to start a fresh recovery cycle.`,
+      }));
+      return;
+    }
+
+    recoveryAttemptsRef.current.set(cameraId, attempt);
+    setTileErrors((current) => {
+      const next = new Map(current);
+      next.delete(cameraId);
+      return next;
+    });
+    setOpening((current) => new Set(current).add(cameraId));
+    const delay = LIVE_RECOVERY_BACKOFF_MS[attempt - 1] ?? LIVE_RECOVERY_BACKOFF_MS[LIVE_RECOVERY_BACKOFF_MS.length - 1];
+    const timer = window.setTimeout(() => {
+      recoveryTimersRef.current.delete(cameraId);
+      if (!mountedRef.current || !selectedRef.current.has(cameraId)) {
+        setOpening((current) => {
+          const next = new Set(current);
+          next.delete(cameraId);
+          return next;
+        });
+        return;
+      }
+      void startOpenGeneration(cameraId, generation);
+    }, delay);
+    recoveryTimersRef.current.set(cameraId, timer);
   }
 
   async function toggleRecording(cameraId: string) {
@@ -676,7 +785,8 @@ export function LiveViewScreen() {
                       key={`${session.session_id}-${backendStatus?.reconnect_attempt ?? 0}`}
                       session={session}
                       reconnectAttempt={backendStatus?.reconnect_attempt ?? 0}
-                      onError={() => void handleMediaError(cameraId)}
+                      onError={(failure) => void handleMediaError(cameraId, failure)}
+                      onStable={() => markLiveStable(cameraId)}
                     />
                   ) : (
                     <div className="live-placeholder">

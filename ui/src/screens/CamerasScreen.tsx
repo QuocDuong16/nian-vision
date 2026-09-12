@@ -451,6 +451,34 @@ export function CamerasScreen() {
     setProbeResult(null);
   }
 
+  async function pairPtz(camera: CameraSummary) {
+    if (!isTauri() || busyCamera || onvifBusy) return;
+    setBusyCamera(camera.camera_id);
+    setError(null);
+    try {
+      const result = await invokeDesktop<PtzMutation<PtzCapabilities>>("ptz_pair_saved", {
+        cameraId: camera.camera_id,
+      });
+      await loadCameras();
+      if (result.warning) {
+        setError({
+          code: "credential_store",
+          message: "PTZ was paired, but an obsolete PTZ credential could not be removed.",
+        });
+      }
+    } catch (cause) {
+      const failure = desktopError(cause);
+      if (failure.code === "onvif_auth_failed") {
+        setBusyCamera(null);
+        await startOnvifDiscovery(camera, "ptz");
+        return;
+      }
+      setError(failure);
+    } finally {
+      setBusyCamera(null);
+    }
+  }
+
   async function unpairPtz(camera: CameraSummary) {
     if (!isTauri() || busyCamera) return;
     setBusyCamera(camera.camera_id);
@@ -695,7 +723,11 @@ export function CamerasScreen() {
                   </button>
                   <button onClick={() => openEdit(camera)} disabled={busyCamera !== null || rowBusy}>Edit</button>
                   <button
-                    onClick={() => void startOnvifDiscovery(camera)}
+                    onClick={() => void (
+                      ptzConfigured.get(camera.camera_id)
+                        ? startOnvifDiscovery(camera, "ptz")
+                        : pairPtz(camera)
+                    )}
                     disabled={busyCamera !== null || rowBusy || onvifBusy}
                   >{ptzConfigured.get(camera.camera_id) ? "Replace PTZ" : "Pair PTZ"}</button>
                   {ptzConfigured.get(camera.camera_id) && (

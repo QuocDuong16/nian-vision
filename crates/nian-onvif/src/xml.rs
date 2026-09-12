@@ -727,10 +727,17 @@ pub(crate) fn parse_stream_uri(xml: &[u8]) -> Result<String, OnvifError> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MotionTopicKind {
+    Cell,
+    Region,
+    Alarm,
+}
+
 #[derive(Debug, Default)]
 struct RawEventNotification {
     topic: Option<String>,
-    topic_is_standard_motion: bool,
+    motion_topic_kind: Option<MotionTopicKind>,
     utc_time: Option<String>,
     property_operation: Option<String>,
     source_items: Vec<(String, String)>,
@@ -771,16 +778,7 @@ pub(crate) fn parse_event_properties(xml: &[u8]) -> Result<EventProperties, Onvi
                         return Err(OnvifError::ResponseTooLarge);
                     }
                     let relative = &stack[topic_set + 1..];
-                    if relative.len() >= 3
-                        && relative[relative.len() - 3..]
-                            .iter()
-                            .map(|(name, standard)| (name.as_str(), *standard))
-                            .eq([
-                                ("RuleEngine", true),
-                                ("CellMotionDetector", true),
-                                ("Motion", true),
-                            ])
-                    {
+                    if standard_motion_topic_kind_from_tree(relative).is_some() {
                         motion_supported = true;
                     }
                 }
@@ -799,16 +797,7 @@ pub(crate) fn parse_event_properties(xml: &[u8]) -> Result<EventProperties, Onvi
                     );
                     let mut relative = stack[topic_set + 1..].to_vec();
                     relative.push((name, standard_topic));
-                    if relative.len() >= 3
-                        && relative[relative.len() - 3..]
-                            .iter()
-                            .map(|(name, standard)| (name.as_str(), *standard))
-                            .eq([
-                                ("RuleEngine", true),
-                                ("CellMotionDetector", true),
-                                ("Motion", true),
-                            ])
-                    {
+                    if standard_motion_topic_kind_from_tree(&relative).is_some() {
                         motion_supported = true;
                     }
                 }
@@ -976,8 +965,8 @@ pub(crate) fn parse_motion_notifications(
                     if value.len() > MAX_EVENT_TOPIC_BYTES {
                         return Err(OnvifError::ResponseTooLarge);
                     }
-                    notification.topic_is_standard_motion =
-                        is_standard_cell_motion_topic(reader.resolver(), &value);
+                    notification.motion_topic_kind =
+                        standard_motion_topic_kind(reader.resolver(), &value);
                     notification.topic = Some(value);
                 }
             }
@@ -1007,19 +996,26 @@ fn normalize_motion_notification(
     let Some(_topic) = raw.topic.take() else {
         return Ok(None);
     };
-    if !raw.topic_is_standard_motion {
+    let Some(topic_kind) = raw.motion_topic_kind else {
         return Ok(None);
-    }
+    };
 
+    let expected_data_name = match topic_kind {
+        MotionTopicKind::Cell => "IsMotion",
+        MotionTopicKind::Region | MotionTopicKind::Alarm => "State",
+    };
     let mut motion = None;
     for (name, value) in &raw.data_items {
-        if name != "IsMotion" {
+        if name != expected_data_name {
             continue;
         }
-        let parsed = match value.trim() {
-            "true" | "1" => true,
-            "false" | "0" => false,
-            _ => return Err(OnvifError::Protocol),
+        let value = value.trim();
+        let parsed = if value == "1" || value.eq_ignore_ascii_case("true") {
+            true
+        } else if value == "0" || value.eq_ignore_ascii_case("false") {
+            false
+        } else {
+            return Err(OnvifError::Protocol);
         };
         if motion.replace(parsed).is_some() {
             return Err(OnvifError::Protocol);
@@ -1059,28 +1055,52 @@ fn normalize_motion_notification(
     }))
 }
 
-fn is_standard_cell_motion_topic(
+fn standard_motion_topic_kind_from_tree(parts: &[(String, bool)]) -> Option<MotionTopicKind> {
+    if parts.len() >= 2 {
+        let tail = &parts[parts.len() - 2..];
+        if tail[0].0 == "VideoSource" && tail[0].1 && tail[1].0 == "MotionAlarm" && tail[1].1 {
+            return Some(MotionTopicKind::Alarm);
+        }
+    }
+    if parts.len() < 3 {
+        return None;
+    }
+    let tail = &parts[parts.len() - 3..];
+    if tail[0].0 != "RuleEngine" || !tail[0].1 || tail[2].0 != "Motion" || !tail[2].1 {
+        return None;
+    }
+    match (tail[1].0.as_str(), tail[1].1) {
+        ("CellMotionDetector", true) => Some(MotionTopicKind::Cell),
+        ("MotionRegionDetector", true) => Some(MotionTopicKind::Region),
+        _ => None,
+    }
+}
+
+fn standard_motion_topic_kind(
     resolver: &quick_xml::name::NamespaceResolver,
     topic: &str,
-) -> bool {
+) -> Option<MotionTopicKind> {
     let parts = topic.trim().split('/').map(str::trim).collect::<Vec<_>>();
-    if parts.len() != 3 {
-        return false;
-    }
-    let first = QName(parts[0]);
-    let Some(prefix) = first.prefix() else {
-        return false;
-    };
-    if first.local_name().as_ref() != "RuleEngine"
-        || parts[1] != "CellMotionDetector"
-        || parts[2] != "Motion"
-    {
-        return false;
-    }
-    matches!(
+    let first = QName(parts.first()?);
+    let prefix = first.prefix()?;
+    if !matches!(
         resolver.resolve_prefix(Some(prefix), false),
         ResolveResult::Bound(namespace) if namespace.as_ref() == ONVIF_TOPICS_NAMESPACE
-    )
+    ) {
+        return None;
+    }
+    if first.local_name().as_ref() == "VideoSource" && parts.len() == 2 && parts[1] == "MotionAlarm"
+    {
+        return Some(MotionTopicKind::Alarm);
+    }
+    if first.local_name().as_ref() != "RuleEngine" || parts.len() != 3 || parts[2] != "Motion" {
+        return None;
+    }
+    match parts[1] {
+        "CellMotionDetector" => Some(MotionTopicKind::Cell),
+        "MotionRegionDetector" => Some(MotionTopicKind::Region),
+        _ => None,
+    }
 }
 
 fn parse_strict_event_timestamp(value: &str) -> Result<DateTime<Utc>, OnvifError> {
@@ -1227,9 +1247,15 @@ mod tests {
     }
 
     #[test]
-    fn event_properties_recognize_only_standard_cell_motion_topic_path() {
+    fn event_properties_recognize_standard_motion_topics() {
         let supported = br#"<tev:GetEventPropertiesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:tns1="http://www.onvif.org/ver10/topics"><tev:TopicSet><tns1:RuleEngine><tns1:CellMotionDetector><tns1:Motion/></tns1:CellMotionDetector></tns1:RuleEngine></tev:TopicSet></tev:GetEventPropertiesResponse>"#;
         assert!(parse_event_properties(supported).unwrap().motion_supported);
+
+        let region = br#"<tev:GetEventPropertiesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:tns1="http://www.onvif.org/ver10/topics"><tev:TopicSet><tns1:RuleEngine><tns1:MotionRegionDetector><tns1:Motion/></tns1:MotionRegionDetector></tns1:RuleEngine></tev:TopicSet></tev:GetEventPropertiesResponse>"#;
+        assert!(parse_event_properties(region).unwrap().motion_supported);
+
+        let alarm = br#"<tev:GetEventPropertiesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:tns1="http://www.onvif.org/ver10/topics"><tev:TopicSet><tns1:VideoSource><tns1:MotionAlarm/></tns1:VideoSource></tev:TopicSet></tev:GetEventPropertiesResponse>"#;
+        assert!(parse_event_properties(alarm).unwrap().motion_supported);
 
         let spoofed = br#"<tev:GetEventPropertiesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:tns1="urn:evil"><tev:TopicSet><tns1:RuleEngine><tns1:CellMotionDetector><tns1:Motion/></tns1:CellMotionDetector></tns1:RuleEngine></tev:TopicSet></tev:GetEventPropertiesResponse>"#;
         assert!(matches!(
@@ -1268,6 +1294,19 @@ mod tests {
         assert!(notification.synchronization_baseline);
         assert_eq!(notification.source_key.as_deref().map(str::len), Some(64));
         assert!(!format!("{notification:?}").contains("SENTINEL-raw-camera-token"));
+    }
+
+    #[test]
+    fn region_and_motion_alarm_notifications_use_standard_state_field() {
+        let region = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:tns1="http://www.onvif.org/ver10/topics"><wsnt:Topic>tns1:RuleEngine/MotionRegionDetector/Motion</wsnt:Topic><wsnt:Message><tt:Message><tt:Data><tt:SimpleItem Name="State" Value="True"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
+        let region_notifications = parse_motion_notifications(region).unwrap();
+        assert_eq!(region_notifications.len(), 1);
+        assert!(region_notifications[0].active);
+
+        let alarm = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:tns1="http://www.onvif.org/ver10/topics"><wsnt:Topic>tns1:VideoSource/MotionAlarm</wsnt:Topic><wsnt:Message><tt:Message><tt:Data><tt:SimpleItem Name="State" Value="false"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
+        let alarm_notifications = parse_motion_notifications(alarm).unwrap();
+        assert_eq!(alarm_notifications.len(), 1);
+        assert!(!alarm_notifications[0].active);
     }
 
     #[test]

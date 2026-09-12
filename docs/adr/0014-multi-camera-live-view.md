@@ -85,10 +85,11 @@ The production bounds are explicit:
 
 - `MAX_SIMULTANEOUS_LIVE_VIEWS = 4`;
 - fragment target: 500 ms;
-- target retained finalized fragments per session: 6;
-- hard finalized-fragment ceiling per session: 8 (six-window target plus two possible reader pins);
-- nominal retained live window: about 3 seconds after the initial keyframe-gated fragment;
+- target retained finalized fragments per session: 24;
+- hard finalized-fragment ceiling per session: 26 (24-window target plus two possible reader pins);
+- nominal retained live window: about 12 seconds after the initial keyframe-gated fragment;
 - maximum finalized fragment size: 16 MiB;
+- retained finalized-byte ceiling: 96 MiB per session, preserving the previous six-by-16-MiB bound even though the time window now uses more smaller fragments;
 - maximum HTTP readers per session: 2;
 - maximum concurrent live HTTP requests across the listener: 8;
 - live keepalive expiry: 2 minutes.
@@ -142,7 +143,7 @@ The frontend consumes the rolling window with `MediaSource`: it polls the small 
 manifest, fetches only unseen bounded fragments, appends them to an H.264 SourceBuffer and
 trims old buffered media. Frontend fragment bookkeeping is O(1): it keeps only the highest
 successfully appended sequence rather than an ever-growing set of historical sequence ids.
-No remote streaming protocol or generic streaming server is introduced.
+No remote streaming protocol or generic streaming server is introduced. Frontend media/manifest/fragment failures are classified rather than collapsed into one media error. A failed media session is closed and replaced automatically with bounded 250/750/1500 ms backoff for at most three consecutive recovery attempts. The recovery streak resets only after ten seconds of stable media; a fourth consecutive failure becomes an explicit per-tile error and requires manual Retry.
 
 ### Keepalive is cheap; the reaper owns expensive expiry cleanup
 

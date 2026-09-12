@@ -168,6 +168,10 @@ pub enum OnvifControllerError {
     ProfileNotFound,
     #[error("ONVIF motion event capability is unavailable")]
     EventUnsupported,
+    #[error("ONVIF Events service is unavailable")]
+    EventServiceUnsupported,
+    #[error("ONVIF Events service has no compatible standard motion topic")]
+    MotionEventUnsupported,
     #[error("ONVIF validation failed")]
     Validation,
     #[error(transparent)]
@@ -338,6 +342,61 @@ impl OnvifController {
         })
     }
 
+    pub fn prepare_ptz_pairing_for_host(
+        &self,
+        host: &str,
+        credentials: Credentials,
+    ) -> Result<PreparedPtzPairing, OnvifControllerError> {
+        self.require_accepting()?;
+        if host.trim().is_empty() {
+            return Err(OnvifControllerError::Validation);
+        }
+        credentials
+            .validate()
+            .map_err(|_| OnvifControllerError::Validation)?;
+        let mut devices: Vec<_> = self
+            .scan_devices()?
+            .into_iter()
+            .filter(|device| discovered_device_matches_host(device, host))
+            .collect();
+        if devices.is_empty() {
+            return Err(OnvifControllerError::DeviceNotFound);
+        }
+        devices.sort_by(|left, right| left.endpoint_reference.cmp(&right.endpoint_reference));
+
+        let network_credentials = OnvifCredentials {
+            username: credentials.username.clone(),
+            password: credentials.password().to_owned(),
+        };
+        let mut last_error = OnvifError::DeviceUnreachable;
+        for device in devices {
+            let mut xaddrs = device.xaddrs.clone();
+            xaddrs.sort_by(|left, right| {
+                right
+                    .starts_with("https://")
+                    .cmp(&left.starts_with("https://"))
+                    .then_with(|| left.cmp(right))
+            });
+            for xaddr in xaddrs {
+                match self.device.ptz_control(&xaddr, &network_credentials) {
+                    Ok(control) => {
+                        return Ok(PreparedPtzPairing {
+                            device_service: xaddr,
+                            endpoint_reference: device.endpoint_reference.clone(),
+                            credentials,
+                            control,
+                        });
+                    }
+                    Err(OnvifError::AuthFailed) => {
+                        return Err(OnvifError::AuthFailed.into());
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+        }
+        Err(last_error.into())
+    }
+
     pub fn prepare_event_pairing_for_host(
         &self,
         host: &str,
@@ -390,10 +449,7 @@ impl OnvifController {
                 }
             }
         }
-        match last_error {
-            OnvifError::Unsupported => Err(OnvifControllerError::EventUnsupported),
-            error => Err(error.into()),
-        }
+        Err(map_event_pairing_error(last_error))
     }
 
     pub fn connect(
@@ -541,10 +597,7 @@ impl OnvifController {
         }
         let (device_service, event_control) = match connected {
             Some(connected) => connected,
-            None if last_error == OnvifError::Unsupported => {
-                return Err(OnvifControllerError::EventUnsupported);
-            }
-            None => return Err(last_error.into()),
+            None => return Err(map_event_pairing_error(last_error)),
         };
         self.require_accepting()?;
 
@@ -750,14 +803,11 @@ impl OnvifController {
                 .event_control(&connection.device_service, &credentials)
             {
                 Ok(control) => control,
-                Err(OnvifError::Unsupported) => {
-                    return Err(OnvifControllerError::EventUnsupported);
-                }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(map_event_pairing_error(error)),
             }
         };
         if !control.properties().motion_supported {
-            return Err(OnvifControllerError::EventUnsupported);
+            return Err(OnvifControllerError::MotionEventUnsupported);
         }
         self.require_accepting()?;
         {
@@ -888,6 +938,15 @@ impl OnvifController {
         } else {
             Err(OnvifControllerError::NotAccepting)
         }
+    }
+}
+
+fn map_event_pairing_error(error: OnvifError) -> OnvifControllerError {
+    match error {
+        OnvifError::EventServiceUnsupported => OnvifControllerError::EventServiceUnsupported,
+        OnvifError::MotionEventUnsupported => OnvifControllerError::MotionEventUnsupported,
+        OnvifError::Unsupported => OnvifControllerError::EventUnsupported,
+        error => OnvifControllerError::Protocol(error),
     }
 }
 
@@ -1042,6 +1101,17 @@ mod tests {
             _profile: &MediaProfile,
         ) -> Result<StreamEndpoint, OnvifError> {
             Err(OnvifError::Unsupported)
+        }
+
+        fn ptz_control(
+            &self,
+            _device_service: &str,
+            credentials: &OnvifCredentials,
+        ) -> Result<PtzControl, OnvifError> {
+            if credentials.password == "wrong" {
+                return Err(OnvifError::AuthFailed);
+            }
+            Ok(PtzControl::test_fixture(true))
         }
 
         fn event_control(
@@ -1238,6 +1308,40 @@ mod tests {
             .prepare_event_pairing(&discovery.session_id, &device_id)
             .unwrap();
         assert!(prepared.control.properties().motion_supported);
+    }
+
+    #[test]
+    fn saved_camera_ptz_pairing_silently_discovers_matching_host() {
+        let controller = OnvifController::with_backends(
+            Arc::new(FakeDiscovery {
+                devices: vec![
+                    DiscoveredDevice {
+                        endpoint_reference: "urn:uuid:other".into(),
+                        xaddrs: vec!["http://192.168.1.7/onvif/device_service".into()],
+                        scopes: vec![],
+                        network_address: "192.168.1.7".into(),
+                    },
+                    DiscoveredDevice {
+                        endpoint_reference: "urn:uuid:target".into(),
+                        xaddrs: vec!["http://192.168.1.8/onvif/device_service".into()],
+                        scopes: vec![],
+                        network_address: "192.168.1.8".into(),
+                    },
+                ],
+            }),
+            Arc::new(EventOnlyDevice),
+        );
+
+        let prepared = controller
+            .prepare_ptz_pairing_for_host("192.168.1.8", Credentials::new("u", "p"))
+            .unwrap();
+
+        assert_eq!(
+            prepared.device_service,
+            "http://192.168.1.8/onvif/device_service"
+        );
+        assert_eq!(prepared.endpoint_reference, "urn:uuid:target");
+        assert!(prepared.control.pan_tilt_supported());
     }
 
     #[test]

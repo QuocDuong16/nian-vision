@@ -525,26 +525,54 @@ describe("LiveViewScreen", () => {
     });
   });
 
-  it("closes the backend session on media failure and unmount", async () => {
+  it("stops automatic media recovery after three consecutive failures and exposes the real failure", async () => {
+    installDesktop();
+    render(<LiveViewScreen />);
+
+    await screen.findByText("No live cameras selected");
+    fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+    await screen.findByRole("article", { name: "Front door live camera" });
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const video = document.querySelector("video") as HTMLVideoElement;
+      fireEvent.error(video);
+      await waitFor(
+        () => expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open").length).toBe(attempt + 1),
+        { timeout: 2_500 },
+      );
+      await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+    }
+
+    fireEvent.error(document.querySelector("video") as HTMLVideoElement);
+    expect(await screen.findByText(/Automatic recovery stopped after 3 attempts/i)).toBeTruthy();
+    expect(screen.getByText(/decode or playback failure/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry live" })).toBeTruthy();
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open")).toHaveLength(4);
+  }, 10_000);
+
+  it("automatically replaces a failed media session and still closes the replacement on unmount", async () => {
     installDesktop();
     const view = render(<LiveViewScreen />);
 
     await screen.findByText("No live cameras selected");
     fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
     await screen.findByRole("article", { name: "Front door live camera" });
-    const video = await waitFor(() => {
+    const firstVideo = await waitFor(() => {
       const found = document.querySelector("video") as HTMLVideoElement | null;
       expect(found).toBeTruthy();
       return found as HTMLVideoElement;
     });
-    fireEvent.error(video);
-    await waitFor(() => {
-      expect(screen.getByText(/live media element failed/i)).toBeTruthy();
-      expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "live_close")).toBe(true);
-    });
+    const firstOpenCount = vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open").length;
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry live" }));
+    fireEvent.error(firstVideo);
+    await waitFor(() => {
+      expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "live_close")).toBe(true);
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open").length).toBe(firstOpenCount + 1);
+    });
+    expect(screen.queryByRole("button", { name: "Retry live" })).toBeNull();
     await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+
     const closesBeforeUnmount = vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_close").length;
     view.unmount();
     await waitFor(() => {

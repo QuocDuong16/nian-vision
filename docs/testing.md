@@ -640,7 +640,7 @@ No hardware model is claimed validated by the M10 automated suite.
 sockets. The suite proves the four-camera cap, duplicate refusal, RAII reservation release,
 opaque/secret-safe DTOs, per-camera status isolation and background expiry without a
 follow-up command. The remediation suite additionally proves that 80 simulated finalized
-fragments collapse to the configured six-fragment rolling window, four sessions are bounded
+fragments collapse to the configured 24-fragment rolling window, four sessions are bounded
 independently, reader-owned old fragments survive trimming until reader release, explicit
 close removes transient cache, and startup removes only canonical owned `session-<uuid>`
 directories while preserving lookalikes/unrelated files.
@@ -648,9 +648,10 @@ directories while preserving lookalikes/unrelated files.
 HTTP tests cover the session base capability, manifest and fixed fragment grammar plus
 wrong Host/Origin, non-GET/HEAD methods, malformed/arbitrary paths, stale sessions and reader
 limits. No request may supply an RTSP URL or arbitrary filesystem path. The configured
-resource contract under test is a 500 ms fragment target, six retained-fragment target,
-eight-finalized-fragment hard ceiling, 16 MiB maximum per fragment, two readers per live
-session, eight concurrent live HTTP requests and four simultaneous live sessions.
+resource contract under test is a 500 ms fragment target, 24 retained-fragment target,
+26-finalized-fragment hard count ceiling, the preserved 96 MiB retained-byte ceiling, 16 MiB
+maximum per fragment, two readers per live session, eight concurrent live HTTP requests and
+four simultaneous live sessions.
 
 Lifecycle tests exercise the split runner stop/join contract and tracked draining phase. A
 Condvar-blocked fake proves `close(A)` removes A from frontend-visible active state but keeps
@@ -692,7 +693,9 @@ pending opens, stale generation 1 resolving after generation 2 has been requeste
 of stale overwrite. A deferred `live_statuses` test proves repeated one-second ticks cannot
 overlap one aggregate refresh, resolve/reject both release polling ownership, and unmount
 ignores a late result. Existing tests continue to cover per-tile failure isolation, recording
-Start/Stop independence, media-error cleanup and reconnect remount. Fragment consumption uses
+Start/Stop independence and reconnect remount. Media failure coverage now proves automatic
+fresh-session replacement, bounded 250/750/1500 ms recovery, hard stop after three consecutive
+automatic recoveries, exposure of the original structured failure, manual Retry reset and timer/session cleanup on unmount. Fragment consumption uses
 a single sequence watermark rather than retaining an unbounded historical sequence set. The
 complete UI gate is TypeScript typecheck + ESLint + Vitest + Vite production build.
 
@@ -755,8 +758,7 @@ Frontend `PtzControls` tests use deferred Promises and fake timers to cover pres
 release before `ptz_move` resolves, Left→Right stale response ordering, periodic renew,
 unmount cleanup and per-camera failure isolation. `LiveViewScreen` regressions keep
 recording/live ownership independent while a tile mounts the PTZ pad. Camera-management
-coverage exercises explicit Pair/Replace/Unpair workflow through the existing ONVIF
-discovery/authentication surface; raw service/token values are never rendered.
+coverage proves initial Pair PTZ sends only `camera_id`, reuses the saved credential through silent exact-host backend discovery without opening the scan/login UI, falls back to explicit discovery only on `onvif_auth_failed`, and keeps Replace/Unpair explicit; raw service/token values are never rendered.
 
 Physical PTZ validation is manual and never required by Forgejo CI. On a Tapo C200 or other
 candidate camera, verify every advertised direction, hold-to-renew behavior, navigation/hide
@@ -771,7 +773,7 @@ shared Event credentials block camera credential replacement, Event-owned creden
 independent camera credential replacement, and camera deletion cleans camera/PTZ/Event-owned
 credentials once and only after the database commit.
 
-`nian-onvif` parser fixtures cover the namespace-qualified `RuleEngine/CellMotionDetector/Motion` TopicSet path, QName-prefix resolution for notification Topic text, rejection/ignore of identical local names under vendor namespaces, boolean `IsMotion`, synchronization `Initialized`, malformed/lookalike messages, PullPoint lifetime validation that accepts the 5-second minimum, rejects shorter remote lifetimes instead of clamping upward, clamps only downward at 24 hours, preserves missing-metadata fallback, and handles invalid/extreme timestamps safely. Renew-response fixtures apply the same minimum validation before mutating subscription metadata. SHA-256 source-token normalization remains unchanged. A local HTTP fixture executes the complete
+`nian-onvif` parser fixtures cover namespace-qualified `RuleEngine/CellMotionDetector/Motion` + `IsMotion`, `RuleEngine/MotionRegionDetector/Motion` + `State`, and `VideoSource/MotionAlarm` + `State`, QName-prefix resolution for notification Topic text, rejection/ignore of identical local names under vendor namespaces, synchronization `Initialized`, malformed/lookalike messages, distinct missing-Events-service versus missing-compatible-motion-topic diagnostics, PullPoint lifetime validation that accepts the 5-second minimum, rejects shorter remote lifetimes instead of clamping upward, clamps only downward at 24 hours, preserves missing-metadata fallback, and handles invalid/extreme timestamps safely. Renew-response fixtures apply the same minimum validation before mutating subscription metadata. SHA-256 source-token normalization remains unchanged. A local HTTP fixture executes the complete
 GetServices/GetEventProperties/CreatePullPointSubscription/SetSynchronizationPoint/PullMessages/
 Renew/Unsubscribe sequence using the production client. It checks the four-second bounded poll,
 32-message cap, secret redaction and normalized source digest. A separate fixture advertises a
@@ -792,8 +794,7 @@ continue through the terminal Event settlement path rather than the Hide path.
 
 Frontend coverage pairs initial Events directly from a saved camera using only `camera_id`, proves the ONVIF scan/login dialog stays hidden when saved credentials authenticate, falls back to explicit ONVIF credentials only on `onvif_auth_failed`, verifies Pair leaves Desired Off until Enable, and exercises Unpair. Cameras loads the aggregate `event_statuses` result instead of issuing N per-camera Event status calls. Live View polls the same aggregate at five-second cadence with an explicit single-flight guard; a deferred-request test fires multiple timer ticks and proves only one backend request remains active until resolution, after which one new poll may start. Motion/error projection still does not close or replace a healthy video tile. Desktop has a thread-identity regression proving aggregate Event status collection executes through `spawn_blocking`, not on the caller/main thread.
 
-Physical Event validation is manual and never claimed by CI. On a compatible camera, verify standard
-CellMotion start/end transitions, reconnect replay suppression, camera reboot, network interruption,
+Physical Event validation is manual and never claimed by CI. On a compatible camera, verify any advertised supported standard CellMotion/MotionRegion/MotionAlarm start/end transitions, reconnect replay suppression, camera reboot, network interruption,
 Suspend/Resume fresh synchronization baseline, close-to-tray continued monitoring, storage-root
 switching, and continued RTSP recording/live/PTZ behavior while Event monitoring fails.
 

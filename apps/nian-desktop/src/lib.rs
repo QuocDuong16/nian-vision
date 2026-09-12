@@ -1263,6 +1263,32 @@ async fn onvif_add_camera(
 }
 
 #[tauri::command]
+async fn ptz_pair_saved(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    camera_id: String,
+) -> Result<PtzMutation<PtzCapabilitiesDto>, DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let prepared_camera = lock(&state.camera_service)?
+            .prepare_onvif_camera(&camera_id)
+            .map_err(map_camera_error)?;
+        let prepared = state
+            .onvif_controller
+            .prepare_ptz_pairing_for_host(&prepared_camera.host, prepared_camera.credentials)
+            .map_err(map_onvif_error)?;
+        state
+            .ptz_controller
+            .pair(&camera_id, prepared)
+            .map_err(map_ptz_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("ptz_internal", "PTZ pairing task failed"))?
+}
+#[tauri::command]
 async fn ptz_pair(
     state: tauri::State<'_, Arc<DesktopState>>,
     input: PtzPairInput,
@@ -2650,6 +2676,14 @@ fn map_onvif_error(error: OnvifControllerError) -> DesktopErrorDto {
             "onvif_event_unsupported",
             "camera does not expose a compatible ONVIF motion event service",
         ),
+        OnvifControllerError::EventServiceUnsupported => DesktopErrorDto::new(
+            "onvif_event_service_unsupported",
+            "camera does not expose an ONVIF Events service",
+        ),
+        OnvifControllerError::MotionEventUnsupported => DesktopErrorDto::new(
+            "onvif_motion_topic_unsupported",
+            "camera exposes ONVIF Events but does not advertise a compatible standard motion topic",
+        ),
         OnvifControllerError::Validation => {
             DesktopErrorDto::new("validation", "ONVIF credentials or selection are invalid")
         }
@@ -2681,6 +2715,14 @@ fn map_onvif_error(error: OnvifControllerError) -> DesktopErrorDto {
             OnvifError::Unsupported => DesktopErrorDto::new(
                 "onvif_unsupported",
                 "camera does not expose the required ONVIF media capability",
+            ),
+            OnvifError::EventServiceUnsupported => DesktopErrorDto::new(
+                "onvif_event_service_unsupported",
+                "camera does not expose an ONVIF Events service",
+            ),
+            OnvifError::MotionEventUnsupported => DesktopErrorDto::new(
+                "onvif_motion_topic_unsupported",
+                "camera exposes ONVIF Events but does not advertise a compatible standard motion topic",
             ),
             OnvifError::NoCompatibleProfile => DesktopErrorDto::new(
                 "onvif_no_compatible_profile",
@@ -3858,6 +3900,7 @@ pub fn run() {
             onvif_connect_events,
             onvif_prepare_profile,
             onvif_add_camera,
+            ptz_pair_saved,
             ptz_pair,
             ptz_unpair,
             ptz_configured,

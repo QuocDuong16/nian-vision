@@ -344,12 +344,12 @@ impl OnvifClient {
             return Err(if rejected_event {
                 OnvifError::AuthorityRejected
             } else {
-                OnvifError::Unsupported
+                OnvifError::EventServiceUnsupported
             });
         }
         event_services.sort();
 
-        let mut last_error = OnvifError::Unsupported;
+        let mut last_error = OnvifError::MotionEventUnsupported;
         for service in event_services {
             match self.soap(
                 &service,
@@ -366,7 +366,7 @@ impl OnvifClient {
                             properties,
                         });
                     }
-                    last_error = OnvifError::Unsupported;
+                    last_error = OnvifError::MotionEventUnsupported;
                 }
                 Err(OnvifError::AuthFailed) => return Err(OnvifError::AuthFailed),
                 Err(error) => last_error = error,
@@ -381,7 +381,7 @@ impl OnvifClient {
         credentials: &OnvifCredentials,
     ) -> Result<PullPointSubscription, OnvifError> {
         if !control.properties.motion_supported {
-            return Err(OnvifError::Unsupported);
+            return Err(OnvifError::MotionEventUnsupported);
         }
         let body = format!(
             "<tev:CreatePullPointSubscription><tev:InitialTerminationTime>PT{}S</tev:InitialTerminationTime></tev:CreatePullPointSubscription>",
@@ -1739,6 +1739,62 @@ mod tests {
             validated_service_xaddrs(&services, "/ver20/ptz/wsdl", "http://127.0.0.1/device");
         assert!(candidates.is_empty());
         assert!(rejected);
+    }
+
+    #[test]
+    fn event_control_distinguishes_missing_service_from_missing_motion_topic() {
+        let service_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let service_address = service_listener.local_addr().unwrap();
+        let service_server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = service_listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let body = if request.contains("GetServices") {
+                    format!(
+                        "<Envelope><Body><GetServicesResponse><Service><Namespace>{MEDIA1_NS}</Namespace><XAddr>http://{service_address}/media</XAddr></Service></GetServicesResponse></Body></Envelope>"
+                    )
+                } else if request.contains("GetCapabilities") {
+                    "<Envelope><Body><GetCapabilitiesResponse><Capabilities/></GetCapabilitiesResponse></Body></Envelope>".to_owned()
+                } else {
+                    panic!("unexpected missing-service request: {request}");
+                };
+                write_http_response(&mut stream, "200 OK", &[], &body);
+            }
+        });
+        let credentials = OnvifCredentials {
+            username: "u".into(),
+            password: "p".into(),
+        };
+        let client = OnvifClient::with_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            client.event_control(&format!("http://{service_address}/device"), &credentials),
+            Err(OnvifError::EventServiceUnsupported)
+        );
+        service_server.join().unwrap();
+
+        let topic_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let topic_address = topic_listener.local_addr().unwrap();
+        let topic_server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = topic_listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let body = if request.contains("GetServices") {
+                    format!(
+                        "<Envelope><Body><GetServicesResponse><Service><Namespace>{EVENT_NS}</Namespace><XAddr>http://{topic_address}/events</XAddr></Service></GetServicesResponse></Body></Envelope>"
+                    )
+                } else if request.contains("GetEventProperties") {
+                    r#"<Envelope xmlns:tns1="http://www.onvif.org/ver10/topics"><Body><GetEventPropertiesResponse><TopicSet><tns1:VideoSource><tns1:ImageTooDark/></tns1:VideoSource></TopicSet></GetEventPropertiesResponse></Body></Envelope>"#.to_owned()
+                } else {
+                    panic!("unexpected missing-topic request: {request}");
+                };
+                write_http_response(&mut stream, "200 OK", &[], &body);
+            }
+        });
+        assert_eq!(
+            client.event_control(&format!("http://{topic_address}/device"), &credentials),
+            Err(OnvifError::MotionEventUnsupported)
+        );
+        topic_server.join().unwrap();
     }
 
     #[test]

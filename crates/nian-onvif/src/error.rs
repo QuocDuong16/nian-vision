@@ -16,6 +16,10 @@ pub enum OnvifError {
     ResponseTooLarge,
     #[error("ONVIF capability is unsupported")]
     Unsupported,
+    #[error("ONVIF Events service is unavailable")]
+    EventServiceUnsupported,
+    #[error("ONVIF Events service does not advertise a compatible motion topic")]
+    MotionEventUnsupported,
     #[error("no compatible H.264 media profile is available")]
     NoCompatibleProfile,
     #[error("camera returned an invalid RTSP stream URI")]

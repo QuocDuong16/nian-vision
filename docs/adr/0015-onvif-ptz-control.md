@@ -35,12 +35,9 @@ settles the camera's PTZ runtime ownership, commits the camera/settings deletion
 then best-effort deletes external camera/PTZ credentials. A failed database deletion therefore
 leaves every still-authoritative native secret intact.
 
-### Pairing is explicit and authority-bound
+### Pairing is authority-bound and reuses saved credentials first
 
-PTZ pairing starts from an explicit M10 discovery/device authentication session. React
-selects a discovered device and submits only opaque session/device handles to the pairing
-command. `OnvifController` resolves the selected device and proves a PTZ service/profile/
-configuration association before returning a Rust-only `PreparedPtzPairing`.
+Initial PTZ pairing for an already configured RTSP camera reuses the camera credential only inside the desktop/native credential boundary. React submits only `camera_id`; the backend silently performs WS-Discovery, exact-host matches the saved RTSP host, authenticates PTZ, and returns a Rust-only `PreparedPtzPairing`. Explicit M10 discovery/device selection and alternate credentials remain the fallback only when the saved credential is rejected, and Replace PTZ remains an explicit replacement flow. The older session/device path stays generation-bound for that fallback/replacement path.
 
 `PtzController` then compares the selected ONVIF Device-service host with the configured
 RTSP camera host. M12 intentionally requires exact host equality; model, manufacturer,

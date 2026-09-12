@@ -680,10 +680,10 @@ The worker accepts `live.start`, `live.status` and `live.stop`, requires H.264 a
 packet-copies video only. Instead of one growing MP4, it writes independently finalized
 fragmented-MP4 files. Only the initial fragment waits for a keyframe; later fragments rotate
 at a 500 ms media-time target without waiting for another keyframe. Production limits are:
-four live sessions, a six-fragment retained target per session (nominally about a 3-second
-post-initial live window), an eight-finalized-fragment hard ceiling that accounts for two
-possible reader pins, 16 MiB maximum per fragment, two HTTP readers per session and eight
-concurrent live HTTP requests globally. The worker backpressures when the hard fragment-count
+four live sessions, a 24-fragment retained target per session (nominally about a 12-second
+post-initial live window), a 26-finalized-fragment hard count ceiling that accounts for two
+possible reader pins, the previous 96 MiB retained-byte ceiling, 16 MiB maximum per fragment,
+two HTTP readers per session and eight concurrent live HTTP requests globally. The worker backpressures when the hard fragment-count
 ceiling is full, uses byte pressure as a second rotation trigger, and fails pathological media
 that cannot stay within the hard fragment-size bound; no decode/transcode path is introduced. Transient source/media loss retains the bounded
 1/2/4/8/15-second, five-attempt reconnect policy.
@@ -710,6 +710,10 @@ request/header/reader caps keep the endpoint a narrow capability. The desktop CS
 and loopback HTTP. React uses `MediaSource` to poll the manifest, fetch unseen fragments,
 append H.264 MP4 data and trim older buffered media. It tracks only the highest successfully
 appended fragment sequence, so frontend bookkeeping stays O(1) for arbitrarily long sessions.
+Manifest, fragment, SourceBuffer and media-element failures are classified. The frontend closes
+a failed session and opens a fresh one with 250/750/1500 ms backoff for at most three consecutive
+automatic recoveries; the streak resets only after ten seconds of stable media, and a fourth
+consecutive failure becomes an explicit per-tile error requiring manual Retry.
 
 Keepalive is deliberately cheap: `live_keepalive` validates one active session and updates
 its timestamp only. The two-minute timeout and background reaper own expensive expiry and
@@ -754,10 +758,12 @@ separate `ptz_bindings` row keyed by `camera_id`; the row contains only bounded 
 Device-service identity plus an opaque credential reference. PTZ service XAddr, profile/
 configuration tokens, SOAP payloads and passwords are never persisted.
 
-Pairing reuses the explicit M10 discovery/authentication session. The user selects a device,
-`OnvifController` resolves its PTZ service/profile/configuration and `PtzController` accepts
-the association only when the ONVIF Device-service host exactly matches the configured RTSP
-host. Service XAddrs are independently authority-validated inside `nian-onvif`. PTZ capability
+Initial Pair PTZ reuses the saved camera credential inside the native credential boundary and
+silently WS-Discovers plus exact-host matches the configured RTSP camera. `OnvifController`
+resolves its PTZ service/profile/configuration and `PtzController` accepts the association only
+when the ONVIF Device-service host exactly matches the configured RTSP host. If saved ONVIF
+authentication is rejected, the UI falls back to explicit M10 discovery/device authentication;
+Replace PTZ remains an explicit replacement flow. Service XAddrs are independently authority-validated inside `nian-onvif`. PTZ capability
 lookup snapshots the authenticated connection identity and revalidates the same session/device/
 connection generation after blocking network work, so refresh/cancel/reconnect cannot publish
 a stale prepared pairing. If ONVIF and RTSP credentials are identical the existing camera
@@ -871,7 +877,7 @@ without preventing the remaining subsystems from converging.
 
 M13 adds an optional background Event plane without changing RTSP recording/live ownership. `CameraConfig` remains the physical RTSP authority. Settings schema v5 introduced an independent `EventBinding` plus per-camera Desired Event Monitoring; Pairing and Enable are separate, so merely pairing a camera never starts monitoring. The binding persists only Device-service identity and an opaque credential reference. Event-service XAddr, PullPoint SubscriptionReference, SOAP payloads and credentials are runtime-only.
 
-Initial Event pairing for an already configured RTSP camera reuses its saved credential entirely inside the desktop/native credential boundary. The backend silently WS-Discovers devices, exact-host matches against the saved RTSP host, authenticates Events, and sends only `camera_id` across the frontend command boundary; explicit device selection and alternate credentials are used only when the saved credential is rejected or for replacement. The explicit session/device path remains generation-bound. Event service resolution prefers `GetServices` and falls back to standard `GetCapabilities(Events)` when Events are omitted there, then validates `GetEventProperties` without requiring ONVIF Media discovery. `EventController` performs a second exact-host check against the current RTSP camera and persisted Event binding before authenticated runtime traffic. `nian-onvif` independently validates Event/PullPoint URLs as HTTP(S), same-host, no userinfo/query/fragment, with redirects disabled and the existing proxy-free hardened SOAP client.
+Initial Event pairing for an already configured RTSP camera reuses its saved credential entirely inside the desktop/native credential boundary. The backend silently WS-Discovers devices, exact-host matches against the saved RTSP host, authenticates Events, and sends only `camera_id` across the frontend command boundary; explicit device selection and alternate credentials are used only when the saved credential is rejected or for replacement. The explicit session/device path remains generation-bound. Event service resolution prefers `GetServices` and falls back to standard `GetCapabilities(Events)` when Events are omitted there, then validates `GetEventProperties` without requiring ONVIF Media discovery. Capability/notification parsing accepts only namespace-qualified standard `RuleEngine/CellMotionDetector/Motion` + `IsMotion`, `RuleEngine/MotionRegionDetector/Motion` + `State`, and `VideoSource/MotionAlarm` + `State`; missing Events service and present Events-without-compatible-motion-topic are reported as distinct typed failures. `EventController` performs a second exact-host check against the current RTSP camera and persisted Event binding before authenticated runtime traffic. `nian-onvif` independently validates Event/PullPoint URLs as HTTP(S), same-host, no userinfo/query/fragment, with redirects disabled and the existing proxy-free hardened SOAP client.
 
 One Event worker is owned per Desired-On camera. Its lifecycle is `opening -> active -> draining`, with independent `mutating` exclusion for pair/replace/unpair/update/delete. `draining` remains represented by a controller-owned `Arc<DrainState>` until the worker join completes; one caller owns the `JoinHandle`, concurrent lifecycle callers wait the same completion condition, and removal uses exact session/Arc identity. `opening + active + draining` is capped at 16; same-camera mutation contention fails fast Busy rather than building a waiter queue. Lifecycle generations and completion states prevent stale openings or mutation side effects from escaping after Suspend/Quit/Update. The registry/global desktop gates are never held over SOAP, SQLite, keyring I/O or joins.
 

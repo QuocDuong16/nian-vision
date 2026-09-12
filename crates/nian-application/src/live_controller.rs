@@ -24,9 +24,13 @@ pub const MAX_SIMULTANEOUS_LIVE_VIEWS: usize = 4;
 const LIVE_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const WORKER_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-pub const LIVE_FRAGMENT_TARGET: Duration = Duration::from_millis(500);
-pub const MAX_RETAINED_LIVE_FRAGMENTS: usize = 6;
+const LIVE_FRAGMENT_TARGET_MS: u64 = 500;
+const LIVE_FRAGMENT_RETENTION_MS: u64 = 12_000;
+pub const LIVE_FRAGMENT_TARGET: Duration = Duration::from_millis(LIVE_FRAGMENT_TARGET_MS);
+pub const MAX_RETAINED_LIVE_FRAGMENTS: usize =
+    (LIVE_FRAGMENT_RETENTION_MS / LIVE_FRAGMENT_TARGET_MS) as usize;
 pub const MAX_LIVE_FRAGMENT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RETAINED_LIVE_BYTES: u64 = 6 * MAX_LIVE_FRAGMENT_BYTES;
 pub const MAX_HTTP_REQUESTS: usize = 8;
 pub const MAX_HTTP_READERS_PER_SESSION: usize = 2;
 pub const MAX_LIVE_CACHE_FRAGMENTS: usize =
@@ -1099,7 +1103,7 @@ fn trim_session_fragments(session: &HttpSession) {
     }
     let retain_from = fragments.len().saturating_sub(MAX_RETAINED_LIVE_FRAGMENTS);
     let mut remaining_bytes = fragments.iter().map(|fragment| fragment.bytes).sum::<u64>();
-    let target_bytes = MAX_RETAINED_LIVE_FRAGMENTS as u64 * MAX_LIVE_FRAGMENT_BYTES;
+    let target_bytes = MAX_RETAINED_LIVE_BYTES;
 
     for (index, fragment) in fragments.into_iter().enumerate() {
         let older_than_window = index < retain_from;
@@ -2457,10 +2461,12 @@ mod tests {
         trim_session_fragments(&session.http);
         let fragments = list_live_fragments(&session.temp_dir);
         assert_eq!(fragments.len(), MAX_RETAINED_LIVE_FRAGMENTS);
-        assert_eq!(fragments.first().unwrap().sequence, 75);
+        assert_eq!(
+            fragments.first().unwrap().sequence,
+            81 - MAX_RETAINED_LIVE_FRAGMENTS as u64
+        );
         assert!(
-            fragments.iter().map(|fragment| fragment.bytes).sum::<u64>()
-                <= MAX_RETAINED_LIVE_FRAGMENTS as u64 * MAX_LIVE_FRAGMENT_BYTES
+            fragments.iter().map(|fragment| fragment.bytes).sum::<u64>() <= MAX_RETAINED_LIVE_BYTES
         );
     }
 
@@ -2472,7 +2478,8 @@ mod tests {
                 .unwrap();
         let opened = controller.open(prepared("front-door")).unwrap();
         let session = committed_session(&controller, &opened.session_id);
-        for sequence in 1..=10 {
+        let fragment_count = MAX_RETAINED_LIVE_FRAGMENTS as u64 + 4;
+        for sequence in 1..=fragment_count {
             write_test_fragment(&session.temp_dir, sequence, 1024);
         }
         let oldest = "fragment-000000000000.mp4";

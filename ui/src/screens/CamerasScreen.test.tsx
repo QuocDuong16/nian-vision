@@ -620,7 +620,7 @@ describe("CamerasScreen", () => {
     expect(screen.queryByText("Front ONVIF")).toBeNull();
   });
 
-  it("pairs PTZ through explicit ONVIF selection without forwarding credentials to ptz_pair", async () => {
+  it("pairs PTZ from the saved camera identity without opening discovery", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
     let paired = false;
     let pairArgs: unknown;
@@ -629,9 +629,7 @@ describe("CamerasScreen", () => {
       if (command === "recording_statuses") return [];
       if (command === "recording_intent") return { camera_ids: [] };
       if (command === "ptz_configured") return paired;
-      if (command === "onvif_discover") return onvifDiscovery;
-      if (command === "onvif_connect") return onvifConnection;
-      if (command === "ptz_pair") {
+      if (command === "ptz_pair_saved") {
         pairArgs = args;
         paired = true;
         return {
@@ -647,32 +645,38 @@ describe("CamerasScreen", () => {
           warning: null,
         };
       }
-      if (command === "onvif_cancel") return undefined;
       throw new Error(`unexpected command ${command}`);
     });
 
     render(<CamerasScreen />);
     await screen.findByText("Front door");
     fireEvent.click(screen.getByRole("button", { name: "Pair PTZ" }));
-    expect(await screen.findByRole("dialog", { name: "ONVIF PTZ pairing" })).toBeTruthy();
-    await screen.findByText("Front ONVIF");
-    fireEvent.click(screen.getByRole("button", { name: "Select" }));
-    fireEvent.change(screen.getByLabelText("ONVIF username"), { target: { value: "admin" } });
-    fireEvent.change(screen.getByLabelText("ONVIF password"), {
-      target: { value: "SENTINEL-ptz-password" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Authenticate & Pair" }));
 
     expect(await screen.findByRole("button", { name: "Replace PTZ" })).toBeTruthy();
-    const serialized = JSON.stringify(pairArgs);
-    expect(serialized).toContain(camera.camera_id);
-    expect(serialized).toContain("session-1");
-    expect(serialized).toContain("device-1");
-    expect(serialized).not.toContain("username");
-    expect(serialized).not.toContain("password");
-    expect(serialized).not.toContain("SENTINEL-ptz-password");
-    expect(document.body.textContent).not.toContain("SENTINEL-ptz-password");
+    expect(pairArgs).toEqual({ cameraId: camera.camera_id });
+    expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "onvif_discover")).toBe(false);
   });
+
+  it("falls back to explicit PTZ discovery only when the saved ONVIF authentication is rejected", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "camera_list") return [camera];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "ptz_configured") return false;
+      if (command === "ptz_pair_saved") throw { code: "onvif_auth_failed", message: "ONVIF authentication failed" };
+      if (command === "onvif_discover") return onvifDiscovery;
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<CamerasScreen />);
+    await screen.findByText("Front door");
+    fireEvent.click(screen.getByRole("button", { name: "Pair PTZ" }));
+
+    expect(await screen.findByRole("dialog", { name: "ONVIF PTZ pairing" })).toBeTruthy();
+    expect(await screen.findByText("Front ONVIF")).toBeTruthy();
+  });
+
 
   it("pairs Motion Events without forwarding credentials and keeps Desired Off until explicitly enabled", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
