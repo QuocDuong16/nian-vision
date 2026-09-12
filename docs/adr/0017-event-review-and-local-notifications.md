@@ -61,7 +61,7 @@ A duplicate insert returns no new `event_id`, so it cannot generate a second not
 - rate-limiter state: at most 128 camera entries, evicting the oldest entry when necessary;
 - notifier failures and delivery timeouts are isolated from Event monitoring;
 - rate-limit admission happens before native delivery, so a failed/timed-out delivery still consumes the 15-second slot and cannot create a retry storm;
-- native delivery has a fixed 3-second ownership deadline;
+- native delivery has a fixed 3-second ownership deadline; timeout accounting is published only after termination settles, so observers never see a completed timeout while the native delivery is still owned;
 - no network I/O and no cloud notification service.
 
 Native notification content is deliberately minimal: title `Motion detected`, body equal to the camera display name. It contains no IP address, ONVIF URL, credential, source token, or recording path.

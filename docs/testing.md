@@ -692,8 +692,8 @@ pending opens, stale generation 1 resolving after generation 2 has been requeste
 `live_close` of late results, exclusion of late sessions from the keepalive set and prevention
 of stale overwrite. A deferred `live_statuses` test proves repeated one-second ticks cannot
 overlap one aggregate refresh, resolve/reject both release polling ownership, and unmount
-ignores a late result. Existing tests continue to cover per-tile failure isolation, recording
-Start/Stop independence and reconnect remount. Media failure coverage now proves automatic
+ignores a late result. Existing tests continue to cover per-tile failure isolation and recording
+Start/Stop independence. Backend reconnect coverage now proves the same `<video>`/MSE pipeline stays mounted across `backoff -> connecting -> live`; worker coverage proves 10 seconds of stable packets resets the consecutive reconnect budget. Media failure coverage separately proves automatic
 fresh-session replacement, bounded 250/750/1500 ms recovery, hard stop after three consecutive
 automatic recoveries, exposure of the original structured failure, manual Retry reset and timer/session cleanup on unmount. Presentation coverage proves Fit tile is the default for fresh preferences, Native pixels can be selected without reopening/closing transport, and the diagnostics toggle is independent of live ownership. A remount regression selects a camera, verifies unmount closes its session, then remounts the screen and requires the persisted camera-id layout to open a fresh session; no session id or loopback capability is persisted. Runtime render diagnostics are derived only from decoded `videoWidth`/`videoHeight`, element geometry and `devicePixelRatio`; CI does not pretend jsdom is a GPU scaler. Fragment consumption uses
 a single sequence watermark rather than retaining an unbounded historical sequence set. The

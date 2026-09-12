@@ -155,14 +155,12 @@ function waitForSourceBuffer(sourceBuffer: SourceBuffer): Promise<void> {
 
 function LiveMedia({
   session,
-  reconnectAttempt,
   scaleMode,
   showDiagnostics,
   onError,
   onStable,
 }: {
   session: LiveOpenDto;
-  reconnectAttempt: number;
   scaleMode: LiveScaleMode;
   showDiagnostics: boolean;
   onError: (failure: DesktopError) => void;
@@ -367,7 +365,7 @@ function LiveMedia({
       video.load();
       URL.revokeObjectURL(objectUrl);
     };
-  }, [reconnectAttempt, session.session_id, session.url]);
+  }, [session.session_id, session.url]);
 
   const fallback = typeof window.MediaSource === "undefined";
   const nativeStyle = scaleMode === "native" && renderStats
@@ -927,7 +925,9 @@ export function LiveViewScreen() {
             const recordingActive = recording ? ACTIVE_RECORDING_STATES.has(recording.state) : false;
             const recordingConvergingOff = !desiredOn && recordingActive;
             const events = eventStatuses.get(cameraId);
-            const canRenderVideo = Boolean(session && backendStatus?.state === "live" && !tileError);
+            const canRenderVideo = Boolean(
+              session && !tileError && state !== "failed" && state !== "stopping",
+            );
             return (
               <article className="live-tile" key={cameraId} aria-label={`${camera.display_name} live camera`}>
                 <div className="live-tile-head">
@@ -943,9 +943,8 @@ export function LiveViewScreen() {
                 <div className="live-media-frame">
                   {canRenderVideo && session ? (
                     <LiveMedia
-                      key={`${session.session_id}-${backendStatus?.reconnect_attempt ?? 0}`}
+                      key={session.session_id}
                       session={session}
-                      reconnectAttempt={backendStatus?.reconnect_attempt ?? 0}
                       scaleMode={scaleMode}
                       showDiagnostics={showVideoDiagnostics}
                       onError={(failure) => void handleMediaError(cameraId, failure)}

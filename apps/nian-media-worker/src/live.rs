@@ -18,7 +18,8 @@ use serde::Serialize;
 
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
-const BACKOFF_SECONDS: [u64; 5] = [1, 2, 4, 8, 15];
+const RECONNECT_STABLE_RESET_AFTER: Duration = Duration::from_secs(10);
+const BACKOFF_SECONDS: [u64; 4] = [1, 2, 4, 8];
 const MIN_FRAGMENT_TARGET: Duration = Duration::from_millis(500);
 const MAX_FRAGMENT_TARGET: Duration = Duration::from_secs(10);
 const MIN_FRAGMENT_BYTES: u64 = 1024 * 1024;
@@ -223,7 +224,8 @@ fn run_live(
     current_interrupt: Arc<Mutex<Option<InterruptHandle>>>,
 ) {
     let mut next_fragment = 0_u64;
-    for attempt in 0..MAX_RECONNECT_ATTEMPTS {
+    let mut attempt = 0_u32;
+    loop {
         if stop.load(Ordering::Acquire) {
             mark_cancelled(&status);
             return;
@@ -248,6 +250,7 @@ fn run_live(
                 if !retry_or_fail(&status, &stop, attempt, "source_open_failed") {
                     return;
                 }
+                attempt = attempt.saturating_add(1);
                 continue;
             }
         };
@@ -273,6 +276,7 @@ fn run_live(
         };
         let video_index = video.stream_index;
         set_status(&status, "live", None, attempt);
+        let live_started_at = Instant::now();
 
         let mut active: Option<ActiveFragment> = None;
         let mut retry_failure = "media_read_failed";
@@ -301,6 +305,11 @@ fn run_live(
             let metadata = packet.metadata();
             if metadata.stream_index != video_index {
                 continue;
+            }
+            let reset_attempt = reconnect_attempt_after_stable(attempt, live_started_at.elapsed());
+            if reset_attempt != attempt {
+                attempt = reset_attempt;
+                set_status(&status, "live", None, attempt);
             }
             if active.is_none() {
                 if !metadata.keyframe {
@@ -437,6 +446,15 @@ fn run_live(
         if !retry_or_fail(&status, &stop, attempt, retry_failure) {
             return;
         }
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+fn reconnect_attempt_after_stable(attempt: u32, stable_for: Duration) -> u32 {
+    if stable_for >= RECONNECT_STABLE_RESET_AFTER {
+        0
+    } else {
+        attempt
     }
 }
 
@@ -850,6 +868,19 @@ mod tests {
 
         assert!(!partial.exists());
         assert_eq!(std::fs::read(&final_path).unwrap(), b"complete-fragment");
+    }
+
+    #[test]
+    fn stable_live_period_resets_consecutive_reconnect_budget() {
+        assert_eq!(reconnect_attempt_after_stable(3, Duration::from_secs(9)), 3);
+        assert_eq!(
+            reconnect_attempt_after_stable(3, RECONNECT_STABLE_RESET_AFTER),
+            0
+        );
+        assert_eq!(
+            reconnect_attempt_after_stable(0, Duration::from_secs(30)),
+            0
+        );
     }
 
     #[test]

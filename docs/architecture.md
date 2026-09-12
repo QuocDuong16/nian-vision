@@ -685,8 +685,8 @@ post-initial live window), a 26-finalized-fragment hard count ceiling that accou
 possible reader pins, the previous 96 MiB retained-byte ceiling, 16 MiB maximum per fragment,
 two HTTP readers per session and eight concurrent live HTTP requests globally. The worker backpressures when the hard fragment-count
 ceiling is full, uses byte pressure as a second rotation trigger, and fails pathological media
-that cannot stay within the hard fragment-size bound; no decode/transcode path is introduced. Transient source/media loss retains the bounded
-1/2/4/8/15-second, five-attempt reconnect policy.
+that cannot stay within the hard fragment-size bound; no decode/transcode path is introduced. Transient source/media loss uses five consecutive
+open/read attempts with 1/2/4/8-second backoffs; 10 seconds of stable live packets resets that budget. The WebView keeps the same MSE pipeline mounted during backend backoff/connecting so a short RTSP reconnect resumes into the existing presentation timeline instead of forcing a player remount.
 Every failed live-fragment finalization best-effort removes only its exact worker-owned
 `.partial.mp4`; successful rename leaves the finalized `.mp4` intact.
 

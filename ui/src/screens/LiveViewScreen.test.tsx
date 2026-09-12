@@ -321,7 +321,7 @@ describe("LiveViewScreen", () => {
     expect(tile.querySelector("video")).toBeTruthy();
   });
 
-  it("remounts media after an independent reconnect cycle", async () => {
+  it("keeps the media pipeline mounted across an independent backend reconnect cycle", async () => {
     const desktop = installDesktop();
     render(<LiveViewScreen />);
 
@@ -337,8 +337,17 @@ describe("LiveViewScreen", () => {
     desktop.setLiveState(front.camera_id, "backoff", 1);
     await waitFor(
       () => {
-        expect(screen.getByText(/Reconnecting · attempt 1/)).toBeTruthy();
-        expect(tile.querySelector("video")).toBeNull();
+        expect(screen.getByText("Reconnecting")).toBeTruthy();
+        expect(tile.querySelector("video")).toBe(firstVideo);
+      },
+      { timeout: 2_500 },
+    );
+
+    desktop.setLiveState(front.camera_id, "connecting", 1);
+    await waitFor(
+      () => {
+        expect(screen.getByText("connecting")).toBeTruthy();
+        expect(tile.querySelector("video")).toBe(firstVideo);
       },
       { timeout: 2_500 },
     );
@@ -346,9 +355,7 @@ describe("LiveViewScreen", () => {
     desktop.setLiveState(front.camera_id, "live", 1);
     await waitFor(
       () => {
-        const reconnected = tile.querySelector("video");
-        expect(reconnected).toBeTruthy();
-        expect(reconnected).not.toBe(firstVideo);
+        expect(tile.querySelector("video")).toBe(firstVideo);
       },
       { timeout: 2_500 },
     );

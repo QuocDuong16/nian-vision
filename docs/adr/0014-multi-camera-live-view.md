@@ -195,9 +195,12 @@ session ids. Quit/update stop admission, cancel openings, signal committed worke
 live ownership and only then complete their lifecycle handoff. Recording restoration remains
 the M9 Desired path.
 
-Transient source/media loss still uses the bounded live reconnect schedule 1/2/4/8/15
-seconds with five total attempts. One camera's failure/status/reconnect remains isolated
-from unrelated live and recording cameras.
+Transient source/media loss uses five consecutive source-open/read attempts with 1/2/4/8-second
+backoffs between attempts. A live period that survives at least 10 seconds resets that consecutive
+retry budget. The frontend keeps the same MSE/video pipeline mounted across backend `backoff` and
+`connecting` states, so a recoverable RTSP hiccup can resume on the same timeline instead of
+discarding the player and presenting a blank Connecting tile. One camera's failure/status/reconnect
+remains isolated from unrelated live and recording cameras.
 
 ## Consequences
 

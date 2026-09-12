@@ -383,10 +383,12 @@ impl NotificationDispatcher {
                             }
                         }
                         if Instant::now() >= deadline {
-                            counters.delivery_timeouts.fetch_add(1, Ordering::Relaxed);
                             if delivery.terminate().is_err() {
                                 counters.notifier_failures.fetch_add(1, Ordering::Relaxed);
                             }
+                            // Publish the timeout only after termination has settled so observers
+                            // cannot see a completed timeout while the native delivery is still live.
+                            counters.delivery_timeouts.fetch_add(1, Ordering::Release);
                             break false;
                         }
                         thread::sleep(NOTIFICATION_DELIVERY_POLL_INTERVAL);
