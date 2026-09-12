@@ -2,11 +2,11 @@
 
 Record the exact tag, commit SHA, OS image/VM and result for every run. A checkbox is evidence only when the step was actually executed. Do not reuse a tag after changing source.
 
-Current retry candidate: `1.0.0-rc.47` / `v1.0.0-rc.47`. RC1 through RC46 remain immutable. RC47 adds post-persistence motion-triggered recording episodes with aggregate multi-source ownership, five-second post-roll, five-minute maximum segment duration, manual-recording promotion safety, recording-index refresh on finalization, and automatic Event Review availability refresh.
+Current retry candidate: `1.0.0-rc.48` / `v1.0.0-rc.48`. RC1 through RC47 remain immutable. RC48 removes hosted-CI timing dependence from the Live View automatic-recovery test while preserving exact 250/750/1500 ms backoff assertions, and treats an empty persisted Live View selection as already restored so an immediate Add action cannot trigger a redundant restore generation.
 
 ## Pre-tag authority
 
-- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.47`.
+- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.48`.
 - [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
@@ -16,7 +16,7 @@ Current retry candidate: `1.0.0-rc.47` / `v1.0.0-rc.47`. RC1 through RC46 remain
 
 ## GitHub RC workflow
 
-- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.47`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.46`; source/tag cross-pairing is forbidden.
+- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.48`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.47`; source/tag cross-pairing is forbidden.
 - [ ] GitHub tag resolves to exactly the same commit as Forgejo.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.

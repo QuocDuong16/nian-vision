@@ -440,7 +440,7 @@ export function LiveViewScreen() {
   const recoveryTimersRef = useRef<Map<string, number>>(new Map());
   const refreshInFlightRef = useRef(false);
   const eventStatusInFlightRef = useRef(false);
-  const restoredSelectionOpenedRef = useRef(false);
+  const restoredSelectionOpenedRef = useRef(initialPreferences.cameraIds.length === 0);
 
   useEffect(() => {
     persistLiveViewPreferences({ cameraIds: selected, scaleMode });

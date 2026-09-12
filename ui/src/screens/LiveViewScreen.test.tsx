@@ -592,6 +592,23 @@ describe("LiveViewScreen", () => {
   });
 
   it("stops automatic media recovery after three consecutive failures and exposes the real failure", async () => {
+    const realSetTimeout = window.setTimeout.bind(window);
+    const recoveryDelays: number[] = [];
+    let syntheticTimerId = 100_000;
+    vi.spyOn(window, "setTimeout").mockImplementation((handler, timeout, ...args) => {
+      const delay = Number(timeout ?? 0);
+      if (
+        typeof handler === "function" &&
+        (delay === 250 || delay === 750 || delay === 1_500)
+      ) {
+        recoveryDelays.push(delay);
+        const timerId = syntheticTimerId;
+        syntheticTimerId += 1;
+        queueMicrotask(() => handler(...args));
+        return timerId;
+      }
+      return realSetTimeout(handler, timeout, ...args);
+    });
     installDesktop();
     render(<LiveViewScreen />);
 
@@ -603,11 +620,10 @@ describe("LiveViewScreen", () => {
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       const video = document.querySelector("video") as HTMLVideoElement;
       fireEvent.error(video);
-      await waitFor(
-        () => expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open").length).toBe(attempt + 1),
-        { timeout: 2_500 },
-      );
-      await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+      await waitFor(() => {
+        expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open").length).toBe(attempt + 1);
+        expect(document.querySelector("video")).toBeTruthy();
+      });
     }
 
     fireEvent.error(document.querySelector("video") as HTMLVideoElement);
@@ -615,6 +631,7 @@ describe("LiveViewScreen", () => {
     expect(screen.getByText(/decode or playback failure/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Retry live" })).toBeTruthy();
     expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open")).toHaveLength(4);
+    expect(recoveryDelays).toEqual([250, 750, 1_500]);
   }, 10_000);
 
   it("automatically replaces a failed media session and still closes the replacement on unmount", async () => {
