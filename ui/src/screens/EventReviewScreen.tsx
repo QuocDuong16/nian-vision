@@ -292,6 +292,28 @@ export function EventReviewScreen() {
     }
   }, [closePlayback]);
 
+  useEffect(() => {
+    if (!selected || recordingContext?.available || !isTauri()) return;
+    const refreshed = rows.find((row) => row.event_id === selected.event_id);
+    if (!refreshed?.recording_available) return;
+    const generation = selectionGenerationRef.current;
+    let cancelled = false;
+    void invokeDesktop<EventRecordingContext>("event_recording_context", { eventId: selected.event_id })
+      .then((context) => {
+        if (!cancelled && generation === selectionGenerationRef.current) {
+          setRecordingContext(context);
+        }
+      })
+      .catch((cause) => {
+        if (!cancelled && generation === selectionGenerationRef.current) {
+          setSelectionMessage(desktopError(cause).message);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [recordingContext?.available, rows, selected]);
+
   const openEventPlayback = useCallback(async () => {
     if (!selected || playbackLoading || !isTauri()) return;
     const eventId = selected.event_id;
@@ -459,7 +481,7 @@ export function EventReviewScreen() {
                   <span className="muted">Playback starts about 5 seconds before the event when footage allows.</span>
                 </div>
               ) : (
-                <p className="muted">No recording available for this event.</p>
+                <p className="muted">No recording available yet. Motion-triggered clips appear here after the segment is finalized.</p>
               )}
               {selectionMessage && <p className="warning-message" role="status">{selectionMessage}</p>}
             </>

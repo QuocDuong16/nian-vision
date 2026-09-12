@@ -1687,9 +1687,14 @@ fn apply_motion_notification_with_sink(
     retention_days: Option<u32>,
 ) -> Result<(), ()> {
     let decision = normalizer.prepare(camera_id, notification, received_time_utc);
-    if let Some(insert) = decision.transition.as_ref()
-        && let Some(event_id) = persist_motion_transition(event_index, insert, retention_days)?
-    {
+    let transition = decision.transition.clone();
+    let persisted_event_id = transition
+        .as_ref()
+        .map(|insert| persist_motion_transition(event_index, insert, retention_days))
+        .transpose()?
+        .flatten();
+    normalizer.commit(decision);
+    if let (Some(insert), Some(event_id)) = (transition.as_ref(), persisted_event_id) {
         projection
             .persisted_event_sink
             .try_publish(PersistedEventSignal {
@@ -1697,10 +1702,10 @@ fn apply_motion_notification_with_sink(
                 camera_id: camera_id.as_str().to_owned(),
                 camera_display_name: projection.camera_display_name.to_owned(),
                 kind: history_kind(insert.kind),
+                motion_active: normalizer.aggregate_motion(),
                 received_time_utc: insert.received_time_utc,
             });
     }
-    normalizer.commit(decision);
     Ok(())
 }
 
@@ -2821,6 +2826,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sink.signals.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn persisted_signal_carries_aggregate_motion_across_multiple_sources() {
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let temp = tempdir().unwrap();
+        let event_index = Mutex::new(Some(
+            EventIndex::open(temp.path().join("events.sqlite3")).unwrap(),
+        ));
+        let sink = RecordingEventSink::default();
+        let mut normalizer = MotionNormalizer::default();
+        let now = Utc::now();
+
+        for source in ["source-a", "source-b"] {
+            apply_motion_notification_with_sink(
+                &mut normalizer,
+                &camera_id,
+                &MotionNotification {
+                    active: false,
+                    device_time_utc: None,
+                    source_key: Some(source.to_owned()),
+                    synchronization_baseline: false,
+                },
+                now,
+                &event_index,
+                MotionNotificationProjection {
+                    camera_display_name: "Front Door",
+                    persisted_event_sink: &sink,
+                },
+                Some(30),
+            )
+            .unwrap();
+        }
+
+        for (source, active) in [
+            ("source-a", true),
+            ("source-b", true),
+            ("source-a", false),
+            ("source-b", false),
+        ] {
+            apply_motion_notification_with_sink(
+                &mut normalizer,
+                &camera_id,
+                &MotionNotification {
+                    active,
+                    device_time_utc: None,
+                    source_key: Some(source.to_owned()),
+                    synchronization_baseline: false,
+                },
+                now,
+                &event_index,
+                MotionNotificationProjection {
+                    camera_display_name: "Front Door",
+                    persisted_event_sink: &sink,
+                },
+                Some(30),
+            )
+            .unwrap();
+        }
+
+        let signals = sink.signals.lock().unwrap();
+        assert_eq!(signals.len(), 4);
+        assert_eq!(signals[0].motion_active, Some(true));
+        assert_eq!(signals[1].motion_active, Some(true));
+        assert_eq!(signals[2].motion_active, Some(true));
+        assert_eq!(signals[3].motion_active, Some(false));
     }
 
     #[test]

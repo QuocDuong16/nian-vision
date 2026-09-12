@@ -537,10 +537,32 @@ impl PlaybackController {
         let recording = storage
             .find_recording_at(camera_id, local_time)
             .map_err(|_| PlaybackError::Internal)?;
-        let Some(recording) = recording else {
-            return Ok(None);
+        let recording = if let Some(recording) = recording {
+            recording
+        } else {
+            // Motion-triggered recording starts only after the normalized event
+            // is committed. Allow a small forward-start grace so the event that
+            // caused a recording can still resolve to that newly finalized clip.
+            let grace_ms =
+                i64::try_from(EVENT_PLAYBACK_PREROLL_MS).map_err(|_| PlaybackError::Internal)?;
+            let grace_end = local_time
+                .checked_add_signed(chrono::Duration::milliseconds(grace_ms))
+                .ok_or(PlaybackError::Internal)?;
+            let Some(recording) = storage
+                .query_time_range(camera_id, local_time, grace_end)
+                .map_err(|_| PlaybackError::Internal)?
+                .into_iter()
+                .find(|recording| recording.media_duration_ms.is_some())
+            else {
+                return Ok(None);
+            };
+            recording
         };
-        let seek_offset_ms = event_seek_offset_ms(recording.started_at, local_time)?;
+        let seek_offset_ms = if local_time < recording.started_at {
+            0
+        } else {
+            event_seek_offset_ms(recording.started_at, local_time)?
+        };
         Ok(Some(EventRecordingMatch {
             recording,
             seek_offset_ms,
@@ -1366,6 +1388,7 @@ fn map_worker_error(code: &str) -> PlaybackError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Timelike;
 
     #[derive(Debug)]
     struct FakeBackend {
@@ -1426,6 +1449,25 @@ mod tests {
             event_seek_offset_ms(start, start + chrono::Duration::seconds(3)).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn event_recording_context_matches_motion_clip_that_starts_just_after_trigger() {
+        let event_local = Local::now().with_nanosecond(0).unwrap();
+        let event_utc = event_local.with_timezone(&Utc);
+        let recording_start = event_local.naive_local() + chrono::Duration::seconds(1);
+        let relative = format!(
+            "front-door/{}.mkv",
+            recording_start.format("%Y/%m/%d/%H-%M-%S")
+        );
+        let (_temp, mut controller) = controller_with_files(&[(&relative, b"motion-recording")]);
+        controller.open(&relative).unwrap();
+
+        let context = controller
+            .event_recording_context(&CameraId::parse("front-door").unwrap(), event_utc)
+            .unwrap();
+        assert!(context.available);
+        assert_eq!(context.seek_offset_ms, Some(0));
     }
 
     #[test]

@@ -249,11 +249,50 @@ describe("EventReviewScreen", () => {
     fireEvent.click(rows[0]!);
     fireEvent.click(rows[1]!);
 
-    expect((await screen.findAllByText("No recording available for this event.")).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText("No recording available yet. Motion-triggered clips appear here after the segment is finalized.")).length).toBeGreaterThan(0);
     firstLookup.resolve({ available: true, camera_id: "cam-a", seek_offset_ms: 5_000 });
     await Promise.resolve();
     expect(screen.queryByRole("button", { name: "Open recording" })).toBeNull();
-    expect(screen.getAllByText("No recording available for this event.").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("No recording available yet. Motion-triggered clips appear here after the segment is finalized.").length).toBeGreaterThan(0);
+  });
+
+
+  it("refreshes selected recording context when a motion clip finishes indexing", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T12:00:00Z"));
+    let queryCount = 0;
+    let contextCount = 0;
+    const pendingEvent = { ...eventA, recording_available: false };
+    const readyEvent = { ...eventA, recording_available: true };
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "camera_list") return [];
+      if (command === "event_query") {
+        queryCount += 1;
+        return {
+          rows: [queryCount === 1 ? pendingEvent : readyEvent],
+          next_cursor: null,
+        } satisfies EventReviewPage;
+      }
+      if (command === "event_recording_context") {
+        contextCount += 1;
+        return contextCount === 1
+          ? { available: false, camera_id: "cam-a", seek_offset_ms: null }
+          : { available: true, camera_id: "cam-a", seek_offset_ms: 0 };
+      }
+      if (command === "playback_close") return undefined;
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<EventReviewScreen />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    fireEvent.click(screen.getByRole("button", { name: /Front Door.*Motion detected/ }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByText(/No recording available yet/)).toBeTruthy();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByRole("button", { name: "Open recording" })).toBeTruthy();
+    expect(contextCount).toBe(2);
   });
 
   it("does not append an old page after filters change", async () => {

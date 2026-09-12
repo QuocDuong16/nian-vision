@@ -1,5 +1,7 @@
-# Nian Vision 1.0.0-rc.46
+# Nian Vision 1.0.0-rc.47
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
+
+RC47 adds post-persistence motion-triggered recording episodes for persisted normalized motion. Aggregate MotionStarted starts a transient recording slot without changing persistent/manual Recording Desired; aggregate idle waits a five-second post-roll before stopping, a new MotionStarted cancels that pending stop, and reactivation while a recorder is still Stopping restarts after the old slot is reaped. Motion-owned sessions clamp segment duration to at most five minutes, so long movement rotates into consecutive bounded files without restarting the recorder process at each boundary. Manual Start can promote an active motion-owned session without a restart, and MotionEnded can never stop a manual/external recording. Finalized-segment status refreshes the recording index so Event Review discovers new footage automatically; selected Event Review context rechecks when a newly finalized clip becomes available, and motion-start correlation tolerates the small forward startup gap before the first packet is written. RC47 does not claim a true pre-event recording buffer: the existing five-second playback pre-roll only seeks into footage that already exists.
 
 RC46 follows physical Tapo C200 V5/1.4.6 acceptance of immutable RC45. The C200 compatibility policy now drops obviously invalid pre-2000 device timestamps before Event persistence and treats Tapo `Initialized` motion states as live transitions so UI-visible motion can produce durable Event history instead of being suppressed by a repeated sentinel fingerprint or baseline classification. PTZ parsing skips malformed velocity-space candidates, and a fingerprinted C200 may fall back to normalized `[-1, 1]` pan/tilt only after the PTZ service and profile association have already been authenticated and configuration options remain unusable; zoom is not fabricated. Live View becomes resident after its first visit, so normal tab navigation no longer tears down a healthy live session, and the desktop can reattach a WebView to an already-open camera session after a renderer reload instead of returning `live_already_open`. Desktop context-menu reload plus F5/Ctrl-R/Command-R shortcuts are blocked in the Tauri UI. Generic ONVIF behavior, same-host authority checks, recording, and the protected FFmpeg release contract remain unchanged.
 
@@ -30,7 +32,8 @@ RC1 through RC9 remain immutable historical release attempts. RC7 proved the det
 - Up to 4 independent Live View sessions and local playback/timeline review.
 - Optional ONVIF PTZ continuous pan/tilt and capability-gated zoom.
 - Up to 16 optional ONVIF PullPoint Event-monitoring sessions with normalized local Event history.
-- Event Review with existing-recording correlation and five-second pre-roll when footage exists.
+- Event Review with recording correlation, five-second playback pre-roll when earlier footage exists, and automatic availability refresh after motion clips finalize.
+- Motion-triggered recording episodes with aggregate multi-source motion ownership, five-second post-roll, manual-promotion safety and a five-minute maximum segment duration.
 - Optional local desktop MotionStarted notifications with bounded dispatch/rate limiting.
 - Single-instance desktop lifecycle, close-to-tray, launch-at-login, Windows suspend/resume handling and signed in-app updater artifacts.
 
@@ -44,6 +47,6 @@ Authoritative settings migrations preserve camera definitions, credential refere
 
 ## Known limitations
 
-v1 requires H.264 and does not transcode or support H.265. ONVIF feature availability depends on the camera. There is no macOS/mobile release, remote/cloud access, AI/person/object detection, motion-triggered recording, generated clips/thumbnails, presets/tours/talkback, email/webhook/cloud push notifications or notification scheduling. See `docs/known-limitations.md` for the normative list.
+v1 requires H.264 and does not transcode or support H.265. ONVIF feature availability depends on the camera. There is no macOS/mobile release, remote/cloud access, AI/person/object detection, true pre-event recording buffer, synthesized/exported event clips or thumbnails, presets/tours/talkback, email/webhook/cloud push notifications or notification scheduling. See `docs/known-limitations.md` for the normative list.
 
 The final `v1.0.0` tag must not be created until M15 acceptance and the clean Windows/Linux release-candidate checklist are complete.

@@ -28,6 +28,9 @@ pub struct PersistedEventSignal {
     pub camera_id: String,
     pub camera_display_name: String,
     pub kind: EventHistoryKind,
+    /// Aggregate normalized motion state after this committed transition.
+    /// `None` means the worker cannot determine aggregate state safely.
+    pub motion_active: Option<bool>,
     pub received_time_utc: DateTime<Utc>,
 }
 
@@ -602,6 +605,10 @@ mod tests {
             camera_id: camera.to_owned(),
             camera_display_name: camera.to_owned(),
             kind,
+            motion_active: match kind {
+                EventHistoryKind::MotionStarted => Some(true),
+                EventHistoryKind::MotionEnded => Some(false),
+            },
             received_time_utc: DateTime::from_timestamp(second, 0).unwrap(),
         }
     }

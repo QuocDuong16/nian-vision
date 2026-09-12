@@ -2,11 +2,11 @@
 
 Record the exact tag, commit SHA, OS image/VM and result for every run. A checkbox is evidence only when the step was actually executed. Do not reuse a tag after changing source.
 
-Current retry candidate: `1.0.0-rc.46` / `v1.0.0-rc.46`. RC1 through RC45 remain immutable. RC46 hardens Tapo C200 motion persistence and PTZ compatibility, keeps Live View resident across ordinary tab navigation, allows WebView reload reattachment to an already-open live session, and blocks browser-style reload controls in the desktop shell.
+Current retry candidate: `1.0.0-rc.47` / `v1.0.0-rc.47`. RC1 through RC46 remain immutable. RC47 adds post-persistence motion-triggered recording episodes with aggregate multi-source ownership, five-second post-roll, five-minute maximum segment duration, manual-recording promotion safety, recording-index refresh on finalization, and automatic Event Review availability refresh.
 
 ## Pre-tag authority
 
-- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.46`.
+- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.47`.
 - [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
@@ -16,7 +16,7 @@ Current retry candidate: `1.0.0-rc.46` / `v1.0.0-rc.46`. RC1 through RC45 remain
 
 ## GitHub RC workflow
 
-- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.46`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.45`; source/tag cross-pairing is forbidden.
+- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.47`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.46`; source/tag cross-pairing is forbidden.
 - [ ] GitHub tag resolves to exactly the same commit as Forgejo.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.
@@ -39,6 +39,7 @@ Current retry candidate: `1.0.0-rc.46` / `v1.0.0-rc.46`. RC1 through RC45 remain
 - [ ] Compatible camera ONVIF discovery/provisioning succeeds.
 - [ ] Compatible camera PTZ works; movement stops on lifecycle teardown and never restores by itself. On Tapo C200 V5 verify multiple/partial velocity-space advertisements do not poison a later complete pan/tilt candidate; any remaining failure must retain the typed services/profiles/options stage instead of generic `onvif_protocol`.
 - [ ] Compatible camera Event monitoring persists normalized Events and Event Review can open correlated footage where available. On Tapo C200 V5/1.4.6 verify the fingerprint-gated adapter can probe same-host TCP 2020 PullPoint, remains Polling rather than Backoff on valid vendor extensions/duplicate state echoes, and record observed CellMotion/People/Smart Event/Line Cross transitions without exposing raw source tokens. If it fails, record the stage-specific `event_control_*`, `event_pull_*`, or `event_renew_*` code.
+- [ ] Motion-triggered recording: with persistent/manual Recording Desired Off, aggregate motion starts recording after the persisted MotionStarted transition, aggregate idle keeps a five-second post-roll then finalizes, repeated detector sources do not stop while another source stays active, motion returning during post-roll cancels the stop, and motion returning while the slot is Stopping restarts after settlement. A continuous >5-minute motion episode rotates to consecutive files no longer than five minutes each. Manual Start during a motion-owned recording promotes the existing session without restart and later MotionEnded never stops it. Event Review changes from unavailable to Recording available after finalization/index refresh without requiring an app restart.
 - [ ] Local notification appears when enabled; missing native notification support/failure remains non-fatal. Run the delivery-timeout isolation regression repeatedly on Windows and verify observing `delivery_timeouts` implies the timed-out native delivery has already been terminated.
 - [ ] Close hides to tray while Recording/Events/notifications continue and Live/PTZ settle.
 - [ ] Suspend/Resume: Recording/Event Desired restore without duplicate workers; Live/PTZ do not restore.
