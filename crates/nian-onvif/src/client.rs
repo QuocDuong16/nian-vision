@@ -552,9 +552,9 @@ impl OnvifClient {
         subscription: &PullPointSubscription,
         credentials: &OnvifCredentials,
     ) -> Result<Vec<MotionNotification>, OnvifError> {
-        let timeout_seconds = EVENT_PULL_TIMEOUT_MS as f64 / 1000.0;
+        let timeout = xs_duration_from_millis(EVENT_PULL_TIMEOUT_MS);
         let body = format!(
-            "<tev:PullMessages><tev:Timeout>PT{timeout_seconds:.3}S</tev:Timeout><tev:MessageLimit>{EVENT_PULL_MESSAGE_LIMIT}</tev:MessageLimit></tev:PullMessages>"
+            "<tev:PullMessages><tev:Timeout>{timeout}</tev:Timeout><tev:MessageLimit>{EVENT_PULL_MESSAGE_LIMIT}</tev:MessageLimit></tev:PullMessages>"
         );
         let xml = self.soap(
             &subscription.endpoint,
@@ -863,6 +863,16 @@ fn parse_digest_challenge_value(raw: &str) -> Option<DigestChallenge> {
 
 fn profile_pixels(profile: &MediaProfile) -> u64 {
     u64::from(profile.width.unwrap_or(0)) * u64::from(profile.height.unwrap_or(0))
+}
+
+fn xs_duration_from_millis(milliseconds: u64) -> String {
+    let seconds = milliseconds / 1_000;
+    let remainder = milliseconds % 1_000;
+    if remainder == 0 {
+        format!("PT{seconds}S")
+    } else {
+        format!("PT{seconds}.{remainder:03}S")
+    }
 }
 
 fn map_http_error(error: reqwest::Error) -> OnvifError {
@@ -1827,7 +1837,7 @@ mod tests {
                 } else if request.contains("GetProfiles") {
                     "<Envelope><Profiles token=\"main\"><PTZConfiguration token=\"ptz-config\"/></Profiles></Envelope>".to_owned()
                 } else if request.contains("GetConfigurationOptions") {
-                    "<Envelope><Spaces><ContinuousPanTiltVelocitySpace><XRange><Min>-1</Min></XRange><YRange><Min>-1</Min><Max>1</Max></YRange></ContinuousPanTiltVelocitySpace></Spaces></Envelope>".to_owned()
+                    "<Envelope><Spaces><ContinuousPanTiltVelocitySpace><XRange><Min>0.25</Min><Max>1</Max></XRange><YRange><Min>-1</Min><Max>1</Max></YRange></ContinuousPanTiltVelocitySpace></Spaces></Envelope>".to_owned()
                 } else {
                     panic!("unexpected PTZ diagnostics fixture request: {request}")
                 };
@@ -2121,7 +2131,11 @@ mod tests {
 
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 7);
-        assert!(requests.iter().any(|request| request.contains("PT4.000S")));
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("<tev:Timeout>PT4S</tev:Timeout>"))
+        );
         assert!(
             requests
                 .iter()

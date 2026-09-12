@@ -176,7 +176,7 @@ lifecycle completion point.
 ### Frontend ownership uses per-camera generations
 
 React keeps current selection, mounted state, committed sessions, in-flight opens and a
-monotonic generation per camera in refs that remain authoritative across `await` points.
+monotonic generation per camera in refs that remain authoritative across `await` points. The frontend also stores only the bounded selected camera-id list and Fit/Native presentation mode in local WebView storage. On remount it intersects those ids with the current configured camera list, caps them at four and opens fresh sessions; persisted session ids, URLs and backend live ownership never exist.
 When a `live_open` result returns, it is committed only if the component is still mounted,
 the camera is still selected and the generation still matches. Otherwise the returned
 session is immediately closed and never enters the keepalive set.
@@ -188,7 +188,7 @@ replace a newer session.
 
 ### Lifecycle does not manufacture persistent live intent
 
-Live selection remains transient and is never persisted as Desired state. Close-to-tray
+Live selection is never persisted as backend Desired state. A small frontend-only layout preference remembers selected camera ids and presentation mode across screen remount/application UI restart, but it conveys no live-session ownership. Close-to-tray
 releases live ownership while leaving recording Desired/Runtime untouched. Suspend closes
 live admission and ownership; Resume only reopens admission and never resurrects stale
 session ids. Quit/update stop admission, cancel openings, signal committed workers, reap all
@@ -201,8 +201,7 @@ from unrelated live and recording cameras.
 
 ## Consequences
 
-- M11 adds no settings schema, camera database, credential store or persisted video-wall
-  layout.
+- M11 adds no settings schema, camera database or credential store for Live View. A bounded frontend-only layout preference stores camera ids and presentation mode, never session ids, URLs or Desired ownership.
 - Live resource use is bounded by explicit session, fragment, byte and HTTP-reader limits
   instead of elapsed session duration.
 - A frontend crash, late Promise, lost keepalive or lifecycle race cannot permanently own a
@@ -210,4 +209,4 @@ from unrelated live and recording cameras.
 - Same-camera recording + live view intentionally trades an extra RTSP connection for
   isolation and avoids destabilizing the accepted recording pipeline.
 - H.265 live view, transcoding, WebRTC, PTZ, ONVIF Events, motion/AI, talkback, cloud/remote
-  streaming and persisted live layouts remain outside M11.
+  streaming and server-synchronized/backend-owned video-wall layouts remain outside M11.

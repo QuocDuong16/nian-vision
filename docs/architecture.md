@@ -743,11 +743,11 @@ authoritative across `await` boundaries. Remove, unmount, retry and media error
 invalidate the generation first. A late `live_open` result that no longer matches current
 ownership is immediately `live_close`d, never enters React session state and therefore
 never joins the keepalive set. A newer generation queued behind a pending open cannot be
-replaced by the stale result.
+replaced by the stale result. The UI persists only a bounded list of selected camera ids and the Fit/Native presentation mode in WebView-local storage. Route/tab unmount still closes all current sessions; remount filters the saved ids against configured cameras and opens fresh sessions, so no session id, capability URL or hidden decoder is persisted.
 
 Recording slots and live slots remain separate; the same camera may record and view live
 using independent RTSP workers. PTZ was outside M11 and is added separately by M12; events,
-H.265 live view, transcoding, WebRTC, remote streaming, motion/AI and persisted live layouts
+H.265 live view, transcoding, WebRTC, remote streaming, motion/AI and backend/server-synchronized live layouts
 remain outside M11. See ADR-0014.
 
 ## Optional ONVIF PTZ control (M12)

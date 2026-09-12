@@ -5,7 +5,7 @@ These are intentional v1 boundaries, not hidden roadmap promises.
 - **Platforms:** Windows x86_64 and Linux x86_64 only. No macOS or mobile release.
 - **Media codec:** RTSP H.264 is required for recording and Live View. There is no H.265 support and no transcoding.
 - **Recording capacity:** at most 8 simultaneous owned Recording sessions. Persisted Desired state beyond capacity remains Desired On but runtime admission fails deterministically.
-- **Live capacity:** at most 4 simultaneous user-opened Live View sessions. Live does not restore after restart or Resume.
+- **Live capacity:** at most 4 simultaneous user-opened Live View sessions. The frontend remembers selected camera ids and Fit/Native preference, but live sessions themselves never persist: leaving/unmounting Live View closes them and returning opens fresh sessions; lifecycle Resume does not resurrect stale session ids.
 - **Event capacity:** at most 16 simultaneous ONVIF Event-monitoring sessions. Event Desired state is independent of Recording and remains persisted when runtime capacity is unavailable.
 - **PTZ:** optional continuous pan/tilt and capability-gated zoom only. No presets, patrol/tours or talkback. PTZ movement does not restore after restart or Resume.
 - **ONVIF compatibility:** discovery/provisioning/PTZ/Events depend on what a camera advertises and on standards-compatible behavior. Manual RTSP configuration remains valid when ONVIF is unavailable.

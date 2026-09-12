@@ -1765,7 +1765,7 @@ fn event_worker(
                     update_status(
                         &status,
                         EventRuntimeState::Failed,
-                        Some(onvif_error_code(&error)),
+                        Some(event_control_error_code(&error)),
                         true,
                     );
                     wait_failed_until_cancel(&cancel);
@@ -1774,7 +1774,7 @@ fn event_worker(
                 update_status(
                     &status,
                     EventRuntimeState::Backoff,
-                    Some(onvif_error_code(&error)),
+                    Some(event_control_error_code(&error)),
                     true,
                 );
                 backend.wait_reconnect(&cancel, backoff.next_delay());
@@ -1825,7 +1825,7 @@ fn event_worker(
         while !cancel.load(Ordering::Acquire) {
             if Instant::now() >= renew_at {
                 if let Err(error) = backend.renew(&mut subscription, &credentials) {
-                    recreate_reason = Some(subscription_error_code(&error));
+                    recreate_reason = Some(renew_error_code(&error));
                     break;
                 }
                 renew_at = match subscription_renew_deadline(&subscription) {
@@ -1883,7 +1883,7 @@ fn event_worker(
                     backoff.reset();
                 }
                 Err(error) => {
-                    recreate_reason = Some(onvif_error_code(&error));
+                    recreate_reason = Some(pull_error_code(&error));
                     break;
                 }
             }
@@ -2129,15 +2129,39 @@ fn validate_runtime_authority(
     Ok(())
 }
 
-fn onvif_error_code(error: &OnvifError) -> &'static str {
+fn event_control_error_code(error: &OnvifError) -> &'static str {
+    match error {
+        OnvifError::AuthFailed => "auth_failed",
+        OnvifError::Timeout => "event_control_timeout",
+        OnvifError::DeviceUnreachable => "device_unreachable",
+        OnvifError::Unsupported => "unsupported",
+        OnvifError::EventServiceUnsupported => "event_service_unsupported",
+        OnvifError::MotionEventUnsupported => "motion_topic_unsupported",
+        OnvifError::AuthorityRejected => "authority_rejected",
+        OnvifError::Cancelled => "lifecycle_cancelled",
+        _ => "event_control_protocol",
+    }
+}
+
+fn pull_error_code(error: &OnvifError) -> &'static str {
     match error {
         OnvifError::AuthFailed => "auth_failed",
         OnvifError::Timeout => "pull_timeout",
         OnvifError::DeviceUnreachable => "device_unreachable",
-        OnvifError::Unsupported => "unsupported",
         OnvifError::AuthorityRejected => "authority_rejected",
         OnvifError::Cancelled => "lifecycle_cancelled",
-        _ => "protocol_error",
+        _ => "event_pull_protocol",
+    }
+}
+
+fn renew_error_code(error: &OnvifError) -> &'static str {
+    match error {
+        OnvifError::AuthFailed => "auth_failed",
+        OnvifError::Timeout => "event_renew_timeout",
+        OnvifError::DeviceUnreachable => "device_unreachable",
+        OnvifError::AuthorityRejected => "authority_rejected",
+        OnvifError::Cancelled => "lifecycle_cancelled",
+        _ => "event_renew_protocol",
     }
 }
 
@@ -3029,6 +3053,23 @@ mod tests {
         b.join().unwrap();
         assert_eq!(controller.ownership_counts(), (0, 0, 0, 0));
         assert_eq!(backend.unsubscribe_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn runtime_event_failures_keep_the_operation_stage_in_the_status_code() {
+        assert_eq!(
+            event_control_error_code(&OnvifError::Protocol),
+            "event_control_protocol"
+        );
+        assert_eq!(
+            pull_error_code(&OnvifError::Protocol),
+            "event_pull_protocol"
+        );
+        assert_eq!(
+            renew_error_code(&OnvifError::Protocol),
+            "event_renew_protocol"
+        );
+        assert_eq!(pull_error_code(&OnvifError::Timeout), "pull_timeout");
     }
 
     #[test]

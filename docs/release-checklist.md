@@ -2,11 +2,11 @@
 
 Record the exact tag, commit SHA, OS image/VM and result for every run. A checkbox is evidence only when the step was actually executed. Do not reuse a tag after changing source.
 
-Current retry candidate: `1.0.0-rc.43` / `v1.0.0-rc.43`. RC1 through RC42 remain immutable. RC43 adds a fingerprint-gated Tapo C200 ONVIF compatibility adapter for same-host port-2020 Event/PTZ service quirks, permits bounded PullPoint probing when C200 Event properties omit compatible motion advertisement, normalizes supported Tapo People/Smart Event/Line Cross states without weakening generic ONVIF namespace or authority validation, splits PTZ protocol diagnostics into services/profiles/options stages, and adds Live View Fit tile/Native pixels rendering plus source/display/DPR scaling diagnostics without changing H.264 packet-copy transport. RC42 made initial PTZ pairing reuse the saved native camera credential with silent exact-host ONVIF discovery, restored a 12-second/24-fragment Live View retention window, added bounded fresh-session recovery, expanded standard motion topics, and split Event-service versus motion-topic diagnostics.
+Current retry candidate: `1.0.0-rc.44` / `v1.0.0-rc.44`. RC1 through RC43 remain immutable. RC44 hardens the Tapo C200 runtime path after physical RC43 testing: PullMessages uses canonical whole-second duration text, the fingerprinted adapter tolerates bounded vendor extensions/non-empty SimpleItems and identical duplicate state fields while conflicting data stays fail-closed, Event runtime errors identify control/pull/renew stage, PTZ velocity spaces are parsed independently so partial candidates cannot poison a later valid one, and Live View locally remembers selected camera IDs plus presentation mode while still closing sessions off-screen. RC43 introduced the fingerprint-gated C200 adapter, PTZ stage diagnostics, and Live Fit/Native rendering diagnostics.
 
 ## Pre-tag authority
 
-- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.43`.
+- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.44`.
 - [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
@@ -16,7 +16,7 @@ Current retry candidate: `1.0.0-rc.43` / `v1.0.0-rc.43`. RC1 through RC42 remain
 
 ## GitHub RC workflow
 
-- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.43`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.42`; source/tag cross-pairing is forbidden.
+- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.44`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.43`; source/tag cross-pairing is forbidden.
 - [ ] GitHub tag resolves to exactly the same commit as Forgejo.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.
@@ -34,11 +34,11 @@ Current retry candidate: `1.0.0-rc.43` / `v1.0.0-rc.43`. RC1 through RC42 remain
 - [ ] Add a camera manually; RTSP probe succeeds.
 - [ ] Start/stop recording; finalized media is playable.
 - [ ] Kill/restart desktop while Recording Desired is On; Desired restores once.
-- [ ] Live View opens and closes; Live does not restore after restart. Fit tile remains default, Native pixels visibly avoids upscale when the tile has spare room, and Diagnostics reports source/display/DPR scaling without changing the live session.
+- [ ] Live View opens and closes; selected camera layout and Fit/Native preference survive tab remount while the old sessions close and fresh sessions reopen on return. Verify no hidden live session remains active after leaving the tab. Fit tile remains default for a fresh preference, Native pixels visibly avoids upscale when the tile has spare room, and Diagnostics reports source/display/DPR scaling without changing the live session.
 - [ ] Playback opens/seeks/closes.
 - [ ] Compatible camera ONVIF discovery/provisioning succeeds.
-- [ ] Compatible camera PTZ works; movement stops on lifecycle teardown and never restores by itself. On Tapo C200 V5 record any typed services/profiles/options protocol-stage failure instead of generic `onvif_protocol`.
-- [ ] Compatible camera Event monitoring persists normalized Events and Event Review can open correlated footage where available. On Tapo C200 V5/1.4.6 verify the fingerprint-gated adapter can probe same-host TCP 2020 PullPoint and record observed CellMotion/People/Smart Event/Line Cross transitions without exposing raw source tokens.
+- [ ] Compatible camera PTZ works; movement stops on lifecycle teardown and never restores by itself. On Tapo C200 V5 verify multiple/partial velocity-space advertisements do not poison a later complete pan/tilt candidate; any remaining failure must retain the typed services/profiles/options stage instead of generic `onvif_protocol`.
+- [ ] Compatible camera Event monitoring persists normalized Events and Event Review can open correlated footage where available. On Tapo C200 V5/1.4.6 verify the fingerprint-gated adapter can probe same-host TCP 2020 PullPoint, remains Polling rather than Backoff on valid vendor extensions/duplicate state echoes, and record observed CellMotion/People/Smart Event/Line Cross transitions without exposing raw source tokens. If it fails, record the stage-specific `event_control_*`, `event_pull_*`, or `event_renew_*` code.
 - [ ] Local notification appears when enabled; missing native notification support/failure remains non-fatal.
 - [ ] Close hides to tray while Recording/Events/notifications continue and Live/PTZ settle.
 - [ ] Suspend/Resume: Recording/Event Desired restore without duplicate workers; Live/PTZ do not restore.

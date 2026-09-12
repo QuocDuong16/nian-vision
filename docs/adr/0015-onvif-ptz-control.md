@@ -78,7 +78,7 @@ small direction enum, not an arbitrary velocity. The application maps it to a fi
 normalized magnitude of 0.45 and `nian-onvif` maps the normalized value into the device's
 advertised bounded velocity range. A malformed/incompatible PTZ setup response is reported at
 its actual preparation stage: `GetServices`, media-profile/PTZ association, or
-`GetConfigurationOptions`. The C200 adapter does not fabricate missing velocity ranges, so a
+`GetConfigurationOptions`. Configuration options are evaluated per advertised continuous velocity space: an incomplete candidate is ignored so it cannot contaminate a later complete candidate, while a complete invalid range remains a protocol failure. The C200 adapter does not fabricate missing velocity ranges, so a
 firmware-specific options quirk can be diagnosed before any motor command is sent. M12 does not
 expose presets, absolute/relative moves, arbitrary speed or arbitrary vendor-specific PTZ
 extensions.

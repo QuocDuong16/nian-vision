@@ -27,6 +27,7 @@ const LIVE_MANIFEST_POLL_MS = 250;
 const LIVE_STABLE_RESET_MS = 10_000;
 const MAX_LIVE_AUTO_RECOVERY_ATTEMPTS = 3;
 const LIVE_RECOVERY_BACKOFF_MS = [250, 750, 1_500] as const;
+const LIVE_VIEW_PREFERENCES_KEY = "nian.live-view.preferences.v1";
 
 const ACTIVE_RECORDING_STATES = new Set<RecordingState>([
   "starting",
@@ -55,6 +56,36 @@ type LiveManifest = {
 };
 
 type LiveScaleMode = "fit" | "native";
+
+type LiveViewPreferences = {
+  cameraIds: string[];
+  scaleMode: LiveScaleMode;
+};
+
+function readLiveViewPreferences(): LiveViewPreferences {
+  const fallback: LiveViewPreferences = { cameraIds: [], scaleMode: "fit" };
+  try {
+    const raw = window.localStorage.getItem(LIVE_VIEW_PREFERENCES_KEY);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Partial<LiveViewPreferences>;
+    const cameraIds = Array.isArray(parsed.cameraIds)
+      ? [...new Set(parsed.cameraIds.filter((cameraId): cameraId is string => typeof cameraId === "string" && cameraId.length > 0))]
+          .slice(0, MAX_LIVE_VIEWS)
+      : [];
+    const scaleMode: LiveScaleMode = parsed.scaleMode === "native" ? "native" : "fit";
+    return { cameraIds, scaleMode };
+  } catch {
+    return fallback;
+  }
+}
+
+function persistLiveViewPreferences(preferences: LiveViewPreferences): void {
+  try {
+    window.localStorage.setItem(LIVE_VIEW_PREFERENCES_KEY, JSON.stringify(preferences));
+  } catch {
+    // A disabled/full WebView storage area must not make live viewing fail.
+  }
+}
 
 type LiveRenderStats = {
   sourceWidth: number;
@@ -380,10 +411,15 @@ function LiveMedia({
 }
 
 export function LiveViewScreen() {
+  const initialPreferencesRef = useRef<LiveViewPreferences | null>(null);
+  if (initialPreferencesRef.current === null) {
+    initialPreferencesRef.current = readLiveViewPreferences();
+  }
+  const initialPreferences = initialPreferencesRef.current;
   const [cameras, setCameras] = useState<CameraSummary[]>([]);
-  const [selected, setSelected] = useState<string[]>([]);
+  const [selected, setSelected] = useState<string[]>(initialPreferences.cameraIds);
   const [pickerCameraId, setPickerCameraId] = useState("");
-  const [scaleMode, setScaleMode] = useState<LiveScaleMode>("fit");
+  const [scaleMode, setScaleMode] = useState<LiveScaleMode>(initialPreferences.scaleMode);
   const [showVideoDiagnostics, setShowVideoDiagnostics] = useState(false);
   const [sessions, setSessions] = useState<Map<string, LiveOpenDto>>(() => new Map());
   const [statuses, setStatuses] = useState<LiveStatus[]>([]);
@@ -398,7 +434,7 @@ export function LiveViewScreen() {
   const [loading, setLoading] = useState(isTauri());
   const [error, setError] = useState<DesktopError | null>(null);
   const sessionsRef = useRef(sessions);
-  const selectedRef = useRef<Set<string>>(new Set());
+  const selectedRef = useRef<Set<string>>(new Set(initialPreferences.cameraIds));
   const mountedRef = useRef(true);
   const generationRef = useRef<Map<string, number>>(new Map());
   const pendingOpenRef = useRef<Map<string, number>>(new Map());
@@ -406,6 +442,11 @@ export function LiveViewScreen() {
   const recoveryTimersRef = useRef<Map<string, number>>(new Map());
   const refreshInFlightRef = useRef(false);
   const eventStatusInFlightRef = useRef(false);
+  const restoredSelectionOpenedRef = useRef(false);
+
+  useEffect(() => {
+    persistLiveViewPreferences({ cameraIds: selected, scaleMode });
+  }, [scaleMode, selected]);
 
   const setSessionForCamera = useCallback((cameraId: string, session: LiveOpenDto | null) => {
     const next = new Map(sessionsRef.current);
@@ -661,6 +702,20 @@ export function LiveViewScreen() {
     }
     return generation;
   }, [nextGeneration, startOpenGeneration]);
+
+  useEffect(() => {
+    if (!isTauri() || loading || restoredSelectionOpenedRef.current) return;
+    const configured = new Set(cameras.map((camera) => camera.camera_id));
+    const restored = [...selectedRef.current]
+      .filter((cameraId) => configured.has(cameraId))
+      .slice(0, MAX_LIVE_VIEWS);
+    selectedRef.current = new Set(restored);
+    if (restored.length !== selected.length || restored.some((cameraId, index) => selected[index] !== cameraId)) {
+      setSelected(restored);
+    }
+    restoredSelectionOpenedRef.current = true;
+    for (const cameraId of restored) requestOpen(cameraId);
+  }, [cameras, loading, requestOpen, selected]);
 
   function addSelectedCamera() {
     if (!pickerCameraId || selectedRef.current.has(pickerCameraId) || selectedRef.current.size >= MAX_LIVE_VIEWS) return;

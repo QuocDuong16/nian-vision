@@ -162,12 +162,23 @@ function liveOpen(cameraId: string, sequence: number): LiveOpenDto {
 
 beforeEach(() => {
   vi.mocked(invoke).mockReset();
+  const storage = new Map<string, string>();
+  Object.defineProperty(window, "localStorage", {
+    configurable: true,
+    value: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+      removeItem: (key: string) => storage.delete(key),
+      clear: () => storage.clear(),
+    },
+  });
 });
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+  Reflect.deleteProperty(window, "localStorage");
 });
 
 describe("LiveViewScreen", () => {
@@ -205,6 +216,31 @@ describe("LiveViewScreen", () => {
       expect(video?.src).not.toContain("rtsp://");
       expect(document.body.textContent).not.toContain("192.168.1.50");
     });
+  });
+
+  it("restores the selected live layout after the screen is remounted", async () => {
+    installDesktop();
+    const firstView = render(<LiveViewScreen />);
+
+    await screen.findByText("No live cameras selected");
+    fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+    await screen.findByRole("article", { name: "Front door live camera" });
+    await waitFor(() => {
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open").length).toBe(1);
+    });
+
+    firstView.unmount();
+    await waitFor(() => {
+      expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "live_close")).toBe(true);
+    });
+    const opensBeforeRemount = vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open").length;
+
+    render(<LiveViewScreen />);
+    expect(await screen.findByRole("article", { name: "Front door live camera" })).toBeTruthy();
+    await waitFor(() => {
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open").length).toBe(opensBeforeRemount + 1);
+    });
+    expect(window.localStorage.getItem("nian.live-view.preferences.v1")).toContain("front-door");
   });
 
   it("shows one failed camera without taking down another live tile", async () => {

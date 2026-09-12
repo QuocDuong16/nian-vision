@@ -156,6 +156,17 @@ fn recognized_onvif_field(name: &str) -> bool {
 }
 
 fn validate_recognized_namespaces(xml: &[u8]) -> Result<(), OnvifError> {
+    validate_namespaces(xml, true)
+}
+
+fn validate_extension_tolerant_namespaces(xml: &[u8]) -> Result<(), OnvifError> {
+    validate_namespaces(xml, false)
+}
+
+fn validate_namespaces(
+    xml: &[u8],
+    reject_recognized_namespace_mismatch: bool,
+) -> Result<(), OnvifError> {
     ensure_body_limit(xml)?;
     let mut reader = NsReader::from_reader(xml);
     reader.config_mut().trim_text(true);
@@ -166,7 +177,7 @@ fn validate_recognized_namespaces(xml: &[u8]) -> Result<(), OnvifError> {
         let (resolved, event) = reader
             .read_resolved_event()
             .map_err(|_| OnvifError::Protocol)?;
-        if matches!(event, Event::DocType(_)) {
+        if matches!(event, Event::DocType(_) | Event::GeneralRef(_)) {
             return Err(OnvifError::Protocol);
         }
         match event {
@@ -182,6 +193,9 @@ fn validate_recognized_namespaces(xml: &[u8]) -> Result<(), OnvifError> {
                     }
                 }
 
+                if !reject_recognized_namespace_mismatch {
+                    continue;
+                }
                 let local_name = start.local_name();
                 let name = local_name.as_ref();
                 if !recognized_onvif_field(name) {
@@ -622,19 +636,66 @@ fn capture_ptz_configuration_token(
 pub(crate) fn parse_ptz_configuration_options(
     xml: &[u8],
 ) -> Result<PtzConfigurationOptions, OnvifError> {
+    #[derive(Default)]
+    struct RawRange {
+        min: Option<f64>,
+        max: Option<f64>,
+    }
+
+    fn assign(slot: &mut Option<f64>, value: f64) -> Result<(), OnvifError> {
+        if let Some(existing) = slot {
+            if (*existing - value).abs() > f64::EPSILON {
+                return Err(OnvifError::Protocol);
+            }
+            return Ok(());
+        }
+        *slot = Some(value);
+        Ok(())
+    }
+
+    fn complete_range(raw: RawRange) -> Result<Option<PtzVelocityRange>, OnvifError> {
+        match (raw.min, raw.max) {
+            (Some(min), Some(max)) => Ok(Some(PtzVelocityRange { min, max }.validate()?)),
+            _ => Ok(None),
+        }
+    }
+
     validate_recognized_namespaces(xml)?;
     let mut reader = reader(xml)?;
     let mut stack = Vec::new();
-    let (mut pan_min, mut pan_max) = (None, None);
-    let (mut tilt_min, mut tilt_max) = (None, None);
-    let (mut zoom_min, mut zoom_max) = (None, None);
+    let mut current_pan_tilt: Option<(RawRange, RawRange)> = None;
+    let mut current_zoom: Option<RawRange> = None;
+    let mut pan = None;
+    let mut tilt = None;
+    let mut zoom = None;
+    let mut invalid_pan_tilt = false;
+    let mut invalid_zoom = false;
+
     loop {
         let event = reader.read_event().map_err(|_| OnvifError::Protocol)?;
         if prohibited(&event) {
             return Err(OnvifError::Protocol);
         }
         match event {
-            Event::Start(start) => push_start(&mut stack, local_name(start.name().as_ref()))?,
+            Event::Start(start) => {
+                let name = local_name(start.name().as_ref());
+                match name.as_str() {
+                    "ContinuousPanTiltVelocitySpace" => {
+                        if current_pan_tilt.is_some() {
+                            return Err(OnvifError::Protocol);
+                        }
+                        current_pan_tilt = Some((RawRange::default(), RawRange::default()));
+                    }
+                    "ContinuousZoomVelocitySpace" => {
+                        if current_zoom.is_some() {
+                            return Err(OnvifError::Protocol);
+                        }
+                        current_zoom = Some(RawRange::default());
+                    }
+                    _ => {}
+                }
+                push_start(&mut stack, name)?;
+            }
             Event::Text(text)
                 if matches!(stack.last().map(String::as_str), Some("Min" | "Max")) =>
             {
@@ -645,43 +706,70 @@ pub(crate) fn parse_ptz_configuration_options(
                     return Err(OnvifError::Protocol);
                 }
                 let is_min = stack.last().is_some_and(|name| name == "Min");
-                let pan_tilt = stack
-                    .iter()
-                    .any(|name| name == "ContinuousPanTiltVelocitySpace");
-                let zoom = stack
-                    .iter()
-                    .any(|name| name == "ContinuousZoomVelocitySpace");
                 let x = stack.iter().any(|name| name == "XRange");
                 let y = stack.iter().any(|name| name == "YRange");
-                match (pan_tilt, zoom, x, y, is_min) {
-                    (true, false, true, false, true) => pan_min = Some(value),
-                    (true, false, true, false, false) => pan_max = Some(value),
-                    (true, false, false, true, true) => tilt_min = Some(value),
-                    (true, false, false, true, false) => tilt_max = Some(value),
-                    (false, true, true, false, true) => zoom_min = Some(value),
-                    (false, true, true, false, false) => zoom_max = Some(value),
-                    _ => {}
+                if let Some((pan_range, tilt_range)) = current_pan_tilt.as_mut() {
+                    match (x, y, is_min) {
+                        (true, false, true) => assign(&mut pan_range.min, value)?,
+                        (true, false, false) => assign(&mut pan_range.max, value)?,
+                        (false, true, true) => assign(&mut tilt_range.min, value)?,
+                        (false, true, false) => assign(&mut tilt_range.max, value)?,
+                        _ => {}
+                    }
+                } else if let Some(zoom_range) = current_zoom.as_mut() {
+                    match (x, y, is_min) {
+                        (true, false, true) => assign(&mut zoom_range.min, value)?,
+                        (true, false, false) => assign(&mut zoom_range.max, value)?,
+                        _ => {}
+                    }
                 }
             }
-            Event::End(_) => {
+            Event::End(end) => {
+                let name = local_name(end.name().as_ref());
+                match name.as_str() {
+                    "ContinuousPanTiltVelocitySpace" => {
+                        let (raw_pan, raw_tilt) =
+                            current_pan_tilt.take().ok_or(OnvifError::Protocol)?;
+                        match (complete_range(raw_pan), complete_range(raw_tilt)) {
+                            (Ok(Some(candidate_pan)), Ok(Some(candidate_tilt))) => {
+                                if pan.is_none() && tilt.is_none() {
+                                    pan = Some(candidate_pan);
+                                    tilt = Some(candidate_tilt);
+                                }
+                            }
+                            (Err(_), _) | (_, Err(_)) => invalid_pan_tilt = true,
+                            _ => {}
+                        }
+                    }
+                    "ContinuousZoomVelocitySpace" => {
+                        let raw_zoom = current_zoom.take().ok_or(OnvifError::Protocol)?;
+                        match complete_range(raw_zoom) {
+                            Ok(Some(candidate_zoom)) if zoom.is_none() => {
+                                zoom = Some(candidate_zoom)
+                            }
+                            Ok(_) => {}
+                            Err(_) => invalid_zoom = true,
+                        }
+                    }
+                    _ => {}
+                }
                 stack.pop().ok_or(OnvifError::Protocol)?;
             }
             Event::Eof => break,
             _ => {}
         }
     }
-    fn range(min: Option<f64>, max: Option<f64>) -> Result<Option<PtzVelocityRange>, OnvifError> {
-        match (min, max) {
-            (Some(min), Some(max)) => Ok(Some(PtzVelocityRange { min, max }.validate()?)),
-            (None, None) => Ok(None),
-            _ => Err(OnvifError::Protocol),
-        }
+
+    if current_pan_tilt.is_some() || current_zoom.is_some() {
+        return Err(OnvifError::Protocol);
     }
-    Ok(PtzConfigurationOptions {
-        pan: range(pan_min, pan_max)?,
-        tilt: range(tilt_min, tilt_max)?,
-        zoom: range(zoom_min, zoom_max)?,
-    })
+    if (pan.is_none() || tilt.is_none()) && invalid_pan_tilt {
+        return Err(OnvifError::Protocol);
+    }
+    if zoom.is_none() && invalid_zoom {
+        return Err(OnvifError::Protocol);
+    }
+    Ok(PtzConfigurationOptions { pan, tilt, zoom })
 }
 
 pub(crate) fn parse_stream_uri(xml: &[u8]) -> Result<String, OnvifError> {
@@ -907,7 +995,10 @@ pub(crate) fn parse_motion_notifications_with_compatibility(
     xml: &[u8],
     compatibility: EventCompatibility,
 ) -> Result<Vec<MotionNotification>, OnvifError> {
-    validate_recognized_namespaces(xml)?;
+    match compatibility {
+        EventCompatibility::Standard => validate_recognized_namespaces(xml)?,
+        EventCompatibility::TapoC200 => validate_extension_tolerant_namespaces(xml)?,
+    }
     let mut reader = NsReader::from_reader(xml);
     reader.config_mut().trim_text(true);
     reader.config_mut().check_end_names = true;
@@ -948,34 +1039,25 @@ pub(crate) fn parse_motion_notifications_with_compatibility(
                     }
                     notification.property_operation = attribute(&start, "PropertyOperation")?;
                 }
+                if name == "SimpleItem" {
+                    capture_event_simple_item(
+                        &start,
+                        &stack,
+                        &mut current,
+                        &mut simple_item_count,
+                    )?;
+                }
                 push_start(&mut stack, name)?;
             }
             Event::Empty(start) => {
                 let name = local_name(start.name().as_ref());
                 if name == "SimpleItem" {
-                    let Some(notification) = current.as_mut() else {
-                        continue;
-                    };
-                    simple_item_count = simple_item_count.saturating_add(1);
-                    if simple_item_count > MAX_EVENT_SIMPLE_ITEMS {
-                        return Err(OnvifError::ResponseTooLarge);
-                    }
-                    let Some(item_name) = attribute(&start, "Name")? else {
-                        continue;
-                    };
-                    let Some(item_value) = attribute(&start, "Value")? else {
-                        continue;
-                    };
-                    if item_name.len() > MAX_EVENT_SIMPLE_ITEM_NAME_BYTES
-                        || item_value.len() > MAX_EVENT_SIMPLE_ITEM_VALUE_BYTES
-                    {
-                        return Err(OnvifError::ResponseTooLarge);
-                    }
-                    if stack.iter().any(|part| part == "Source") {
-                        notification.source_items.push((item_name, item_value));
-                    } else if stack.iter().any(|part| part == "Data") {
-                        notification.data_items.push((item_name, item_value));
-                    }
+                    capture_event_simple_item(
+                        &start,
+                        &stack,
+                        &mut current,
+                        &mut simple_item_count,
+                    )?;
                 }
             }
             Event::Text(text) => {
@@ -1010,6 +1092,38 @@ pub(crate) fn parse_motion_notifications_with_compatibility(
     Ok(notifications)
 }
 
+fn capture_event_simple_item(
+    start: &BytesStart<'_>,
+    stack: &[String],
+    current: &mut Option<RawEventNotification>,
+    simple_item_count: &mut usize,
+) -> Result<(), OnvifError> {
+    let Some(notification) = current.as_mut() else {
+        return Ok(());
+    };
+    *simple_item_count = simple_item_count.saturating_add(1);
+    if *simple_item_count > MAX_EVENT_SIMPLE_ITEMS {
+        return Err(OnvifError::ResponseTooLarge);
+    }
+    let Some(item_name) = attribute(start, "Name")? else {
+        return Ok(());
+    };
+    let Some(item_value) = attribute(start, "Value")? else {
+        return Ok(());
+    };
+    if item_name.len() > MAX_EVENT_SIMPLE_ITEM_NAME_BYTES
+        || item_value.len() > MAX_EVENT_SIMPLE_ITEM_VALUE_BYTES
+    {
+        return Err(OnvifError::ResponseTooLarge);
+    }
+    if stack.iter().any(|part| part == "Source") {
+        notification.source_items.push((item_name, item_value));
+    } else if stack.iter().any(|part| part == "Data") {
+        notification.data_items.push((item_name, item_value));
+    }
+    Ok(())
+}
+
 fn normalize_motion_notifications(
     mut raw: RawEventNotification,
     compatibility: EventCompatibility,
@@ -1034,10 +1148,14 @@ fn normalize_motion_notifications(
         if !expected_data_names.contains(&name.as_str()) {
             continue;
         }
-        if states.iter().any(|(existing, _)| existing == name) {
-            return Err(OnvifError::Protocol);
+        let state = parse_event_bool(value)?;
+        if let Some((_, existing_state)) = states.iter().find(|(existing, _)| existing == name) {
+            if *existing_state != state {
+                return Err(OnvifError::Protocol);
+            }
+            continue;
         }
-        states.push((name.clone(), parse_event_bool(value)?));
+        states.push((name.clone(), state));
     }
     if states.is_empty() {
         return Ok(Vec::new());
@@ -1316,6 +1434,33 @@ mod tests {
     }
 
     #[test]
+    fn ptz_parser_chooses_a_complete_velocity_space_without_mixing_partial_candidates() {
+        let options = br#"<tptz:GetConfigurationOptionsResponse xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><tptz:PTZConfigurationOptions><tt:Spaces><tt:ContinuousPanTiltVelocitySpace><tt:XRange><tt:Min>-9</tt:Min></tt:XRange></tt:ContinuousPanTiltVelocitySpace><tt:ContinuousPanTiltVelocitySpace><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange><tt:YRange><tt:Min>-0.75</tt:Min><tt:Max>0.75</tt:Max></tt:YRange></tt:ContinuousPanTiltVelocitySpace><tt:ContinuousZoomVelocitySpace><tt:XRange><tt:Min>-8</tt:Min></tt:XRange></tt:ContinuousZoomVelocitySpace><tt:ContinuousZoomVelocitySpace><tt:XRange><tt:Min>-0.5</tt:Min><tt:Max>0.5</tt:Max></tt:XRange></tt:ContinuousZoomVelocitySpace></tt:Spaces></tptz:PTZConfigurationOptions></tptz:GetConfigurationOptionsResponse>"#;
+        let parsed = parse_ptz_configuration_options(options).unwrap();
+        assert_eq!(
+            parsed.pan,
+            Some(PtzVelocityRange {
+                min: -1.0,
+                max: 1.0
+            })
+        );
+        assert_eq!(
+            parsed.tilt,
+            Some(PtzVelocityRange {
+                min: -0.75,
+                max: 0.75
+            })
+        );
+        assert_eq!(
+            parsed.zoom,
+            Some(PtzVelocityRange {
+                min: -0.5,
+                max: 0.5
+            })
+        );
+    }
+
+    #[test]
     fn ptz_parser_rejects_namespace_spoofing_and_invalid_ranges() {
         let spoofed = br#"<root xmlns:evil="urn:evil"><evil:Profiles token="main"><evil:PTZConfiguration token="ptz"/></evil:Profiles></root>"#;
         assert_eq!(
@@ -1388,6 +1533,31 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), original_len);
+    }
+
+    #[test]
+    fn tapo_c200_pull_parser_tolerates_extensions_nonempty_items_and_identical_duplicates() {
+        let xml = br#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:tns1="http://www.onvif.org/ver10/topics" xmlns:tapo="urn:tapo:extension"><s:Body><tapo:Message><tapo:Data>ignored extension</tapo:Data></tapo:Message><wsnt:NotificationMessage><wsnt:Topic>tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic><wsnt:Message><tt:Message UtcTime="2026-09-12T10:00:03Z"><tt:Source><tt:SimpleItem Name="Rule" Value="motion"></tt:SimpleItem></tt:Source><tt:Data><tt:SimpleItem Name="IsMotion" Value="true"></tt:SimpleItem><tt:SimpleItem Name="IsMotion" Value="TRUE"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage></s:Body></s:Envelope>"#;
+
+        assert_eq!(parse_motion_notifications(xml), Err(OnvifError::Protocol));
+        let notifications =
+            parse_motion_notifications_with_compatibility(xml, EventCompatibility::TapoC200)
+                .unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(notifications[0].active);
+        assert_eq!(
+            notifications[0].source_key.as_ref().map(String::len),
+            Some(64)
+        );
+    }
+
+    #[test]
+    fn tapo_c200_pull_parser_still_rejects_conflicting_duplicate_states() {
+        let xml = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:tns1="http://www.onvif.org/ver10/topics"><wsnt:Topic>tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic><wsnt:Message><tt:Message><tt:Data><tt:SimpleItem Name="IsMotion" Value="true"/><tt:SimpleItem Name="IsMotion" Value="false"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
+        assert_eq!(
+            parse_motion_notifications_with_compatibility(xml, EventCompatibility::TapoC200),
+            Err(OnvifError::Protocol)
+        );
     }
 
     #[test]
