@@ -14,16 +14,19 @@ use sha2::Sha256;
 use url::Url;
 use uuid::Uuid;
 
+use crate::adapter::DeviceAdapter;
 use crate::authority::{
     parse_stream_uri as normalize_stream_uri, validate_event_xaddr, validate_service_xaddr,
 };
 use crate::types::{
-    EventControl, MediaProfile, MediaServiceKind, MotionNotification, OnvifCredentials,
-    OnvifInterrogation, PtzControl, PtzProfileAssociation, PullPointSubscription, ServiceEndpoint,
+    DeviceInformation, EventControl, MediaProfile, MediaServiceKind, MotionNotification,
+    OnvifCredentials, OnvifInterrogation, PtzControl, PtzProfileAssociation, PullPointSubscription,
+    ServiceEndpoint,
 };
 use crate::xml::{
-    parse_device_information, parse_event_capability_xaddr, parse_event_properties, parse_hostname,
-    parse_motion_notifications, parse_profiles, parse_ptz_configuration_options,
+    parse_device_information, parse_event_capability_xaddr,
+    parse_event_properties_with_compatibility, parse_hostname,
+    parse_motion_notifications_with_compatibility, parse_profiles, parse_ptz_configuration_options,
     parse_ptz_profile_associations, parse_pullpoint_subscription, parse_renew_times,
     parse_services, parse_stream_uri,
 };
@@ -67,13 +70,7 @@ impl OnvifClient {
         device_service: &str,
         credentials: &OnvifCredentials,
     ) -> Result<OnvifInterrogation, OnvifError> {
-        let info_xml = self.soap(
-            device_service,
-            credentials,
-            &format!("{DEVICE_NS}/GetDeviceInformation"),
-            "<tds:GetDeviceInformation/>",
-        )?;
-        let mut device = parse_device_information(&info_xml)?;
+        let mut device = self.device_information(device_service, credentials)?;
 
         if let Ok(hostname_xml) = self.soap(
             device_service,
@@ -124,6 +121,32 @@ impl OnvifClient {
         })
     }
 
+    fn device_information(
+        &self,
+        device_service: &str,
+        credentials: &OnvifCredentials,
+    ) -> Result<DeviceInformation, OnvifError> {
+        let xml = self.soap(
+            device_service,
+            credentials,
+            &format!("{DEVICE_NS}/GetDeviceInformation"),
+            "<tds:GetDeviceInformation/>",
+        )?;
+        parse_device_information(&xml)
+    }
+
+    fn device_adapter(
+        &self,
+        device_service: &str,
+        credentials: &OnvifCredentials,
+    ) -> Result<DeviceAdapter, OnvifError> {
+        match self.device_information(device_service, credentials) {
+            Ok(device) => Ok(DeviceAdapter::detect(&device)),
+            Err(OnvifError::AuthFailed) => Err(OnvifError::AuthFailed),
+            Err(OnvifError::ResponseTooLarge) => Err(OnvifError::ResponseTooLarge),
+            Err(_) => Ok(DeviceAdapter::Generic),
+        }
+    }
     pub fn stream_endpoint(
         &self,
         device_service: &str,
@@ -159,15 +182,31 @@ impl OnvifClient {
         device_service: &str,
         credentials: &OnvifCredentials,
     ) -> Result<PtzControl, OnvifError> {
-        let services_xml = self.soap(
-            device_service,
-            credentials,
-            &format!("{DEVICE_NS}/GetServices"),
-            "<tds:GetServices><tds:IncludeCapability>false</tds:IncludeCapability></tds:GetServices>",
-        )?;
-        let services = parse_services(&services_xml)?;
-        let (ptz_services, rejected_ptz) =
+        let services_xml = self
+            .soap(
+                device_service,
+                credentials,
+                &format!("{DEVICE_NS}/GetServices"),
+                "<tds:GetServices><tds:IncludeCapability>false</tds:IncludeCapability></tds:GetServices>",
+            )
+            .map_err(|error| match error {
+                OnvifError::Protocol => OnvifError::PtzServicesProtocol,
+                error => error,
+            })?;
+        let services = parse_services(&services_xml).map_err(|error| match error {
+            OnvifError::Protocol => OnvifError::PtzServicesProtocol,
+            error => error,
+        })?;
+        let (mut ptz_services, rejected_ptz) =
             validated_service_xaddrs(&services, "/ver20/ptz/wsdl", device_service);
+        if ptz_services.is_empty() && !rejected_ptz {
+            let adapter = self.device_adapter(device_service, credentials)?;
+            if let Some(candidate) = adapter.known_tapo_service_candidate(device_service)
+                && let Ok(candidate) = validate_service_xaddr(&candidate, device_service)
+            {
+                ptz_services.push(candidate);
+            }
+        }
         if ptz_services.is_empty() {
             return Err(if rejected_ptz {
                 OnvifError::AuthorityRejected
@@ -177,8 +216,16 @@ impl OnvifClient {
         }
         let (media2, rejected_media2) =
             validated_service_xaddrs(&services, "/ver20/media/wsdl", device_service);
-        let (media1, rejected_media1) =
+        let (mut media1, rejected_media1) =
             validated_service_xaddrs(&services, "/ver10/media/wsdl", device_service);
+        if media2.is_empty() && media1.is_empty() && !rejected_media2 && !rejected_media1 {
+            let adapter = self.device_adapter(device_service, credentials)?;
+            if let Some(candidate) = adapter.known_tapo_service_candidate(device_service)
+                && let Ok(candidate) = validate_service_xaddr(&candidate, device_service)
+            {
+                media1.push(candidate);
+            }
+        }
         if media2.is_empty() && media1.is_empty() {
             return Err(if rejected_media2 || rejected_media1 {
                 OnvifError::AuthorityRejected
@@ -197,6 +244,7 @@ impl OnvifClient {
                 match self.get_ptz_associations(media, credentials, kind) {
                     Ok(found) => associations.extend(found),
                     Err(OnvifError::AuthFailed) => return Err(OnvifError::AuthFailed),
+                    Err(OnvifError::Protocol) => last_error = OnvifError::PtzProfilesProtocol,
                     Err(error) => last_error = error,
                 }
             }
@@ -220,9 +268,8 @@ impl OnvifClient {
                     &format!("{PTZ_NS}/GetConfigurationOptions"),
                     &body,
                 ) {
-                    Ok(xml) => {
-                        let options = parse_ptz_configuration_options(&xml)?;
-                        if options.pan.is_some() && options.tilt.is_some() {
+                    Ok(xml) => match parse_ptz_configuration_options(&xml) {
+                        Ok(options) if options.pan.is_some() && options.tilt.is_some() => {
                             return Ok(PtzControl {
                                 service,
                                 profile_token: association.profile_token.clone(),
@@ -231,9 +278,16 @@ impl OnvifClient {
                                 zoom: options.zoom,
                             });
                         }
-                        last_error = OnvifError::Unsupported;
-                    }
+                        Ok(_) => last_error = OnvifError::Unsupported,
+                        Err(OnvifError::Protocol) => {
+                            last_error = OnvifError::PtzConfigurationOptionsProtocol;
+                        }
+                        Err(error) => last_error = error,
+                    },
                     Err(OnvifError::AuthFailed) => return Err(OnvifError::AuthFailed),
+                    Err(OnvifError::Protocol) => {
+                        last_error = OnvifError::PtzConfigurationOptionsProtocol;
+                    }
                     Err(error) => last_error = error,
                 }
             }
@@ -340,12 +394,22 @@ impl OnvifClient {
                 }
             }
         }
+        if event_services.is_empty() && rejected_event {
+            return Err(OnvifError::AuthorityRejected);
+        }
+
+        let mut adapter = None;
         if event_services.is_empty() {
-            return Err(if rejected_event {
-                OnvifError::AuthorityRejected
-            } else {
-                OnvifError::EventServiceUnsupported
-            });
+            let detected = self.device_adapter(device_service, credentials)?;
+            adapter = Some(detected);
+            if let Some(candidate) = detected.known_tapo_service_candidate(device_service)
+                && let Ok(candidate) = validate_event_xaddr(&candidate, device_service)
+            {
+                event_services.push(candidate);
+            }
+        }
+        if event_services.is_empty() {
+            return Err(OnvifError::EventServiceUnsupported);
         }
         event_services.sort();
 
@@ -358,17 +422,79 @@ impl OnvifClient {
                 "<tev:GetEventProperties/>",
             ) {
                 Ok(xml) => {
-                    let properties = parse_event_properties(&xml)?;
-                    if properties.motion_supported {
+                    match parse_event_properties_with_compatibility(
+                        &xml,
+                        crate::adapter::EventCompatibility::Standard,
+                    ) {
+                        Ok(properties) if properties.motion_supported => {
+                            return Ok(EventControl {
+                                device_service: device_service.to_owned(),
+                                event_service: service,
+                                properties,
+                                compatibility: crate::adapter::EventCompatibility::Standard,
+                            });
+                        }
+                        Ok(_) | Err(OnvifError::Protocol | OnvifError::Unsupported) => {
+                            let detected = match adapter {
+                                Some(adapter) => adapter,
+                                None => {
+                                    let detected =
+                                        self.device_adapter(device_service, credentials)?;
+                                    adapter = Some(detected);
+                                    detected
+                                }
+                            };
+                            if detected.allows_unadvertised_motion_probe() {
+                                let compatibility = detected.event_compatibility();
+                                let advertised_motion =
+                                    match parse_event_properties_with_compatibility(
+                                        &xml,
+                                        compatibility,
+                                    ) {
+                                        Ok(properties) => properties.motion_supported,
+                                        Err(OnvifError::Protocol | OnvifError::Unsupported) => {
+                                            false
+                                        }
+                                        Err(error) => return Err(error),
+                                    };
+                                return Ok(EventControl {
+                                    device_service: device_service.to_owned(),
+                                    event_service: service,
+                                    properties: crate::EventProperties {
+                                        motion_supported: advertised_motion
+                                            || detected.allows_unadvertised_motion_probe(),
+                                    },
+                                    compatibility,
+                                });
+                            }
+                            last_error = OnvifError::MotionEventUnsupported;
+                        }
+                        Err(OnvifError::AuthFailed) => return Err(OnvifError::AuthFailed),
+                        Err(error) => last_error = error,
+                    }
+                }
+                Err(OnvifError::AuthFailed) => return Err(OnvifError::AuthFailed),
+                Err(OnvifError::Protocol | OnvifError::Unsupported) => {
+                    let detected = match adapter {
+                        Some(adapter) => adapter,
+                        None => {
+                            let detected = self.device_adapter(device_service, credentials)?;
+                            adapter = Some(detected);
+                            detected
+                        }
+                    };
+                    if detected.allows_unadvertised_motion_probe() {
                         return Ok(EventControl {
                             device_service: device_service.to_owned(),
                             event_service: service,
-                            properties,
+                            properties: crate::EventProperties {
+                                motion_supported: true,
+                            },
+                            compatibility: detected.event_compatibility(),
                         });
                     }
                     last_error = OnvifError::MotionEventUnsupported;
                 }
-                Err(OnvifError::AuthFailed) => return Err(OnvifError::AuthFailed),
                 Err(error) => last_error = error,
             }
         }
@@ -394,6 +520,7 @@ impl OnvifClient {
             &body,
         )?;
         let mut subscription = parse_pullpoint_subscription(&xml)?;
+        subscription.compatibility = control.compatibility;
         subscription.endpoint =
             validate_event_xaddr(&subscription.endpoint, &control.device_service)?;
         if let (Some(current), Some(termination)) = (
@@ -435,7 +562,7 @@ impl OnvifClient {
             &format!("{EVENT_NS}/PullPointSubscription/PullMessagesRequest"),
             &body,
         )?;
-        parse_motion_notifications(&xml)
+        parse_motion_notifications_with_compatibility(&xml, subscription.compatibility)
     }
 
     pub fn renew_subscription(
@@ -458,6 +585,7 @@ impl OnvifClient {
             endpoint: subscription.endpoint.clone(),
             current_time_utc: current,
             termination_time_utc: termination,
+            compatibility: subscription.compatibility,
         };
         candidate.bounded_lifetime_secs()?;
         subscription.current_time_utc = current;
@@ -1685,6 +1813,40 @@ mod tests {
     }
 
     #[test]
+    fn ptz_control_reports_configuration_options_as_the_protocol_failure_stage() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let body = if request.contains("GetServices") {
+                    format!(
+                        "<Envelope><Service><Namespace>{MEDIA1_NS}</Namespace><XAddr>http://{address}/media</XAddr></Service><Service><Namespace>{PTZ_NS}</Namespace><XAddr>http://{address}/ptz</XAddr></Service></Envelope>"
+                    )
+                } else if request.contains("GetProfiles") {
+                    "<Envelope><Profiles token=\"main\"><PTZConfiguration token=\"ptz-config\"/></Profiles></Envelope>".to_owned()
+                } else if request.contains("GetConfigurationOptions") {
+                    "<Envelope><Spaces><ContinuousPanTiltVelocitySpace><XRange><Min>-1</Min></XRange><YRange><Min>-1</Min><Max>1</Max></YRange></ContinuousPanTiltVelocitySpace></Spaces></Envelope>".to_owned()
+                } else {
+                    panic!("unexpected PTZ diagnostics fixture request: {request}")
+                };
+                write_http_response(&mut stream, "200 OK", &[], &body);
+            }
+        });
+        let client = OnvifClient::with_timeout(Duration::from_secs(1)).unwrap();
+        let credentials = OnvifCredentials {
+            username: String::new(),
+            password: String::new(),
+        };
+        assert_eq!(
+            client.ptz_control(&format!("http://{address}/device"), &credentials),
+            Err(OnvifError::PtzConfigurationOptionsProtocol)
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
     fn continuous_move_and_stop_are_bounded_and_axis_specific() {
         use crate::PtzVelocityRange;
 
@@ -1841,6 +2003,56 @@ mod tests {
     }
 
     #[test]
+    fn tapo_c200_adapter_accepts_unadvertised_vendor_motion_after_device_fingerprint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let body = if request.contains("GetServices") {
+                    format!(
+                        "<Envelope><Body><GetServicesResponse><Service><Namespace>{EVENT_NS}</Namespace><XAddr>http://{address}/onvif/service</XAddr></Service></GetServicesResponse></Body></Envelope>"
+                    )
+                } else if request.contains("GetEventProperties") {
+                    r#"<Envelope xmlns:tns1="http://www.onvif.org/ver10/topics"><Body><GetEventPropertiesResponse><TopicSet><tns1:RuleEngine><tns1:PeopleDetector><tns1:People/></tns1:PeopleDetector></tns1:RuleEngine></TopicSet></GetEventPropertiesResponse></Body></Envelope>"#.to_owned()
+                } else if request.contains("GetDeviceInformation") {
+                    "<Envelope><Body><GetDeviceInformationResponse><Manufacturer>TP-Link</Manufacturer><Model>Tapo C200</Model><FirmwareVersion>1.4.6</FirmwareVersion><HardwareId>5.0</HardwareId></GetDeviceInformationResponse></Body></Envelope>".to_owned()
+                } else {
+                    panic!("unexpected C200 fixture request: {request}");
+                };
+                write_http_response(&mut stream, "200 OK", &[], &body);
+                requests.push(request);
+            }
+            requests
+        });
+
+        let client = OnvifClient::new().unwrap();
+        let credentials = OnvifCredentials {
+            username: String::new(),
+            password: String::new(),
+        };
+        let control = client
+            .event_control(
+                &format!("http://{address}/onvif/device_service"),
+                &credentials,
+            )
+            .unwrap();
+        assert!(control.properties().motion_supported);
+        assert_eq!(
+            control.compatibility,
+            crate::adapter::EventCompatibility::TapoC200
+        );
+        let requests = server.join().unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("GetDeviceInformation"))
+        );
+    }
+
+    #[test]
     fn local_event_fixture_runs_pullpoint_sync_pull_renew_and_unsubscribe() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1944,6 +2156,7 @@ mod tests {
             endpoint: format!("http://{address}/pullpoint"),
             current_time_utc: Some(original_current),
             termination_time_utc: Some(original_termination),
+            compatibility: crate::adapter::EventCompatibility::Standard,
         };
         let client = OnvifClient::new().unwrap();
         let credentials = OnvifCredentials {

@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+use crate::adapter::EventCompatibility;
 use crate::{
     MAX_EVENT_SUBSCRIPTION_LIFETIME_SECS, MIN_EVENT_SUBSCRIPTION_LIFETIME_SECS, OnvifError,
 };
@@ -163,6 +164,7 @@ pub struct EventControl {
     pub(crate) device_service: String,
     pub(crate) event_service: String,
     pub(crate) properties: EventProperties,
+    pub(crate) compatibility: EventCompatibility,
 }
 
 impl std::fmt::Debug for EventControl {
@@ -187,6 +189,7 @@ impl EventControl {
             properties: EventProperties {
                 motion_supported: true,
             },
+            compatibility: EventCompatibility::Standard,
         }
     }
 }
@@ -196,6 +199,7 @@ pub struct PullPointSubscription {
     pub(crate) endpoint: String,
     pub(crate) current_time_utc: Option<DateTime<Utc>>,
     pub(crate) termination_time_utc: Option<DateTime<Utc>>,
+    pub(crate) compatibility: EventCompatibility,
 }
 
 impl std::fmt::Debug for PullPointSubscription {
@@ -243,6 +247,7 @@ impl PullPointSubscription {
             endpoint: "http://127.0.0.1/onvif/pullpoint-fixture".to_owned(),
             current_time_utc: Some(current),
             termination_time_utc: Some(current + chrono::Duration::seconds(lifetime_secs)),
+            compatibility: EventCompatibility::Standard,
         }
     }
 
@@ -256,6 +261,7 @@ impl PullPointSubscription {
             endpoint: "http://127.0.0.1/onvif/pullpoint-fixture".to_owned(),
             current_time_utc,
             termination_time_utc,
+            compatibility: EventCompatibility::Standard,
         }
     }
 }

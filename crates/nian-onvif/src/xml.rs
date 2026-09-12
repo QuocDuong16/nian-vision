@@ -4,6 +4,7 @@ use quick_xml::name::{QName, ResolveResult};
 use quick_xml::{NsReader, Reader, XmlVersion};
 use sha2::{Digest as _, Sha256};
 
+use crate::adapter::EventCompatibility;
 use crate::types::{
     DeviceInformation, EventProperties, MediaProfile, MediaServiceKind, MotionNotification,
     ProbeMatch, PtzConfigurationOptions, PtzProfileAssociation, PtzVelocityRange,
@@ -732,6 +733,9 @@ enum MotionTopicKind {
     Cell,
     Region,
     Alarm,
+    TapoPeople,
+    TapoSmart,
+    TapoLineCross,
 }
 
 #[derive(Debug, Default)]
@@ -744,7 +748,15 @@ struct RawEventNotification {
     data_items: Vec<(String, String)>,
 }
 
+#[cfg(test)]
 pub(crate) fn parse_event_properties(xml: &[u8]) -> Result<EventProperties, OnvifError> {
+    parse_event_properties_with_compatibility(xml, EventCompatibility::Standard)
+}
+
+pub(crate) fn parse_event_properties_with_compatibility(
+    xml: &[u8],
+    compatibility: EventCompatibility,
+) -> Result<EventProperties, OnvifError> {
     validate_recognized_namespaces(xml)?;
     let mut reader = NsReader::from_reader(xml);
     reader.config_mut().trim_text(true);
@@ -778,7 +790,7 @@ pub(crate) fn parse_event_properties(xml: &[u8]) -> Result<EventProperties, Onvi
                         return Err(OnvifError::ResponseTooLarge);
                     }
                     let relative = &stack[topic_set + 1..];
-                    if standard_motion_topic_kind_from_tree(relative).is_some() {
+                    if motion_topic_kind_from_tree(relative, compatibility).is_some() {
                         motion_supported = true;
                     }
                 }
@@ -797,7 +809,7 @@ pub(crate) fn parse_event_properties(xml: &[u8]) -> Result<EventProperties, Onvi
                     );
                     let mut relative = stack[topic_set + 1..].to_vec();
                     relative.push((name, standard_topic));
-                    if standard_motion_topic_kind_from_tree(&relative).is_some() {
+                    if motion_topic_kind_from_tree(&relative, compatibility).is_some() {
                         motion_supported = true;
                     }
                 }
@@ -825,6 +837,7 @@ pub(crate) fn parse_pullpoint_subscription(
         endpoint: endpoint.ok_or(OnvifError::Protocol)?,
         current_time_utc,
         termination_time_utc,
+        compatibility: EventCompatibility::Standard,
     })
 }
 
@@ -883,8 +896,16 @@ fn parse_subscription_metadata(
     Ok((endpoint, current, termination))
 }
 
+#[cfg(test)]
 pub(crate) fn parse_motion_notifications(
     xml: &[u8],
+) -> Result<Vec<MotionNotification>, OnvifError> {
+    parse_motion_notifications_with_compatibility(xml, EventCompatibility::Standard)
+}
+
+pub(crate) fn parse_motion_notifications_with_compatibility(
+    xml: &[u8],
+    compatibility: EventCompatibility,
 ) -> Result<Vec<MotionNotification>, OnvifError> {
     validate_recognized_namespaces(xml)?;
     let mut reader = NsReader::from_reader(xml);
@@ -966,7 +987,7 @@ pub(crate) fn parse_motion_notifications(
                         return Err(OnvifError::ResponseTooLarge);
                     }
                     notification.motion_topic_kind =
-                        standard_motion_topic_kind(reader.resolver(), &value);
+                        motion_topic_kind(reader.resolver(), &value, compatibility);
                     notification.topic = Some(value);
                 }
             }
@@ -975,9 +996,8 @@ pub(crate) fn parse_motion_notifications(
                 stack.pop().ok_or(OnvifError::Protocol)?;
                 if name == "NotificationMessage"
                     && let Some(raw) = current.take()
-                    && let Some(normalized) = normalize_motion_notification(raw)?
                 {
-                    notifications.push(normalized);
+                    notifications.extend(normalize_motion_notifications(raw, compatibility)?);
                 }
             }
             Event::Eof => break,
@@ -990,72 +1010,109 @@ pub(crate) fn parse_motion_notifications(
     Ok(notifications)
 }
 
-fn normalize_motion_notification(
+fn normalize_motion_notifications(
     mut raw: RawEventNotification,
-) -> Result<Option<MotionNotification>, OnvifError> {
-    let Some(_topic) = raw.topic.take() else {
-        return Ok(None);
+    compatibility: EventCompatibility,
+) -> Result<Vec<MotionNotification>, OnvifError> {
+    let Some(topic) = raw.topic.take() else {
+        return Ok(Vec::new());
     };
     let Some(topic_kind) = raw.motion_topic_kind else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
 
-    let expected_data_name = match topic_kind {
-        MotionTopicKind::Cell => "IsMotion",
-        MotionTopicKind::Region | MotionTopicKind::Alarm => "State",
+    let expected_data_names: &[&str] = match topic_kind {
+        MotionTopicKind::Cell => &["IsMotion"],
+        MotionTopicKind::Region | MotionTopicKind::Alarm => &["State"],
+        MotionTopicKind::TapoPeople => &["IsPeople", "IsMotion"],
+        MotionTopicKind::TapoSmart => &["IsTPSmartEvent", "IsVehicle", "IsPet"],
+        MotionTopicKind::TapoLineCross => &["IsLineCross"],
     };
-    let mut motion = None;
+
+    let mut states = Vec::new();
     for (name, value) in &raw.data_items {
-        if name != expected_data_name {
+        if !expected_data_names.contains(&name.as_str()) {
             continue;
         }
-        let value = value.trim();
-        let parsed = if value == "1" || value.eq_ignore_ascii_case("true") {
-            true
-        } else if value == "0" || value.eq_ignore_ascii_case("false") {
-            false
-        } else {
-            return Err(OnvifError::Protocol);
-        };
-        if motion.replace(parsed).is_some() {
+        if states.iter().any(|(existing, _)| existing == name) {
             return Err(OnvifError::Protocol);
         }
+        states.push((name.clone(), parse_event_bool(value)?));
     }
-    let Some(active) = motion else {
-        return Ok(None);
-    };
+    if states.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    let source_key = if raw.source_items.is_empty() {
-        None
-    } else {
-        raw.source_items.sort();
-        let mut digest = Sha256::new();
-        for (name, value) in raw.source_items {
-            let name_len = u32::try_from(name.len()).map_err(|_| OnvifError::ResponseTooLarge)?;
-            let value_len = u32::try_from(value.len()).map_err(|_| OnvifError::ResponseTooLarge)?;
-            digest.update(name_len.to_be_bytes());
-            digest.update(name.as_bytes());
-            digest.update(value_len.to_be_bytes());
-            digest.update(value.as_bytes());
-        }
-        Some(hex_lower(&digest.finalize()))
-    };
+    raw.source_items.sort();
+    let device_time_utc = raw
+        .utc_time
+        .as_deref()
+        .and_then(parse_lenient_event_timestamp);
+    let synchronization_baseline = raw
+        .property_operation
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("Initialized"));
+    let tapo_topic =
+        matches!(compatibility, EventCompatibility::TapoC200).then_some(topic.as_str());
 
-    Ok(Some(MotionNotification {
-        active,
-        device_time_utc: raw
-            .utc_time
-            .as_deref()
-            .and_then(parse_lenient_event_timestamp),
-        source_key,
-        synchronization_baseline: raw
-            .property_operation
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("Initialized")),
-    }))
+    let mut notifications = Vec::with_capacity(states.len());
+    for (data_name, active) in states {
+        notifications.push(MotionNotification {
+            active,
+            device_time_utc,
+            source_key: motion_source_key(
+                &raw.source_items,
+                tapo_topic.map(|topic| (topic, data_name.as_str())),
+            )?,
+            synchronization_baseline,
+        });
+    }
+    Ok(notifications)
 }
 
-fn standard_motion_topic_kind_from_tree(parts: &[(String, bool)]) -> Option<MotionTopicKind> {
+fn parse_event_bool(value: &str) -> Result<bool, OnvifError> {
+    let value = value.trim();
+    if value == "1" || value.eq_ignore_ascii_case("true") {
+        Ok(true)
+    } else if value == "0" || value.eq_ignore_ascii_case("false") {
+        Ok(false)
+    } else {
+        Err(OnvifError::Protocol)
+    }
+}
+
+fn motion_source_key(
+    source_items: &[(String, String)],
+    tapo_discriminator: Option<(&str, &str)>,
+) -> Result<Option<String>, OnvifError> {
+    if source_items.is_empty() && tapo_discriminator.is_none() {
+        return Ok(None);
+    }
+
+    let mut digest = Sha256::new();
+    if let Some((topic, data_name)) = tapo_discriminator {
+        digest.update(b"nian-tapo-c200-event-v1\0");
+        for value in [topic, data_name] {
+            let len = u32::try_from(value.len()).map_err(|_| OnvifError::ResponseTooLarge)?;
+            digest.update(len.to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+    }
+    for (name, value) in source_items {
+        let name_len = u32::try_from(name.len()).map_err(|_| OnvifError::ResponseTooLarge)?;
+        let value_len = u32::try_from(value.len()).map_err(|_| OnvifError::ResponseTooLarge)?;
+        digest.update(name_len.to_be_bytes());
+        digest.update(name.as_bytes());
+        digest.update(value_len.to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    Ok(Some(hex_lower(&digest.finalize())))
+}
+
+fn motion_topic_kind_from_tree(
+    parts: &[(String, bool)],
+    compatibility: EventCompatibility,
+) -> Option<MotionTopicKind> {
     if parts.len() >= 2 {
         let tail = &parts[parts.len() - 2..];
         if tail[0].0 == "VideoSource" && tail[0].1 && tail[1].0 == "MotionAlarm" && tail[1].1 {
@@ -1066,19 +1123,33 @@ fn standard_motion_topic_kind_from_tree(parts: &[(String, bool)]) -> Option<Moti
         return None;
     }
     let tail = &parts[parts.len() - 3..];
-    if tail[0].0 != "RuleEngine" || !tail[0].1 || tail[2].0 != "Motion" || !tail[2].1 {
+    if tail[0].0 != "RuleEngine" || !tail[0].1 || !tail[1].1 || !tail[2].1 {
         return None;
     }
-    match (tail[1].0.as_str(), tail[1].1) {
-        ("CellMotionDetector", true) => Some(MotionTopicKind::Cell),
-        ("MotionRegionDetector", true) => Some(MotionTopicKind::Region),
+    match (tail[1].0.as_str(), tail[2].0.as_str()) {
+        ("CellMotionDetector", "Motion") => Some(MotionTopicKind::Cell),
+        ("MotionRegionDetector", "Motion") => Some(MotionTopicKind::Region),
+        ("PeopleDetector", "People") if matches!(compatibility, EventCompatibility::TapoC200) => {
+            Some(MotionTopicKind::TapoPeople)
+        }
+        ("TPSmartEventDetector", "TPSmartEvent")
+            if matches!(compatibility, EventCompatibility::TapoC200) =>
+        {
+            Some(MotionTopicKind::TapoSmart)
+        }
+        ("LineCrossDetector", "LineCross")
+            if matches!(compatibility, EventCompatibility::TapoC200) =>
+        {
+            Some(MotionTopicKind::TapoLineCross)
+        }
         _ => None,
     }
 }
 
-fn standard_motion_topic_kind(
+fn motion_topic_kind(
     resolver: &quick_xml::name::NamespaceResolver,
     topic: &str,
+    compatibility: EventCompatibility,
 ) -> Option<MotionTopicKind> {
     let parts = topic.trim().split('/').map(str::trim).collect::<Vec<_>>();
     let first = QName(parts.first()?);
@@ -1093,12 +1164,25 @@ fn standard_motion_topic_kind(
     {
         return Some(MotionTopicKind::Alarm);
     }
-    if first.local_name().as_ref() != "RuleEngine" || parts.len() != 3 || parts[2] != "Motion" {
+    if first.local_name().as_ref() != "RuleEngine" || parts.len() != 3 {
         return None;
     }
-    match parts[1] {
-        "CellMotionDetector" => Some(MotionTopicKind::Cell),
-        "MotionRegionDetector" => Some(MotionTopicKind::Region),
+    match (parts[1], parts[2]) {
+        ("CellMotionDetector", "Motion") => Some(MotionTopicKind::Cell),
+        ("MotionRegionDetector", "Motion") => Some(MotionTopicKind::Region),
+        ("PeopleDetector", "People") if matches!(compatibility, EventCompatibility::TapoC200) => {
+            Some(MotionTopicKind::TapoPeople)
+        }
+        ("TPSmartEventDetector", "TPSmartEvent")
+            if matches!(compatibility, EventCompatibility::TapoC200) =>
+        {
+            Some(MotionTopicKind::TapoSmart)
+        }
+        ("LineCrossDetector", "LineCross")
+            if matches!(compatibility, EventCompatibility::TapoC200) =>
+        {
+            Some(MotionTopicKind::TapoLineCross)
+        }
         _ => None,
     }
 }
@@ -1267,6 +1351,43 @@ mod tests {
 
         let lookalike = br#"<tev:GetEventPropertiesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl"><tev:TopicSet><RuleEngine><VendorMotion><Motion/></VendorMotion></RuleEngine></tev:TopicSet></tev:GetEventPropertiesResponse>"#;
         assert!(!parse_event_properties(lookalike).unwrap().motion_supported);
+    }
+
+    #[test]
+    fn tapo_c200_policy_recognizes_vendor_detection_topics_without_weakening_generic_onvif() {
+        let vendor = br#"<tev:GetEventPropertiesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:tns1="http://www.onvif.org/ver10/topics"><tev:TopicSet><tns1:RuleEngine><tns1:PeopleDetector><tns1:People/></tns1:PeopleDetector><tns1:TPSmartEventDetector><tns1:TPSmartEvent/></tns1:TPSmartEventDetector><tns1:LineCrossDetector><tns1:LineCross/></tns1:LineCrossDetector></tns1:RuleEngine></tev:TopicSet></tev:GetEventPropertiesResponse>"#;
+        assert!(!parse_event_properties(vendor).unwrap().motion_supported);
+        assert!(
+            parse_event_properties_with_compatibility(vendor, EventCompatibility::TapoC200)
+                .unwrap()
+                .motion_supported
+        );
+    }
+
+    #[test]
+    fn tapo_c200_notifications_are_normalized_and_detector_sources_remain_independent() {
+        let xml = br#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:tns1="http://www.onvif.org/ver10/topics"><s:Body><wsnt:NotificationMessage><wsnt:Topic>tns1:RuleEngine/PeopleDetector/People</wsnt:Topic><wsnt:Message><tt:Message UtcTime="2026-09-12T10:00:00Z"><tt:Source><tt:SimpleItem Name="Rule" Value="people"/></tt:Source><tt:Data><tt:SimpleItem Name="IsPeople" Value="true"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage><wsnt:NotificationMessage><wsnt:Topic>tns1:RuleEngine/TPSmartEventDetector/TPSmartEvent</wsnt:Topic><wsnt:Message><tt:Message UtcTime="2026-09-12T10:00:01Z"><tt:Source><tt:SimpleItem Name="Rule" Value="smart"/></tt:Source><tt:Data><tt:SimpleItem Name="IsVehicle" Value="true"/><tt:SimpleItem Name="IsPet" Value="false"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage><wsnt:NotificationMessage><wsnt:Topic>tns1:RuleEngine/LineCrossDetector/LineCross</wsnt:Topic><wsnt:Message><tt:Message UtcTime="2026-09-12T10:00:02Z"><tt:Source><tt:SimpleItem Name="Rule" Value="line"/></tt:Source><tt:Data><tt:SimpleItem Name="IsLineCross" Value="TRUE"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage></s:Body></s:Envelope>"#;
+
+        assert!(parse_motion_notifications(xml).unwrap().is_empty());
+        let notifications =
+            parse_motion_notifications_with_compatibility(xml, EventCompatibility::TapoC200)
+                .unwrap();
+        assert_eq!(notifications.len(), 4);
+        assert_eq!(
+            notifications
+                .iter()
+                .map(|notification| notification.active)
+                .collect::<Vec<_>>(),
+            vec![true, true, false, true]
+        );
+        let mut keys = notifications
+            .iter()
+            .map(|notification| notification.source_key.clone().unwrap())
+            .collect::<Vec<_>>();
+        let original_len = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), original_len);
     }
 
     #[test]

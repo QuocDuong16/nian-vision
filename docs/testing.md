@@ -695,7 +695,7 @@ overlap one aggregate refresh, resolve/reject both release polling ownership, an
 ignores a late result. Existing tests continue to cover per-tile failure isolation, recording
 Start/Stop independence and reconnect remount. Media failure coverage now proves automatic
 fresh-session replacement, bounded 250/750/1500 ms recovery, hard stop after three consecutive
-automatic recoveries, exposure of the original structured failure, manual Retry reset and timer/session cleanup on unmount. Fragment consumption uses
+automatic recoveries, exposure of the original structured failure, manual Retry reset and timer/session cleanup on unmount. Presentation coverage proves Fit tile is the default, Native pixels can be selected without reopening/closing transport, and the diagnostics toggle is independent of live ownership. Runtime render diagnostics are derived only from decoded `videoWidth`/`videoHeight`, element geometry and `devicePixelRatio`; CI does not pretend jsdom is a GPU scaler. Fragment consumption uses
 a single sequence watermark rather than retaining an unbounded historical sequence set. The
 complete UI gate is TypeScript typecheck + ESLint + Vitest + Vite production build.
 
@@ -715,7 +715,7 @@ passwords remain behind the existing native credential boundary.
 
 `nian-onvif` PTZ fixtures cover PTZ service discovery, media-profile/configuration
 association, continuous pan/tilt and zoom velocity-space parsing, invalid ranges, namespace
-spoofing and service-authority mismatch. The client tests also assert bounded
+spoofing and service-authority mismatch. A staged-protocol regression feeds an incomplete configuration-options range and requires `PtzConfigurationOptionsProtocol`, so desktop errors can distinguish GetServices, media-profile/PTZ association and GetConfigurationOptions failures. Adapter tests fingerprint only TP-Link/Tapo C200 metadata and prove the derived TCP 2020 `/onvif/service` candidate stays on the trusted device host. The client tests also assert bounded
 `ContinuousMove`/`Stop` request construction and the same redirect/authentication/response
 hardening used by M10. No test creates a generic proxy or accepts an unrelated PTZ host.
 
@@ -773,7 +773,7 @@ shared Event credentials block camera credential replacement, Event-owned creden
 independent camera credential replacement, and camera deletion cleans camera/PTZ/Event-owned
 credentials once and only after the database commit.
 
-`nian-onvif` parser fixtures cover namespace-qualified `RuleEngine/CellMotionDetector/Motion` + `IsMotion`, `RuleEngine/MotionRegionDetector/Motion` + `State`, and `VideoSource/MotionAlarm` + `State`, QName-prefix resolution for notification Topic text, rejection/ignore of identical local names under vendor namespaces, synchronization `Initialized`, malformed/lookalike messages, distinct missing-Events-service versus missing-compatible-motion-topic diagnostics, PullPoint lifetime validation that accepts the 5-second minimum, rejects shorter remote lifetimes instead of clamping upward, clamps only downward at 24 hours, preserves missing-metadata fallback, and handles invalid/extreme timestamps safely. Renew-response fixtures apply the same minimum validation before mutating subscription metadata. SHA-256 source-token normalization remains unchanged. A local HTTP fixture executes the complete
+`nian-onvif` parser fixtures cover namespace-qualified `RuleEngine/CellMotionDetector/Motion` + `IsMotion`, `RuleEngine/MotionRegionDetector/Motion` + `State`, and `VideoSource/MotionAlarm` + `State`, QName-prefix resolution for notification Topic text, rejection/ignore of identical local names under vendor namespaces, synchronization `Initialized`, malformed/lookalike messages, distinct missing-Events-service versus missing-compatible-motion-topic diagnostics, PullPoint lifetime validation that accepts the 5-second minimum, rejects shorter remote lifetimes instead of clamping upward, clamps only downward at 24 hours, preserves missing-metadata fallback, and handles invalid/extreme timestamps safely. Tapo C200 adapter fixtures prove generic policy ignores People/Smart Event/Line Cross vendor paths, fingerprinted C200 policy accepts only their ONVIF-topic forms, vehicle/pet/people/line states get independent hashed source discriminators, an unrelated vendor model named C200 never activates the adapter, and a client integration fixture accepts a vendor topic only after TP-Link/Tapo device fingerprinting. Renew-response fixtures apply the same minimum validation before mutating subscription metadata. SHA-256 source-token normalization remains unchanged. A local HTTP fixture executes the complete
 GetServices/GetEventProperties/CreatePullPointSubscription/SetSynchronizationPoint/PullMessages/
 Renew/Unsubscribe sequence using the production client. It checks the four-second bounded poll,
 32-message cap, secret redaction and normalized source digest. A separate fixture advertises a
@@ -794,7 +794,7 @@ continue through the terminal Event settlement path rather than the Hide path.
 
 Frontend coverage pairs initial Events directly from a saved camera using only `camera_id`, proves the ONVIF scan/login dialog stays hidden when saved credentials authenticate, falls back to explicit ONVIF credentials only on `onvif_auth_failed`, verifies Pair leaves Desired Off until Enable, and exercises Unpair. Cameras loads the aggregate `event_statuses` result instead of issuing N per-camera Event status calls. Live View polls the same aggregate at five-second cadence with an explicit single-flight guard; a deferred-request test fires multiple timer ticks and proves only one backend request remains active until resolution, after which one new poll may start. Motion/error projection still does not close or replace a healthy video tile. Desktop has a thread-identity regression proving aggregate Event status collection executes through `spawn_blocking`, not on the caller/main thread.
 
-Physical Event validation is manual and never claimed by CI. On a compatible camera, verify any advertised supported standard CellMotion/MotionRegion/MotionAlarm start/end transitions, reconnect replay suppression, camera reboot, network interruption,
+Physical Event validation is manual and never claimed by CI. On a generic compatible camera, verify advertised standard CellMotion/MotionRegion/MotionAlarm transitions. On the reference Tapo C200 V5, additionally record the Device Information fingerprint, whether TCP 2020 `/onvif/service` is used, whether PullPoint succeeds despite incomplete `GetEventProperties`, and observed People/Smart Event/Line Cross/CellMotion start/end behavior. In both cases verify reconnect replay suppression, camera reboot, network interruption,
 Suspend/Resume fresh synchronization baseline, close-to-tray continued monitoring, storage-root
 switching, and continued RTSP recording/live/PTZ behavior while Event monitoring fails.
 

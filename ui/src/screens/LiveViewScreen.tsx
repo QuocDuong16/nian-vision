@@ -54,6 +54,17 @@ type LiveManifest = {
   fragments: number[];
 };
 
+type LiveScaleMode = "fit" | "native";
+
+type LiveRenderStats = {
+  sourceWidth: number;
+  sourceHeight: number;
+  displayDeviceWidth: number;
+  displayDeviceHeight: number;
+  devicePixelRatio: number;
+  scale: number;
+};
+
 function fragmentName(sequence: number): string {
   return `fragment-${String(sequence).padStart(12, "0")}.mp4`;
 }
@@ -114,17 +125,22 @@ function waitForSourceBuffer(sourceBuffer: SourceBuffer): Promise<void> {
 function LiveMedia({
   session,
   reconnectAttempt,
+  scaleMode,
+  showDiagnostics,
   onError,
   onStable,
 }: {
   session: LiveOpenDto;
   reconnectAttempt: number;
+  scaleMode: LiveScaleMode;
+  showDiagnostics: boolean;
   onError: (failure: DesktopError) => void;
   onStable: () => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const onErrorRef = useRef(onError);
   const onStableRef = useRef(onStable);
+  const [renderStats, setRenderStats] = useState<LiveRenderStats | null>(null);
 
   useEffect(() => {
     onErrorRef.current = onError;
@@ -133,6 +149,46 @@ function LiveMedia({
   useEffect(() => {
     onStableRef.current = onStable;
   }, [onStable]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const update = () => {
+      const sourceWidth = video.videoWidth;
+      const sourceHeight = video.videoHeight;
+      if (!sourceWidth || !sourceHeight) return;
+      const rect = video.getBoundingClientRect();
+      const dpr = Math.max(window.devicePixelRatio || 1, 1);
+      const sourceAspect = sourceWidth / sourceHeight;
+      const boxAspect = rect.width > 0 && rect.height > 0 ? rect.width / rect.height : sourceAspect;
+      const renderedCssWidth = boxAspect > sourceAspect ? rect.height * sourceAspect : rect.width;
+      const renderedCssHeight = boxAspect > sourceAspect ? rect.height : rect.width / sourceAspect;
+      const displayDeviceWidth = Math.max(1, Math.round(renderedCssWidth * dpr));
+      const displayDeviceHeight = Math.max(1, Math.round(renderedCssHeight * dpr));
+      setRenderStats({
+        sourceWidth,
+        sourceHeight,
+        displayDeviceWidth,
+        displayDeviceHeight,
+        devicePixelRatio: dpr,
+        scale: Math.max(displayDeviceWidth / sourceWidth, displayDeviceHeight / sourceHeight),
+      });
+    };
+
+    video.addEventListener("loadedmetadata", update);
+    video.addEventListener("resize", update);
+    window.addEventListener("resize", update);
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+    observer?.observe(video);
+    update();
+    return () => {
+      video.removeEventListener("loadedmetadata", update);
+      video.removeEventListener("resize", update);
+      window.removeEventListener("resize", update);
+      observer?.disconnect();
+    };
+  }, [scaleMode, session.session_id]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -283,19 +339,43 @@ function LiveMedia({
   }, [reconnectAttempt, session.session_id, session.url]);
 
   const fallback = typeof window.MediaSource === "undefined";
+  const nativeStyle = scaleMode === "native" && renderStats
+    ? {
+        maxWidth: `min(100%, ${Math.max(1, Math.round(renderStats.sourceWidth / renderStats.devicePixelRatio))}px)`,
+        maxHeight: `min(100%, ${Math.max(1, Math.round(renderStats.sourceHeight / renderStats.devicePixelRatio))}px)`,
+      }
+    : undefined;
+  const scaleLabel = renderStats
+    ? renderStats.scale > 1.02
+      ? `${renderStats.scale.toFixed(2)}× upscale`
+      : renderStats.scale < 0.98
+        ? `${renderStats.scale.toFixed(2)}× downscale`
+        : "1:1 pixels"
+    : null;
   return (
-    <video
-      ref={videoRef}
-      className="live-video"
-      src={fallback ? session.url : undefined}
-      autoPlay
-      muted
-      playsInline
-      onError={() => onErrorRef.current({
-        code: "media_element_failed",
-        message: "The live video element reported a decode or playback failure.",
-      })}
-    />
+    <>
+      <video
+        ref={videoRef}
+        className={`live-video ${scaleMode === "native" ? "live-video-native" : "live-video-fit"}`}
+        style={nativeStyle}
+        src={fallback ? session.url : undefined}
+        autoPlay
+        muted
+        playsInline
+        onError={() => onErrorRef.current({
+          code: "media_element_failed",
+          message: "The live video element reported a decode or playback failure.",
+        })}
+      />
+      {showDiagnostics && renderStats && (
+        <div className="live-video-diagnostics" aria-label="Live video render diagnostics">
+          <span>{renderStats.sourceWidth}×{renderStats.sourceHeight} source</span>
+          <span>{renderStats.displayDeviceWidth}×{renderStats.displayDeviceHeight} display px</span>
+          <span>{scaleLabel}</span>
+          <span>DPR {renderStats.devicePixelRatio.toFixed(2)}</span>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -303,6 +383,8 @@ export function LiveViewScreen() {
   const [cameras, setCameras] = useState<CameraSummary[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
   const [pickerCameraId, setPickerCameraId] = useState("");
+  const [scaleMode, setScaleMode] = useState<LiveScaleMode>("fit");
+  const [showVideoDiagnostics, setShowVideoDiagnostics] = useState(false);
   const [sessions, setSessions] = useState<Map<string, LiveOpenDto>>(() => new Map());
   const [statuses, setStatuses] = useState<LiveStatus[]>([]);
   const [recordings, setRecordings] = useState<RecordingStatus[]>([]);
@@ -722,6 +804,30 @@ export function LiveViewScreen() {
           <p className="muted">Up to {MAX_LIVE_VIEWS} independent H.264 live sessions. Recording remains separate.</p>
         </div>
         <div className="live-picker">
+          <div className="live-quality-controls" role="group" aria-label="Live video quality">
+            <button
+              type="button"
+              aria-pressed={scaleMode === "fit"}
+              onClick={() => setScaleMode("fit")}
+            >
+              Fit tile
+            </button>
+            <button
+              type="button"
+              aria-pressed={scaleMode === "native"}
+              onClick={() => setScaleMode("native")}
+            >
+              Native pixels
+            </button>
+            <label className="live-diagnostics-toggle">
+              <input
+                type="checkbox"
+                checked={showVideoDiagnostics}
+                onChange={(event) => setShowVideoDiagnostics(event.target.checked)}
+              />
+              Diagnostics
+            </label>
+          </div>
           <select
             aria-label="Camera to add"
             value={pickerCameraId}
@@ -785,6 +891,8 @@ export function LiveViewScreen() {
                       key={`${session.session_id}-${backendStatus?.reconnect_attempt ?? 0}`}
                       session={session}
                       reconnectAttempt={backendStatus?.reconnect_attempt ?? 0}
+                      scaleMode={scaleMode}
+                      showDiagnostics={showVideoDiagnostics}
                       onError={(failure) => void handleMediaError(cameraId, failure)}
                       onStable={() => markLiveStable(cameraId)}
                     />

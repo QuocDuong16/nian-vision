@@ -171,6 +171,25 @@ afterEach(() => {
 });
 
 describe("LiveViewScreen", () => {
+  it("switches between fit and native-pixel rendering without changing the live transport", async () => {
+    installDesktop();
+    render(<LiveViewScreen />);
+
+    await screen.findByText("No live cameras selected");
+    const fit = screen.getByRole("button", { name: "Fit tile" });
+    const native = screen.getByRole("button", { name: "Native pixels" });
+    expect(fit.getAttribute("aria-pressed")).toBe("true");
+    expect(native.getAttribute("aria-pressed")).toBe("false");
+
+    fireEvent.click(native);
+    expect(fit.getAttribute("aria-pressed")).toBe("false");
+    expect(native.getAttribute("aria-pressed")).toBe("true");
+
+    fireEvent.click(screen.getByLabelText("Diagnostics"));
+    expect((screen.getByLabelText("Diagnostics") as HTMLInputElement).checked).toBe(true);
+    expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "live_close")).toBe(false);
+  });
+
   it("selects configured cameras and exposes only opaque localhost media URLs", async () => {
     installDesktop();
     render(<LiveViewScreen />);

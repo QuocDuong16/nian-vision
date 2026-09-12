@@ -66,14 +66,22 @@ The existing hardened SOAP client is extended with PTZ service discovery, media-
 PTZ-configuration association, configuration-option parsing, `ContinuousMove` and `Stop`.
 The existing no-proxy client, disabled redirects, bounded SOAP body/XML depth/text,
 namespace validation, DTD/custom-entity rejection, authentication negotiation and service
-authority checks remain authoritative.
+authority checks remain authoritative. When standard PTZ/media service discovery is absent, a
+bounded `GetDeviceInformation` fingerprint may select the TP-Link/Tapo C200 compatibility adapter
+and derive the fixed same-host TCP 2020 `/onvif/service` candidate. That candidate still passes
+normal service-authority validation; the adapter cannot retarget another host, add userinfo, follow
+redirects or bypass XML/response bounds.
 
 Velocity is capability driven. Pan/tilt is required for an M12-compatible PTZ binding;
 zoom is exposed only when a continuous zoom velocity space is advertised. User input is a
 small direction enum, not an arbitrary velocity. The application maps it to a fixed
 normalized magnitude of 0.45 and `nian-onvif` maps the normalized value into the device's
-advertised bounded velocity range. M12 does not expose presets, absolute/relative moves,
-arbitrary speed or vendor-specific PTZ extensions.
+advertised bounded velocity range. A malformed/incompatible PTZ setup response is reported at
+its actual preparation stage: `GetServices`, media-profile/PTZ association, or
+`GetConfigurationOptions`. The C200 adapter does not fabricate missing velocity ranges, so a
+firmware-specific options quirk can be diagnosed before any motor command is sent. M12 does not
+expose presets, absolute/relative moves, arbitrary speed or arbitrary vendor-specific PTZ
+extensions.
 
 Every `ContinuousMove` also carries an ONVIF camera-side timeout of one second. This is a
 second dead-man layer in addition to application ownership and protects against host loss

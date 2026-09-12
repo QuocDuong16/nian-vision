@@ -2708,6 +2708,18 @@ fn map_onvif_error(error: OnvifControllerError) -> DesktopErrorDto {
                 "onvif_protocol",
                 "camera returned a malformed ONVIF response",
             ),
+            OnvifError::PtzServicesProtocol => DesktopErrorDto::new(
+                "onvif_ptz_services_protocol",
+                "camera returned an incompatible ONVIF GetServices response while preparing PTZ",
+            ),
+            OnvifError::PtzProfilesProtocol => DesktopErrorDto::new(
+                "onvif_ptz_profiles_protocol",
+                "camera returned an incompatible ONVIF media profile response while preparing PTZ",
+            ),
+            OnvifError::PtzConfigurationOptionsProtocol => DesktopErrorDto::new(
+                "onvif_ptz_options_protocol",
+                "camera returned incompatible ONVIF PTZ configuration options",
+            ),
             OnvifError::ResponseTooLarge => DesktopErrorDto::new(
                 "onvif_response_too_large",
                 "camera returned an ONVIF response that exceeded safety limits",

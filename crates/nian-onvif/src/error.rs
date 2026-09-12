@@ -12,6 +12,12 @@ pub enum OnvifError {
     AuthFailed,
     #[error("malformed or unsupported ONVIF response")]
     Protocol,
+    #[error("malformed or unsupported ONVIF GetServices response while preparing PTZ")]
+    PtzServicesProtocol,
+    #[error("malformed or unsupported ONVIF media profile response while preparing PTZ")]
+    PtzProfilesProtocol,
+    #[error("malformed or unsupported ONVIF PTZ configuration options response")]
+    PtzConfigurationOptionsProtocol,
     #[error("ONVIF response exceeded the configured limit")]
     ResponseTooLarge,
     #[error("ONVIF capability is unsupported")]
