@@ -76,25 +76,26 @@ cleanup.
 ### Live media uses a bounded rolling fragmented-MP4 window
 
 The media worker opens RTSP through the existing FFmpeg wrapper, requires H.264 video and
-packet-copies video only. It creates independently finalized fragmented-MP4 files beginning
-on video keyframes. There is no decode/transcode path and recorder muxing semantics are not
-changed.
+packet-copies video only. It creates independently finalized fragmented-MP4 files. The initial
+fragment waits for a video keyframe; follow-up fragments rotate on the media-time target without
+waiting for another keyframe so MSE latency does not inherit the camera GOP cadence. There is no
+decode/transcode path and recorder muxing semantics are not changed.
 
 The production bounds are explicit:
 
 - `MAX_SIMULTANEOUS_LIVE_VIEWS = 4`;
-- fragment target: 2 seconds;
+- fragment target: 500 ms;
 - target retained finalized fragments per session: 6;
 - hard finalized-fragment ceiling per session: 8 (six-window target plus two possible reader pins);
-- nominal retained live window: about 12 seconds, subject to camera keyframe cadence;
+- nominal retained live window: about 3 seconds after the initial keyframe-gated fragment;
 - maximum finalized fragment size: 16 MiB;
 - maximum HTTP readers per session: 2;
 - maximum concurrent live HTTP requests across the listener: 8;
 - live keepalive expiry: 2 minutes.
 
-The worker rotates at a keyframe after the target window. Byte pressure also requests a
-keyframe rotation; a pathological stream that cannot produce a safe bounded fragment is
-failed rather than allowed to consume disk indefinitely. The application reaper trims old
+After the initial keyframe-gated fragment, the worker rotates at the target media-time window.
+Byte pressure remains a second rotation trigger; a pathological stream that cannot produce a
+safe bounded fragment is failed rather than allowed to consume disk indefinitely. The application reaper trims old
 finalized fragments continuously. If finalized files reach the hard ceiling, the worker
 backpressures at the next keyframe boundary until retention or reader release creates room;
 lifecycle cancellation interrupts that wait. Four sessions are bounded independently.

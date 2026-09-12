@@ -1131,6 +1131,36 @@ async fn onvif_connect(
 }
 
 #[tauri::command]
+async fn onvif_connect_events(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    input: OnvifConnectInput,
+) -> Result<(), DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    if input.username.trim().is_empty() || input.password.is_empty() {
+        return Err(DesktopErrorDto::new(
+            "validation",
+            "username and password are required",
+        ));
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .onvif_controller
+            .connect_events(
+                &input.session_id,
+                &input.device_id,
+                Credentials::new(input.username, input.password),
+            )
+            .map_err(map_onvif_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("onvif_internal", "ONVIF event authentication task failed"))?
+}
+
+#[tauri::command]
 async fn onvif_prepare_profile(
     state: tauri::State<'_, Arc<DesktopState>>,
     input: OnvifProfileInput,
@@ -2585,6 +2615,10 @@ fn map_onvif_error(error: OnvifControllerError) -> DesktopErrorDto {
             "onvif_profile_not_found",
             "selected ONVIF media profile is no longer available",
         ),
+        OnvifControllerError::EventUnsupported => DesktopErrorDto::new(
+            "onvif_event_unsupported",
+            "camera does not expose a compatible ONVIF motion event service",
+        ),
         OnvifControllerError::Validation => {
             DesktopErrorDto::new("validation", "ONVIF credentials or selection are invalid")
         }
@@ -3790,6 +3824,7 @@ pub fn run() {
             onvif_discover,
             onvif_cancel,
             onvif_connect,
+            onvif_connect_events,
             onvif_prepare_profile,
             onvif_add_camera,
             ptz_pair,

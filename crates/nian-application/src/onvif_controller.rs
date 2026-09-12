@@ -163,6 +163,8 @@ pub enum OnvifControllerError {
     DeviceExpired,
     #[error("ONVIF media profile was not found")]
     ProfileNotFound,
+    #[error("ONVIF motion event capability is unavailable")]
+    EventUnsupported,
     #[error("ONVIF validation failed")]
     Validation,
     #[error(transparent)]
@@ -210,7 +212,8 @@ struct ConnectedDevice {
     connection_id: Uuid,
     credentials: Credentials,
     device_service: String,
-    interrogation: OnvifInterrogation,
+    interrogation: Option<OnvifInterrogation>,
+    event_control: Option<EventControl>,
     prepared: Option<PreparedProfile>,
 }
 
@@ -417,7 +420,8 @@ impl OnvifController {
                 connection_id: Uuid::new_v4(),
                 credentials,
                 device_service,
-                interrogation: interrogation.clone(),
+                interrogation: Some(interrogation.clone()),
+                event_control: None,
                 prepared: None,
             },
         );
@@ -433,6 +437,87 @@ impl OnvifController {
             proposed_camera_id,
             proposed_display_name,
         })
+    }
+
+    pub fn connect_events(
+        &self,
+        session_id: &str,
+        device_id: &str,
+        credentials: Credentials,
+    ) -> Result<(), OnvifControllerError> {
+        self.require_accepting()?;
+        credentials
+            .validate()
+            .map_err(|_| OnvifControllerError::Validation)?;
+        let device = {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| OnvifControllerError::Internal)?;
+            let session = sessions
+                .get(session_id)
+                .ok_or(OnvifControllerError::SessionExpired)?;
+            session
+                .devices
+                .get(device_id)
+                .cloned()
+                .ok_or(OnvifControllerError::DeviceExpired)?
+        };
+        let network_credentials = OnvifCredentials {
+            username: credentials.username.clone(),
+            password: credentials.password().to_owned(),
+        };
+
+        let mut last_error = OnvifError::DeviceUnreachable;
+        let mut connected = None;
+        let mut xaddrs = device.xaddrs.clone();
+        xaddrs.sort_by(|left, right| {
+            right
+                .starts_with("https://")
+                .cmp(&left.starts_with("https://"))
+                .then_with(|| left.cmp(right))
+        });
+        for xaddr in &xaddrs {
+            match self.device.event_control(xaddr, &network_credentials) {
+                Ok(control) => {
+                    connected = Some((xaddr.clone(), control));
+                    break;
+                }
+                Err(OnvifError::AuthFailed) => return Err(OnvifError::AuthFailed.into()),
+                Err(error) => last_error = error,
+            }
+        }
+        let (device_service, event_control) = match connected {
+            Some(connected) => connected,
+            None if last_error == OnvifError::Unsupported => {
+                return Err(OnvifControllerError::EventUnsupported);
+            }
+            None => return Err(last_error.into()),
+        };
+        self.require_accepting()?;
+
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| OnvifControllerError::Internal)?;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or(OnvifControllerError::SessionExpired)?;
+        if !session.devices.contains_key(device_id) {
+            return Err(OnvifControllerError::DeviceExpired);
+        }
+        session.connections.insert(
+            device_id.to_owned(),
+            ConnectedDevice {
+                connection_id: Uuid::new_v4(),
+                credentials,
+                device_service,
+                interrogation: None,
+                event_control: Some(event_control),
+                prepared: None,
+            },
+        );
+        Ok(())
     }
 
     pub fn prepare_profile(
@@ -455,8 +540,11 @@ impl OnvifController {
                 .cloned()
                 .ok_or(OnvifControllerError::DeviceExpired)?
         };
-        let profile = connection
+        let interrogation = connection
             .interrogation
+            .as_ref()
+            .ok_or(OnvifControllerError::ProfileNotFound)?;
+        let profile = interrogation
             .profiles
             .iter()
             .find(|profile| profile.token == profile_token)
@@ -471,7 +559,7 @@ impl OnvifController {
         };
         let endpoint = self.device.stream_endpoint(
             &connection.device_service,
-            &connection.interrogation.media_service,
+            &interrogation.media_service,
             &network_credentials,
             &profile,
         )?;
@@ -602,11 +690,22 @@ impl OnvifController {
             username: connection.credentials.username.clone(),
             password: connection.credentials.password().to_owned(),
         };
-        let control = self
-            .device
-            .event_control(&connection.device_service, &credentials)?;
+        let control = if let Some(control) = connection.event_control.clone() {
+            control
+        } else {
+            match self
+                .device
+                .event_control(&connection.device_service, &credentials)
+            {
+                Ok(control) => control,
+                Err(OnvifError::Unsupported) => {
+                    return Err(OnvifControllerError::EventUnsupported);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         if !control.properties().motion_supported {
-            return Err(OnvifControllerError::Protocol(OnvifError::Unsupported));
+            return Err(OnvifControllerError::EventUnsupported);
         }
         self.require_accepting()?;
         {
@@ -659,8 +758,11 @@ impl OnvifController {
             .connections
             .get(device_id)
             .ok_or(OnvifControllerError::DeviceExpired)?;
-        let profile = connection
+        let interrogation = connection
             .interrogation
+            .as_ref()
+            .ok_or(OnvifControllerError::ProfileNotFound)?;
+        let profile = interrogation
             .profiles
             .iter()
             .find(|profile| profile.token == profile_token)
@@ -856,6 +958,40 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct EventOnlyDevice;
+
+    impl DeviceBackend for EventOnlyDevice {
+        fn interrogate(
+            &self,
+            _device_service: &str,
+            _credentials: &OnvifCredentials,
+        ) -> Result<OnvifInterrogation, OnvifError> {
+            Err(OnvifError::Unsupported)
+        }
+
+        fn stream_endpoint(
+            &self,
+            _device_service: &str,
+            _media_service: &str,
+            _credentials: &OnvifCredentials,
+            _profile: &MediaProfile,
+        ) -> Result<StreamEndpoint, OnvifError> {
+            Err(OnvifError::Unsupported)
+        }
+
+        fn event_control(
+            &self,
+            _device_service: &str,
+            credentials: &OnvifCredentials,
+        ) -> Result<EventControl, OnvifError> {
+            if credentials.password == "wrong" {
+                return Err(OnvifError::AuthFailed);
+            }
+            Ok(EventControl::test_fixture())
+        }
+    }
+
     struct BlockingPtzDevice {
         inner: FakeDevice,
         entered: Arc<AtomicBool>,
@@ -1000,6 +1136,44 @@ mod tests {
             }),
             Arc::new(FakeDevice { auth_failure }),
         )
+    }
+
+    #[test]
+    fn event_pairing_authentication_does_not_require_media_capability() {
+        let controller = OnvifController::with_backends(
+            Arc::new(FakeDiscovery {
+                devices: vec![DiscoveredDevice {
+                    endpoint_reference: "urn:uuid:event-only".into(),
+                    xaddrs: vec!["http://192.168.1.8/onvif/device_service".into()],
+                    scopes: vec![],
+                    network_address: "192.168.1.8".into(),
+                }],
+            }),
+            Arc::new(EventOnlyDevice),
+        );
+        let discovery = controller.discover().unwrap();
+        let device_id = discovery.devices[0].device_id.clone();
+
+        assert!(matches!(
+            controller.connect(
+                &discovery.session_id,
+                &device_id,
+                Credentials::new("admin", "secret"),
+            ),
+            Err(OnvifControllerError::Protocol(OnvifError::Unsupported))
+        ));
+
+        controller
+            .connect_events(
+                &discovery.session_id,
+                &device_id,
+                Credentials::new("admin", "secret"),
+            )
+            .unwrap();
+        let prepared = controller
+            .prepare_event_pairing(&discovery.session_id, &device_id)
+            .unwrap();
+        assert!(prepared.control.properties().motion_supported);
     }
 
     #[test]

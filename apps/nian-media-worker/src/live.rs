@@ -689,14 +689,14 @@ mod tests {
         let valid = LiveSpec::from_params(&serde_json::json!({
             "source": {"kind": "rtsp", "url": "rtsp://user:secret@127.0.0.1:9/stream1"},
             "output_dir": absolute.clone(),
-            "fragment_target_ms": 2_000,
+            "fragment_target_ms": 500,
             "max_fragment_bytes": 16 * 1024 * 1024_u64,
             "max_fragment_count": 8,
         }))
         .unwrap();
         assert!(valid.source_url.starts_with("rtsp://"));
         assert!(valid.output_dir.is_absolute());
-        assert_eq!(valid.fragment_target, Duration::from_secs(2));
+        assert_eq!(valid.fragment_target, Duration::from_millis(500));
         assert_eq!(valid.max_fragment_count, 8);
 
         assert!(

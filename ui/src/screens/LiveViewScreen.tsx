@@ -23,6 +23,7 @@ const KEEPALIVE_MS = 30_000;
 const MAX_LIVE_LATENCY_SECONDS = 2.5;
 const LIVE_EDGE_OFFSET_SECONDS = 0.75;
 const LIVE_BUFFER_HISTORY_SECONDS = 12;
+const LIVE_MANIFEST_POLL_MS = 250;
 
 const ACTIVE_RECORDING_STATES = new Set<RecordingState>([
   "starting",
@@ -207,7 +208,7 @@ function LiveMedia({
           }
           await appendFragment(sequence);
         }
-        if (!disposed) timer = window.setTimeout(() => void pump(), 500);
+        if (!disposed) timer = window.setTimeout(() => void pump(), LIVE_MANIFEST_POLL_MS);
       } catch (cause) {
         if (cause instanceof DOMException && cause.name === "AbortError") return;
         fail();

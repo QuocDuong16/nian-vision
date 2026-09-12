@@ -678,14 +678,14 @@ session.
 
 The worker accepts `live.start`, `live.status` and `live.stop`, requires H.264 and
 packet-copies video only. Instead of one growing MP4, it writes independently finalized
-fragmented-MP4 files beginning on keyframes. Production limits are: four live sessions, a
-2-second fragment target, a six-fragment retained target per session (nominally about a
-12-second live window), an eight-finalized-fragment hard ceiling that accounts for two
+fragmented-MP4 files. Only the initial fragment waits for a keyframe; later fragments rotate
+at a 500 ms media-time target without waiting for another keyframe. Production limits are:
+four live sessions, a six-fragment retained target per session (nominally about a 3-second
+post-initial live window), an eight-finalized-fragment hard ceiling that accounts for two
 possible reader pins, 16 MiB maximum per fragment, two HTTP readers per session and eight
-concurrent live HTTP requests globally. The worker backpressures at a keyframe boundary when
-the hard fragment-count ceiling is full, uses byte pressure as a second rotation trigger,
-and fails pathological media that cannot stay within the hard fragment-size bound; no
-decode/transcode path is introduced. Transient source/media loss retains the bounded
+concurrent live HTTP requests globally. The worker backpressures when the hard fragment-count
+ceiling is full, uses byte pressure as a second rotation trigger, and fails pathological media
+that cannot stay within the hard fragment-size bound; no decode/transcode path is introduced. Transient source/media loss retains the bounded
 1/2/4/8/15-second, five-attempt reconnect policy.
 Every failed live-fragment finalization best-effort removes only its exact worker-owned
 `.partial.mp4`; successful rename leaves the finalized `.mp4` intact.
@@ -871,7 +871,7 @@ without preventing the remaining subsystems from converging.
 
 M13 adds an optional background Event plane without changing RTSP recording/live ownership. `CameraConfig` remains the physical RTSP authority. Settings schema v5 introduced an independent `EventBinding` plus per-camera Desired Event Monitoring; Pairing and Enable are separate, so merely pairing a camera never starts monitoring. The binding persists only Device-service identity and an opaque credential reference. Event-service XAddr, PullPoint SubscriptionReference, SOAP payloads and credentials are runtime-only.
 
-`OnvifController::prepare_event_pairing` reuses explicit M10 discovery/authentication. The frontend supplies only selected session/device handles. The controller snapshots endpoint reference plus authenticated `connection_id`, performs Event capability lookup, then revalidates that same session/device/connection generation. Cancel, refresh or reconnect therefore invalidates stale preparation. `EventController` performs a second exact-host check against the current RTSP camera and persisted Event binding before authenticated runtime traffic. `nian-onvif` independently validates Event/PullPoint URLs as HTTP(S), same-host, no userinfo/query/fragment, with redirects disabled and the existing proxy-free hardened SOAP client.
+Event pairing reuses explicit M10 discovery but authenticates through an Events-specific connection path that calls `GetServices`/`GetEventProperties` directly and does not require ONVIF Media discovery. The frontend still supplies only selected session/device handles to `event_pair`; credentials remain confined to the authentication command. `OnvifController::prepare_event_pairing` snapshots endpoint reference plus authenticated `connection_id`, reuses the validated Event control when available, then revalidates that same session/device/connection generation. Cancel, refresh or reconnect therefore invalidates stale preparation. `EventController` performs a second exact-host check against the current RTSP camera and persisted Event binding before authenticated runtime traffic. `nian-onvif` independently validates Event/PullPoint URLs as HTTP(S), same-host, no userinfo/query/fragment, with redirects disabled and the existing proxy-free hardened SOAP client.
 
 One Event worker is owned per Desired-On camera. Its lifecycle is `opening -> active -> draining`, with independent `mutating` exclusion for pair/replace/unpair/update/delete. `draining` remains represented by a controller-owned `Arc<DrainState>` until the worker join completes; one caller owns the `JoinHandle`, concurrent lifecycle callers wait the same completion condition, and removal uses exact session/Arc identity. `opening + active + draining` is capped at 16; same-camera mutation contention fails fast Busy rather than building a waiter queue. Lifecycle generations and completion states prevent stale openings or mutation side effects from escaping after Suspend/Quit/Update. The registry/global desktop gates are never held over SOAP, SQLite, keyring I/O or joins.
 

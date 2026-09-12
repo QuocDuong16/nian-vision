@@ -648,7 +648,7 @@ directories while preserving lookalikes/unrelated files.
 HTTP tests cover the session base capability, manifest and fixed fragment grammar plus
 wrong Host/Origin, non-GET/HEAD methods, malformed/arbitrary paths, stale sessions and reader
 limits. No request may supply an RTSP URL or arbitrary filesystem path. The configured
-resource contract under test is a 2-second fragment target, six retained-fragment target,
+resource contract under test is a 500 ms fragment target, six retained-fragment target,
 eight-finalized-fragment hard ceiling, 16 MiB maximum per fragment, two readers per live
 session, eight concurrent live HTTP requests and four simultaneous live sessions.
 

@@ -332,15 +332,15 @@ export function CamerasScreen() {
     setOnvifBusy(true);
     setError(null);
     try {
-      const connection = await invokeDesktop<OnvifConnection>("onvif_connect", {
-        input: {
-          session_id: onvifSessionId,
-          device_id: onvifDevice.device_id,
-          username,
-          password,
-        },
-      });
       if (eventTarget) {
+        await invokeDesktop<void>("onvif_connect_events", {
+          input: {
+            session_id: onvifSessionId,
+            device_id: onvifDevice.device_id,
+            username,
+            password,
+          },
+        });
         const paired = await invokeDesktop<EventMutation<EventStatus>>("event_pair", {
           input: {
             camera_id: eventTarget.camera_id,
@@ -356,6 +356,14 @@ export function CamerasScreen() {
         }
         return;
       }
+      const connection = await invokeDesktop<OnvifConnection>("onvif_connect", {
+        input: {
+          session_id: onvifSessionId,
+          device_id: onvifDevice.device_id,
+          username,
+          password,
+        },
+      });
       if (ptzTarget) {
         const paired = await invokeDesktop<PtzMutation<PtzCapabilities>>("ptz_pair", {
           input: {

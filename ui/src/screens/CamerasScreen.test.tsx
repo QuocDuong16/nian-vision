@@ -688,7 +688,7 @@ describe("CamerasScreen", () => {
       if (command === "ptz_configured") return false;
       if (command === "event_statuses") return [status];
       if (command === "onvif_discover") return onvifDiscovery;
-      if (command === "onvif_connect") return onvifConnection;
+      if (command === "onvif_connect_events") return undefined;
       if (command === "event_pair") {
         pairArgs = args;
         status = { ...status, configured: true };
