@@ -640,20 +640,24 @@ pub(crate) fn parse_ptz_configuration_options(
     struct RawRange {
         min: Option<f64>,
         max: Option<f64>,
+        invalid: bool,
     }
 
-    fn assign(slot: &mut Option<f64>, value: f64) -> Result<(), OnvifError> {
-        if let Some(existing) = slot {
-            if (*existing - value).abs() > f64::EPSILON {
-                return Err(OnvifError::Protocol);
+    fn assign(raw: &mut RawRange, is_min: bool, value: f64) {
+        let slot = if is_min { &mut raw.min } else { &mut raw.max };
+        if let Some(existing) = *slot {
+            if (existing - value).abs() > f64::EPSILON {
+                raw.invalid = true;
             }
-            return Ok(());
+            return;
         }
         *slot = Some(value);
-        Ok(())
     }
 
     fn complete_range(raw: RawRange) -> Result<Option<PtzVelocityRange>, OnvifError> {
+        if raw.invalid {
+            return Err(OnvifError::Protocol);
+        }
         match (raw.min, raw.max) {
             (Some(min), Some(max)) => Ok(Some(PtzVelocityRange { min, max }.validate()?)),
             _ => Ok(None),
@@ -710,16 +714,16 @@ pub(crate) fn parse_ptz_configuration_options(
                 let y = stack.iter().any(|name| name == "YRange");
                 if let Some((pan_range, tilt_range)) = current_pan_tilt.as_mut() {
                     match (x, y, is_min) {
-                        (true, false, true) => assign(&mut pan_range.min, value)?,
-                        (true, false, false) => assign(&mut pan_range.max, value)?,
-                        (false, true, true) => assign(&mut tilt_range.min, value)?,
-                        (false, true, false) => assign(&mut tilt_range.max, value)?,
+                        (true, false, true) => assign(pan_range, true, value),
+                        (true, false, false) => assign(pan_range, false, value),
+                        (false, true, true) => assign(tilt_range, true, value),
+                        (false, true, false) => assign(tilt_range, false, value),
                         _ => {}
                     }
                 } else if let Some(zoom_range) = current_zoom.as_mut() {
                     match (x, y, is_min) {
-                        (true, false, true) => assign(&mut zoom_range.min, value)?,
-                        (true, false, false) => assign(&mut zoom_range.max, value)?,
+                        (true, false, true) => assign(zoom_range, true, value),
+                        (true, false, false) => assign(zoom_range, false, value),
                         _ => {}
                     }
                 }
@@ -1165,11 +1169,16 @@ fn normalize_motion_notifications(
     let device_time_utc = raw
         .utc_time
         .as_deref()
-        .and_then(parse_lenient_event_timestamp);
-    let synchronization_baseline = raw
-        .property_operation
-        .as_deref()
-        .is_some_and(|value| value.eq_ignore_ascii_case("Initialized"));
+        .and_then(parse_lenient_event_timestamp)
+        .filter(|value| {
+            !matches!(compatibility, EventCompatibility::TapoC200)
+                || value.timestamp() >= 946_684_800
+        });
+    let synchronization_baseline = !matches!(compatibility, EventCompatibility::TapoC200)
+        && raw
+            .property_operation
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("Initialized"));
     let tapo_topic =
         matches!(compatibility, EventCompatibility::TapoC200).then_some(topic.as_str());
 
@@ -1461,6 +1470,26 @@ mod tests {
     }
 
     #[test]
+    fn ptz_parser_skips_conflicting_velocity_space_when_a_later_candidate_is_valid() {
+        let options = br#"<tptz:GetConfigurationOptionsResponse xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><tptz:PTZConfigurationOptions><tt:Spaces><tt:ContinuousPanTiltVelocitySpace><tt:XRange><tt:Min>-9</tt:Min><tt:Min>-8</tt:Min><tt:Max>9</tt:Max></tt:XRange><tt:YRange><tt:Min>-9</tt:Min><tt:Max>9</tt:Max></tt:YRange></tt:ContinuousPanTiltVelocitySpace><tt:ContinuousPanTiltVelocitySpace><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange><tt:YRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:YRange></tt:ContinuousPanTiltVelocitySpace></tt:Spaces></tptz:PTZConfigurationOptions></tptz:GetConfigurationOptionsResponse>"#;
+        let parsed = parse_ptz_configuration_options(options).unwrap();
+        assert_eq!(
+            parsed.pan,
+            Some(PtzVelocityRange {
+                min: -1.0,
+                max: 1.0
+            })
+        );
+        assert_eq!(
+            parsed.tilt,
+            Some(PtzVelocityRange {
+                min: -1.0,
+                max: 1.0
+            })
+        );
+    }
+
+    #[test]
     fn ptz_parser_rejects_namespace_spoofing_and_invalid_ranges() {
         let spoofed = br#"<root xmlns:evil="urn:evil"><evil:Profiles token="main"><evil:PTZConfiguration token="ptz"/></evil:Profiles></root>"#;
         assert_eq!(
@@ -1533,6 +1562,31 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), original_len);
+    }
+
+    #[test]
+    fn tapo_c200_epoch_sentinel_does_not_become_a_persistent_event_identity() {
+        let xml = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:tns1="http://www.onvif.org/ver10/topics"><wsnt:Topic>tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic><wsnt:Message><tt:Message UtcTime="1970-01-01T00:00:00Z" PropertyOperation="Changed"><tt:Source><tt:SimpleItem Name="Rule" Value="motion"/></tt:Source><tt:Data><tt:SimpleItem Name="IsMotion" Value="true"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
+        let notification =
+            parse_motion_notifications_with_compatibility(xml, EventCompatibility::TapoC200)
+                .unwrap()
+                .pop()
+                .unwrap();
+        assert!(notification.active);
+        assert_eq!(notification.device_time_utc, None);
+    }
+
+    #[test]
+    fn tapo_c200_initialized_motion_is_treated_as_a_live_state_transition() {
+        let xml = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:tns1="http://www.onvif.org/ver10/topics"><wsnt:Topic>tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic><wsnt:Message><tt:Message UtcTime="1970-01-01T00:00:00Z" PropertyOperation="Initialized"><tt:Source><tt:SimpleItem Name="Rule" Value="motion"/></tt:Source><tt:Data><tt:SimpleItem Name="IsMotion" Value="true"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
+        let notification =
+            parse_motion_notifications_with_compatibility(xml, EventCompatibility::TapoC200)
+                .unwrap()
+                .pop()
+                .unwrap();
+        assert!(notification.active);
+        assert!(!notification.synchronization_baseline);
+        assert_eq!(notification.device_time_utc, None);
     }
 
     #[test]

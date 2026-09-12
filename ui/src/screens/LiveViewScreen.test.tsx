@@ -294,7 +294,11 @@ describe("LiveViewScreen", () => {
     expect(screen.getByText(/Event error:/)).toBeTruthy();
     expect(screen.getByText("subscription_failed")).toBeTruthy();
     await waitFor(() => expect(tile.querySelector("video")).toBeTruthy());
-    expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "live_close")).toBe(false);
+    expect(
+      vi.mocked(invoke).mock.calls.filter(([command, args]) =>
+        command === "live_open" && (args as { cameraId?: string } | undefined)?.cameraId === front.camera_id,
+      ),
+    ).toHaveLength(1);
   });
 
   it("uses existing recording commands without closing a healthy live session", async () => {

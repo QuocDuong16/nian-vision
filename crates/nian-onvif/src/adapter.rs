@@ -1,6 +1,6 @@
 use url::Url;
 
-use crate::DeviceInformation;
+use crate::{DeviceInformation, PtzVelocityRange};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeviceAdapter {
@@ -54,6 +54,17 @@ impl DeviceAdapter {
         matches!(self, Self::TapoC200)
     }
 
+    pub(crate) fn ptz_pan_tilt_fallback(self) -> Option<(PtzVelocityRange, PtzVelocityRange)> {
+        if !matches!(self, Self::TapoC200) {
+            return None;
+        }
+        let unit = PtzVelocityRange {
+            min: -1.0,
+            max: 1.0,
+        };
+        Some((unit, unit))
+    }
+
     pub(crate) fn known_tapo_service_candidate(self, device_service: &str) -> Option<String> {
         if !matches!(self, Self::TapoC200) {
             return None;
@@ -103,6 +114,26 @@ mod tests {
             ..DeviceInformation::default()
         };
         assert_eq!(DeviceAdapter::detect(&device), DeviceAdapter::Generic);
+    }
+
+    #[test]
+    fn tapo_ptz_fallback_is_scoped_to_c200_pan_tilt_only() {
+        let (pan, tilt) = DeviceAdapter::TapoC200.ptz_pan_tilt_fallback().unwrap();
+        assert_eq!(
+            pan,
+            PtzVelocityRange {
+                min: -1.0,
+                max: 1.0
+            }
+        );
+        assert_eq!(
+            tilt,
+            PtzVelocityRange {
+                min: -1.0,
+                max: 1.0
+            }
+        );
+        assert_eq!(DeviceAdapter::Generic.ptz_pan_tilt_fallback(), None);
     }
 
     #[test]

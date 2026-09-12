@@ -2693,6 +2693,55 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_less_motion_cycles_persist_each_real_transition() {
+        let temp = tempdir().unwrap();
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let base = Utc::now();
+        let event_index = Mutex::new(Some(
+            EventIndex::open(temp.path().join("events.sqlite3")).unwrap(),
+        ));
+        let mut normalizer = MotionNormalizer::default();
+        let idle = MotionNotification {
+            active: false,
+            device_time_utc: None,
+            source_key: Some("source-a".to_owned()),
+            synchronization_baseline: false,
+        };
+        let started = MotionNotification {
+            active: true,
+            ..idle.clone()
+        };
+
+        for (offset, notification) in [(0, &idle), (1, &started), (2, &idle), (3, &started)] {
+            apply_motion_notification(
+                &mut normalizer,
+                &camera_id,
+                notification,
+                base + chrono::Duration::seconds(offset),
+                &event_index,
+                Some(30),
+            )
+            .unwrap();
+        }
+
+        let rows = event_index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .recent(&camera_id, 10)
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == EventKind::MotionStarted)
+                .count(),
+            2
+        );
+        assert!(rows.iter().all(|row| row.device_time_utc.is_none()));
+    }
+
+    #[test]
     fn notification_signal_requires_new_successful_event_insert() {
         let temp = tempdir().unwrap();
         let camera_id = CameraId::parse("front-door").unwrap();

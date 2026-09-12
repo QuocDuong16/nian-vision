@@ -1877,13 +1877,30 @@ fn recording_intent(
 
 fn open_live(state: &DesktopState, camera_id: &str) -> Result<LiveOpenDto, DesktopErrorDto> {
     admit_running(state)?;
+    let parsed_camera_id = CameraId::parse(camera_id)
+        .map_err(|error| DesktopErrorDto::new("validation", error.to_string()))?;
+    if let Some(attached) = state
+        .live_controller
+        .attach(&parsed_camera_id)
+        .map_err(map_live_error)?
+    {
+        return Ok(attached);
+    }
+
     let prepared = lock(&state.camera_service)?
         .prepare_live(camera_id)
         .map_err(map_camera_error)?;
-    let admission = state
-        .live_controller
-        .admit(prepared)
-        .map_err(map_live_error)?;
+    let admission = match state.live_controller.admit(prepared) {
+        Ok(admission) => admission,
+        Err(LiveError::AlreadyOpen) => {
+            return state
+                .live_controller
+                .attach(&parsed_camera_id)
+                .map_err(map_live_error)?
+                .ok_or_else(|| map_live_error(LiveError::AlreadyOpen));
+        }
+        Err(error) => return Err(map_live_error(error)),
+    };
     let started = match admission.start() {
         Ok(started) => started,
         Err(failed) => {

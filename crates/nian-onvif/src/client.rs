@@ -256,12 +256,35 @@ impl OnvifClient {
             return Err(last_error);
         }
 
+        let mut detected_adapter = None;
         for service in ptz_services {
             for association in &associations {
                 let token = xml_escape(&association.configuration_token);
                 let body = format!(
                     "<tptz:GetConfigurationOptions><tptz:ConfigurationToken>{token}</tptz:ConfigurationToken></tptz:GetConfigurationOptions>"
                 );
+                let fallback = |adapter: DeviceAdapter| {
+                    adapter
+                        .ptz_pan_tilt_fallback()
+                        .map(|(pan, tilt)| PtzControl {
+                            service: service.clone(),
+                            profile_token: association.profile_token.clone(),
+                            pan: Some(pan),
+                            tilt: Some(tilt),
+                            zoom: None,
+                        })
+                };
+                let mut resolve_fallback = || -> Result<Option<PtzControl>, OnvifError> {
+                    let adapter = match detected_adapter {
+                        Some(adapter) => adapter,
+                        None => {
+                            let adapter = self.device_adapter(device_service, credentials)?;
+                            detected_adapter = Some(adapter);
+                            adapter
+                        }
+                    };
+                    Ok(fallback(adapter))
+                };
                 match self.soap(
                     &service,
                     credentials,
@@ -278,15 +301,26 @@ impl OnvifClient {
                                 zoom: options.zoom,
                             });
                         }
-                        Ok(_) => last_error = OnvifError::Unsupported,
+                        Ok(_) => {
+                            last_error = OnvifError::Unsupported;
+                            if let Some(control) = resolve_fallback()? {
+                                return Ok(control);
+                            }
+                        }
                         Err(OnvifError::Protocol) => {
                             last_error = OnvifError::PtzConfigurationOptionsProtocol;
+                            if let Some(control) = resolve_fallback()? {
+                                return Ok(control);
+                            }
                         }
                         Err(error) => last_error = error,
                     },
                     Err(OnvifError::AuthFailed) => return Err(OnvifError::AuthFailed),
                     Err(OnvifError::Protocol) => {
                         last_error = OnvifError::PtzConfigurationOptionsProtocol;
+                        if let Some(control) = resolve_fallback()? {
+                            return Ok(control);
+                        }
                     }
                     Err(error) => last_error = error,
                 }
@@ -1854,6 +1888,66 @@ mod tests {
             Err(OnvifError::PtzConfigurationOptionsProtocol)
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn tapo_c200_ptz_falls_back_to_normalized_pan_tilt_when_options_are_unusable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let body = if request.contains("GetServices") {
+                    format!(
+                        "<Envelope><Service><Namespace>{MEDIA1_NS}</Namespace><XAddr>http://{address}/media</XAddr></Service><Service><Namespace>{PTZ_NS}</Namespace><XAddr>http://{address}/ptz</XAddr></Service></Envelope>"
+                    )
+                } else if request.contains("GetProfiles") {
+                    "<Envelope><Profiles token=\"main\"><PTZConfiguration token=\"ptz-config\"/></Profiles></Envelope>".to_owned()
+                } else if request.contains("GetConfigurationOptions") {
+                    "<Envelope><Spaces><ContinuousPanTiltVelocitySpace><XRange><Min>0.25</Min><Max>1</Max></XRange><YRange><Min>-1</Min><Max>1</Max></YRange></ContinuousPanTiltVelocitySpace></Spaces></Envelope>".to_owned()
+                } else if request.contains("GetDeviceInformation") {
+                    "<Envelope><Body><GetDeviceInformationResponse><Manufacturer>TP-Link</Manufacturer><Model>Tapo C200</Model><FirmwareVersion>1.4.6</FirmwareVersion><HardwareId>5.0</HardwareId></GetDeviceInformationResponse></Body></Envelope>".to_owned()
+                } else {
+                    panic!("unexpected Tapo PTZ fallback fixture request: {request}")
+                };
+                write_http_response(&mut stream, "200 OK", &[], &body);
+                requests.push(request);
+            }
+            requests
+        });
+
+        let client = OnvifClient::with_timeout(Duration::from_secs(1)).unwrap();
+        let credentials = OnvifCredentials {
+            username: String::new(),
+            password: String::new(),
+        };
+        let control = client
+            .ptz_control(&format!("http://{address}/device"), &credentials)
+            .unwrap();
+        assert!(control.pan_tilt_supported());
+        assert!(!control.zoom_supported());
+        assert_eq!(
+            control.pan.unwrap(),
+            crate::PtzVelocityRange {
+                min: -1.0,
+                max: 1.0
+            }
+        );
+        assert_eq!(
+            control.tilt.unwrap(),
+            crate::PtzVelocityRange {
+                min: -1.0,
+                max: 1.0
+            }
+        );
+        let requests = server.join().unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("GetDeviceInformation"))
+        );
     }
 
     #[test]

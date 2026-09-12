@@ -631,6 +631,32 @@ impl LiveViewController {
         }
     }
 
+    pub fn attach(&self, camera_id: &CameraId) -> Result<Option<LiveOpenDto>, LiveError> {
+        let (session_id, session) = {
+            let registry = self.registry.lock().map_err(|_| LiveError::Internal)?;
+            let Some(session_id) = registry.camera_sessions.get(camera_id).cloned() else {
+                return Ok(None);
+            };
+            let session = registry
+                .sessions
+                .get(&session_id)
+                .cloned()
+                .ok_or(LiveError::Internal)?;
+            (session_id, session)
+        };
+        *session
+            .last_keepalive
+            .lock()
+            .map_err(|_| LiveError::Internal)? = Instant::now();
+        let port = self.server.lock().map_err(|_| LiveError::Internal)?.port;
+        Ok(Some(LiveOpenDto {
+            session_id: session_id.clone(),
+            camera_id: camera_id.as_str().to_owned(),
+            url: format!("http://127.0.0.1:{port}/live/{session_id}"),
+            state: LiveState::Starting,
+        }))
+    }
+
     pub fn admit(&self, prepared: PreparedLive) -> Result<LiveOpenAdmission, LiveError> {
         let mut registry = self.registry.lock().map_err(|_| LiveError::Internal)?;
         if !registry.accepting {
@@ -2004,6 +2030,22 @@ mod tests {
             controller.keep_alive(&opened.session_id),
             Err(LiveError::SessionExpired)
         );
+    }
+
+    #[test]
+    fn attach_reuses_the_existing_camera_session_after_webview_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let controller =
+            LiveViewController::with_factory(Arc::new(FakeFactory), temp.path().to_path_buf())
+                .unwrap();
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let opened = controller.open(prepared("front-door")).unwrap();
+
+        let attached = controller.attach(&camera_id).unwrap().unwrap();
+        assert_eq!(attached.session_id, opened.session_id);
+        assert_eq!(attached.camera_id, opened.camera_id);
+        assert_eq!(attached.url, opened.url);
+        assert_eq!(controller.statuses().unwrap().len(), 1);
     }
 
     #[test]
