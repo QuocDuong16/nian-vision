@@ -116,6 +116,8 @@ fn recognized_onvif_field(name: &str) -> bool {
             | "Service"
             | "Namespace"
             | "XAddr"
+            | "Capabilities"
+            | "Events"
             | "Profiles"
             | "Profile"
             | "VideoEncoderConfiguration"
@@ -394,6 +396,41 @@ pub(crate) fn parse_services(xml: &[u8]) -> Result<Vec<ServiceEndpoint>, OnvifEr
         }
     }
     Ok(services)
+}
+
+pub(crate) fn parse_event_capability_xaddr(xml: &[u8]) -> Result<Option<String>, OnvifError> {
+    validate_recognized_namespaces(xml)?;
+    let mut reader = reader(xml)?;
+    let mut depth = 0usize;
+    loop {
+        let event = reader.read_event().map_err(|_| OnvifError::Protocol)?;
+        if prohibited(&event) {
+            return Err(OnvifError::Protocol);
+        }
+        match event {
+            Event::Start(start) => {
+                if depth >= MAX_XML_DEPTH {
+                    return Err(OnvifError::Protocol);
+                }
+                depth += 1;
+                if local_name(start.name().as_ref()) == "Events"
+                    && let Some(xaddr) = attribute(&start, "XAddr")?
+                {
+                    return Ok(Some(xaddr));
+                }
+            }
+            Event::Empty(start) => {
+                if local_name(start.name().as_ref()) == "Events"
+                    && let Some(xaddr) = attribute(&start, "XAddr")?
+                {
+                    return Ok(Some(xaddr));
+                }
+            }
+            Event::End(_) => depth = depth.checked_sub(1).ok_or(OnvifError::Protocol)?,
+            Event::Eof => return Ok(None),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Default)]

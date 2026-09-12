@@ -15,6 +15,7 @@ use nian_onvif::{
 };
 use serde::Serialize;
 use thiserror::Error;
+use url::Url;
 use uuid::Uuid;
 
 use crate::CameraDraft;
@@ -161,6 +162,8 @@ pub enum OnvifControllerError {
     SessionExpired,
     #[error("ONVIF discovered device handle expired")]
     DeviceExpired,
+    #[error("ONVIF device matching the saved camera host was not discovered")]
+    DeviceNotFound,
     #[error("ONVIF media profile was not found")]
     ProfileNotFound,
     #[error("ONVIF motion event capability is unavailable")]
@@ -267,7 +270,7 @@ impl OnvifController {
         }
     }
 
-    pub fn discover(&self) -> Result<OnvifDiscoveryDto, OnvifControllerError> {
+    fn scan_devices(&self) -> Result<Vec<DiscoveredDevice>, OnvifControllerError> {
         self.require_accepting()?;
         self.cancel_active_discovery()?;
         let _gate = self
@@ -282,26 +285,21 @@ impl OnvifController {
             .map_err(|_| OnvifControllerError::Internal)? = Some(cancel.clone());
 
         let discovered = self.discovery.discover(&cancel);
-        let mut active_discovery = self
+        let cancelled = cancel.load(Ordering::Acquire);
+        *self
             .active_discovery_cancel
             .lock()
-            .map_err(|_| OnvifControllerError::Internal)?;
-        if cancel.load(Ordering::Acquire) {
-            *active_discovery = None;
+            .map_err(|_| OnvifControllerError::Internal)? = None;
+        if cancelled {
             return Err(OnvifError::Cancelled.into());
         }
-        let discovered = match discovered {
-            Ok(discovered) => discovered,
-            Err(error) => {
-                *active_discovery = None;
-                return Err(error.into());
-            }
-        };
-        if let Err(error) = self.require_accepting() {
-            *active_discovery = None;
-            return Err(error);
-        }
+        let discovered = discovered?;
+        self.require_accepting()?;
+        Ok(discovered)
+    }
 
+    pub fn discover(&self) -> Result<OnvifDiscoveryDto, OnvifControllerError> {
+        let discovered = self.scan_devices()?;
         let session_id = Uuid::new_v4().to_string();
         let mut internal = HashMap::new();
         let mut devices = Vec::new();
@@ -321,13 +319,10 @@ impl OnvifController {
                 .then_with(|| left.endpoint_reference.cmp(&right.endpoint_reference))
         });
 
-        let mut sessions = match self.sessions.lock() {
-            Ok(sessions) => sessions,
-            Err(_) => {
-                *active_discovery = None;
-                return Err(OnvifControllerError::Internal);
-            }
-        };
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| OnvifControllerError::Internal)?;
         // Refresh intentionally invalidates all previously returned handles.
         sessions.clear();
         sessions.insert(
@@ -337,11 +332,68 @@ impl OnvifController {
                 connections: HashMap::new(),
             },
         );
-        *active_discovery = None;
         Ok(OnvifDiscoveryDto {
             session_id,
             devices,
         })
+    }
+
+    pub fn prepare_event_pairing_for_host(
+        &self,
+        host: &str,
+        credentials: Credentials,
+    ) -> Result<PreparedEventPairing, OnvifControllerError> {
+        self.require_accepting()?;
+        if host.trim().is_empty() {
+            return Err(OnvifControllerError::Validation);
+        }
+        credentials
+            .validate()
+            .map_err(|_| OnvifControllerError::Validation)?;
+        let mut devices: Vec<_> = self
+            .scan_devices()?
+            .into_iter()
+            .filter(|device| discovered_device_matches_host(device, host))
+            .collect();
+        if devices.is_empty() {
+            return Err(OnvifControllerError::DeviceNotFound);
+        }
+        devices.sort_by(|left, right| left.endpoint_reference.cmp(&right.endpoint_reference));
+
+        let network_credentials = OnvifCredentials {
+            username: credentials.username.clone(),
+            password: credentials.password().to_owned(),
+        };
+        let mut last_error = OnvifError::DeviceUnreachable;
+        for device in devices {
+            let mut xaddrs = device.xaddrs.clone();
+            xaddrs.sort_by(|left, right| {
+                right
+                    .starts_with("https://")
+                    .cmp(&left.starts_with("https://"))
+                    .then_with(|| left.cmp(right))
+            });
+            for xaddr in xaddrs {
+                match self.device.event_control(&xaddr, &network_credentials) {
+                    Ok(control) => {
+                        return Ok(PreparedEventPairing {
+                            device_service: xaddr,
+                            endpoint_reference: device.endpoint_reference.clone(),
+                            credentials,
+                            control,
+                        });
+                    }
+                    Err(OnvifError::AuthFailed) => {
+                        return Err(OnvifError::AuthFailed.into());
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+        }
+        match last_error {
+            OnvifError::Unsupported => Err(OnvifControllerError::EventUnsupported),
+            error => Err(error.into()),
+        }
     }
 
     pub fn connect(
@@ -839,6 +891,18 @@ impl OnvifController {
     }
 }
 
+fn discovered_device_matches_host(device: &DiscoveredDevice, host: &str) -> bool {
+    if device.network_address.eq_ignore_ascii_case(host) {
+        return true;
+    }
+    device.xaddrs.iter().any(|xaddr| {
+        Url::parse(xaddr)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(host))
+    })
+}
+
 fn discovery_label(device: &DiscoveredDevice) -> String {
     device
         .scopes
@@ -1173,6 +1237,40 @@ mod tests {
         let prepared = controller
             .prepare_event_pairing(&discovery.session_id, &device_id)
             .unwrap();
+        assert!(prepared.control.properties().motion_supported);
+    }
+
+    #[test]
+    fn saved_camera_event_pairing_silently_discovers_matching_host() {
+        let controller = OnvifController::with_backends(
+            Arc::new(FakeDiscovery {
+                devices: vec![
+                    DiscoveredDevice {
+                        endpoint_reference: "urn:uuid:other".into(),
+                        xaddrs: vec!["http://192.168.1.7/onvif/device_service".into()],
+                        scopes: vec![],
+                        network_address: "192.168.1.7".into(),
+                    },
+                    DiscoveredDevice {
+                        endpoint_reference: "urn:uuid:target".into(),
+                        xaddrs: vec!["http://192.168.1.8/onvif/device_service".into()],
+                        scopes: vec![],
+                        network_address: "192.168.1.8".into(),
+                    },
+                ],
+            }),
+            Arc::new(EventOnlyDevice),
+        );
+
+        let prepared = controller
+            .prepare_event_pairing_for_host("192.168.1.8", Credentials::new("admin", "secret"))
+            .unwrap();
+
+        assert_eq!(
+            prepared.device_service,
+            "http://192.168.1.8/onvif/device_service"
+        );
+        assert_eq!(prepared.endpoint_reference, "urn:uuid:target");
         assert!(prepared.control.properties().motion_supported);
     }
 

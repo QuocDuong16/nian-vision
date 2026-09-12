@@ -22,9 +22,10 @@ use crate::types::{
     OnvifInterrogation, PtzControl, PtzProfileAssociation, PullPointSubscription, ServiceEndpoint,
 };
 use crate::xml::{
-    parse_device_information, parse_event_properties, parse_hostname, parse_motion_notifications,
-    parse_profiles, parse_ptz_configuration_options, parse_ptz_profile_associations,
-    parse_pullpoint_subscription, parse_renew_times, parse_services, parse_stream_uri,
+    parse_device_information, parse_event_capability_xaddr, parse_event_properties, parse_hostname,
+    parse_motion_notifications, parse_profiles, parse_ptz_configuration_options,
+    parse_ptz_profile_associations, parse_pullpoint_subscription, parse_renew_times,
+    parse_services, parse_stream_uri,
 };
 use crate::{
     EVENT_INITIAL_SUBSCRIPTION_SECS, EVENT_PULL_MESSAGE_LIMIT, EVENT_PULL_TIMEOUT_MS,
@@ -320,8 +321,25 @@ impl OnvifClient {
             "<tds:GetServices><tds:IncludeCapability>false</tds:IncludeCapability></tds:GetServices>",
         )?;
         let services = parse_services(&services_xml)?;
-        let (event_services, rejected_event) =
+        let (mut event_services, mut rejected_event) =
             validated_event_service_xaddrs(&services, device_service);
+        if event_services.is_empty() && rejected_event {
+            return Err(OnvifError::AuthorityRejected);
+        }
+        if event_services.is_empty() {
+            let capabilities_xml = self.soap(
+                device_service,
+                credentials,
+                &format!("{DEVICE_NS}/GetCapabilities"),
+                "<tds:GetCapabilities><tds:Category>Events</tds:Category></tds:GetCapabilities>",
+            )?;
+            if let Some(xaddr) = parse_event_capability_xaddr(&capabilities_xml)? {
+                match validate_event_xaddr(&xaddr, device_service) {
+                    Ok(xaddr) => event_services.push(xaddr),
+                    Err(_) => rejected_event = true,
+                }
+            }
+        }
         if event_services.is_empty() {
             return Err(if rejected_event {
                 OnvifError::AuthorityRejected
@@ -329,6 +347,7 @@ impl OnvifClient {
                 OnvifError::Unsupported
             });
         }
+        event_services.sort();
 
         let mut last_error = OnvifError::Unsupported;
         for service in event_services {
@@ -1720,6 +1739,49 @@ mod tests {
             validated_service_xaddrs(&services, "/ver20/ptz/wsdl", "http://127.0.0.1/device");
         assert!(candidates.is_empty());
         assert!(rejected);
+    }
+
+    #[test]
+    fn event_control_falls_back_to_get_capabilities_when_get_services_omits_events() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let body = if request.contains("GetServices") {
+                    format!(
+                        "<Envelope><Body><GetServicesResponse><Service><Namespace>{MEDIA1_NS}</Namespace><XAddr>http://{address}/media</XAddr></Service></GetServicesResponse></Body></Envelope>"
+                    )
+                } else if request.contains("GetCapabilities") {
+                    format!(
+                        "<Envelope xmlns:tds=\"{DEVICE_NS}\" xmlns:tt=\"http://www.onvif.org/ver10/schema\"><Body><tds:GetCapabilitiesResponse><tds:Capabilities><tt:Events XAddr=\"http://{address}/events\"/></tds:Capabilities></tds:GetCapabilitiesResponse></Body></Envelope>"
+                    )
+                } else if request.contains("GetEventProperties") {
+                    r#"<Envelope xmlns:tns1="http://www.onvif.org/ver10/topics"><Body><GetEventPropertiesResponse><TopicSet><tns1:RuleEngine><tns1:CellMotionDetector><tns1:Motion/></tns1:CellMotionDetector></tns1:RuleEngine></TopicSet></GetEventPropertiesResponse></Body></Envelope>"#.to_owned()
+                } else {
+                    panic!("unexpected Event capability fixture request: {request}");
+                };
+                write_http_response(&mut stream, "200 OK", &[], &body);
+                requests.push(request);
+            }
+            requests
+        });
+
+        let client = OnvifClient::with_timeout(Duration::from_secs(1)).unwrap();
+        let credentials = OnvifCredentials {
+            username: "admin".into(),
+            password: "secret".into(),
+        };
+        let control = client
+            .event_control(&format!("http://{address}/device"), &credentials)
+            .unwrap();
+
+        assert!(control.properties().motion_supported);
+        let requests = server.join().unwrap();
+        assert!(requests[1].contains("GetCapabilities"));
+        assert!(requests.iter().all(|request| !request.contains("secret")));
     }
 
     #[test]

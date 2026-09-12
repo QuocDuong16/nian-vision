@@ -30,7 +30,8 @@ pub use camera_service::{
     ApplicationSettingsDto, CameraDraft, CameraMutation, CameraService, CameraServiceError,
     CameraSummary, CameraWarning, CredentialRefGenerator, CredentialRefGeneratorError,
     CredentialStore, CredentialStoreError, MemoryCredentialStore, PreparedApplicationSettings,
-    PreparedProbe, RandomCredentialRefGenerator, SettingsRepository, SettingsRepositoryError,
+    PreparedOnvifCamera, PreparedProbe, RandomCredentialRefGenerator, SettingsRepository,
+    SettingsRepositoryError,
 };
 pub use config::{AppConfig, SegmentTargetDuration};
 pub use desktop_lifecycle::{DesktopLifecycle, DesktopLifecycleError, DesktopLifecycleState};

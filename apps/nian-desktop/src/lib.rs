@@ -1393,6 +1393,33 @@ async fn ptz_stop(
 }
 
 #[tauri::command]
+async fn event_pair_saved(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    camera_id: String,
+) -> Result<EventMutation<EventStatusDto>, DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let prepared_camera = lock(&state.camera_service)?
+            .prepare_onvif_camera(&camera_id)
+            .map_err(map_camera_error)?;
+        let prepared = state
+            .onvif_controller
+            .prepare_event_pairing_for_host(&prepared_camera.host, prepared_camera.credentials)
+            .map_err(map_onvif_error)?;
+        state
+            .event_controller
+            .pair(&camera_id, prepared)
+            .map_err(map_event_error)
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("event_internal", "event pairing task failed"))?
+}
+
+#[tauri::command]
 async fn event_pair(
     state: tauri::State<'_, Arc<DesktopState>>,
     input: EventPairInput,
@@ -2611,6 +2638,10 @@ fn map_onvif_error(error: OnvifControllerError) -> DesktopErrorDto {
                 "ONVIF discovery results expired; run discovery again",
             )
         }
+        OnvifControllerError::DeviceNotFound => DesktopErrorDto::new(
+            "onvif_device_not_found",
+            "saved camera host was not found in local ONVIF discovery",
+        ),
         OnvifControllerError::ProfileNotFound => DesktopErrorDto::new(
             "onvif_profile_not_found",
             "selected ONVIF media profile is no longer available",
@@ -3834,6 +3865,7 @@ pub fn run() {
             ptz_move,
             ptz_renew,
             ptz_stop,
+            event_pair_saved,
             event_pair,
             event_unpair,
             event_enable,

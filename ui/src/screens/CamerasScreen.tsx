@@ -485,6 +485,34 @@ export function CamerasScreen() {
     }
   }
 
+  async function pairEvents(camera: CameraSummary) {
+    if (!isTauri() || busyCamera || onvifBusy) return;
+    setBusyCamera(camera.camera_id);
+    setError(null);
+    try {
+      const result = await invokeDesktop<EventMutation<EventStatus>>("event_pair_saved", {
+        cameraId: camera.camera_id,
+      });
+      await loadCameras();
+      if (result.warning) {
+        setError({
+          code: "credential_store",
+          message: "Motion Events were paired, but an obsolete Events credential could not be removed.",
+        });
+      }
+    } catch (cause) {
+      const failure = desktopError(cause);
+      if (failure.code === "onvif_auth_failed") {
+        setBusyCamera(null);
+        await startOnvifDiscovery(camera, "events");
+        return;
+      }
+      setError(failure);
+    } finally {
+      setBusyCamera(null);
+    }
+  }
+
   async function unpairEvents(camera: CameraSummary) {
     if (!isTauri() || busyCamera) return;
     setBusyCamera(camera.camera_id);
@@ -674,7 +702,11 @@ export function CamerasScreen() {
                     <button onClick={() => void unpairPtz(camera)} disabled={busyCamera !== null || rowBusy}>Unpair PTZ</button>
                   )}
                   <button
-                    onClick={() => void startOnvifDiscovery(camera, "events")}
+                    onClick={() => void (
+                      events?.configured
+                        ? startOnvifDiscovery(camera, "events")
+                        : pairEvents(camera)
+                    )}
                     disabled={busyCamera !== null || rowBusy || onvifBusy}
                   >{events?.configured ? "Replace Motion Events" : "Pair Motion Events"}</button>
                   {events?.configured && (

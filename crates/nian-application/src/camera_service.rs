@@ -246,6 +246,22 @@ impl From<&CameraConfig> for CameraSummary {
     }
 }
 
+#[derive(Clone)]
+pub struct PreparedOnvifCamera {
+    pub camera_id: CameraId,
+    pub host: String,
+    pub credentials: Credentials,
+}
+
+impl std::fmt::Debug for PreparedOnvifCamera {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedOnvifCamera")
+            .field("camera_id", &self.camera_id)
+            .field("host", &self.host)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Command-side camera data. Credentials are optional for updates so the UI
 /// can explicitly leave the current secret untouched. This type intentionally
 /// does not implement `Debug` or `Serialize`.
@@ -803,6 +819,26 @@ impl CameraService {
                 "kind": "rtsp",
                 "url": endpoint.url_with(Some(&credentials)),
             }),
+        })
+    }
+
+    pub fn prepare_onvif_camera(
+        &self,
+        camera_id: &str,
+    ) -> Result<PreparedOnvifCamera, CameraServiceError> {
+        let camera_id = parse_camera_id(camera_id)?;
+        let camera = self
+            .repository
+            .get_camera(&camera_id)
+            .map_err(map_repository_service_error)?
+            .ok_or(CameraServiceError::CameraNotFound)?;
+        let credentials = self.credentials.get(camera.credential_ref())?;
+        validate_credentials(&credentials)?;
+        let CameraSource::Rtsp(endpoint) = camera.source();
+        Ok(PreparedOnvifCamera {
+            camera_id,
+            host: endpoint.host().as_str().to_owned(),
+            credentials,
         })
     }
 
