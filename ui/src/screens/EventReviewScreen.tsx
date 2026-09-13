@@ -12,7 +12,6 @@ import {
 } from "../lib/tauri";
 
 type RangePreset = "hour" | "day" | "week" | "custom";
-type EventKindFilter = "all" | EventHistoryKind;
 
 type EventDatasetSnapshot = {
   generation: number;
@@ -60,15 +59,14 @@ function eventTime(value: string): string {
   return Number.isFinite(parsed.getTime()) ? parsed.toLocaleString() : value;
 }
 
-function eventKindLabel(event: EventReviewRow): string {
-  return event.kind === "motion_started" ? "Motion detected" : "Motion ended";
+function eventKindLabel(): string {
+  return "Motion event";
 }
 
 export function EventReviewScreen() {
   const initialNow = useMemo(() => new Date(), []);
   const [cameras, setCameras] = useState<CameraSummary[]>([]);
   const [cameraId, setCameraId] = useState("all");
-  const [eventKind, setEventKind] = useState<EventKindFilter>("all");
   const [rangePreset, setRangePreset] = useState<RangePreset>("day");
   const [customFrom, setCustomFrom] = useState(() => dateTimeLocalValue(new Date(initialNow.getTime() - 24 * 60 * 60_000)));
   const [customTo, setCustomTo] = useState(() => dateTimeLocalValue(initialNow));
@@ -112,13 +110,13 @@ export function EventReviewScreen() {
       generation,
       query: {
         camera_ids: cameraId === "all" ? [] : [cameraId],
-        kind: eventKind === "all" ? null : eventKind,
+        kind: null,
         from_utc: bounds.fromUtc,
         to_utc: bounds.toUtc,
         limit: PAGE_SIZE,
       },
     };
-  }, [cameraId, customFrom, customTo, eventKind, rangePreset]);
+  }, [cameraId, customFrom, customTo, rangePreset]);
 
   const executeReload = useCallback(async () => {
     if (reloadInFlightRef.current || !isTauri()) return;
@@ -193,7 +191,7 @@ export function EventReviewScreen() {
     setSelectionMessage(null);
     void closePlayback();
     queueRootReload();
-  }, [cameraId, closePlayback, customFrom, customTo, eventKind, queueRootReload, rangePreset]);
+  }, [cameraId, closePlayback, customFrom, customTo, queueRootReload, rangePreset]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -386,14 +384,6 @@ export function EventReviewScreen() {
           </select>
         </label>
         <label>
-          Event type
-          <select value={eventKind} onChange={(event) => setEventKind(event.target.value as EventKindFilter)}>
-            <option value="all">All motion events</option>
-            <option value="motion_started">Motion started</option>
-            <option value="motion_ended">Motion ended</option>
-          </select>
-        </label>
-        <label>
           Time range
           <select value={rangePreset} onChange={(event) => setRangePreset(event.target.value as RangePreset)}>
             <option value="hour">Last hour</option>
@@ -438,8 +428,8 @@ export function EventReviewScreen() {
                   >
                     <span className="event-row-time">{eventTime(event.received_time_utc)}</span>
                     <strong>{event.camera_display_name}</strong>
-                    <span>{eventKindLabel(event)}</span>
-                    <small>{event.recording_available ? "Recording available" : "No recording"}</small>
+                    <span>{eventKindLabel()}</span>
+                    <small>{event.recording_available ? "Recording available" : "Preparing recording…"}</small>
                   </button>
                 </li>
               ))}
@@ -463,7 +453,7 @@ export function EventReviewScreen() {
             <>
               <dl className="event-detail-grid">
                 <div><dt>Camera</dt><dd>{selected.camera_display_name}</dd></div>
-                <div><dt>Event</dt><dd>{eventKindLabel(selected)}</dd></div>
+                <div><dt>Event</dt><dd>{eventKindLabel()}</dd></div>
                 <div><dt>Received</dt><dd>{eventTime(selected.received_time_utc)}</dd></div>
                 {selected.device_time_utc && <div><dt>Device time</dt><dd>{eventTime(selected.device_time_utc)}</dd></div>}
               </dl>

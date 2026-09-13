@@ -1,3 +1,8 @@
+# Nian Vision 1.0.0-rc.50
+Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
+
+RC50 refines the independent RC49 Event-capture model after physical Tapo C200 review showed that multiple short motion bursts could be merged into one long event clip merely because the next burst arrived inside the previous five-second post-roll window. Each aggregate motion burst now owns its own Event episode from MotionStarted through MotionEnded plus bounded real pre-roll/post-roll. MotionStarted during another episode's post-roll creates a new independent episode instead of cancelling the older episode's finalization; the resulting clips may intentionally overlap because both are projections from the same rolling buffer. Continuous motion still splits only at the five-minute hard clip limit and preserves one root Event across its continuation parts. Default Event Review now presents one user-facing Motion event per burst, collapses historical RC49 raw transitions that resolve to the same legacy clip, hides raw MotionEnded transitions from the normal review surface, and keeps raw normalized transitions in the Event index for audit/debug. Manual Recording/Timeline ownership, dedicated Event storage, retention/quota behavior, real buffered pre-roll and PTZ transport semantics remain unchanged.
+
 # Nian Vision 1.0.0-rc.49
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 

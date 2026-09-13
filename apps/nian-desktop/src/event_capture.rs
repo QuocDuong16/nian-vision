@@ -67,7 +67,8 @@ impl EventCaptureDispatcher {
                     }));
                 let composer = WorkerEventClipComposer::new(worker_program);
                 let mut buffers = HashMap::<CameraId, BufferRuntime>::new();
-                let mut episodes = HashMap::<CameraId, ActiveEpisode>::new();
+                let mut active_episodes = HashMap::<CameraId, ActiveEpisode>::new();
+                let mut pending_episodes = Vec::<(CameraId, ActiveEpisode)>::new();
                 let mut aggregate_motion = HashMap::<CameraId, bool>::new();
                 let mut next_clip_housekeeping = Instant::now();
 
@@ -75,14 +76,16 @@ impl EventCaptureDispatcher {
                     match receiver.recv_timeout(EVENT_CAPTURE_POLL) {
                         Ok(signal) => {
                             apply_signal(
-                                &mut episodes,
+                                &mut active_episodes,
+                                &mut pending_episodes,
                                 &mut aggregate_motion,
                                 signal,
                                 Instant::now(),
                             );
                             while let Ok(signal) = receiver.try_recv() {
                                 apply_signal(
-                                    &mut episodes,
+                                    &mut active_episodes,
+                                    &mut pending_episodes,
                                     &mut aggregate_motion,
                                     signal,
                                     Instant::now(),
@@ -101,7 +104,8 @@ impl EventCaptureDispatcher {
                         &mut controller,
                         &composer,
                         &mut buffers,
-                        &mut episodes,
+                        &mut active_episodes,
+                        &mut pending_episodes,
                         &aggregate_motion,
                     );
                     if Instant::now() >= next_clip_housekeeping {
@@ -194,7 +198,8 @@ impl ActiveEpisode {
 }
 
 fn apply_signal(
-    episodes: &mut HashMap<CameraId, ActiveEpisode>,
+    active_episodes: &mut HashMap<CameraId, ActiveEpisode>,
+    pending_episodes: &mut Vec<(CameraId, ActiveEpisode)>,
     aggregate_motion: &mut HashMap<CameraId, bool>,
     signal: PersistedEventSignal,
     now: Instant,
@@ -209,16 +214,15 @@ fn apply_signal(
     aggregate_motion.insert(camera_id.clone(), motion_active);
 
     if motion_active {
-        let episode = episodes
+        let episode = active_episodes
             .entry(camera_id)
             .or_insert_with(|| ActiveEpisode::new(&signal));
         episode.add_event(signal.event_id);
-        episode.ended_utc = None;
-        episode.finalize_after = None;
-    } else if let Some(episode) = episodes.get_mut(&camera_id) {
+    } else if let Some(mut episode) = active_episodes.remove(&camera_id) {
         episode.add_event(signal.event_id);
         episode.ended_utc = Some(signal.received_time_utc);
         episode.finalize_after = Some(now + EVENT_POST_ROLL);
+        pending_episodes.push((camera_id, episode));
     }
 }
 
@@ -227,7 +231,8 @@ fn reconcile(
     controller: &mut RecordingController,
     composer: &WorkerEventClipComposer,
     buffers: &mut HashMap<CameraId, BufferRuntime>,
-    episodes: &mut HashMap<CameraId, ActiveEpisode>,
+    active_episodes: &mut HashMap<CameraId, ActiveEpisode>,
+    pending_episodes: &mut Vec<(CameraId, ActiveEpisode)>,
     aggregate_motion: &HashMap<CameraId, bool>,
 ) {
     let running = state
@@ -258,9 +263,9 @@ fn reconcile(
     };
 
     reconcile_buffers(state, controller, buffers, &desired);
-    reconcile_episode_deadlines(episodes, aggregate_motion);
-    finalize_ready_episodes(controller, composer, buffers, episodes, aggregate_motion);
-    prune_buffers(buffers, episodes);
+    reconcile_episode_deadlines(active_episodes, pending_episodes, aggregate_motion);
+    finalize_ready_episodes(controller, composer, buffers, pending_episodes);
+    prune_buffers(buffers, active_episodes, pending_episodes);
 }
 
 fn reconcile_buffers(
@@ -360,24 +365,41 @@ fn reconcile_buffers(
 }
 
 fn reconcile_episode_deadlines(
-    episodes: &mut HashMap<CameraId, ActiveEpisode>,
+    active_episodes: &mut HashMap<CameraId, ActiveEpisode>,
+    pending_episodes: &mut Vec<(CameraId, ActiveEpisode)>,
     aggregate_motion: &HashMap<CameraId, bool>,
 ) {
     let now_utc = Utc::now();
     let now = Instant::now();
     let max =
         TimeDelta::from_std(EVENT_CLIP_MAX_DURATION).unwrap_or_else(|_| TimeDelta::minutes(5));
-    for (camera_id, episode) in episodes.iter_mut() {
-        if episode.ended_utc.is_none() && now_utc.signed_duration_since(episode.trigger_utc) >= max
-        {
+    let cameras = active_episodes.keys().cloned().collect::<Vec<_>>();
+
+    for camera_id in cameras {
+        let Some(episode) = active_episodes.get(&camera_id) else {
+            continue;
+        };
+        let reached_cap = now_utc.signed_duration_since(episode.trigger_utc) >= max;
+        let motion_active = aggregate_motion.get(&camera_id).copied().unwrap_or(false);
+        if !reached_cap && motion_active {
+            continue;
+        }
+
+        let Some(mut episode) = active_episodes.remove(&camera_id) else {
+            continue;
+        };
+        if reached_cap {
             episode.ended_utc = episode.trigger_utc.checked_add_signed(max);
             episode.finalize_after = Some(now);
-        }
-        if !aggregate_motion.get(camera_id).copied().unwrap_or(false)
-            && episode.ended_utc.is_some()
-            && episode.finalize_after.is_none()
-        {
+            let continuation = motion_active.then(|| continuation_episode(&episode));
+            pending_episodes.push((camera_id.clone(), episode));
+            if let Some(continuation) = continuation {
+                active_episodes.insert(camera_id, continuation);
+            }
+        } else {
+            episode.ended_utc = Some(now_utc);
             episode.finalize_after = Some(now);
+            pending_episodes.push((camera_id, episode));
         }
     }
 }
@@ -400,25 +422,23 @@ fn finalize_ready_episodes(
     controller: &mut RecordingController,
     composer: &WorkerEventClipComposer,
     buffers: &HashMap<CameraId, BufferRuntime>,
-    episodes: &mut HashMap<CameraId, ActiveEpisode>,
-    aggregate_motion: &HashMap<CameraId, bool>,
+    pending_episodes: &mut Vec<(CameraId, ActiveEpisode)>,
 ) {
     let now = Instant::now();
-    let ready = episodes
-        .iter()
-        .filter(|(_, episode)| {
-            episode
-                .finalize_after
-                .is_some_and(|deadline| now >= deadline)
-        })
-        .map(|(camera_id, _)| camera_id.clone())
-        .collect::<Vec<_>>();
-
-    for camera_id in ready {
-        let Some(runtime) = buffers.get(&camera_id) else {
+    let mut index = 0;
+    while index < pending_episodes.len() {
+        let ready = pending_episodes[index]
+            .1
+            .finalize_after
+            .is_some_and(|deadline| now >= deadline);
+        if !ready {
+            index += 1;
             continue;
-        };
-        let Some(episode) = episodes.get(&camera_id).cloned() else {
+        }
+
+        let (camera_id, episode) = pending_episodes[index].clone();
+        let Some(runtime) = buffers.get(&camera_id) else {
+            index += 1;
             continue;
         };
         let buffer_active = controller
@@ -427,17 +447,19 @@ fn finalize_ready_episodes(
             .unwrap_or(false);
         match materialize_episode(runtime, &camera_id, &episode, composer, buffer_active) {
             Ok(true) => {
-                episodes.remove(&camera_id);
-                if aggregate_motion.get(&camera_id).copied().unwrap_or(false) {
-                    episodes.insert(camera_id.clone(), continuation_episode(&episode));
-                }
+                pending_episodes.swap_remove(index);
             }
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                camera_id = %camera_id.as_str(),
-                error = %error,
-                "event clip materialization failed"
-            ),
+            Ok(false) => {
+                index += 1;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    camera_id = %camera_id.as_str(),
+                    error = %error,
+                    "event clip materialization failed"
+                );
+                index += 1;
+            }
         }
     }
 }
@@ -464,6 +486,7 @@ struct EventAlias {
 #[derive(Debug, Clone)]
 pub(crate) struct EventClipRef {
     pub(crate) episode_id: String,
+    pub(crate) root_event_id: u64,
     pub(crate) started_at_local: NaiveDateTime,
 }
 
@@ -693,8 +716,12 @@ pub(crate) fn event_clips_for_event(
                         "invalid event clip manifest time",
                     )
                 })?;
+        let Some(root_event_id) = manifest.event_ids.first().copied() else {
+            continue;
+        };
         clips.push(EventClipRef {
             episode_id: manifest.episode_id,
+            root_event_id,
             started_at_local,
         });
     }
@@ -943,7 +970,8 @@ fn delete_event_clip_candidate(
 
 fn prune_buffers(
     buffers: &HashMap<CameraId, BufferRuntime>,
-    episodes: &HashMap<CameraId, ActiveEpisode>,
+    active_episodes: &HashMap<CameraId, ActiveEpisode>,
+    pending_episodes: &[(CameraId, ActiveEpisode)],
 ) {
     let idle =
         TimeDelta::from_std(EVENT_BUFFER_IDLE_RETENTION).unwrap_or_else(|_| TimeDelta::seconds(30));
@@ -969,18 +997,32 @@ fn prune_buffers(
             continue;
         }
         let idle_cutoff = Local::now().naive_local() - idle;
-        let keep_from = episodes
-            .get(camera_id)
-            .map(|episode| {
+        let active_keep_from = active_episodes.get(camera_id).map(|episode| {
+            episode
+                .trigger_utc
+                .checked_sub_signed(pre)
+                .unwrap_or(episode.trigger_utc)
+                .with_timezone(&Local)
+                .naive_local()
+        });
+        let pending_keep_from = pending_episodes
+            .iter()
+            .filter(|(pending_camera_id, _)| pending_camera_id == camera_id)
+            .map(|(_, episode)| {
                 episode
                     .trigger_utc
                     .checked_sub_signed(pre)
                     .unwrap_or(episode.trigger_utc)
                     .with_timezone(&Local)
                     .naive_local()
-                    .min(idle_cutoff)
             })
-            .unwrap_or(idle_cutoff);
+            .min();
+        let keep_from = active_keep_from
+            .into_iter()
+            .chain(pending_keep_from)
+            .min()
+            .unwrap_or(idle_cutoff)
+            .min(idle_cutoff);
         for pair in recordings.windows(2) {
             if pair[1].started_at <= keep_from
                 && let Err(error) = std::fs::remove_file(&pair[0].path)
@@ -1261,32 +1303,76 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_motion_builds_one_episode_and_post_roll_is_cancelled_by_reactivation() {
+    fn a_new_motion_burst_does_not_merge_into_the_previous_post_roll() {
         let camera = CameraId::parse("cam-front").unwrap();
         let at = Utc::now();
-        let mut episodes = HashMap::new();
+        let mut active = HashMap::new();
+        let mut pending = Vec::new();
         let mut aggregate = HashMap::new();
         apply_signal(
-            &mut episodes,
+            &mut active,
+            &mut pending,
             &mut aggregate,
             signal(1, true, at),
             Instant::now(),
         );
         apply_signal(
-            &mut episodes,
+            &mut active,
+            &mut pending,
             &mut aggregate,
             signal(2, false, at + TimeDelta::seconds(1)),
             Instant::now(),
         );
-        assert!(episodes[&camera].finalize_after.is_some());
+        assert!(!active.contains_key(&camera));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1.event_ids, vec![1, 2]);
+        assert!(pending[0].1.finalize_after.is_some());
+
         apply_signal(
-            &mut episodes,
+            &mut active,
+            &mut pending,
             &mut aggregate,
             signal(3, true, at + TimeDelta::seconds(2)),
             Instant::now(),
         );
-        assert!(episodes[&camera].finalize_after.is_none());
-        assert_eq!(episodes[&camera].event_ids, vec![1, 2, 3]);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1.event_ids, vec![1, 2]);
+        assert_eq!(active[&camera].event_ids, vec![3]);
+    }
+
+    #[test]
+    fn nearby_motion_bursts_keep_independent_clip_windows() {
+        let at = Utc::now();
+        let mut active = HashMap::new();
+        let mut pending = Vec::new();
+        let mut aggregate = HashMap::new();
+
+        for (event_id, active_state, offset) in
+            [(1, true, 0), (2, false, 1), (3, true, 2), (4, false, 3)]
+        {
+            apply_signal(
+                &mut active,
+                &mut pending,
+                &mut aggregate,
+                signal(event_id, active_state, at + TimeDelta::seconds(offset)),
+                Instant::now(),
+            );
+        }
+
+        assert!(active.is_empty());
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].1.event_ids, vec![1, 2]);
+        assert_eq!(pending[1].1.event_ids, vec![3, 4]);
+        let first_window = pending[0].1.requested_window().unwrap();
+        let second_window = pending[1].1.requested_window().unwrap();
+        assert_eq!(first_window.0, at - TimeDelta::seconds(5));
+        assert_eq!(first_window.1, at + TimeDelta::seconds(6));
+        assert_eq!(second_window.0, at - TimeDelta::seconds(3));
+        assert_eq!(second_window.1, at + TimeDelta::seconds(8));
+        assert!(
+            first_window.1 > second_window.0,
+            "event clips may overlap during pre/post-roll"
+        );
     }
 
     #[test]

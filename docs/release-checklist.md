@@ -2,11 +2,11 @@
 
 Record the exact tag, commit SHA, OS image/VM and result for every run. A checkbox is evidence only when the step was actually executed. Do not reuse a tag after changing source.
 
-Current retry candidate: `1.0.0-rc.49` / `v1.0.0-rc.49`. RC1 through RC48 remain immutable. RC49 separates motion Event capture from manual Recording/Timeline, adds real buffered pre-roll plus bounded event-only multi-part clips, hardens event-clip retention/quota/playback ownership, and prevents stale pooled ONVIF HTTP sockets from breaking PTZ commands after successful pairing.
+Current retry candidate: `1.0.0-rc.50` / `v1.0.0-rc.50`. RC1 through RC49 remain immutable. RC50 keeps RC49 independent Event capture but makes each aggregate MotionStarted→MotionEnded burst its own user-facing event/clip, even when a new burst arrives inside the previous post-roll window; legacy RC49 transition rows that share one clip collapse to one review item.
 
 ## Pre-tag authority
 
-- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.49`.
+- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.50`.
 - [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
@@ -16,7 +16,7 @@ Current retry candidate: `1.0.0-rc.49` / `v1.0.0-rc.49`. RC1 through RC48 remain
 
 ## GitHub RC workflow
 
-- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.49`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.48`; source/tag cross-pairing is forbidden.
+- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.50`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.49`; source/tag cross-pairing is forbidden.
 - [ ] GitHub tag resolves to exactly the same commit as Forgejo.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.

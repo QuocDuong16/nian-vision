@@ -9,7 +9,7 @@
 mod event_capture;
 
 use event_capture::{EventCaptureDispatcher, event_clips_for_event};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -1643,6 +1643,15 @@ fn event_recording_available(playback: &PlaybackController, event: &EventReviewR
         .unwrap_or(false)
 }
 
+fn event_root_event_id(playback: &PlaybackController, event: &EventReviewRowDto) -> Option<u64> {
+    let camera_id = CameraId::parse(&event.camera_id).ok()?;
+    let storage_root = playback.configured_storage_root()?;
+    event_clips_for_event(storage_root, &camera_id, event.event_id)
+        .ok()?
+        .first()
+        .map(|clip| clip.root_event_id)
+}
+
 #[tauri::command]
 async fn event_query(
     state: tauri::State<'_, Arc<DesktopState>>,
@@ -1665,16 +1674,40 @@ async fn event_query(
             )
             .map_err(map_event_error)?;
         let playback = state.playback_controller.lock().ok();
-        let rows = page
-            .rows
-            .into_iter()
-            .map(|event| DesktopEventReviewRowDto {
+        let mut seen_event_roots = HashSet::new();
+        let mut rows = Vec::new();
+        for event in page.rows {
+            if input.kind.is_none() {
+                if let Some(root_event_id) = playback
+                    .as_deref()
+                    .and_then(|playback| event_root_event_id(playback, &event))
+                {
+                    let key = (event.camera_id.clone(), root_event_id);
+                    if !seen_event_roots.insert(key) {
+                        continue;
+                    }
+                    let representative = state
+                        .event_controller
+                        .review_get(root_event_id)
+                        .map_err(map_event_error)?
+                        .unwrap_or(event);
+                    rows.push(DesktopEventReviewRowDto {
+                        event: representative,
+                        recording_available: true,
+                    });
+                    continue;
+                }
+                if event.kind == EventHistoryKind::MotionEnded {
+                    continue;
+                }
+            }
+            rows.push(DesktopEventReviewRowDto {
                 recording_available: playback
                     .as_deref()
                     .is_some_and(|playback| event_recording_available(playback, &event)),
                 event,
-            })
-            .collect();
+            });
+        }
         Ok(DesktopEventReviewPageDto {
             rows,
             next_cursor: page.next_cursor,

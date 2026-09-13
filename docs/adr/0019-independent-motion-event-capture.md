@@ -1,6 +1,6 @@
 # ADR 0019 — Independent Motion Event Capture
 
-- Status: Accepted for RC49
+- Status: Accepted for RC49; burst-boundary refinement accepted for RC50
 - Date: 2026-09-13
 
 ## Context
@@ -13,7 +13,7 @@ The product requirement is stricter: manual Recording and motion Event footage a
 
 Nian Vision uses a separate Event capture plane. While Event monitoring Desired is On, a dedicated recording controller continuously packet-copies short H.264 segments into `<storage_root>/.nian/event-buffer`. It has no access to the manual Recording controller or persistent Recording Desired. The buffer is short-lived and pruned independently.
 
-A newly persisted aggregate MotionStarted creates an Event episode over that already-running buffer. The requested window includes approximately five seconds before the trigger and five seconds after aggregate motion becomes idle. Motion reactivation cancels pending finalization. The media worker concatenates selected finalized segments into `<storage_root>/.nian/event-clips/<camera>/<episode>/clip.mkv` without transcoding. Each source segment is rebased to a cumulative output timeline; packet spacing is preserved and a mux-level duration guard keeps every clip part below the five-minute hard limit. Long continuous motion creates continuation episodes with boundary overlap and preserves the root Event aliases so every part remains discoverable.
+A newly persisted aggregate MotionStarted creates an Event episode over that already-running buffer. The requested window includes approximately five seconds before the trigger and five seconds after the matching aggregate MotionEnded. RC50 treats that MotionStarted→MotionEnded interval as the product event boundary: a later MotionStarted always opens a new independent episode even when the previous episode is still collecting post-roll. Those clips may overlap in time because both read from the rolling buffer; the older episode's finalization is never cancelled merely to merge nearby human actions. The media worker concatenates selected finalized segments into `<storage_root>/.nian/event-clips/<camera>/<episode>/clip.mkv` without transcoding. Each source segment is rebased to a cumulative output timeline; packet spacing is preserved and a mux-level duration guard keeps every clip part below the five-minute hard limit. Long uninterrupted motion creates continuation episodes with boundary overlap and preserves the root Event aliases so every part remains discoverable.
 
 Event aliases are immutable files under `by-event/<event-id>/<episode-id>.json`. Event Review never queries the manual Recording index for footage. An Event may resolve to multiple clip parts and the UI exposes Clip N/M navigation. Event playback validates real, non-symlink directory/file identity and pins the active episode against retention.
 
