@@ -230,14 +230,14 @@ describe("EventReviewScreen", () => {
   });
 
   it("ignores stale selected-event recording lookup completion", async () => {
-    const firstLookup = deferred<{ available: boolean; camera_id: string; seek_offset_ms: number | null }>();
+    const firstLookup = deferred<{ available: boolean; camera_id: string; seek_offset_ms: number | null; clip_count: number }>();
     vi.mocked(invoke).mockImplementation(async (command, args) => {
       if (command === "camera_list") return [];
       if (command === "event_query") return { rows: [eventA, eventB], next_cursor: null } satisfies EventReviewPage;
       if (command === "event_recording_context") {
         const eventId = (args as { eventId: number }).eventId;
         if (eventId === 1) return firstLookup.promise;
-        return { available: false, camera_id: "cam-b", seek_offset_ms: null };
+        return { available: false, camera_id: "cam-b", seek_offset_ms: null, clip_count: 0 };
       }
       if (command === "playback_close") return undefined;
       throw new Error(`unexpected command ${command}`);
@@ -250,7 +250,7 @@ describe("EventReviewScreen", () => {
     fireEvent.click(rows[1]!);
 
     expect((await screen.findAllByText("No recording available yet. Motion-triggered clips appear here after the segment is finalized.")).length).toBeGreaterThan(0);
-    firstLookup.resolve({ available: true, camera_id: "cam-a", seek_offset_ms: 5_000 });
+    firstLookup.resolve({ available: true, camera_id: "cam-a", seek_offset_ms: 5_000, clip_count: 1 });
     await Promise.resolve();
     expect(screen.queryByRole("button", { name: "Open recording" })).toBeNull();
     expect(screen.getAllByText("No recording available yet. Motion-triggered clips appear here after the segment is finalized.").length).toBeGreaterThan(0);
@@ -276,8 +276,8 @@ describe("EventReviewScreen", () => {
       if (command === "event_recording_context") {
         contextCount += 1;
         return contextCount === 1
-          ? { available: false, camera_id: "cam-a", seek_offset_ms: null }
-          : { available: true, camera_id: "cam-a", seek_offset_ms: 0 };
+          ? { available: false, camera_id: "cam-a", seek_offset_ms: null, clip_count: 0 }
+          : { available: true, camera_id: "cam-a", seek_offset_ms: 0, clip_count: 1 };
       }
       if (command === "playback_close") return undefined;
       throw new Error(`unexpected command ${command}`);
@@ -293,6 +293,63 @@ describe("EventReviewScreen", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     expect(screen.getByRole("button", { name: "Open recording" })).toBeTruthy();
     expect(contextCount).toBe(2);
+  });
+
+  it("navigates every bounded clip part for a long motion event", async () => {
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "camera_list") return [];
+      if (command === "event_query") return { rows: [eventA], next_cursor: null } satisfies EventReviewPage;
+      if (command === "event_recording_context") {
+        return { available: true, camera_id: "cam-a", seek_offset_ms: 0, clip_count: 2 };
+      }
+      if (command === "event_playback_open") {
+        const clipIndex = (args as { clipIndex: number }).clipIndex;
+        return {
+          playback: {
+            session_id: `session-${clipIndex}`,
+            url: `http://127.0.0.1:1234/playback/session-${clipIndex}`,
+            recording: {
+              recording_id: `event:1:episode-${clipIndex}`,
+              camera_id: "cam-a",
+              kind: "normal",
+              started_at: "2026-09-05T12:00:00.000",
+              sequence: 1,
+              size_bytes: 1024,
+              media_duration_ms: 300_000,
+              end_at: "2026-09-05T12:05:00.000",
+            },
+            inspect: {
+              duration_ms: 300_000,
+              video_codec: "h264",
+              width: 1920,
+              height: 1080,
+              audio_available: true,
+              container_compatibility: "fragmented_mp4",
+              seekable: true,
+            },
+            adjacent: { previous: null, next: null },
+          },
+          seek_offset_ms: 0,
+          clip_index: clipIndex,
+          clip_count: 2,
+        };
+      }
+      if (command === "playback_close") return undefined;
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<EventReviewScreen />);
+    fireEvent.click(await screen.findByRole("button", { name: /Front Door.*Motion detected/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Open recording" }));
+    expect(await screen.findByText("Clip 1 of 2")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Next clip" }));
+    expect(await screen.findByText("Clip 2 of 2")).toBeTruthy();
+    expect(vi.mocked(invoke).mock.calls.some(([command, args]) =>
+      command === "event_playback_open"
+      && (args as { clipIndex?: number })?.clipIndex === 1,
+    )).toBe(true);
+    expect((screen.getByRole("button", { name: "Next clip" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("does not append an old page after filters change", async () => {

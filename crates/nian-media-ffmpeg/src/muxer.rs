@@ -58,6 +58,7 @@ enum TimestampPolicy {
     Preserve,
     Repair,
     RebaseAndRepair,
+    Concatenate,
 }
 
 /// Translation table entry for one copied stream, ordered by output index.
@@ -73,6 +74,10 @@ struct StreamMapping {
     timestamp_origin: Option<i64>,
     /// Last normalized segment DTS written for this output stream.
     last_dts: Option<i64>,
+    /// Fixed output-time-base offset applied while concatenating one source
+    /// segment. This advances only at explicit segment boundaries so packet
+    /// spacing inside a segment is preserved.
+    segment_offset: i64,
 }
 
 fn normalize_segment_timestamp_pair(
@@ -117,6 +122,46 @@ fn normalize_segment_timestamp_pair(
     (dts, pts)
 }
 
+fn normalize_concatenated_timestamp_pair(
+    mapping: &mut StreamMapping,
+    dts: Option<i64>,
+    pts: Option<i64>,
+) -> (Option<i64>, Option<i64>) {
+    let anchor = dts.or(pts);
+    if mapping.timestamp_origin.is_none() {
+        mapping.timestamp_origin = anchor;
+    }
+    let origin = mapping.timestamp_origin.unwrap_or(0);
+    let mut dts = dts.map(|value| {
+        value
+            .saturating_sub(origin)
+            .saturating_add(mapping.segment_offset)
+    });
+    let mut pts = pts.map(|value| {
+        value
+            .saturating_sub(origin)
+            .saturating_add(mapping.segment_offset)
+    });
+
+    match (dts, pts) {
+        (None, Some(value)) => dts = Some(value),
+        (Some(value), None) => pts = Some(value),
+        _ => {}
+    }
+
+    if let Some(current_dts) = dts {
+        if let Some(last_dts) = mapping.last_dts
+            && current_dts <= last_dts
+        {
+            let shift = last_dts.saturating_add(1).saturating_sub(current_dts);
+            dts = Some(current_dts.saturating_add(shift));
+            pts = pts.map(|value| value.saturating_add(shift));
+        }
+        mapping.last_dts = dts;
+    }
+    (dts, pts)
+}
+
 /// Writes a Matroska file by copying packets from an open [`MediaInput`].
 pub struct MatroskaMuxer {
     context: *mut sys::AVFormatContext,
@@ -131,6 +176,8 @@ pub struct MatroskaMuxer {
     stream_map: Vec<StreamMapping>,
     timestamp_policy: TimestampPolicy,
     output_path: PathBuf,
+    duration_limit_ms: Option<u64>,
+    duration_limit_reached: bool,
     finalized: bool,
 }
 
@@ -195,6 +242,46 @@ impl MatroskaMuxer {
             TimestampPolicy::Repair,
             selector,
         )
+    }
+
+    /// Creates one Matroska output intended to concatenate multiple compatible
+    /// source segments without transcoding. Every source segment is rebased to
+    /// zero and then shifted by a stable cumulative offset, preserving packet
+    /// spacing while keeping the output timeline monotonic.
+    pub fn create_concatenated_recording_with_selection<F>(
+        input: &mut MediaInput,
+        output_path: &Path,
+        interrupt: &InterruptHandle,
+        selector: F,
+    ) -> Result<Self, MediaError>
+    where
+        F: FnMut(&nian_domain::MediaStreamInfo) -> bool,
+    {
+        Self::create_with_selection_for_format(
+            input,
+            output_path,
+            interrupt,
+            false,
+            TimestampPolicy::Concatenate,
+            selector,
+        )
+    }
+
+    /// Starts another input segment in concatenate mode. The next packet seen
+    /// for each mapped stream establishes that segment's timestamp origin; all
+    /// packets in the segment share one fixed cumulative offset.
+    pub fn begin_concatenated_segment(&mut self) -> Result<(), MediaError> {
+        if self.timestamp_policy != TimestampPolicy::Concatenate {
+            return Err(MediaError::WriteFailed {
+                message: "concatenated segment boundary used by a non-concatenating muxer"
+                    .to_owned(),
+            });
+        }
+        for mapping in &mut self.stream_map {
+            mapping.timestamp_origin = None;
+            mapping.segment_offset = mapping.last_dts.map_or(0, |last| last.saturating_add(1));
+        }
+        Ok(())
     }
 
     /// Creates a fragmented MP4 suitable for HTML `<video>` playback while
@@ -288,6 +375,7 @@ impl MatroskaMuxer {
                 input_time_base: time_base,
                 timestamp_origin: None,
                 last_dts: None,
+                segment_offset: 0,
             });
         }
 
@@ -454,8 +542,23 @@ impl MatroskaMuxer {
             stream_map,
             timestamp_policy,
             output_path: output_path.to_path_buf(),
+            duration_limit_ms: None,
+            duration_limit_reached: false,
             finalized: false,
         })
+    }
+
+    /// Applies a hard output timeline cap. Packets that would extend the
+    /// written timeline beyond `limit` are not written and mark the limit as
+    /// reached. Intended for bounded event clips; ordinary recording leaves
+    /// this unset.
+    pub fn set_duration_limit(&mut self, limit: std::time::Duration) {
+        self.duration_limit_ms = u64::try_from(limit.as_millis()).ok();
+        self.duration_limit_reached = false;
+    }
+
+    pub fn duration_limit_reached(&self) -> bool {
+        self.duration_limit_reached
     }
 
     /// Input stream indices that were selected/mapped into the output,
@@ -556,14 +659,48 @@ impl MatroskaMuxer {
                     .then_some((*self.scratch).dts);
                 let pts = ((*self.scratch).pts != sys::NIAN_AV_NOPTS_VALUE)
                     .then_some((*self.scratch).pts);
-                let (dts, pts) = normalize_segment_timestamp_pair(
-                    mapping,
-                    dts,
-                    pts,
-                    self.timestamp_policy == TimestampPolicy::RebaseAndRepair,
-                );
+                let (dts, pts) = if self.timestamp_policy == TimestampPolicy::Concatenate {
+                    normalize_concatenated_timestamp_pair(mapping, dts, pts)
+                } else {
+                    normalize_segment_timestamp_pair(
+                        mapping,
+                        dts,
+                        pts,
+                        self.timestamp_policy == TimestampPolicy::RebaseAndRepair,
+                    )
+                };
                 (*self.scratch).dts = dts.unwrap_or(sys::NIAN_AV_NOPTS_VALUE);
                 (*self.scratch).pts = pts.unwrap_or(sys::NIAN_AV_NOPTS_VALUE);
+            }
+        }
+
+        if let Some(limit_ms) = self.duration_limit_ms {
+            // `av_packet_rescale_ts` above has already converted PTS, DTS and
+            // duration into this output stream's time base. Reject the packet
+            // before muxing if its end would cross the configured hard cap.
+            let packet_end = unsafe {
+                let pts = ((*self.scratch).pts != sys::NIAN_AV_NOPTS_VALUE)
+                    .then_some((*self.scratch).pts);
+                let dts = ((*self.scratch).dts != sys::NIAN_AV_NOPTS_VALUE)
+                    .then_some((*self.scratch).dts);
+                let start = pts.into_iter().chain(dts).max().unwrap_or(0);
+                start.saturating_add((*self.scratch).duration.max(0))
+            };
+            let packet_end_ms = if out_time_base.num > 0 && out_time_base.den > 0 {
+                let scaled = i128::from(packet_end)
+                    .saturating_mul(i128::from(out_time_base.num))
+                    .saturating_mul(1000)
+                    / i128::from(out_time_base.den);
+                u64::try_from(scaled.max(0)).unwrap_or(u64::MAX)
+            } else {
+                u64::MAX
+            };
+            if packet_end_ms > limit_ms {
+                // This private scratch reference has not been handed to the
+                // muxer, so release it explicitly before returning.
+                unsafe { sys::av_packet_unref(self.scratch) };
+                self.duration_limit_reached = true;
+                return Ok(());
             }
         }
 
@@ -684,6 +821,7 @@ mod tests {
             input_time_base: MediaRational::new(1, 90_000).unwrap(),
             timestamp_origin: None,
             last_dts: None,
+            segment_offset: 0,
         }
     }
 

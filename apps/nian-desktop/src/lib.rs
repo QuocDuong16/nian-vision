@@ -6,13 +6,15 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
+mod event_capture;
+
+use event_capture::{EventCaptureDispatcher, event_clips_for_event};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, Weak, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use nian_application::{
@@ -49,9 +51,6 @@ const CREDENTIAL_SERVICE: &str = "Nian Vision";
 const STARTUP_HIDDEN_ARG: &str = "--startup-hidden";
 const NOTIFICATION_HELPER_ARG: &str = "--nian-notification-helper";
 const MAX_NOTIFICATION_HELPER_INPUT_BYTES: u64 = 4_096;
-const MOTION_RECORDING_MAX_CLIP_SECS: u64 = 5 * 60;
-const MOTION_RECORDING_WORKER_POLL: Duration = Duration::from_millis(250);
-const MOTION_RECORDING_POST_ROLL: Duration = Duration::from_secs(5);
 static PENDING_MANUAL_ACTIVATION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -483,8 +482,7 @@ struct DesktopState {
     ptz_controller: PtzController,
     event_controller: EventController,
     notification_dispatcher: NotificationDispatcher,
-    _motion_recording_dispatcher: Mutex<Option<MotionRecordingDispatcher>>,
-    motion_recording_owners: Mutex<HashSet<CameraId>>,
+    _event_capture_dispatcher: Mutex<Option<EventCaptureDispatcher>>,
     notification_settings: Mutex<SettingsStore>,
     lifecycle: DesktopLifecycle,
     power_subscription: Mutex<Option<Box<dyn PowerEventSubscription>>>,
@@ -524,251 +522,6 @@ impl PersistedEventSink for FanoutPersistedEventSink {
         for sink in &self.sinks {
             sink.try_publish(signal.clone());
         }
-    }
-}
-
-struct MotionRecordingSink {
-    sender: mpsc::Sender<PersistedEventSignal>,
-}
-
-impl PersistedEventSink for MotionRecordingSink {
-    fn try_publish(&self, signal: PersistedEventSignal) {
-        // Persisted motion transitions are already normalized and much lower
-        // volume than raw ONVIF notifications. Use an unbounded handoff so a
-        // queue saturation event can never drop the MotionEnded transition
-        // that releases a motion-owned recorder.
-        if self.sender.send(signal).is_err() {
-            tracing::warn!("motion recording dispatcher is unavailable");
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MotionRecordingIntent {
-    motion_active: bool,
-    stop_after: Option<Instant>,
-}
-
-impl MotionRecordingIntent {
-    fn active() -> Self {
-        Self {
-            motion_active: true,
-            stop_after: None,
-        }
-    }
-
-    fn ended(now: Instant) -> Self {
-        Self {
-            motion_active: false,
-            stop_after: Some(now + MOTION_RECORDING_POST_ROLL),
-        }
-    }
-
-    fn should_record(self, now: Instant) -> bool {
-        self.motion_active || self.stop_after.is_some_and(|deadline| now < deadline)
-    }
-}
-
-struct MotionRecordingDispatcher {
-    running: Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-    sink: Arc<MotionRecordingSink>,
-}
-
-impl MotionRecordingDispatcher {
-    fn new(state: Weak<DesktopState>) -> std::io::Result<Self> {
-        let (sender, receiver) = mpsc::channel();
-        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let worker_running = running.clone();
-        let thread = std::thread::Builder::new()
-            .name("motion-recording-dispatcher".to_owned())
-            .spawn(move || {
-                let mut intents = HashMap::<CameraId, MotionRecordingIntent>::new();
-                while worker_running.load(std::sync::atomic::Ordering::Acquire) {
-                    match receiver.recv_timeout(MOTION_RECORDING_WORKER_POLL) {
-                        Ok(signal) => {
-                            if !apply_motion_recording_signal(&mut intents, &signal, Instant::now())
-                            {
-                                tracing::warn!(
-                                    "persisted motion signal carried an invalid camera id"
-                                );
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-
-                    let Some(state) = state.upgrade() else {
-                        break;
-                    };
-                    if let Err(error) = reconcile_motion_recordings(&state, &mut intents) {
-                        tracing::warn!(
-                            code = error.code,
-                            message = %error.message,
-                            "motion-triggered recording reconciliation failed"
-                        );
-                    }
-                }
-            })?;
-        Ok(Self {
-            running,
-            thread: Some(thread),
-            sink: Arc::new(MotionRecordingSink { sender }),
-        })
-    }
-
-    fn sink(&self) -> Arc<dyn PersistedEventSink> {
-        self.sink.clone()
-    }
-}
-
-impl std::fmt::Debug for MotionRecordingDispatcher {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MotionRecordingDispatcher")
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for MotionRecordingDispatcher {
-    fn drop(&mut self) {
-        self.running
-            .store(false, std::sync::atomic::Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn apply_motion_recording_signal(
-    intents: &mut HashMap<CameraId, MotionRecordingIntent>,
-    signal: &PersistedEventSignal,
-    now: Instant,
-) -> bool {
-    let Some(motion_active) = signal.motion_active else {
-        return true;
-    };
-    let Ok(camera_id) = CameraId::parse(&signal.camera_id) else {
-        return false;
-    };
-    let intent = if motion_active {
-        MotionRecordingIntent::active()
-    } else {
-        MotionRecordingIntent::ended(now)
-    };
-    intents.insert(camera_id, intent);
-    true
-}
-
-fn reconcile_motion_recordings(
-    state: &DesktopState,
-    intents: &mut HashMap<CameraId, MotionRecordingIntent>,
-) -> Result<(), DesktopErrorDto> {
-    let _gate = lock(&state.control_gate)?;
-    if require_running(state).is_err() {
-        return Ok(());
-    }
-    let now = Instant::now();
-    let cameras = intents.keys().cloned().collect::<Vec<_>>();
-    for camera_id in cameras {
-        let Some(intent) = intents.get(&camera_id).copied() else {
-            continue;
-        };
-        let should_record = intent.should_record(now);
-        reconcile_motion_recording_camera(state, &camera_id, should_record)?;
-
-        if !intent.motion_active && !should_record {
-            let still_owned = lock(&state.motion_recording_owners)?.contains(&camera_id);
-            if !still_owned {
-                intents.remove(&camera_id);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn reconcile_motion_recording_camera(
-    state: &DesktopState,
-    camera_id: &CameraId,
-    should_record: bool,
-) -> Result<(), DesktopErrorDto> {
-    let mut controller = lock(&state.recording_controller)?;
-    let status = controller.status(camera_id).map_err(map_recording_error)?;
-    let owned = lock(&state.motion_recording_owners)?.contains(camera_id);
-
-    if owned {
-        if should_record {
-            if status.state.is_active() {
-                return Ok(());
-            }
-            // A previous stop completed while aggregate motion became active
-            // again. Release the stale ownership marker and start a fresh slot.
-            lock(&state.motion_recording_owners)?.remove(camera_id);
-            drop(controller);
-            return start_motion_owned_recording(state, camera_id);
-        }
-
-        if status.state.is_active() {
-            if status.state != RecordingState::Stopping {
-                match controller.stop(camera_id) {
-                    Ok(_) => tracing::info!(
-                        camera_id = %camera_id.as_str(),
-                        "motion-triggered recording post-roll completed; stop requested"
-                    ),
-                    Err(RecordingControllerError::NotRecording) => {}
-                    Err(error) => return Err(map_recording_error(error)),
-                }
-            }
-        } else {
-            lock(&state.motion_recording_owners)?.remove(camera_id);
-        }
-        return Ok(());
-    }
-
-    if !should_record || status.state.is_active() {
-        // An active session we do not own is manual/external and must never be
-        // stopped or replaced by motion automation.
-        return Ok(());
-    }
-    drop(controller);
-
-    // Consult persistent Desired only at the point where motion would claim an
-    // idle slot. This keeps the hot active-motion path out of the settings DB.
-    let manual_desired = lock(&state.camera_service)?
-        .recording_enabled_cameras()
-        .map_err(map_desired_state_error)?
-        .iter()
-        .any(|desired| desired == camera_id);
-    if manual_desired {
-        return Ok(());
-    }
-    start_motion_owned_recording(state, camera_id)
-}
-
-fn start_motion_owned_recording(
-    state: &DesktopState,
-    camera_id: &CameraId,
-) -> Result<(), DesktopErrorDto> {
-    let mut desired = lock(&state.camera_service)?
-        .prepare_recording(camera_id.as_str())
-        .map_err(map_camera_error)?;
-    desired.segment_target_secs = desired
-        .segment_target_secs
-        .clamp(1, MOTION_RECORDING_MAX_CLIP_SECS);
-
-    let segment_target_secs = desired.segment_target_secs;
-    let mut controller = lock(&state.recording_controller)?;
-    match controller.start(camera_id.clone(), desired) {
-        Ok(_) => {
-            lock(&state.motion_recording_owners)?.insert(camera_id.clone());
-            tracing::info!(
-                camera_id = %camera_id.as_str(),
-                segment_target_secs,
-                "motion-triggered recording started"
-            );
-            Ok(())
-        }
-        Err(RecordingControllerError::AlreadyRecording) => Ok(()),
-        Err(error) => Err(map_recording_error(error)),
     }
 }
 
@@ -1882,12 +1635,11 @@ fn event_recording_available(playback: &PlaybackController, event: &EventReviewR
     let Ok(camera_id) = CameraId::parse(&event.camera_id) else {
         return false;
     };
-    let Ok(received_time_utc) = parse_event_utc(&event.received_time_utc) else {
+    let Some(storage_root) = playback.configured_storage_root() else {
         return false;
     };
-    playback
-        .event_recording_context(&camera_id, received_time_utc)
-        .map(|context| context.available)
+    event_clips_for_event(storage_root, &camera_id, event.event_id)
+        .map(|clips| !clips.is_empty())
         .unwrap_or(false)
 }
 
@@ -1961,11 +1713,9 @@ async fn event_get(
     .map_err(|_| DesktopErrorDto::new("event_internal", "event lookup task failed"))?
 }
 
-fn event_identity(event: &EventReviewRowDto) -> Result<(CameraId, DateTime<Utc>), DesktopErrorDto> {
-    let camera_id = CameraId::parse(&event.camera_id)
-        .map_err(|_| DesktopErrorDto::new("event_not_found", "event camera is unavailable"))?;
-    let received_time_utc = parse_event_utc(&event.received_time_utc)?;
-    Ok((camera_id, received_time_utc))
+fn event_camera_id(event: &EventReviewRowDto) -> Result<CameraId, DesktopErrorDto> {
+    CameraId::parse(&event.camera_id)
+        .map_err(|_| DesktopErrorDto::new("event_not_found", "event camera is unavailable"))
 }
 
 #[tauri::command]
@@ -1983,10 +1733,22 @@ async fn event_recording_context(
             .ok_or_else(|| {
                 DesktopErrorDto::new("event_not_found", "event is no longer available")
             })?;
-        let (camera_id, received_time_utc) = event_identity(&event)?;
-        lock(&state.playback_controller)?
-            .event_recording_context(&camera_id, received_time_utc)
-            .map_err(map_playback_error)
+        let camera_id = event_camera_id(&event)?;
+        let playback = lock(&state.playback_controller)?;
+        let clips = playback
+            .configured_storage_root()
+            .and_then(|storage_root| {
+                event_clips_for_event(storage_root, &camera_id, event.event_id).ok()
+            })
+            .unwrap_or_default();
+        let clip_count = u32::try_from(clips.len()).unwrap_or(u32::MAX);
+        let available = clip_count > 0;
+        Ok(EventRecordingContextDto {
+            available,
+            camera_id: camera_id.as_str().to_owned(),
+            seek_offset_ms: available.then_some(0),
+            clip_count,
+        })
     })
     .await
     .map_err(|_| DesktopErrorDto::new("event_internal", "event recording lookup task failed"))?
@@ -1996,6 +1758,7 @@ async fn event_recording_context(
 async fn event_playback_open(
     state: tauri::State<'_, Arc<DesktopState>>,
     event_id: u64,
+    clip_index: Option<u32>,
 ) -> Result<Option<EventPlaybackOpenDto>, DesktopErrorDto> {
     admit_running(&state)?;
     let state = state.inner().clone();
@@ -2007,10 +1770,47 @@ async fn event_playback_open(
             .ok_or_else(|| {
                 DesktopErrorDto::new("event_not_found", "event is no longer available")
             })?;
-        let (camera_id, received_time_utc) = event_identity(&event)?;
-        lock(&state.playback_controller)?
-            .open_event_recording(&camera_id, received_time_utc)
-            .map_err(map_playback_error)
+        let camera_id = event_camera_id(&event)?;
+        let mut playback = lock(&state.playback_controller)?;
+        let Some(storage_root) = playback.configured_storage_root().map(PathBuf::from) else {
+            return Ok(None);
+        };
+        let clips =
+            event_clips_for_event(&storage_root, &camera_id, event.event_id).map_err(|_| {
+                DesktopErrorDto::new(
+                    "event_clip_unavailable",
+                    "event clip metadata is unavailable",
+                )
+            })?;
+        if clips.is_empty() {
+            return Ok(None);
+        }
+        let clip_count = u32::try_from(clips.len()).unwrap_or(u32::MAX);
+        let clip_index = clip_index.unwrap_or(0);
+        let Some(clip) = usize::try_from(clip_index)
+            .ok()
+            .and_then(|index| clips.get(index))
+            .cloned()
+        else {
+            return Err(DesktopErrorDto::new(
+                "event_clip_not_found",
+                "event clip part is no longer available",
+            ));
+        };
+        let opened = playback
+            .open_event_clip(
+                &camera_id,
+                event.event_id,
+                &clip.episode_id,
+                clip.started_at_local,
+            )
+            .map_err(map_playback_error)?;
+        Ok(Some(EventPlaybackOpenDto {
+            playback: opened,
+            seek_offset_ms: 0,
+            clip_index,
+            clip_count,
+        }))
     })
     .await
     .map_err(|_| DesktopErrorDto::new("event_internal", "event playback task failed"))?
@@ -2024,26 +1824,6 @@ fn start_recording(
     require_running(state)?;
     let id = CameraId::parse(camera_id)
         .map_err(|error| DesktopErrorDto::new("validation", error.to_string()))?;
-
-    let motion_owned = lock(&state.motion_recording_owners)?.contains(&id);
-    if motion_owned {
-        let status = lock(&state.recording_controller)?
-            .status(&id)
-            .map_err(map_recording_error)?;
-        if status.state.is_active() {
-            lock(&state.camera_service)?
-                .set_recording_enabled(camera_id, true)
-                .map_err(map_desired_state_error)?;
-            lock(&state.motion_recording_owners)?.remove(&id);
-            tracing::info!(
-                camera_id = %id.as_str(),
-                "motion-triggered recording promoted to persistent manual recording"
-            );
-            wake_tray_intent(state);
-            return Ok(status);
-        }
-        lock(&state.motion_recording_owners)?.remove(&id);
-    }
 
     let desired = lock(&state.camera_service)?
         .prepare_recording(camera_id)
@@ -2075,7 +1855,6 @@ fn stop_recording(
     require_running(state)?;
     let id = CameraId::parse(camera_id)
         .map_err(|error| DesktopErrorDto::new("validation", error.to_string()))?;
-    lock(&state.motion_recording_owners)?.remove(&id);
     let desired_on = lock(&state.camera_service)?
         .recording_enabled_cameras()
         .map_err(map_desired_state_error)?
@@ -2118,7 +1897,6 @@ fn stop_all_recordings(state: &DesktopState) -> Result<Vec<RecordingStatus>, Des
     lock(&state.camera_service)?
         .set_all_recording_enabled(false)
         .map_err(map_desired_state_error)?;
-    lock(&state.motion_recording_owners)?.clear();
     wake_tray_intent(state);
     let mut controller = lock(&state.recording_controller)?;
     controller
@@ -4130,7 +3908,7 @@ pub fn run() {
                 LiveViewController::new(worker_program.clone(), app_data.join("live-cache"))
                     .map_err(|_| std::io::Error::other("live-view service could not start"))?;
             let mut playback_controller =
-                PlaybackController::new(worker_program, app_data.join("playback-cache"))
+                PlaybackController::new(worker_program.clone(), app_data.join("playback-cache"))
                     .map_err(|_| std::io::Error::other("playback service could not start"))?;
             let (storage_root, retention, quota) = playback_storage_config(&initial_settings)
                 .map_err(|error| std::io::Error::other(error.message))?;
@@ -4157,8 +3935,7 @@ pub fn run() {
                 ptz_controller,
                 event_controller,
                 notification_dispatcher,
-                _motion_recording_dispatcher: Mutex::new(None),
-                motion_recording_owners: Mutex::new(HashSet::new()),
+                _event_capture_dispatcher: Mutex::new(None),
                 notification_settings: Mutex::new(notification_settings),
                 lifecycle: DesktopLifecycle::new(),
                 power_subscription: Mutex::new(None),
@@ -4172,20 +3949,20 @@ pub fn run() {
                 control_gate: Mutex::new(()),
                 settings_update_gate: Mutex::new(()),
             });
-            let motion_recording_dispatcher =
-                MotionRecordingDispatcher::new(Arc::downgrade(&state)).map_err(|_| {
-                    std::io::Error::other("motion recording dispatcher could not start")
-                })?;
+            let event_capture_dispatcher =
+                EventCaptureDispatcher::new(Arc::downgrade(&state), worker_program).map_err(
+                    |_| std::io::Error::other("event capture dispatcher could not start"),
+                )?;
             state
                 .event_controller
                 .set_persisted_event_sink(Arc::new(FanoutPersistedEventSink::new(vec![
                     state.notification_dispatcher.sink(),
-                    motion_recording_dispatcher.sink(),
+                    event_capture_dispatcher.sink(),
                 ])))
                 .map_err(|_| std::io::Error::other("event sinks could not attach"))?;
-            *state._motion_recording_dispatcher.lock().map_err(|_| {
-                std::io::Error::other("motion recording dispatcher state is unavailable")
-            })? = Some(motion_recording_dispatcher);
+            *state._event_capture_dispatcher.lock().map_err(|_| {
+                std::io::Error::other("event capture dispatcher state is unavailable")
+            })? = Some(event_capture_dispatcher);
             app.manage(state.clone());
 
             // Subscribe before restoration so Windows cannot lose early power
@@ -5195,8 +4972,7 @@ mod tests {
                 ptz_controller,
                 event_controller,
                 notification_dispatcher,
-                _motion_recording_dispatcher: Mutex::new(None),
-                motion_recording_owners: Mutex::new(HashSet::new()),
+                _event_capture_dispatcher: Mutex::new(None),
                 notification_settings: Mutex::new(notification_settings),
                 lifecycle: DesktopLifecycle::new(),
                 power_subscription: Mutex::new(None),
@@ -5224,316 +5000,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("recording runner did not reach expected start count");
-    }
-
-    fn motion_recording_signal(
-        event_id: u64,
-        kind: EventHistoryKind,
-        motion_active: Option<bool>,
-    ) -> PersistedEventSignal {
-        PersistedEventSignal {
-            event_id,
-            camera_id: "front-door".to_owned(),
-            camera_display_name: "Front door".to_owned(),
-            kind,
-            motion_active,
-            received_time_utc: Utc::now(),
-        }
-    }
-
-    fn wait_for_recording_stopped(state: &DesktopState, camera_id: &CameraId) {
-        for _ in 0..200 {
-            let status = state
-                .recording_controller
-                .lock()
-                .unwrap()
-                .status(camera_id)
-                .unwrap();
-            if status.state == RecordingState::Stopped {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        panic!("motion-owned recording did not stop within the test bound");
-    }
-
-    #[test]
-    fn motion_recording_episode_is_transient_capped_and_stops_after_post_roll() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("recordings");
-        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
-        {
-            let mut repository = repository.lock().unwrap();
-            repository.settings.segment_target_secs = 900;
-            repository.desired_camera = None;
-        }
-        let camera_id = CameraId::parse("front-door").unwrap();
-        let mut intents = HashMap::new();
-
-        assert!(apply_motion_recording_signal(
-            &mut intents,
-            &motion_recording_signal(1, EventHistoryKind::MotionStarted, Some(true)),
-            Instant::now(),
-        ));
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-        wait_for_starts(&runner.starts, 1);
-
-        assert_eq!(runner.segment_targets.lock().unwrap().as_slice(), &[300]);
-        assert!(
-            state
-                .motion_recording_owners
-                .lock()
-                .unwrap()
-                .contains(&camera_id)
-        );
-        assert!(
-            state
-                .camera_service
-                .lock()
-                .unwrap()
-                .recording_enabled_cameras()
-                .unwrap()
-                .is_empty(),
-            "motion recording must not persist the continuous/manual desired flag"
-        );
-
-        // One detector can end while another detector still reports motion.
-        assert!(apply_motion_recording_signal(
-            &mut intents,
-            &motion_recording_signal(2, EventHistoryKind::MotionEnded, Some(true)),
-            Instant::now(),
-        ));
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-        assert_eq!(runner.starts.load(Ordering::SeqCst), 1);
-        assert!(
-            state
-                .recording_controller
-                .lock()
-                .unwrap()
-                .status(&camera_id)
-                .unwrap()
-                .state
-                .is_active()
-        );
-
-        // Aggregate idle enters post-roll instead of cutting the clip immediately.
-        assert!(apply_motion_recording_signal(
-            &mut intents,
-            &motion_recording_signal(3, EventHistoryKind::MotionEnded, Some(false)),
-            Instant::now(),
-        ));
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-        assert!(
-            state
-                .recording_controller
-                .lock()
-                .unwrap()
-                .status(&camera_id)
-                .unwrap()
-                .state
-                .is_active()
-        );
-
-        intents.get_mut(&camera_id).unwrap().stop_after =
-            Some(Instant::now() - Duration::from_millis(1));
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-        wait_for_recording_stopped(&state, &camera_id);
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-        assert!(
-            !state
-                .motion_recording_owners
-                .lock()
-                .unwrap()
-                .contains(&camera_id)
-        );
-        assert!(!intents.contains_key(&camera_id));
-    }
-
-    #[test]
-    fn motion_reactivation_during_stopping_restarts_after_old_slot_reaps() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("recordings");
-        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
-        repository.lock().unwrap().desired_camera = None;
-        let camera_id = CameraId::parse("front-door").unwrap();
-        let mut intents = HashMap::new();
-
-        assert!(apply_motion_recording_signal(
-            &mut intents,
-            &motion_recording_signal(20, EventHistoryKind::MotionStarted, Some(true)),
-            Instant::now(),
-        ));
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-        wait_for_starts(&runner.starts, 1);
-
-        assert!(apply_motion_recording_signal(
-            &mut intents,
-            &motion_recording_signal(21, EventHistoryKind::MotionEnded, Some(false)),
-            Instant::now(),
-        ));
-        intents.get_mut(&camera_id).unwrap().stop_after =
-            Some(Instant::now() - Duration::from_millis(1));
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-        assert_eq!(
-            state
-                .recording_controller
-                .lock()
-                .unwrap()
-                .status(&camera_id)
-                .unwrap()
-                .state,
-            RecordingState::Stopping
-        );
-
-        assert!(apply_motion_recording_signal(
-            &mut intents,
-            &motion_recording_signal(22, EventHistoryKind::MotionStarted, Some(true)),
-            Instant::now(),
-        ));
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-        wait_for_recording_stopped(&state, &camera_id);
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-        wait_for_starts(&runner.starts, 2);
-        assert!(
-            state
-                .recording_controller
-                .lock()
-                .unwrap()
-                .status(&camera_id)
-                .unwrap()
-                .state
-                .is_active()
-        );
-
-        state
-            .recording_controller
-            .lock()
-            .unwrap()
-            .shutdown_all()
-            .unwrap();
-    }
-
-    #[test]
-    fn motion_reactivation_during_post_roll_cancels_pending_stop() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("recordings");
-        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
-        repository.lock().unwrap().desired_camera = None;
-        let camera_id = CameraId::parse("front-door").unwrap();
-        let mut intents = HashMap::new();
-
-        assert!(apply_motion_recording_signal(
-            &mut intents,
-            &motion_recording_signal(30, EventHistoryKind::MotionStarted, Some(true)),
-            Instant::now(),
-        ));
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-        wait_for_starts(&runner.starts, 1);
-
-        assert!(apply_motion_recording_signal(
-            &mut intents,
-            &motion_recording_signal(31, EventHistoryKind::MotionEnded, Some(false)),
-            Instant::now(),
-        ));
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-        assert!(intents[&camera_id].stop_after.is_some());
-
-        assert!(apply_motion_recording_signal(
-            &mut intents,
-            &motion_recording_signal(32, EventHistoryKind::MotionStarted, Some(true)),
-            Instant::now(),
-        ));
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-        assert!(intents[&camera_id].motion_active);
-        assert!(intents[&camera_id].stop_after.is_none());
-        assert_eq!(runner.starts.load(Ordering::SeqCst), 1);
-
-        state
-            .recording_controller
-            .lock()
-            .unwrap()
-            .shutdown_all()
-            .unwrap();
-    }
-
-    #[test]
-    fn persistent_manual_desired_prevents_motion_from_claiming_an_idle_slot() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("recordings");
-        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
-        let camera_id = CameraId::parse("front-door").unwrap();
-        repository.lock().unwrap().desired_camera = Some(camera_id.as_str().to_owned());
-        let mut intents = HashMap::new();
-
-        assert!(apply_motion_recording_signal(
-            &mut intents,
-            &motion_recording_signal(40, EventHistoryKind::MotionStarted, Some(true)),
-            Instant::now(),
-        ));
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-
-        assert_eq!(runner.starts.load(Ordering::SeqCst), 0);
-        assert!(state.motion_recording_owners.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn manual_start_promotes_motion_owned_recording_without_restart_or_motion_stop() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("recordings");
-        let (state, repository, runner, _probe) = lifecycle_state(&root, true);
-        repository.lock().unwrap().desired_camera = None;
-        let camera_id = CameraId::parse("front-door").unwrap();
-        let mut intents = HashMap::new();
-
-        assert!(apply_motion_recording_signal(
-            &mut intents,
-            &motion_recording_signal(10, EventHistoryKind::MotionStarted, Some(true)),
-            Instant::now(),
-        ));
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-        wait_for_starts(&runner.starts, 1);
-        let promoted = start_recording(&state, "front-door").unwrap();
-        assert!(promoted.state.is_active());
-        assert_eq!(runner.starts.load(Ordering::SeqCst), 1);
-        assert!(
-            !state
-                .motion_recording_owners
-                .lock()
-                .unwrap()
-                .contains(&camera_id)
-        );
-        assert_eq!(
-            state
-                .camera_service
-                .lock()
-                .unwrap()
-                .recording_enabled_cameras()
-                .unwrap(),
-            vec![camera_id.clone()]
-        );
-
-        assert!(apply_motion_recording_signal(
-            &mut intents,
-            &motion_recording_signal(11, EventHistoryKind::MotionEnded, Some(false)),
-            Instant::now(),
-        ));
-        intents.get_mut(&camera_id).unwrap().stop_after =
-            Some(Instant::now() - Duration::from_millis(1));
-        reconcile_motion_recordings(&state, &mut intents).unwrap();
-        assert!(
-            state
-                .recording_controller
-                .lock()
-                .unwrap()
-                .status(&camera_id)
-                .unwrap()
-                .state
-                .is_active(),
-            "MotionEnded must not stop a session promoted to manual ownership"
-        );
-
-        stop_recording(&state, "front-door").unwrap();
-        wait_for_recording_stopped(&state, &camera_id);
     }
 
     fn input(username: &str, password: &str) -> CameraCommandInput {

@@ -818,6 +818,13 @@ fn build_http_client(timeout: Duration) -> Result<Client, OnvifError> {
     Client::builder()
         .no_proxy()
         .timeout(timeout)
+        // Some embedded ONVIF stacks close an HTTP/1.1 connection after a
+        // response without reliably making that socket safe to reuse. A
+        // pooled stale socket makes the next PTZ command fail at the
+        // transport layer even though pairing just succeeded. ONVIF control
+        // traffic is tiny compared with RTSP media, so prefer a fresh
+        // connection over a stale pooled one.
+        .pool_max_idle_per_host(0)
         .redirect(Policy::none())
         .build()
         .map_err(|_| OnvifError::Internal)
@@ -1993,6 +2000,60 @@ mod tests {
         assert!(requests[0].contains("PT1.000S"));
         assert!(requests[1].contains("<tptz:PanTilt>true</tptz:PanTilt>"));
         assert!(requests[1].contains("<tptz:Zoom>false</tptz:Zoom>"));
+    }
+
+    #[test]
+    fn ptz_commands_do_not_reuse_stale_embedded_http_connections() {
+        use crate::PtzVelocityRange;
+        use std::io::Write as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                // Deliberately claim keep-alive and then drop the socket. Some
+                // embedded camera HTTP stacks behave exactly like this. The
+                // next ONVIF command must establish a fresh connection rather
+                // than inherit a dead pooled transport.
+                let body = "<Envelope/>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        let unit = PtzVelocityRange {
+            min: -1.0,
+            max: 1.0,
+        };
+        let control = PtzControl {
+            service: format!("http://{address}/ptz"),
+            profile_token: "main".to_owned(),
+            pan: Some(unit),
+            tilt: Some(unit),
+            zoom: None,
+        };
+        let client = OnvifClient::with_timeout(Duration::from_secs(1)).unwrap();
+        let credentials = OnvifCredentials {
+            username: "admin".into(),
+            password: "secret".into(),
+        };
+
+        client
+            .continuous_move(&control, &credentials, Some((0.5, 0.0)), None)
+            .unwrap();
+        client.stop(&control, &credentials, true, false).unwrap();
+
+        let requests = server.join().unwrap();
+        assert!(requests[0].contains("ContinuousMove"));
+        assert!(requests[1].contains("<tptz:Stop>"));
     }
 
     #[test]

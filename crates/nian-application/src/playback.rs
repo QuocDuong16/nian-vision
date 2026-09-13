@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local, NaiveDateTime, Utc};
+use chrono::NaiveDateTime;
 use nian_domain::{CameraId, RetentionPolicy, StorageQuota};
 use nian_index::{IndexedRecording, RecordingKind};
 use nian_ipc::message::{Envelope, PROTOCOL_VERSION, event, method};
@@ -37,7 +37,6 @@ const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const CACHE_INSTANCE_PREFIX: &str = "instance-";
 const CACHE_INSTANCE_LOCK: &str = ".nian-playback-instance.lock";
 const CACHE_COORDINATION_LOCK: &str = ".nian-playback-cache.lock";
-pub const EVENT_PLAYBACK_PREROLL_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -157,18 +156,15 @@ pub struct EventRecordingContextDto {
     pub available: bool,
     pub camera_id: String,
     pub seek_offset_ms: Option<u64>,
+    pub clip_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EventPlaybackOpenDto {
     pub playback: PlaybackOpenDto,
     pub seek_offset_ms: u64,
-}
-
-#[derive(Debug, Clone)]
-struct EventRecordingMatch {
-    recording: IndexedRecording,
-    seek_offset_ms: u64,
+    pub clip_index: u32,
+    pub clip_count: u32,
 }
 
 pub trait PlaybackBackend: Send + Sync {
@@ -334,13 +330,25 @@ impl Drop for PlaybackCacheDir {
     }
 }
 
+enum PlaybackSourceGuard {
+    Indexed {
+        layout: RecordingsLayout,
+        indexed: IndexedRecording,
+        _pin: PlaybackPin,
+    },
+    EventClip {
+        camera_id: CameraId,
+        episode_id: String,
+        expected_size: u64,
+        expected_modified: Option<std::time::SystemTime>,
+    },
+}
+
 struct PlaybackSession {
-    layout: RecordingsLayout,
-    indexed: IndexedRecording,
+    source_guard: PlaybackSourceGuard,
     _cache_instance_lease: Arc<File>,
     source_path: PathBuf,
     _source_handle: File,
-    _pin: PlaybackPin,
     media_path: PathBuf,
     temp_dir: PathBuf,
     last_activity: Instant,
@@ -497,78 +505,6 @@ impl PlaybackController {
             .map_err(|_| PlaybackError::Internal)
     }
 
-    pub fn event_recording_context(
-        &self,
-        camera_id: &CameraId,
-        received_time_utc: DateTime<Utc>,
-    ) -> Result<EventRecordingContextDto, PlaybackError> {
-        let matched = self.event_recording_match(camera_id, received_time_utc)?;
-        Ok(EventRecordingContextDto {
-            available: matched.is_some(),
-            camera_id: camera_id.as_str().to_owned(),
-            seek_offset_ms: matched.as_ref().map(|value| value.seek_offset_ms),
-        })
-    }
-
-    pub fn open_event_recording(
-        &mut self,
-        camera_id: &CameraId,
-        received_time_utc: DateTime<Utc>,
-    ) -> Result<Option<EventPlaybackOpenDto>, PlaybackError> {
-        let Some(matched) = self.event_recording_match(camera_id, received_time_utc)? else {
-            return Ok(None);
-        };
-        let playback = self.open(&matched.recording.relative_path)?;
-        Ok(Some(EventPlaybackOpenDto {
-            playback,
-            seek_offset_ms: matched.seek_offset_ms,
-        }))
-    }
-
-    fn event_recording_match(
-        &self,
-        camera_id: &CameraId,
-        received_time_utc: DateTime<Utc>,
-    ) -> Result<Option<EventRecordingMatch>, PlaybackError> {
-        let local_time = received_time_utc.with_timezone(&Local).naive_local();
-        let Some(storage) = self.storage.as_ref() else {
-            return Ok(None);
-        };
-        let recording = storage
-            .find_recording_at(camera_id, local_time)
-            .map_err(|_| PlaybackError::Internal)?;
-        let recording = if let Some(recording) = recording {
-            recording
-        } else {
-            // Motion-triggered recording starts only after the normalized event
-            // is committed. Allow a small forward-start grace so the event that
-            // caused a recording can still resolve to that newly finalized clip.
-            let grace_ms =
-                i64::try_from(EVENT_PLAYBACK_PREROLL_MS).map_err(|_| PlaybackError::Internal)?;
-            let grace_end = local_time
-                .checked_add_signed(chrono::Duration::milliseconds(grace_ms))
-                .ok_or(PlaybackError::Internal)?;
-            let Some(recording) = storage
-                .query_time_range(camera_id, local_time, grace_end)
-                .map_err(|_| PlaybackError::Internal)?
-                .into_iter()
-                .find(|recording| recording.media_duration_ms.is_some())
-            else {
-                return Ok(None);
-            };
-            recording
-        };
-        let seek_offset_ms = if local_time < recording.started_at {
-            0
-        } else {
-            event_seek_offset_ms(recording.started_at, local_time)?
-        };
-        Ok(Some(EventRecordingMatch {
-            recording,
-            seek_offset_ms,
-        }))
-    }
-
     pub fn adjacent(&self, recording_id: &str) -> Result<AdjacentRecordingsDto, PlaybackError> {
         let storage = self
             .storage
@@ -671,12 +607,14 @@ impl PlaybackController {
         };
         let layout = storage.layout().clone();
         let session = PlaybackSession {
-            layout,
-            indexed: indexed.clone(),
+            source_guard: PlaybackSourceGuard::Indexed {
+                layout,
+                indexed: indexed.clone(),
+                _pin: pin,
+            },
             _cache_instance_lease: self.cache_instance.lease(),
             source_path: validated.path,
             _source_handle: source_handle,
-            _pin: pin,
             media_path,
             temp_dir: temp_dir.into_session_path(),
             last_activity: Instant::now(),
@@ -695,6 +633,112 @@ impl PlaybackController {
             recording: recording_dto(&indexed),
             inspect,
             adjacent,
+        })
+    }
+
+    pub fn open_event_clip(
+        &mut self,
+        camera_id: &CameraId,
+        event_id: u64,
+        episode_id: &str,
+        started_at: NaiveDateTime,
+    ) -> Result<PlaybackOpenDto, PlaybackError> {
+        if !self.accepting {
+            return Err(PlaybackError::LifecycleBlocked);
+        }
+        if event_id == 0 || Uuid::parse_str(episode_id).is_err() {
+            return Err(PlaybackError::RecordingNotFound);
+        }
+        self.expire_sessions();
+        if self.active_session_count() >= MAX_PLAYBACK_SESSIONS {
+            return Err(PlaybackError::PlaybackBusy);
+        }
+
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or(PlaybackError::StorageUnavailable)?;
+        let clip_dir = storage
+            .layout()
+            .root()
+            .join(".nian")
+            .join("event-clips")
+            .join(camera_id.as_str())
+            .join(episode_id);
+        validate_real_directory_chain(storage.layout().root(), &clip_dir)?;
+        let source_path = clip_dir.join("clip.mkv");
+        let source_metadata = event_clip_metadata(&source_path)?;
+        let source_handle = File::open(&source_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                PlaybackError::RecordingMissing
+            } else {
+                PlaybackError::RecordingStale
+            }
+        })?;
+
+        let token = Uuid::new_v4().to_string();
+        let temp_dir =
+            PlaybackCacheDir::create(self.cache_instance.path().join(format!("session-{token}")))?;
+        let media_path = temp_dir.path().join("media.mp4");
+        let inspect = self.backend.prepare(&source_path, &media_path)?;
+        if event_clip_metadata(&source_path)? != source_metadata {
+            return Err(PlaybackError::RecordingStale);
+        }
+        let media_metadata =
+            std::fs::symlink_metadata(&media_path).map_err(|_| PlaybackError::MediaUnreadable)?;
+        if !media_metadata.is_file() || media_metadata.file_type().is_symlink() {
+            return Err(PlaybackError::MediaUnreadable);
+        }
+
+        let end_at = inspect.duration_ms.and_then(|duration_ms| {
+            i64::try_from(duration_ms)
+                .ok()
+                .and_then(|duration_ms| {
+                    started_at.checked_add_signed(chrono::TimeDelta::milliseconds(duration_ms))
+                })
+                .map(format_wall_time)
+        });
+        let recording = RecordingDto {
+            recording_id: format!("event:{event_id}:{episode_id}"),
+            camera_id: camera_id.as_str().to_owned(),
+            kind: TimelineRecordingKind::Normal,
+            started_at: format_wall_time(started_at),
+            sequence: 1,
+            size_bytes: source_metadata.0,
+            media_duration_ms: inspect.duration_ms,
+            end_at,
+        };
+        let session = PlaybackSession {
+            source_guard: PlaybackSourceGuard::EventClip {
+                camera_id: camera_id.clone(),
+                episode_id: episode_id.to_owned(),
+                expected_size: source_metadata.0,
+                expected_modified: source_metadata.1,
+            },
+            _cache_instance_lease: self.cache_instance.lease(),
+            source_path,
+            _source_handle: source_handle,
+            media_path,
+            temp_dir: temp_dir.into_session_path(),
+            last_activity: Instant::now(),
+            active_requests: 0,
+            close_requested: false,
+        };
+        self.runtime
+            .lock()
+            .map_err(|_| PlaybackError::Internal)?
+            .sessions
+            .insert(token.clone(), session);
+
+        Ok(PlaybackOpenDto {
+            session_id: token.clone(),
+            url: format!("http://127.0.0.1:{}/playback/{token}", self.server.port),
+            recording,
+            inspect,
+            adjacent: AdjacentRecordingsDto {
+                previous: None,
+                next: None,
+            },
         })
     }
 
@@ -723,6 +767,24 @@ impl PlaybackController {
         }
         session.last_activity = Instant::now();
         Ok(())
+    }
+
+    pub fn event_clip_in_use(&self, camera_id: &CameraId, episode_id: &str) -> bool {
+        self.runtime
+            .lock()
+            .map(|runtime| {
+                runtime.sessions.values().any(|session| {
+                    matches!(
+                        &session.source_guard,
+                        PlaybackSourceGuard::EventClip {
+                            camera_id: active_camera,
+                            episode_id: active_episode,
+                            ..
+                        } if active_camera == camera_id && active_episode == episode_id
+                    )
+                })
+            })
+            .unwrap_or(true)
     }
 
     pub fn session_active(&mut self, session_id: &str) -> Result<bool, PlaybackError> {
@@ -790,17 +852,6 @@ impl Drop for PlaybackController {
     }
 }
 
-fn event_seek_offset_ms(
-    recording_started_at: NaiveDateTime,
-    event_at: NaiveDateTime,
-) -> Result<u64, PlaybackError> {
-    let offset_ms = event_at
-        .signed_duration_since(recording_started_at)
-        .num_milliseconds();
-    let offset_ms = u64::try_from(offset_ms).map_err(|_| PlaybackError::Internal)?;
-    Ok(offset_ms.saturating_sub(EVENT_PLAYBACK_PREROLL_MS))
-}
-
 fn recording_dto(recording: &IndexedRecording) -> RecordingDto {
     let end_at = recording.media_duration_ms.and_then(|duration_ms| {
         let millis = i64::try_from(duration_ms).ok()?;
@@ -836,6 +887,44 @@ fn map_lookup_error(error: &RecordingLookupError) -> PlaybackError {
         RecordingLookupError::NotFinalized => PlaybackError::RecordingNotFinalized,
         RecordingLookupError::Index(_) => PlaybackError::Internal,
     }
+}
+
+fn validate_real_directory_chain(root: &Path, directory: &Path) -> Result<(), PlaybackError> {
+    let relative = directory
+        .strip_prefix(root)
+        .map_err(|_| PlaybackError::RecordingStale)?;
+    let root_metadata =
+        std::fs::symlink_metadata(root).map_err(|_| PlaybackError::RecordingMissing)?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return Err(PlaybackError::RecordingStale);
+    }
+    let mut cursor = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(PlaybackError::RecordingStale);
+        };
+        cursor.push(component);
+        let metadata =
+            std::fs::symlink_metadata(&cursor).map_err(|_| PlaybackError::RecordingMissing)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(PlaybackError::RecordingStale);
+        }
+    }
+    Ok(())
+}
+
+fn event_clip_metadata(path: &Path) -> Result<(u64, Option<std::time::SystemTime>), PlaybackError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            PlaybackError::RecordingMissing
+        } else {
+            PlaybackError::RecordingStale
+        }
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(PlaybackError::RecordingStale);
+    }
+    Ok((metadata.len(), metadata.modified().ok()))
 }
 
 fn revalidate(validated: &ValidatedRecording) -> Result<(), PlaybackError> {
@@ -983,6 +1072,29 @@ fn reject_busy(mut stream: TcpStream) -> std::io::Result<()> {
     )
 }
 
+fn playback_source_is_stale(session: &PlaybackSession) -> bool {
+    match &session.source_guard {
+        PlaybackSourceGuard::Indexed {
+            layout, indexed, ..
+        } => match validate_indexed_playback_path(layout, indexed) {
+            Ok(path) => path != session.source_path,
+            Err(_) => true,
+        },
+        PlaybackSourceGuard::EventClip {
+            expected_size,
+            expected_modified,
+            ..
+        } => !matches!(
+            std::fs::symlink_metadata(&session.source_path),
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() == *expected_size
+                    && metadata.modified().ok() == *expected_modified
+        ),
+    }
+}
+
 fn serve_request(
     mut stream: TcpStream,
     port: u16,
@@ -1018,10 +1130,7 @@ fn serve_request(
         if session.close_requested {
             return write_empty(&mut stream, "410 Gone");
         }
-        let stale = match validate_indexed_playback_path(&session.layout, &session.indexed) {
-            Ok(path) => path != session.source_path,
-            Err(_) => true,
-        };
+        let stale = playback_source_is_stale(session);
         if stale {
             let remove_now = session.active_requests == 0;
             if !remove_now {
@@ -1245,11 +1354,13 @@ impl Drop for WorkerGuard {
     }
 }
 
-fn run_worker_prepare(
+fn run_worker_rpc(
     program: &str,
-    source_path: &Path,
-    output_path: &Path,
-) -> Result<PlaybackInspectDto, PlaybackError> {
+    method_name: &str,
+    params: serde_json::Value,
+    timeout: Duration,
+    reader_name: &str,
+) -> Result<serde_json::Value, PlaybackError> {
     let mut command = Command::new(program);
     command
         .arg("run")
@@ -1276,7 +1387,7 @@ fn run_worker_prepare(
         .ok_or(PlaybackError::WorkerUnavailable)?;
     let (tx, rx) = mpsc::channel();
     let reader = std::thread::Builder::new()
-        .name("playback-worker-stdout".to_owned())
+        .name(reader_name.to_owned())
         .spawn(move || {
             let mut reader = FramedReader::new(BufReader::new(stdout));
             loop {
@@ -1321,12 +1432,8 @@ fn run_worker_prepare(
     let request = Envelope::Request {
         v: PROTOCOL_VERSION,
         id: 1,
-        method: "playback.prepare".to_owned(),
-        params: serde_json::json!({
-            "source_path": source_path.to_string_lossy(),
-            "output_path": output_path.to_string_lossy(),
-            "timeout_ms": WORKER_PREPARE_TIMEOUT.as_millis() as u64,
-        }),
+        method: method_name.to_owned(),
+        params,
     };
     FramedWriter::new(
         worker
@@ -1337,7 +1444,7 @@ fn run_worker_prepare(
     .send(&request)
     .map_err(|_| PlaybackError::WorkerUnavailable)?;
 
-    let deadline = Instant::now() + WORKER_PREPARE_TIMEOUT + Duration::from_secs(2);
+    let deadline = Instant::now() + timeout + Duration::from_secs(2);
     let result = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(remaining) {
@@ -1347,9 +1454,7 @@ fn run_worker_prepare(
                 ok: true,
                 result,
                 ..
-            })) if v == PROTOCOL_VERSION => {
-                break serde_json::from_value(result).map_err(|_| PlaybackError::Internal);
-            }
+            })) if v == PROTOCOL_VERSION => break Ok(result),
             Ok(WorkerMessage::Frame(Envelope::Response {
                 v,
                 id: 1,
@@ -1365,14 +1470,64 @@ fn run_worker_prepare(
             Ok(WorkerMessage::Eof | WorkerMessage::Error) => {
                 break Err(PlaybackError::WorkerUnavailable);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => break Err(PlaybackError::WorkerUnavailable),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
                 break Err(PlaybackError::WorkerUnavailable);
             }
         }
     };
     worker.cleanup();
     result
+}
+
+fn run_worker_prepare(
+    program: &str,
+    source_path: &Path,
+    output_path: &Path,
+) -> Result<PlaybackInspectDto, PlaybackError> {
+    let result = run_worker_rpc(
+        program,
+        "playback.prepare",
+        serde_json::json!({
+            "source_path": source_path.to_string_lossy(),
+            "output_path": output_path.to_string_lossy(),
+            "timeout_ms": WORKER_PREPARE_TIMEOUT.as_millis() as u64,
+        }),
+        WORKER_PREPARE_TIMEOUT,
+        "playback-worker-stdout",
+    )?;
+    serde_json::from_value(result).map_err(|_| PlaybackError::Internal)
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerEventClipComposer {
+    worker_program: String,
+}
+
+impl WorkerEventClipComposer {
+    pub fn new(worker_program: String) -> Self {
+        Self { worker_program }
+    }
+
+    pub fn compose(&self, sources: &[PathBuf], output: &Path) -> Result<(), PlaybackError> {
+        const COMPOSE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+        let source_paths = sources
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        run_worker_rpc(
+            &self.worker_program,
+            "event_clip.compose",
+            serde_json::json!({
+                "source_paths": source_paths,
+                "output_path": output.to_string_lossy(),
+                "timeout_ms": COMPOSE_TIMEOUT.as_millis() as u64,
+                "max_duration_ms": 300_000_u64,
+            }),
+            COMPOSE_TIMEOUT,
+            "event-clip-worker-stdout",
+        )?;
+        Ok(())
+    }
 }
 
 fn map_worker_error(code: &str) -> PlaybackError {
@@ -1388,7 +1543,6 @@ fn map_worker_error(code: &str) -> PlaybackError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Timelike;
 
     #[derive(Debug)]
     struct FakeBackend {
@@ -1437,38 +1591,6 @@ mod tests {
     const CACHE_CHILD_ENV: &str = "NIAN_PLAYBACK_CACHE_TEST_CHILD";
     const CACHE_ROOT_ENV: &str = "NIAN_PLAYBACK_CACHE_TEST_ROOT";
     const RECORDING_ROOT_ENV: &str = "NIAN_PLAYBACK_CACHE_TEST_RECORDINGS";
-
-    #[test]
-    fn event_playback_preroll_is_five_seconds_and_clamped_to_segment_start() {
-        let start =
-            NaiveDateTime::parse_from_str("2026-08-29T10:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let event =
-            NaiveDateTime::parse_from_str("2026-08-29T10:02:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        assert_eq!(event_seek_offset_ms(start, event).unwrap(), 115_000);
-        assert_eq!(
-            event_seek_offset_ms(start, start + chrono::Duration::seconds(3)).unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn event_recording_context_matches_motion_clip_that_starts_just_after_trigger() {
-        let event_local = Local::now().with_nanosecond(0).unwrap();
-        let event_utc = event_local.with_timezone(&Utc);
-        let recording_start = event_local.naive_local() + chrono::Duration::seconds(1);
-        let relative = format!(
-            "front-door/{}.mkv",
-            recording_start.format("%Y/%m/%d/%H-%M-%S")
-        );
-        let (_temp, mut controller) = controller_with_files(&[(&relative, b"motion-recording")]);
-        controller.open(&relative).unwrap();
-
-        let context = controller
-            .event_recording_context(&CameraId::parse("front-door").unwrap(), event_utc)
-            .unwrap();
-        assert!(context.available);
-        assert_eq!(context.seek_offset_ms, Some(0));
-    }
 
     #[test]
     #[ignore = "spawned explicitly by live_cache_instance_is_not_cleaned_by_another_process"]
@@ -1538,6 +1660,24 @@ mod tests {
             .unwrap();
         let headers = std::str::from_utf8(&response[..boundary]).unwrap();
         (headers, &response[boundary + 4..])
+    }
+
+    #[test]
+    fn event_clip_session_pins_episode_identity_until_close() {
+        let episode_id = Uuid::new_v4().to_string();
+        let relative = format!(".nian/event-clips/front-door/{episode_id}/clip.mkv");
+        let (_temp, mut controller) = controller_with_files(&[(&relative, b"event-clip")]);
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let started_at =
+            NaiveDateTime::parse_from_str("2026-09-13T06:30:00.000", "%Y-%m-%dT%H:%M:%S%.3f")
+                .unwrap();
+
+        let opened = controller
+            .open_event_clip(&camera_id, 7, &episode_id, started_at)
+            .unwrap();
+        assert!(controller.event_clip_in_use(&camera_id, &episode_id));
+        controller.close(&opened.session_id).unwrap();
+        assert!(!controller.event_clip_in_use(&camera_id, &episode_id));
     }
 
     #[test]

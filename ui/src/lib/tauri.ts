@@ -169,6 +169,7 @@ export interface EventRecordingContext {
   available: boolean;
   camera_id: string;
   seek_offset_ms: number | null;
+  clip_count: number;
 }
 
 export interface EventMutation<T> {
@@ -290,6 +291,8 @@ export interface PlaybackOpenDto {
 export interface EventPlaybackOpenDto {
   playback: PlaybackOpenDto;
   seek_offset_ms: number;
+  clip_index: number;
+  clip_count: number;
 }
 
 export interface NotificationSettings {

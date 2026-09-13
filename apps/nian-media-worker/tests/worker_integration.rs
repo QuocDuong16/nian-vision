@@ -315,6 +315,157 @@ fn ipc_playback_prepare_packet_copies_h264_mkv_to_browser_mp4() {
 }
 
 #[test]
+fn ipc_event_clip_compose_packet_copies_multiple_segments_into_playable_clip() {
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/nian-media-ffmpeg/tests/fixtures/playback_h264.mkv");
+    let temp = tempfile::tempdir().unwrap();
+    let clip = temp.path().join("event-clip.mkv");
+    let playback = temp.path().join("event-playback.mp4");
+
+    let mut child = spawn_run();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut stdin = child.stdin.take().unwrap();
+    let _hello = read_message(&mut reader);
+
+    stdin
+        .write_all(
+            request_with_params(
+                1,
+                "event_clip.compose",
+                serde_json::json!({
+                    "source_paths": [fixture.clone(), fixture],
+                    "output_path": clip,
+                    "timeout_ms": 30_000,
+                }),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let Envelope::Response {
+        id, ok, error_code, ..
+    } = read_message(&mut reader)
+    else {
+        panic!("expected event clip compose response");
+    };
+    assert_eq!(id, 1);
+    assert!(ok, "event clip compose failed: {error_code:?}");
+    assert!(std::fs::metadata(&clip).unwrap().len() > 10_000);
+
+    stdin
+        .write_all(
+            request_with_params(
+                2,
+                "playback.prepare",
+                serde_json::json!({
+                    "source_path": clip,
+                    "output_path": playback,
+                    "timeout_ms": 30_000,
+                }),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let Envelope::Response {
+        id,
+        ok,
+        result,
+        error_code,
+        ..
+    } = read_message(&mut reader)
+    else {
+        panic!("expected event clip playback response");
+    };
+    assert_eq!(id, 2);
+    assert!(ok, "event clip playback prepare failed: {error_code:?}");
+    assert_eq!(result["video_codec"], "h264");
+    assert!(
+        result["duration_ms"]
+            .as_u64()
+            .is_some_and(|ms| (7_000..=9_000).contains(&ms)),
+        "composed clip must preserve both source segment timelines: {result:?}"
+    );
+    assert!(std::fs::metadata(&playback).unwrap().len() > 10_000);
+
+    stdin
+        .write_all(request(3, method::SHUTDOWN).as_bytes())
+        .unwrap();
+    let _ = read_message(&mut reader);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn ipc_event_clip_compose_honors_hard_duration_limit() {
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/nian-media-ffmpeg/tests/fixtures/playback_h264.mkv");
+    let temp = tempfile::tempdir().unwrap();
+    let clip = temp.path().join("bounded-event-clip.mkv");
+    let playback = temp.path().join("bounded-event-playback.mp4");
+
+    let mut child = spawn_run();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut stdin = child.stdin.take().unwrap();
+    let _hello = read_message(&mut reader);
+
+    stdin
+        .write_all(
+            request_with_params(
+                1,
+                "event_clip.compose",
+                serde_json::json!({
+                    "source_paths": [fixture.clone(), fixture],
+                    "output_path": clip,
+                    "timeout_ms": 30_000,
+                    "max_duration_ms": 5_000,
+                }),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let Envelope::Response { ok, error_code, .. } = read_message(&mut reader) else {
+        panic!("expected bounded event clip compose response");
+    };
+    assert!(ok, "bounded event clip compose failed: {error_code:?}");
+
+    stdin
+        .write_all(
+            request_with_params(
+                2,
+                "playback.prepare",
+                serde_json::json!({
+                    "source_path": clip,
+                    "output_path": playback,
+                    "timeout_ms": 30_000,
+                }),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let Envelope::Response {
+        ok,
+        result,
+        error_code,
+        ..
+    } = read_message(&mut reader)
+    else {
+        panic!("expected bounded event clip playback response");
+    };
+    assert!(ok, "bounded event clip playback failed: {error_code:?}");
+    let duration_ms = result["duration_ms"].as_u64().expect("duration");
+    assert!(
+        (4_000..=5_000).contains(&duration_ms),
+        "hard-capped event clip duration escaped the requested limit: {duration_ms}ms"
+    );
+
+    stdin
+        .write_all(request(3, method::SHUTDOWN).as_bytes())
+        .unwrap();
+    let _ = read_message(&mut reader);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
 fn ipc_playback_prepare_rejects_malformed_media_with_typed_failure() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("broken.mkv");

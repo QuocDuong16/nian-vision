@@ -683,6 +683,10 @@ pub mod playback_method {
     pub const PREPARE: &str = "playback.prepare";
 }
 
+pub mod event_clip_method {
+    pub const COMPOSE: &str = "event_clip.compose";
+}
+
 impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
     fn handle(
         &mut self,
@@ -788,6 +792,10 @@ impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
                 ))),
             },
             playback_method::PREPARE => match playback_prepare(params) {
+                Ok(result) => nian_ipc::Dispatch::Reply(Ok(result)),
+                Err(code) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(code))),
+            },
+            event_clip_method::COMPOSE => match compose_event_clip(params) {
                 Ok(result) => nian_ipc::Dispatch::Reply(Ok(result)),
                 Err(code) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(code))),
             },
@@ -948,6 +956,195 @@ fn playback_prepare(params: &serde_json::Value) -> Result<serde_json::Value, &'s
         "container_compatibility": "fragmented_mp4",
         "seekable": true,
     }))
+}
+
+fn compose_event_clip(params: &serde_json::Value) -> Result<serde_json::Value, &'static str> {
+    const MAX_EVENT_CLIP_SEGMENTS: usize = 256;
+
+    let source_paths = params
+        .get("source_paths")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("internal")?;
+    if source_paths.is_empty() || source_paths.len() > MAX_EVENT_CLIP_SEGMENTS {
+        return Err("internal");
+    }
+    let source_paths = source_paths
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .ok_or("internal")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let output_path = params
+        .get("output_path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or("internal")?;
+    if source_paths.iter().any(|source| source == &output_path) {
+        return Err("internal");
+    }
+    let timeout_ms = params
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(120_000);
+    if !(1_000..=300_000).contains(&timeout_ms) {
+        return Err("internal");
+    }
+    let max_duration_ms = params
+        .get("max_duration_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(300_000);
+    if !(1_000..=300_000).contains(&max_duration_ms) {
+        return Err("internal");
+    }
+
+    for source in &source_paths {
+        let metadata = std::fs::symlink_metadata(source).map_err(|_| "media_unreadable")?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("media_unreadable");
+        }
+    }
+    let claim = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output_path)
+        .map_err(|_| "internal")?;
+    drop(claim);
+
+    let interrupt = InterruptHandle::new();
+    let _deadline = interrupt.scoped_deadline(Duration::from_millis(timeout_ms));
+    let mut first = match MediaInput::open(&MediaSource::File(source_paths[0].clone()), &interrupt)
+    {
+        Ok(input) => input,
+        Err(_) => {
+            let _ = std::fs::remove_file(&output_path);
+            return Err("media_unreadable");
+        }
+    };
+    let first_streams = first.streams();
+    let Some(video) = first_streams
+        .iter()
+        .find(|stream| stream.media_type == nian_domain::MediaType::Video)
+        .cloned()
+    else {
+        let _ = std::fs::remove_file(&output_path);
+        return Err("unsupported_codec");
+    };
+    if video.codec_name != "h264" {
+        let _ = std::fs::remove_file(&output_path);
+        return Err("unsupported_codec");
+    }
+    let selected = first_streams
+        .iter()
+        .filter(|stream| {
+            stream.stream_index == video.stream_index
+                || (stream.media_type == nian_domain::MediaType::Audio
+                    && stream.codec_name == "aac")
+        })
+        .map(|stream| {
+            (
+                stream.stream_index,
+                stream.media_type,
+                stream.codec_name.clone(),
+                stream.time_base,
+            )
+        })
+        .collect::<Vec<_>>();
+    let selected_indices = selected
+        .iter()
+        .map(|(index, _, _, _)| *index)
+        .collect::<std::collections::HashSet<_>>();
+    let mut muxer = match MatroskaMuxer::create_concatenated_recording_with_selection(
+        &mut first,
+        &output_path,
+        &interrupt,
+        |stream| selected_indices.contains(&stream.stream_index),
+    ) {
+        Ok(muxer) => muxer,
+        Err(_) => {
+            let _ = std::fs::remove_file(&output_path);
+            return Err("unsupported_container");
+        }
+    };
+    // Leave bounded headroom for container timestamp rounding / final packet
+    // tail so the inspected file itself never exceeds the requested hard cap.
+    let muxer_limit_ms = max_duration_ms.saturating_sub(1_000).max(1);
+    muxer.set_duration_limit(Duration::from_millis(muxer_limit_ms));
+
+    let write_input =
+        |input: &mut MediaInput, muxer: &mut MatroskaMuxer| -> Result<bool, &'static str> {
+            loop {
+                let packet = match input.next_packet() {
+                    Ok(Some(packet)) => packet,
+                    Ok(None) => break,
+                    Err(_) => return Err("media_unreadable"),
+                };
+                muxer
+                    .write_packet(&packet)
+                    .map_err(|_| "unsupported_container")?;
+                if muxer.duration_limit_reached() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+    let limit_reached = match write_input(&mut first, &mut muxer) {
+        Ok(reached) => reached,
+        Err(code) => {
+            drop(muxer);
+            let _ = std::fs::remove_file(&output_path);
+            return Err(code);
+        }
+    };
+
+    if !limit_reached {
+        for path in source_paths.iter().skip(1) {
+            let mut input = match MediaInput::open(&MediaSource::File(path.clone()), &interrupt) {
+                Ok(input) => input,
+                Err(_) => {
+                    drop(muxer);
+                    let _ = std::fs::remove_file(&output_path);
+                    return Err("media_unreadable");
+                }
+            };
+            let current = input
+                .streams()
+                .into_iter()
+                .filter(|stream| selected_indices.contains(&stream.stream_index))
+                .map(|stream| {
+                    (
+                        stream.stream_index,
+                        stream.media_type,
+                        stream.codec_name,
+                        stream.time_base,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if current != selected || muxer.begin_concatenated_segment().is_err() {
+                drop(muxer);
+                let _ = std::fs::remove_file(&output_path);
+                return Err("unsupported_container");
+            }
+            match write_input(&mut input, &mut muxer) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(code) => {
+                    drop(muxer);
+                    let _ = std::fs::remove_file(&output_path);
+                    return Err(code);
+                }
+            }
+        }
+    }
+    if muxer.finalize().is_err() {
+        let _ = std::fs::remove_file(&output_path);
+        return Err("unsupported_container");
+    }
+    Ok(json!({"composed": true}))
 }
 
 /// Combines a stable error code with a short, secret-free reason so hosts

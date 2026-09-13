@@ -59,10 +59,10 @@ pub use onvif_controller::{
     PreparedPtzPairing,
 };
 pub use playback::{
-    AdjacentRecordingsDto, EVENT_PLAYBACK_PREROLL_MS, EventPlaybackOpenDto,
-    EventRecordingContextDto, PlaybackBackend, PlaybackController, PlaybackError,
-    PlaybackErrorCode, PlaybackInspectDto, PlaybackOpenDto, PreparedPlaybackStorage, RecordingDto,
-    TimelineRecordingKind, WorkerPlaybackBackend,
+    AdjacentRecordingsDto, EventPlaybackOpenDto, EventRecordingContextDto, PlaybackBackend,
+    PlaybackController, PlaybackError, PlaybackErrorCode, PlaybackInspectDto, PlaybackOpenDto,
+    PreparedPlaybackStorage, RecordingDto, TimelineRecordingKind, WorkerEventClipComposer,
+    WorkerPlaybackBackend,
 };
 pub use probe_controller::{
     ProbeController, ProbeError, ProbeResult, ProbeRunner, WorkerProbeRunner,

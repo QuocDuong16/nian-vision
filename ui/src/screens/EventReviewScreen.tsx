@@ -314,7 +314,7 @@ export function EventReviewScreen() {
     };
   }, [recordingContext?.available, rows, selected]);
 
-  const openEventPlayback = useCallback(async () => {
+  const openEventPlayback = useCallback(async (clipIndex = 0) => {
     if (!selected || playbackLoading || !isTauri()) return;
     const eventId = selected.event_id;
     const generation = selectionGenerationRef.current;
@@ -322,7 +322,7 @@ export function EventReviewScreen() {
     setSelectionMessage(null);
     await closePlayback();
     try {
-      const opened = await invokeDesktop<EventPlaybackOpenDto | null>("event_playback_open", { eventId });
+      const opened = await invokeDesktop<EventPlaybackOpenDto | null>("event_playback_open", { eventId, clipIndex });
       if (generation !== selectionGenerationRef.current || selected.event_id !== eventId) {
         if (opened) {
           void invokeDesktop<void>("playback_close", { sessionId: opened.playback.session_id }).catch(() => undefined);
@@ -330,7 +330,7 @@ export function EventReviewScreen() {
         return;
       }
       if (!opened) {
-        setRecordingContext({ available: false, camera_id: selected.camera_id, seek_offset_ms: null });
+        setRecordingContext({ available: false, camera_id: selected.camera_id, seek_offset_ms: null, clip_count: 0 });
         return;
       }
       playbackSessionRef.current = opened.playback.session_id;
@@ -339,6 +339,7 @@ export function EventReviewScreen() {
         available: true,
         camera_id: opened.playback.recording.camera_id,
         seek_offset_ms: opened.seek_offset_ms,
+        clip_count: opened.clip_count,
       });
     } catch (cause) {
       if (generation !== selectionGenerationRef.current) return;
@@ -474,11 +475,11 @@ export function EventReviewScreen() {
                     type="button"
                     className="primary-button"
                     disabled={playbackLoading}
-                    onClick={() => void openEventPlayback()}
+                    onClick={() => void openEventPlayback(0)}
                   >
                     {playbackLoading ? "Preparing…" : selectedPlayback ? "Reopen recording" : "Open recording"}
                   </button>
-                  <span className="muted">Playback starts about 5 seconds before the event when footage allows.</span>
+                  <span className="muted">Dedicated event clips include about 5 seconds of real pre-roll before motion.</span>
                 </div>
               ) : (
                 <p className="muted">No recording available yet. Motion-triggered clips appear here after the segment is finalized.</p>
@@ -509,8 +510,27 @@ export function EventReviewScreen() {
               <div className="playback-meta">
                 <span>{playback.playback.inspect.video_codec.toUpperCase()}</span>
                 <span>{playback.playback.inspect.audio_available ? "Audio available" : "Video only"}</span>
-                <span>Seek {Math.round(playback.seek_offset_ms / 1000)}s into segment</span>
+                <span>Event clip pre-roll included</span>
+                <span>Clip {playback.clip_index + 1} of {playback.clip_count}</span>
               </div>
+              {playback.clip_count > 1 && (
+                <div className="button-row">
+                  <button
+                    type="button"
+                    disabled={playbackLoading || playback.clip_index === 0}
+                    onClick={() => void openEventPlayback(playback.clip_index - 1)}
+                  >
+                    Previous clip
+                  </button>
+                  <button
+                    type="button"
+                    disabled={playbackLoading || playback.clip_index + 1 >= playback.clip_count}
+                    onClick={() => void openEventPlayback(playback.clip_index + 1)}
+                  >
+                    Next clip
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>

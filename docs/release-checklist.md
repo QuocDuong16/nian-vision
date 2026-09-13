@@ -2,11 +2,11 @@
 
 Record the exact tag, commit SHA, OS image/VM and result for every run. A checkbox is evidence only when the step was actually executed. Do not reuse a tag after changing source.
 
-Current retry candidate: `1.0.0-rc.48` / `v1.0.0-rc.48`. RC1 through RC47 remain immutable. RC48 removes hosted-CI timing dependence from the Live View automatic-recovery test while preserving exact 250/750/1500 ms backoff assertions, and treats an empty persisted Live View selection as already restored so an immediate Add action cannot trigger a redundant restore generation.
+Current retry candidate: `1.0.0-rc.49` / `v1.0.0-rc.49`. RC1 through RC48 remain immutable. RC49 separates motion Event capture from manual Recording/Timeline, adds real buffered pre-roll plus bounded event-only multi-part clips, hardens event-clip retention/quota/playback ownership, and prevents stale pooled ONVIF HTTP sockets from breaking PTZ commands after successful pairing.
 
 ## Pre-tag authority
 
-- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.48`.
+- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.49`.
 - [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
@@ -16,7 +16,7 @@ Current retry candidate: `1.0.0-rc.48` / `v1.0.0-rc.48`. RC1 through RC47 remain
 
 ## GitHub RC workflow
 
-- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.48`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.47`; source/tag cross-pairing is forbidden.
+- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.49`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.48`; source/tag cross-pairing is forbidden.
 - [ ] GitHub tag resolves to exactly the same commit as Forgejo.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.
@@ -37,9 +37,9 @@ Current retry candidate: `1.0.0-rc.48` / `v1.0.0-rc.48`. RC1 through RC47 remain
 - [ ] Live View opens and closes; selected camera layout and Fit/Native preference survive tab remount while the old sessions close and fresh sessions reopen on return. Verify no hidden live session remains active after leaving the tab. During an in-session RTSP hiccup, `backoff -> connecting -> live` must keep the same video/MSE presentation mounted (a brief frozen frame is acceptable; a blank Connecting tile/remount is not), and a stable >=10-second live period must reset the consecutive reconnect budget. Fit tile remains default for a fresh preference, Native pixels visibly avoids upscale when the tile has spare room, and Diagnostics reports source/display/DPR scaling without changing the live session.
 - [ ] Playback opens/seeks/closes.
 - [ ] Compatible camera ONVIF discovery/provisioning succeeds.
-- [ ] Compatible camera PTZ works; movement stops on lifecycle teardown and never restores by itself. On Tapo C200 V5 verify multiple/partial velocity-space advertisements do not poison a later complete pan/tilt candidate; any remaining failure must retain the typed services/profiles/options stage instead of generic `onvif_protocol`.
+- [ ] Compatible camera PTZ works; movement stops on lifecycle teardown and never restores by itself. On Tapo C200 V5 verify multiple/partial velocity-space advertisements do not poison a later complete pan/tilt candidate, and verify repeated ContinuousMove/Stop commands remain reachable after pairing even when the camera closes HTTP sockets between SOAP responses. Any remaining failure must retain the typed services/profiles/options stage instead of generic `onvif_protocol`.
 - [ ] Compatible camera Event monitoring persists normalized Events and Event Review can open correlated footage where available. On Tapo C200 V5/1.4.6 verify the fingerprint-gated adapter can probe same-host TCP 2020 PullPoint, remains Polling rather than Backoff on valid vendor extensions/duplicate state echoes, and record observed CellMotion/People/Smart Event/Line Cross transitions without exposing raw source tokens. If it fails, record the stage-specific `event_control_*`, `event_pull_*`, or `event_renew_*` code.
-- [ ] Motion-triggered recording: with persistent/manual Recording Desired Off, aggregate motion starts recording after the persisted MotionStarted transition, aggregate idle keeps a five-second post-roll then finalizes, repeated detector sources do not stop while another source stays active, motion returning during post-roll cancels the stop, and motion returning while the slot is Stopping restarts after settlement. A continuous >5-minute motion episode rotates to consecutive files no longer than five minutes each. Manual Start during a motion-owned recording promotes the existing session without restart and later MotionEnded never stops it. Event Review changes from unavailable to Recording available after finalization/index refresh without requiring an app restart.
+- [ ] Independent motion Event capture: with manual Recording Desired Off, enabling Events starts the short rolling Event buffer before motion occurs. Verify a motion clip includes the movement that began before MotionStarted reached the app (about five seconds of real pre-roll when the buffer is warmed), includes five seconds of post-roll, and appears only in Event Review under `.nian/event-clips`, never in Timeline. While manual Recording is already On, motion must not stop/restart/promote or otherwise alter the manual recorder; manual footage remains continuous and the Event gets its own clip. A continuous >5-minute motion episode must expose multiple Event Review clip parts, each no longer than five minutes, with Previous/Next navigation and no hidden continuation parts. Event Review must change from unavailable to Recording available automatically after finalization. Verify retention skips an actively playing Event clip and old Event clips are removed according to Event age/quota without deleting the corresponding manual Timeline recording.
 - [ ] Local notification appears when enabled; missing native notification support/failure remains non-fatal. Run the delivery-timeout isolation regression repeatedly on Windows and verify observing `delivery_timeouts` implies the timed-out native delivery has already been terminated.
 - [ ] Close hides to tray while Recording/Events/notifications continue and Live/PTZ settle.
 - [ ] Suspend/Resume: Recording/Event Desired restore without duplicate workers; Live/PTZ do not restore.

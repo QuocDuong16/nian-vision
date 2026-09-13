@@ -1,5 +1,7 @@
-# Nian Vision 1.0.0-rc.48
+# Nian Vision 1.0.0-rc.49
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
+
+RC49 replaces the RC47/RC48 motion-recording ownership model after physical Tapo C200 acceptance proved that sharing the manual Recording controller with motion automation was the wrong abstraction. Motion Events now own an independent rolling event-capture plane under `<storage_root>/.nian/event-buffer`; it starts while Event monitoring is Desired On, keeps short H.264 packet-copy segments for about five seconds of real pre-roll, retains five seconds of post-roll after aggregate motion becomes idle, and materializes immutable event-only clips under `<storage_root>/.nian/event-clips`. Manual Recording Desired, manual Start/Stop, the normal recording controller and Timeline index are never started, stopped, promoted or mutated by motion capture. Event Review resolves clips by immutable Event-ID aliases instead of searching the manual recording index by timestamp. Long continuous motion is split into independently playable bounded clip parts, each hard-limited below five minutes at the mux timeline, and Event Review exposes Clip N/M navigation. Event clip retention follows Event/history age (configured max age or 30 days), counts event clips together with manual footage for quota pressure, preferentially removes old event clips under quota cleanup, and skips clips held by an active playback session. The event buffer remains short-lived and independently pruned. The media worker adds packet-copy event-clip composition with explicit multi-segment timestamp concatenation and no transcoding. PTZ SOAP transport also disables idle HTTP connection reuse so a Tapo C200 that closes a nominal keep-alive socket cannot pair successfully and then fail the next ContinuousMove on a stale pooled connection. Generic ONVIF authority/authentication rules and manual Timeline semantics remain unchanged.
 
 RC48 fixes two Live View startup/recovery races exposed by hosted CI after immutable RC47. Empty persisted Live View selection is now treated as already restored on the first render, preventing an immediate user Add action from being mistaken for a delayed restore generation and avoiding a redundant close/reopen cycle. The bounded automatic media-recovery test no longer sleeps through the production 250/750/1500 ms backoff on wall-clock time; it drives only those recovery timers deterministically and still asserts the exact backoff sequence plus the three-attempt stop policy. Production media recovery limits and delays are unchanged.
 
@@ -34,8 +36,8 @@ RC1 through RC9 remain immutable historical release attempts. RC7 proved the det
 - Up to 4 independent Live View sessions and local playback/timeline review.
 - Optional ONVIF PTZ continuous pan/tilt and capability-gated zoom.
 - Up to 16 optional ONVIF PullPoint Event-monitoring sessions with normalized local Event history.
-- Event Review with recording correlation, five-second playback pre-roll when earlier footage exists, and automatic availability refresh after motion clips finalize.
-- Motion-triggered recording episodes with aggregate multi-source motion ownership, five-second post-roll, manual-promotion safety and a five-minute maximum segment duration.
+- Event Review with dedicated immutable event clips, about five seconds of real buffered pre-roll, five-second post-roll, automatic availability refresh, and bounded multi-part playback for long motion.
+- Independent motion event capture that never controls manual Recording/Timeline state; long motion is split into event-only clips no longer than five minutes each.
 - Optional local desktop MotionStarted notifications with bounded dispatch/rate limiting.
 - Single-instance desktop lifecycle, close-to-tray, launch-at-login, Windows suspend/resume handling and signed in-app updater artifacts.
 
@@ -49,6 +51,6 @@ Authoritative settings migrations preserve camera definitions, credential refere
 
 ## Known limitations
 
-v1 requires H.264 and does not transcode or support H.265. ONVIF feature availability depends on the camera. There is no macOS/mobile release, remote/cloud access, AI/person/object detection, true pre-event recording buffer, synthesized/exported event clips or thumbnails, presets/tours/talkback, email/webhook/cloud push notifications or notification scheduling. See `docs/known-limitations.md` for the normative list.
+v1 requires H.264 and does not transcode or support H.265. ONVIF feature availability depends on the camera. RC49 includes a local real-pre-roll Event capture buffer and dedicated event-only clips, but there is no macOS/mobile release, remote/cloud access, Nian-side AI/person/object detection, Event thumbnail/export workflow, presets/tours/talkback, email/webhook/cloud push notifications or notification scheduling. See `docs/known-limitations.md` for the normative list.
 
 The final `v1.0.0` tag must not be created until M15 acceptance and the clean Windows/Linux release-candidate checklist are complete.
