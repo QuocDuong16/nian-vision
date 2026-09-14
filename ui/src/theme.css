@@ -2383,3 +2383,41 @@ input[type="checkbox"] {
 @media (max-width: 720px) {
   .performance-monitor { display: none; }
 }
+.performance-process-card {
+  grid-column: 1 / -1;
+}
+
+.performance-process-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  max-height: 240px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.performance-process-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 9px 10px;
+  border: 1px solid rgb(148 163 184 / 10%);
+  border-radius: 10px;
+  background: rgb(8 22 40 / 72%);
+}
+
+.performance-process-row > div:first-child,
+.performance-process-metrics {
+  display: grid;
+  gap: 2px;
+}
+
+.performance-process-row small {
+  color: #70849d;
+}
+
+.performance-process-metrics {
+  text-align: right;
+  white-space: nowrap;
+}

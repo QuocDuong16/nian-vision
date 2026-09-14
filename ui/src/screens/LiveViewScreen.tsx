@@ -8,6 +8,7 @@ import type {
   CameraSummary,
   DesktopError,
   EventStatus,
+  LiveFailureCategory,
   LiveOpenDto,
   LiveState,
   LiveStatus,
@@ -51,6 +52,41 @@ function liveChipClass(state: LiveState): string {
   if (state === "backoff") return "chip-reconnecting";
   if (state === "failed") return "chip-failed";
   return `chip-${state}`;
+}
+
+function recordingStateLabel(state: RecordingState): string {
+  if (state === "backoff") return "Reconnecting";
+  return state.charAt(0).toUpperCase() + state.slice(1).replaceAll("_", " ");
+}
+
+function recordingFailureLabel(category: string | null | undefined): string | null {
+  switch (category) {
+    case "source_open_failed": return "stream unavailable";
+    case "source_read_failed": return "stream disconnected";
+    case "source_timed_out": return "stream timeout";
+    case "output_write_failed": return "output write failed";
+    case "storage_failed": return "storage unavailable";
+    default: return null;
+  }
+}
+
+function liveFailureLabel(category: LiveFailureCategory | null | undefined): string | null {
+  switch (category) {
+    case "source_open_failed": return "Camera stream unavailable";
+    case "unsupported_codec": return "Camera codec is not supported for live view";
+    case "worker_unavailable": return "Live media worker is unavailable";
+    case "media_read_failed": return "Camera stream disconnected";
+    case "media_fragment_create_failed": return "Could not create the live buffer";
+    case "media_fragment_write_failed": return "Could not write the live buffer";
+    case "media_packet_too_large": return "Camera sent an oversized media packet";
+    case "media_fragment_limit_exceeded": return "Live buffer reached its safety limit";
+    case "media_mux_write_failed": return "Could not package the live stream";
+    case "media_fragment_finalize_failed": return "Could not finalize the live buffer";
+    case "media_fragment_capacity_failed": return "Live buffer capacity is exhausted";
+    case "lifecycle_cancelled": return "Live session was interrupted by app lifecycle";
+    case "media_failed": return "Live media pipeline failed";
+    default: return null;
+  }
 }
 
 type LiveManifest = {
@@ -1039,6 +1075,9 @@ export function LiveViewScreen() {
             const recording = recordingByCamera.get(cameraId);
             const desiredOn = intent.camera_ids.includes(cameraId);
             const recordingActive = recording ? ACTIVE_RECORDING_STATES.has(recording.state) : false;
+            const recordingLabel = recordingStateLabel(recording?.state ?? "stopped");
+            const recordingReason = recordingFailureLabel(recording?.failure_category);
+            const liveReason = liveFailureLabel(backendStatus?.failure_category);
             const recordingConvergingOff = !desiredOn && recordingActive;
             const events = eventStatuses.get(cameraId);
             const isFocused = focusedCameraId === cameraId;
@@ -1063,7 +1102,7 @@ export function LiveViewScreen() {
                 <div className="live-tile-head" onDoubleClick={(event) => event.stopPropagation()}>
                   <div className="live-tile-identity">
                     <h3>{camera.display_name}</h3>
-                    <span className={`chip ${liveChipClass(tileError ? "failed" : state)}`}>
+                    <span className={`chip ${liveChipClass(tileError ? "failed" : state)}`} title={liveReason ?? undefined}>
                       {tileError ? "Failed" : isOpening ? "Starting" : stateLabel(state)}
                     </span>
                   </div>
@@ -1097,9 +1136,9 @@ export function LiveViewScreen() {
                         {tileError
                           ? tileError.message
                           : state === "backoff"
-                            ? `Reconnecting · attempt ${backendStatus?.reconnect_attempt ?? 0}`
+                            ? `Reconnecting${liveReason ? ` · ${liveReason}` : ""} · attempt ${backendStatus?.reconnect_attempt ?? 0}`
                             : state === "failed"
-                              ? backendStatus?.failure_category ?? "Live stream failed"
+                              ? liveReason ?? "Live stream failed"
                               : "Connecting to camera…"}
                       </div>
                     )}
@@ -1123,7 +1162,7 @@ export function LiveViewScreen() {
                         })}
                       />
                       <div className="live-focus-status-grid">
-                        <div><span>Recording</span><strong>{desiredOn ? "Desired on" : "Manual off"}</strong><small>{recording?.state ?? "stopped"}</small></div>
+                        <div><span>Recording</span><strong>{desiredOn ? "Desired on" : "Manual off"}</strong><small>{recordingLabel}{recordingReason ? ` · ${recordingReason}` : ""}</small></div>
                         <div className={events?.motion_active === true ? "is-motion-active" : ""}><span>Motion</span><strong>{motionLabel}</strong><small>{events?.last_error_code ?? "No event error"}</small></div>
                       </div>
                       <div className="live-focus-actions">
@@ -1147,7 +1186,7 @@ export function LiveViewScreen() {
                 {!isFocused && (
                   <div className="live-tile-quickbar" onDoubleClick={(event) => event.stopPropagation()}>
                     <div className="live-tile-meta">
-                      <span>Rec <strong>{recording?.state ?? "stopped"}</strong></span>
+                      <span title={recordingReason ?? undefined}>Rec <strong>{recordingLabel}{recordingReason && recording?.state === "backoff" ? ` · ${recordingReason}` : ""}</strong></span>
                       <span className={events?.motion_active === true ? "motion-indicator" : ""}>{motionLabel}</span>
                       {events?.last_error_code && <span>Event error: <strong>{events.last_error_code}</strong></span>}
                     </div>

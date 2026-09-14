@@ -75,7 +75,29 @@ function validateCamera(form: CameraFormState, creating: boolean): string | null
 }
 
 function statusLabel(state: RecordingState): string {
-  return state.replaceAll("_", " ");
+  switch (state) {
+    case "backoff": return "Reconnecting";
+    case "starting": return "Starting";
+    case "recovering": return "Recovering";
+    case "connecting": return "Connecting";
+    case "recording": return "Recording";
+    case "stopping": return "Stopping";
+    case "failed": return "Failed";
+    case "stopped": return "Stopped";
+  }
+}
+
+function recordingFailureLabel(category: string | null | undefined): string | null {
+  switch (category) {
+    case "source_open_failed": return "Cannot open the camera stream";
+    case "source_read_failed": return "Camera stream disconnected";
+    case "source_timed_out": return "Camera stream timed out";
+    case "output_write_failed": return "Could not write recording output";
+    case "storage_failed": return "Recording storage is unavailable";
+    case "camera_in_use": return "Camera is already owned by another recorder";
+    case "permanent_configuration": return "Recording configuration is not usable";
+    default: return null;
+  }
 }
 
 function ProbeSummary({ result }: { result: ProbeResult }) {
@@ -713,6 +735,7 @@ export function CamerasScreen() {
             const desiredOffRuntimeActive = !desiredOn && ownActive;
             const rowBusy = recordingBusyCameras.has(camera.camera_id);
             const events = eventStatuses.get(camera.camera_id);
+            const failureLabel = recordingFailureLabel(runtime?.failure_category);
             const recordingControlDisabled = busyCamera !== null || rowBusy || state === "stopping" || desiredOffRuntimeActive;
             const recordingControlLabel = desiredOn
               ? (state === "stopping" ? "Stopping…" : "Stop")
@@ -743,8 +766,16 @@ export function CamerasScreen() {
                   </div>
                   <div className="camera-status-item">
                     <span className="camera-status-label">Stream health</span>
-                    <strong>{runtime?.failure_category ?? (ownActive ? "Healthy" : "Idle")}</strong>
-                    <small>{runtime ? `${runtime.finalized_segments} segments · retry ${runtime.reconnect_attempt}` : "No active recorder"}</small>
+                    <strong>{state === "backoff" ? "Reconnecting" : state === "failed" ? "Recording failed" : ownActive ? "Healthy" : "Idle"}</strong>
+                    <small>
+                      {runtime
+                        ? state === "backoff"
+                          ? `${failureLabel ?? "Camera stream unavailable"} · retry ${runtime.reconnect_attempt} · ${runtime.finalized_segments} segments`
+                          : state === "failed"
+                            ? `${failureLabel ?? "Recorder stopped because of an error"} · ${runtime.finalized_segments} segments`
+                            : `${runtime.finalized_segments} segments · retry ${runtime.reconnect_attempt}`
+                        : "No active recorder"}
+                    </small>
                   </div>
                 </div>
                 <div className="camera-actions">

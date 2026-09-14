@@ -68,7 +68,7 @@ export function PerformanceMonitor() {
   }, [snapshot]);
 
   const footerLabel = snapshot?.sample_ready
-    ? `CPU ${formatPercent(snapshot.app_cpu_percent)} · RAM ${formatBytes(snapshot.app_memory_bytes)}`
+    ? `CPU ${formatPercent(snapshot.root_process_cpu_percent)} · Host ${formatBytes(snapshot.root_process_memory_bytes)}`
     : available ? "Performance warming up…" : "Performance unavailable";
   const childProcessCount = Math.max(0, (snapshot?.process_count ?? 1) - 1);
 
@@ -99,15 +99,30 @@ export function PerformanceMonitor() {
               <div className="performance-card">
                 <span>CPU</span>
                 <strong>{formatPercent(snapshot.app_cpu_percent)}</strong>
-                <small>Process tree · desktop {formatPercent(snapshot.root_process_cpu_percent)} · system {formatPercent(snapshot.system_cpu_percent)}</small>
+                <small>Total Nian Vision · desktop {formatPercent(snapshot.root_process_cpu_percent)} · system {formatPercent(snapshot.system_cpu_percent)}</small>
                 <div className="performance-bar"><span style={{ width: `${Math.min(100, snapshot.app_cpu_percent)}%` }} /></div>
               </div>
               <div className="performance-card">
                 <span>Memory</span>
                 <strong>{formatBytes(snapshot.app_memory_bytes)}</strong>
-                <small>Tree {formatPercent(memoryPercent)} of {formatBytes(snapshot.system_memory_total_bytes)} · system {formatPercent(systemMemoryPercent)}</small>
-                <em>Desktop {formatBytes(snapshot.root_process_memory_bytes)} · children {formatBytes(snapshot.child_process_memory_bytes)}</em>
+                <small>Total Nian Vision {formatPercent(memoryPercent)} of {formatBytes(snapshot.system_memory_total_bytes)} · system {formatPercent(systemMemoryPercent)}</small>
+                <em>Desktop {formatBytes(snapshot.root_process_memory_bytes)} · child processes {formatBytes(snapshot.child_process_memory_bytes)}</em>
                 <div className="performance-bar"><span style={{ width: `${memoryPercent}%` }} /></div>
+              </div>
+              <div className="performance-card performance-process-card">
+                <span>Process memory</span>
+                <div className="performance-process-list">
+                  {snapshot.processes.map((process) => (
+                    <div className="performance-process-row" key={process.pid}>
+                      <div><strong>{process.role}</strong><small>{process.name} · PID {process.pid}</small></div>
+                      <div className="performance-process-metrics">
+                        <strong>{formatBytes(process.memory_bytes)}</strong>
+                        <small>{formatPercent(process.cpu_percent)} CPU · {formatPercent(snapshot.app_memory_bytes > 0 ? (process.memory_bytes / snapshot.app_memory_bytes) * 100 : 0)} memory</small>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <small>Windows prefers private working set per process; inaccessible counters fall back to the portable working-set estimate.</small>
               </div>
               <div className="performance-card">
                 <span>Network</span>

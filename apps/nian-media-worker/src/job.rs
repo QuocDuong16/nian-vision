@@ -281,8 +281,9 @@ pub struct JobStatus {
     /// MUST NOT equate worker health with recording health — this field is
     /// how they differ observably.
     pub end_kind: String,
-    /// §7: typed failure category behind a `failed` end_kind
-    /// (e.g. `StorageFailed`); empty when not applicable.
+    /// Latest typed failure category. Retryable source failures remain visible
+    /// while the job is in backoff/connecting so the desktop can explain why
+    /// it is reconnecting; cleared after a healthy connection is established.
     pub failure_category: String,
     /// §13: startup reconciliation summary (None before first start).
     pub recovery: Option<RecoverySummary>,
@@ -928,6 +929,51 @@ fn run_recovering_then_supervising<
     supervise_and_fold(supervisor, &shared);
 }
 
+/// Folds one typed supervisor event into the worker's observable status.
+/// Retryable failure categories deliberately survive reconnect backoff.
+fn fold_supervisor_event(slot: &mut JobStatus, event: SupervisorEvent) {
+    match event {
+        SupervisorEvent::StateChanged { to, .. } => {
+            slot.state = to.as_str().to_owned();
+        }
+        SupervisorEvent::ReconnectScheduled { retry_attempt, .. } => {
+            slot.state = "backoff".to_owned();
+            slot.retry_attempt = retry_attempt;
+        }
+        SupervisorEvent::ConnectionEstablished { .. } => {
+            slot.state = "recording".to_owned();
+            slot.retry_attempt = 0;
+            slot.failure_category.clear();
+        }
+        SupervisorEvent::SessionEnded { outcome, .. } => match outcome {
+            nian_recorder::AttemptOutcome::GracefulStop { finalized_segments }
+            | nian_recorder::AttemptOutcome::Eof {
+                finalized_segments, ..
+            } => {
+                slot.finalized_segments += finalized_segments;
+            }
+            nian_recorder::AttemptOutcome::Failure { category } => {
+                slot.failure_category = category.as_str().to_owned();
+            }
+        },
+        SupervisorEvent::Finished {
+            end,
+            finalized_segments,
+            ..
+        } => {
+            slot.finalized_segments = finalized_segments;
+            slot.finished = true;
+            let (kind, category) = match end {
+                SupervisorEnd::SourceCompleted => ("completed", None),
+                SupervisorEnd::StoppedByOperator { .. } => ("stopped", None),
+                SupervisorEnd::PermanentFailure { category } => ("failed", Some(category.as_str())),
+            };
+            slot.end_kind = kind.to_owned();
+            slot.failure_category = category.unwrap_or_default().to_owned();
+        }
+    }
+}
+
 /// Runs the supervisor to completion on the job thread, folding events into
 /// the shared status snapshot; marks the slot done when finished.
 fn supervise_and_fold<
@@ -940,56 +986,7 @@ fn supervise_and_fold<
 ) {
     let fold = |event: SupervisorEvent| {
         let mut slot = shared.status.lock().unwrap();
-        match event {
-            SupervisorEvent::StateChanged { to, .. } => {
-                // Final safety remediation §8: the wire value is the
-                // EXPLICIT stable vocabulary (`SupervisorState::as_str`),
-                // never Rust Debug output.
-                slot.state = to.as_str().to_owned();
-            }
-            SupervisorEvent::ReconnectScheduled { retry_attempt, .. } => {
-                slot.state = "backoff".to_owned();
-                slot.retry_attempt = retry_attempt;
-            }
-            SupervisorEvent::ConnectionEstablished { .. } => {
-                slot.state = "recording".to_owned();
-                slot.retry_attempt = 0;
-            }
-            // Segment totals arrive authoritatively via Finished; per-attempt
-            // progress increments below keep the counter live meanwhile.
-            SupervisorEvent::SessionEnded { outcome, .. } => match outcome {
-                nian_recorder::AttemptOutcome::GracefulStop { finalized_segments }
-                | nian_recorder::AttemptOutcome::Eof {
-                    finalized_segments, ..
-                } => {
-                    slot.finalized_segments += finalized_segments;
-                }
-                nian_recorder::AttemptOutcome::Failure { .. } => {}
-            },
-            SupervisorEvent::Finished {
-                end,
-                finalized_segments,
-                ..
-            } => {
-                slot.finalized_segments = finalized_segments;
-                slot.finished = true;
-                // §7: terminal disposition AND its failure category must be
-                // visible to hosts — worker-alive ≠ recording-healthy. §9:
-                // the category crosses the wire as its STABLE as_str value,
-                // never Rust Debug output.
-                let (kind, category) = match end {
-                    SupervisorEnd::SourceCompleted => ("completed", None),
-                    SupervisorEnd::StoppedByOperator { .. } => ("stopped", None),
-                    SupervisorEnd::PermanentFailure { category } => {
-                        ("failed", Some(category.as_str()))
-                    }
-                };
-                slot.end_kind = kind.to_owned();
-                if let Some(category) = category {
-                    slot.failure_category = category.to_owned();
-                }
-            }
-        }
+        fold_supervisor_event(&mut slot, event);
     };
 
     let _outcome = supervisor.run_until_end(&mut |event| fold(event));
@@ -1066,6 +1063,72 @@ mod tests {
         // (each new() starts stop_presses = 0).
         assert_eq!(RecordingJobManager::new().stop_presses_field(), 0);
         assert_eq!(manager.stop_presses_field(), 0);
+    }
+
+    #[test]
+    fn retry_failure_category_stays_visible_until_connection_recovers() {
+        let camera = CameraId::parse("cam-backoff").unwrap();
+        let mut status = JobStatus::initial();
+        fold_supervisor_event(
+            &mut status,
+            SupervisorEvent::SessionEnded {
+                camera_id: camera.clone(),
+                outcome: nian_recorder::AttemptOutcome::Failure {
+                    category: nian_recorder::FailureCategory::SourceOpenFailed,
+                },
+            },
+        );
+        fold_supervisor_event(
+            &mut status,
+            SupervisorEvent::ReconnectScheduled {
+                camera_id: camera.clone(),
+                retry_attempt: 2,
+                retry_delay: Duration::from_secs(5),
+                base_delay: Duration::from_secs(5),
+            },
+        );
+        assert_eq!(status.state, "backoff");
+        assert_eq!(status.retry_attempt, 2);
+        assert_eq!(status.failure_category, "source_open_failed");
+
+        fold_supervisor_event(
+            &mut status,
+            SupervisorEvent::ConnectionEstablished {
+                camera_id: camera,
+                prior_attempts: 2,
+                stable_recording_reset_applied: false,
+            },
+        );
+        assert_eq!(status.state, "recording");
+        assert_eq!(status.failure_category, "");
+    }
+
+    #[test]
+    fn clean_terminal_finish_clears_a_stale_retry_failure() {
+        let camera = CameraId::parse("cam-stop-backoff").unwrap();
+        let mut status = JobStatus::initial();
+        fold_supervisor_event(
+            &mut status,
+            SupervisorEvent::SessionEnded {
+                camera_id: camera.clone(),
+                outcome: nian_recorder::AttemptOutcome::Failure {
+                    category: nian_recorder::FailureCategory::SourceOpenFailed,
+                },
+            },
+        );
+        assert_eq!(status.failure_category, "source_open_failed");
+
+        fold_supervisor_event(
+            &mut status,
+            SupervisorEvent::Finished {
+                camera_id: camera,
+                end: SupervisorEnd::StoppedByOperator { clean: true },
+                finalized_segments: 0,
+            },
+        );
+        assert!(status.finished);
+        assert_eq!(status.end_kind, "stopped");
+        assert_eq!(status.failure_category, "");
     }
 
     #[test]

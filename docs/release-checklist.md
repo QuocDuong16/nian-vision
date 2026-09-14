@@ -2,11 +2,11 @@
 
 Record the exact tag, commit SHA, OS image/VM and result for every run. A checkbox is evidence only when the step was actually executed. Do not reuse a tag after changing source.
 
-Current retry candidate: `1.0.0-rc.54` / `v1.0.0-rc.54`. RC1 through RC53 remain immutable. RC54 refines the desktop usability tranche with fixed 1/4/8/16 Live View zones, a non-destructive focus viewer, clearer process-tree performance telemetry, Media Chrome/Sutro playback, viewport-correct camera dialogs and application-owned update confirmation.
+Current retry candidate: `1.0.0-rc.55` / `v1.0.0-rc.55`. RC1 through RC54 remain immutable. RC55 hardens Windows telemetry and recording recovery UX after physical RC54 review: per-process RAM/CPU breakdown uses Windows private working set when available, WebView2/media roles are labeled explicitly, compact telemetry reports the desktop host instead of an unexplained process-tree total, and recording/live reconnect states retain typed retry causes while presenting human-readable diagnostics instead of raw `backoff`/failure codes.
 
 ## Pre-tag authority
 
-- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.54`.
+- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.55`.
 - [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
@@ -16,7 +16,7 @@ Current retry candidate: `1.0.0-rc.54` / `v1.0.0-rc.54`. RC1 through RC53 remain
 
 ## GitHub RC workflow
 
-- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.54`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.53`; source/tag cross-pairing is forbidden.
+- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.55`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.54`; source/tag cross-pairing is forbidden.
 - [ ] GitHub tag resolves to exactly the same commit as Forgejo.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.
@@ -31,9 +31,10 @@ Current retry candidate: `1.0.0-rc.54` / `v1.0.0-rc.54`. RC1 through RC53 remain
 
 - [ ] NSIS current-user install succeeds from a path containing spaces.
 - [ ] First startup succeeds with no cameras and no fake failure state.
+- [ ] Performance telemetry matches Windows reality closely enough to diagnose ownership: the compact footer reports the Nian desktop host rather than the whole tree, the detail popover lists each owned PID/role separately (desktop, WebView2 roles, media workers), and the sum of the displayed rows equals the reported Nian Vision total. Compare the desktop PID and at least one WebView2 PID against Task Manager; record any material discrepancy instead of accepting an unexplained aggregate.
 - [ ] UI resize acceptance: verify the default 1280×800 window, a medium rail layout (roughly 900–1100 px wide), and the 720×520 minimum window. Navigation must remain reachable, dialogs must fit/scroll inside the viewport, bottom navigation must not cover actionable content, and Cameras/Live View/Events/Timeline/Storage/Settings must remain operable without horizontal page overflow.
 - [ ] Add a camera manually; RTSP probe succeeds.
-- [ ] Start/stop recording; finalized media is playable.
+- [ ] Start/stop recording; finalized media is playable. Force or observe a retryable RTSP open/read timeout and verify Cameras/Live View say Reconnecting with a human-readable reason and retry count instead of exposing raw `backoff`/wire codes; after recovery or a clean Stop, the stale failure reason must disappear.
 - [ ] Kill/restart desktop while Recording Desired is On; Desired restores once.
 - [ ] Live View opens and closes; selected camera layout and Fit/Native preference survive tab remount while the old sessions close and fresh sessions reopen on return. Verify no hidden live session remains active after leaving the tab. During an in-session RTSP hiccup, `backoff -> connecting -> live` must keep the same video/MSE presentation mounted (a brief frozen frame is acceptable; a blank Connecting tile/remount is not), and a stable >=10-second live period must reset the consecutive reconnect budget. Fit tile remains default for a fresh preference, Native pixels visibly avoids upscale when the tile has spare room, and Diagnostics reports source/display/DPR scaling without changing the live session.
 - [ ] Playback opens/seeks/closes.

@@ -680,7 +680,15 @@ fn apply_worker_progress(shared: &SlotShared, payload: &serde_json::Value) {
             .get("finalized_segments")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(status.finalized_segments);
-        status.failure_category = None;
+        let reported_failure = payload
+            .get("failure_category")
+            .and_then(serde_json::Value::as_str)
+            .filter(|category| !category.is_empty());
+        if mapped == RecordingState::Recording {
+            status.failure_category = None;
+        } else if let Some(category) = reported_failure {
+            status.failure_category = Some(category.to_owned());
+        }
         let snapshot = status.clone();
         drop(status);
         notify_status_observer(shared, snapshot);
@@ -977,5 +985,47 @@ mod tests {
         assert!(!controller.is_owned(&a).unwrap());
         assert!(controller.is_owned(&b).unwrap());
         controller.shutdown_all().unwrap();
+    }
+
+    #[test]
+    fn worker_progress_keeps_retry_failure_until_recording_recovers() {
+        let shared = SlotShared {
+            status: Mutex::new(RecordingStatus {
+                state: RecordingState::Connecting,
+                camera_id: Some("cam-a".to_owned()),
+                ..RecordingStatus::default()
+            }),
+            observer: Arc::new(Mutex::new(None)),
+        };
+
+        apply_worker_progress(
+            &shared,
+            &serde_json::json!({
+                "state": "backoff",
+                "retry_attempt": 2,
+                "finalized_segments": 1,
+                "failure_category": "source_open_failed"
+            }),
+        );
+        let retrying = shared.status.lock().unwrap().clone();
+        assert_eq!(retrying.state, RecordingState::Backoff);
+        assert_eq!(retrying.reconnect_attempt, 2);
+        assert_eq!(
+            retrying.failure_category.as_deref(),
+            Some("source_open_failed")
+        );
+
+        apply_worker_progress(
+            &shared,
+            &serde_json::json!({
+                "state": "recording",
+                "retry_attempt": 0,
+                "finalized_segments": 1,
+                "failure_category": ""
+            }),
+        );
+        let recovered = shared.status.lock().unwrap().clone();
+        assert_eq!(recovered.state, RecordingState::Recording);
+        assert_eq!(recovered.failure_category, None);
     }
 }

@@ -39,7 +39,13 @@ mod imp {
         DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS, HPOWERNOTIFY, PowerRegisterSuspendResumeNotification,
         PowerUnregisterSuspendResumeNotification,
     };
-    use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, GetCurrentProcess};
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, GetCurrentProcess, OpenProcess, PROCESS_QUERY_INFORMATION,
+        PROCESS_VM_READ,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DEVICE_NOTIFY_CALLBACK, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
     };
@@ -144,6 +150,31 @@ mod imp {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    pub fn process_private_working_set_bytes(pid: u32) -> Option<u64> {
+        let counter_size =
+            u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>()).ok()?;
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        let mut counters = PROCESS_MEMORY_COUNTERS_EX2::default();
+        counters.cb = counter_size;
+        let ok = unsafe {
+            GetProcessMemoryInfo(
+                handle,
+                (&raw mut counters).cast::<PROCESS_MEMORY_COUNTERS>(),
+                counters.cb,
+            )
+        };
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        if ok == 0 {
+            return None;
+        }
+        u64::try_from(counters.PrivateWorkingSetSize).ok()
     }
 
     type Callback = Box<dyn Fn(PowerEvent) + Send + Sync + 'static>;
@@ -264,6 +295,10 @@ mod imp {
 
     pub fn configure_worker_command(_command: &mut std::process::Command) {}
 
+    pub fn process_private_working_set_bytes(_pid: u32) -> Option<u64> {
+        None
+    }
+
     pub fn contain_worker(_child: &std::process::Child) -> io::Result<()> {
         Ok(())
     }
@@ -289,6 +324,13 @@ pub fn initialize_worker_process_containment() -> std::io::Result<()> {
 /// this suppresses the transient console window; other platforms are unchanged.
 pub fn configure_worker_command(command: &mut Command) {
     imp::configure_worker_command(command);
+}
+
+/// Returns the process-private working set for `pid` when available.
+/// On Windows this is closer to the private-memory number users compare
+/// against Task Manager; other platforms return `None` for caller fallback.
+pub fn process_private_working_set_bytes(pid: u32) -> Option<u64> {
+    imp::process_private_working_set_bytes(pid)
 }
 
 /// Assigns a media-worker child to a process-wide Windows Job Object whose

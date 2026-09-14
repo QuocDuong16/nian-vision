@@ -146,6 +146,17 @@ function installDesktop(
           : status,
       );
     },
+    setRecordingState(
+      cameraId: string,
+      state: RecordingStatus["state"],
+      failureCategory: string | null = null,
+      reconnectAttempt = 0,
+    ) {
+      recording = recording.map((status) => status.camera_id === cameraId
+        ? { ...status, state, failure_category: failureCategory, reconnect_attempt: reconnectAttempt }
+        : status);
+      intent = { camera_ids: state === "stopped" ? intent.camera_ids.filter((id) => id !== cameraId) : [...new Set([...intent.camera_ids, cameraId])] };
+    },
   };
 }
 
@@ -307,7 +318,8 @@ describe("LiveViewScreen", () => {
     await screen.findByRole("article", { name: "Front door live camera" });
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Retry live" })).toBeTruthy());
-    expect(screen.getByText("source_open_failed")).toBeTruthy();
+    expect(screen.getByText("Camera stream unavailable")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("source_open_failed");
 
     fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
     expect(await screen.findByRole("article", { name: "Garage live camera" })).toBeTruthy();
@@ -374,6 +386,22 @@ describe("LiveViewScreen", () => {
     expect(tile.querySelector("video")).toBeTruthy();
   });
 
+  it("shows recorder reconnecting reason in live view instead of raw backoff", async () => {
+    const desktop = installDesktop();
+    desktop.setRecordingState(front.camera_id, "backoff", "source_open_failed", 2);
+    render(<LiveViewScreen />);
+
+    await screen.findByText("No live cameras selected");
+    fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+    const tile = await screen.findByRole("article", { name: "Front door live camera" });
+
+    await waitFor(() => {
+      expect(tile.textContent).toContain("Rec Reconnecting · stream unavailable");
+    });
+    expect(tile.textContent).not.toContain("source_open_failed");
+    expect(tile.textContent).not.toContain("backoff");
+  });
+
   it("keeps the media pipeline mounted across an independent backend reconnect cycle", async () => {
     const desktop = installDesktop();
     render(<LiveViewScreen />);
@@ -390,8 +418,11 @@ describe("LiveViewScreen", () => {
     desktop.setLiveState(front.camera_id, "backoff", 1);
     await waitFor(
       () => {
-        expect(screen.getByText("Reconnecting")).toBeTruthy();
+        const reconnecting = screen.getByText("Reconnecting");
+        expect(reconnecting).toBeTruthy();
+        expect(reconnecting.getAttribute("title")).toBe("Camera stream unavailable");
         expect(tile.querySelector("video")).toBe(firstVideo);
+        expect(tile.textContent).not.toContain("source_open_failed");
       },
       { timeout: 2_500 },
     );

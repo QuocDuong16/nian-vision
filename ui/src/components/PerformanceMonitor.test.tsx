@@ -7,7 +7,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 const snapshot = {
   sample_ready: true,
-  process_count: 4,
+  process_count: 3,
   app_cpu_percent: 6.25,
   root_process_cpu_percent: 1.5,
   system_cpu_percent: 31.5,
@@ -22,6 +22,11 @@ const snapshot = {
   app_network_tx_bps: null,
   app_gpu_percent: null,
   system_gpu_percent: null,
+  processes: [
+    { pid: 100, name: "nian-vision.exe", role: "Desktop host", cpu_percent: 1.5, memory_bytes: 128 * 1024 * 1024, is_root: true },
+    { pid: 101, name: "msedgewebview2.exe", role: "WebView2 renderer", cpu_percent: 3.25, memory_bytes: 256 * 1024 * 1024, is_root: false },
+    { pid: 102, name: "nian-media-worker.exe", role: "Media worker", cpu_percent: 1.5, memory_bytes: 128 * 1024 * 1024, is_root: false },
+  ],
 };
 
 beforeEach(() => {
@@ -42,12 +47,16 @@ describe("PerformanceMonitor", () => {
   it("shows lightweight process telemetry and honest unsupported counters", async () => {
     render(<PerformanceMonitor />);
 
-    await waitFor(() => expect(screen.getByText(/CPU 6.3% · RAM 512 MB/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/CPU 1.5% · Host 128 MB/)).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "Nian Vision performance" }));
 
     expect(screen.getByRole("region", { name: "Performance details" })).toBeTruthy();
-    expect(screen.getByText("4 processes")).toBeTruthy();
-    expect(screen.getByText(/Desktop 128 MB · children 384 MB/)).toBeTruthy();
+    expect(screen.getByText("3 processes")).toBeTruthy();
+    expect(screen.getByText(/Desktop 128 MB · child processes 384 MB/)).toBeTruthy();
+    expect(screen.getByText("WebView2 renderer")).toBeTruthy();
+    expect(screen.getByText("Media worker")).toBeTruthy();
+    expect(screen.getByText(/msedgewebview2.exe · PID 101/)).toBeTruthy();
+    expect(screen.getByText(/3.3% CPU · 50% memory/)).toBeTruthy();
     expect(screen.getByText(/system 32%/)).toBeTruthy();
     expect(screen.getByText(/Per-process network accounting/)).toBeTruthy();
     expect(screen.getByText("GPU accounting unavailable")).toBeTruthy();

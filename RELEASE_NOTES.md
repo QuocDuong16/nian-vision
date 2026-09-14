@@ -1,3 +1,8 @@
+# Nian Vision 1.0.0-rc.55
+Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
+
+RC55 hardens the telemetry and recording-recovery surfaces exposed by physical RC54 Windows review. Performance telemetry now reports the desktop host separately from the full Nian Vision process tree and exposes each owned process with PID, role, CPU, memory and share of total application memory. On Windows, memory accounting prefers each process's private working set through the native process-status API, with a portable working-set fallback only when a counter cannot be read; WebView2 browser, renderer, GPU, network, audio, utility and crash-handler roles plus Nian media workers are labeled independently so Task Manager comparisons are diagnosable instead of collapsed into one unexplained total. Recording supervision now carries retryable source failure categories through reconnect backoff and clears them only after recovery or a clean terminal stop, while Cameras and Live View translate those categories into user-facing reconnect/failure text instead of exposing raw `backoff` or wire codes. Live View also translates its own typed media failure categories into readable diagnostics. The accepted H.264 packet-copy recording/event-capture contract, Media Chrome/Sutro playback stack and RC54 Live View layout/focus behavior remain unchanged.
+
 # Nian Vision 1.0.0-rc.54
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 

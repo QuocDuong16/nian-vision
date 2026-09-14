@@ -173,6 +173,44 @@ describe("CamerasScreen", () => {
     expect(document.body.textContent).not.toContain("SENTINEL-ui-password");
   });
 
+  it("explains why a recorder is reconnecting instead of exposing raw backoff state", async () => {
+    installDesktop([camera], {
+      state: "backoff",
+      camera_id: camera.camera_id,
+      failure_category: "source_open_failed",
+      reconnect_attempt: 2,
+      finalized_segments: 0,
+    });
+    render(<CamerasScreen />);
+
+    const title = await screen.findByText("Front door");
+    const card = title.closest("article") as HTMLElement;
+    expect(within(card).getAllByText("Reconnecting").length).toBeGreaterThanOrEqual(1);
+    expect(card.textContent).toContain("Cannot open the camera stream");
+    expect(card.textContent).toContain("retry 2");
+    expect(card.textContent).not.toContain("source_open_failed");
+    expect(card.textContent).not.toContain("backoff");
+  });
+
+  it("does not present a permanent recording failure as another retry", async () => {
+    installDesktop([camera], {
+      state: "failed",
+      camera_id: camera.camera_id,
+      failure_category: "storage_failed",
+      reconnect_attempt: 7,
+      finalized_segments: 3,
+    });
+    render(<CamerasScreen />);
+
+    const title = await screen.findByText("Front door");
+    const card = title.closest("article") as HTMLElement;
+    expect(card.textContent).toContain("Recording failed");
+    expect(card.textContent).toContain("Recording storage is unavailable");
+    expect(card.textContent).toContain("3 segments");
+    expect(card.textContent).not.toContain("retry 7");
+    expect(card.textContent).not.toContain("storage_failed");
+  });
+
   it("tests an unsaved connection with loading and typed result state", async () => {
     installDesktop();
     let resolveProbe: ((value: unknown) => void) | undefined;

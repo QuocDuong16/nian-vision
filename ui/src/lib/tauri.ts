@@ -274,6 +274,16 @@ export interface PerformanceSnapshot {
   app_network_tx_bps: number | null;
   app_gpu_percent: number | null;
   system_gpu_percent: number | null;
+  processes: PerformanceProcess[];
+}
+
+export interface PerformanceProcess {
+  pid: number;
+  name: string;
+  role: string;
+  cpu_percent: number;
+  memory_bytes: number;
+  is_root: boolean;
 }
 
 export interface RecordingIntent {
