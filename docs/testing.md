@@ -444,7 +444,7 @@ at the 45-second cadence; opening another recording transfers heartbeat ownershi
 media error and unmount stop the old timer and request close; backend expiry clears
 the dead video/session and offers Reopen; isolated internal keepalive failures retry
 silently while three consecutive failures surface one safe warning that clears
-after recovery. Lint (`eslint`), `tsc --noEmit`, Vitest and Vite build gate the frontend.
+after recovery. RC51 keeps those behavioral tests unchanged while the shared interface layer is gated by App-shell/navigation DOM coverage, semantic button/label accessibility, production CSS build and the desktop configuration minimum-window contract. Manual release acceptance additionally exercises wide sidebar, medium icon-rail and 720×520 bottom-navigation layouts because jsdom does not implement CSS layout or WebView viewport rendering. Lint (`eslint`), `tsc --noEmit`, Vitest and Vite build gate the frontend.
 
 Desktop configuration tests parse the committed `tauri.conf.json` and assert the
 CSP contains the narrow playback allowance

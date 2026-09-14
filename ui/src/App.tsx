@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { AppInfo } from "./lib/tauri";
 import { isTauri, useTauriCommand } from "./lib/tauri";
-import type { ScreenId } from "./navigation";
+import { SCREENS, type ScreenId } from "./navigation";
 import { Sidebar } from "./components/Sidebar";
 import { CamerasScreen } from "./screens/CamerasScreen";
 import { LiveViewScreen } from "./screens/LiveViewScreen";
@@ -24,6 +24,7 @@ export function App() {
   const [screen, setScreen] = useState<ScreenId>("cameras");
   const [liveVisited, setLiveVisited] = useState(false);
   const appInfo = useTauriCommand<AppInfo>("app_info", FALLBACK_APP_INFO);
+  const activeScreenLabel = SCREENS.find((entry) => entry.id === screen)?.label ?? "Cameras";
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -52,8 +53,15 @@ export function App() {
       <Sidebar active={screen} onNavigate={navigate} />
       <main className="app-content">
         <header className="app-header">
-          <h1>{appInfo.name}</h1>
-          <span className="app-version">v{appInfo.version}</span>
+          <div className="app-header-context">
+            <span className="app-header-eyebrow">{appInfo.name}</span>
+            <span className="app-header-separator" aria-hidden="true">/</span>
+            <span className="app-header-section">{activeScreenLabel}</span>
+          </div>
+          <div className="app-header-meta">
+            <span className="app-runtime-badge"><span className="app-runtime-dot" aria-hidden="true" /> Desktop</span>
+            <span className="app-version">v{appInfo.version}</span>
+          </div>
         </header>
         {screen === "cameras" && <CamerasScreen />}
         {liveVisited && (

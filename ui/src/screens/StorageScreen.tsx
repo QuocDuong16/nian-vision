@@ -125,18 +125,23 @@ export function StorageScreen() {
               onChange={(event) => setForm({ ...form, storage_root: event.target.value })}
               placeholder="D:\\Nian Vision Recordings"
             />
+            <span className="field-help">Manual recordings and Nian-managed event storage live under this root.</span>
           </label>
-          <label>Segment target (seconds)
-            <input aria-label="Segment target" type="number" min={5} max={3600} value={form.segment_target_secs} onChange={(event) => setForm({ ...form, segment_target_secs: event.target.value })} />
+          <label>Segment target
+            <div className="field-with-unit"><input aria-label="Segment target" type="number" min={5} max={3600} value={form.segment_target_secs} onChange={(event) => setForm({ ...form, segment_target_secs: event.target.value })} /><span>sec</span></div>
+            <span className="field-help">Target duration for finalized manual recording segments.</span>
           </label>
-          <label>Max age (days, optional)
-            <input aria-label="Max age days" type="number" min={1} value={form.max_age_days} onChange={(event) => setForm({ ...form, max_age_days: event.target.value })} />
+          <label>Retention age
+            <div className="field-with-unit"><input aria-label="Max age days" type="number" min={1} value={form.max_age_days} onChange={(event) => setForm({ ...form, max_age_days: event.target.value })} /><span>days</span></div>
+            <span className="field-help">Optional. Older eligible footage is removed first.</span>
           </label>
-          <label>Max storage bytes (optional HIGH watermark)
-            <input aria-label="Max storage bytes" type="number" min={1048576} value={form.max_storage_bytes} onChange={(event) => setForm({ ...form, max_storage_bytes: event.target.value })} />
+          <label>Storage high watermark
+            <div className="field-with-unit"><input aria-label="Max storage bytes" type="number" min={1048576} value={form.max_storage_bytes} onChange={(event) => setForm({ ...form, max_storage_bytes: event.target.value })} /><span>bytes</span></div>
+            <span className="field-help">Optional. Cleanup begins after usage crosses this limit.</span>
           </label>
-          <label>Cleanup target bytes (optional LOW watermark)
-            <input aria-label="Cleanup target bytes" type="number" min={1} value={form.cleanup_target_bytes} onChange={(event) => setForm({ ...form, cleanup_target_bytes: event.target.value })} />
+          <label>Cleanup low watermark
+            <div className="field-with-unit"><input aria-label="Cleanup target bytes" type="number" min={1} value={form.cleanup_target_bytes} onChange={(event) => setForm({ ...form, cleanup_target_bytes: event.target.value })} /><span>bytes</span></div>
+            <span className="field-help">Optional. Cleanup stops once usage falls below this target.</span>
           </label>
           <div className="form-actions full-width">
             <button className="primary-button" type="submit" disabled={saving}>{saving ? "Saving…" : "Save storage settings"}</button>

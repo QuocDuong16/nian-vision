@@ -93,7 +93,8 @@ export function SettingsScreen() {
         </div>
       </div>
       {error && <div className="error-banner" role="alert"><strong>{error.code}</strong>: {error.message}</div>}
-      <div className="panel form-grid">
+      <div className="settings-layout">
+      <div className="panel form-grid settings-card">
         <h3>Desktop lifecycle</h3>
         <label className="checkbox-row">
           <input
@@ -107,7 +108,7 @@ export function SettingsScreen() {
         </label>
         <p className="muted">Login launch starts hidden in the system tray. Manual launch opens the main window.</p>
       </div>
-      <div className="panel form-grid">
+      <div className="panel form-grid settings-card">
         <h3>Notifications</h3>
         <label className="checkbox-row">
           <input
@@ -125,7 +126,7 @@ export function SettingsScreen() {
           <p className="muted">Off by default. Only newly persisted MotionStarted events are eligible.</p>
         )}
       </div>
-      <div className="panel">
+      <div className="panel settings-card settings-card-wide">
         <h3>Updates</h3>
         <p>Current version: <strong>{appInfo?.version ?? "unknown"}</strong></p>
         <div className="button-row">
@@ -153,9 +154,10 @@ export function SettingsScreen() {
           </div>
         )}
       </div>
-      <div className="panel">
+      <div className="panel settings-card">
         <h3>Window behavior</h3>
         <p>Closing the main window hides Nian Vision to the tray. Recording continues. Use tray Quit for a graceful process shutdown.</p>
+      </div>
       </div>
     </section>
   );

@@ -123,11 +123,22 @@ export function PtzControls({
     return <div className="ptz-status muted">PTZ: unsupported</div>;
   }
 
+  const buttonGlyph = (label: string) => {
+    if (label === "Up") return "↑";
+    if (label === "Down") return "↓";
+    if (label === "Left") return "←";
+    if (label === "Right") return "→";
+    if (label === "Zoom out") return "−";
+    if (label === "Zoom in") return "+";
+    return label;
+  };
+
   const button = (label: string, direction: PtzDirection, className?: string) => (
     <button
       type="button"
       className={className}
       aria-label={`PTZ ${label}`}
+      title={label}
       onPointerDown={(event) => {
         event.preventDefault();
         event.currentTarget.setPointerCapture?.(event.pointerId);
@@ -152,7 +163,7 @@ export function PtzControls({
       onBlur={release}
       onClick={(event) => event.preventDefault()}
     >
-      {label}
+      <span className="ptz-button-glyph" aria-hidden="true">{buttonGlyph(label)}</span>
     </button>
   );
 

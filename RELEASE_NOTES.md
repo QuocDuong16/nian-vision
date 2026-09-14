@@ -1,3 +1,8 @@
+# Nian Vision 1.0.0-rc.51
+Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
+
+RC51 is a desktop UI/UX overhaul over the functionally accepted RC50 behavior. It introduces a shared interface system with explicit color/type/spacing/control tokens, a full navigation sidebar on wide windows, an icon rail on medium windows, and a bottom navigation surface on narrow windows. The Tauri minimum window contract is lowered from 960×600 to 720×520 and the interface adds compact-height behavior so camera management, Live View, Event Review, Timeline, Storage, Settings, onboarding dialogs and PTZ remain usable across realistic resized desktop windows. Camera management now presents operational summary metrics, separated Recording/Motion/Stream-health state and primary/integration/destructive action hierarchy instead of an undifferentiated button row. ONVIF/add/delete flows render as bounded desktop dialogs; Settings uses grouped preference cards and custom switches; Storage exposes units/help text; Live View uses grouped layout/add controls and a custom diagnostics switch; Event/Timeline/playback surfaces receive clearer selection/status treatment; PTZ uses tactile directional glyph controls while retaining the existing pointer/keyboard/dead-man semantics. Native controls keep semantic HTML and focus behavior while receiving application-specific styling. Recording, independent Event capture, Timeline ownership, Live transport, ONVIF/PTZ/Event protocol behavior and storage semantics are unchanged from RC50.
+
 # Nian Vision 1.0.0-rc.50
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 

@@ -881,24 +881,26 @@ export function LiveViewScreen() {
               Diagnostics
             </label>
           </div>
-          <select
-            aria-label="Camera to add"
-            value={pickerCameraId}
-            onChange={(event) => setPickerCameraId(event.target.value)}
-            disabled={!availableCameras.length || selected.length >= MAX_LIVE_VIEWS}
-          >
-            {availableCameras.map((camera) => (
-              <option key={camera.camera_id} value={camera.camera_id}>{camera.display_name}</option>
-            ))}
-          </select>
-          <button
-            className="primary-button"
-            type="button"
-            onClick={addSelectedCamera}
-            disabled={!pickerCameraId || selected.length >= MAX_LIVE_VIEWS}
-          >
-            Add to live view
-          </button>
+          <div className="live-add-control">
+            <select
+              aria-label="Camera to add"
+              value={pickerCameraId}
+              onChange={(event) => setPickerCameraId(event.target.value)}
+              disabled={!availableCameras.length || selected.length >= MAX_LIVE_VIEWS}
+            >
+              {availableCameras.map((camera) => (
+                <option key={camera.camera_id} value={camera.camera_id}>{camera.display_name}</option>
+              ))}
+            </select>
+            <button
+              className="primary-button"
+              type="button"
+              onClick={addSelectedCamera}
+              disabled={!pickerCameraId || selected.length >= MAX_LIVE_VIEWS}
+            >
+              Add to live view
+            </button>
+          </div>
         </div>
       </div>
 

@@ -429,7 +429,7 @@ export function EventReviewScreen() {
                     <span className="event-row-time">{eventTime(event.received_time_utc)}</span>
                     <strong>{event.camera_display_name}</strong>
                     <span>{eventKindLabel()}</span>
-                    <small>{event.recording_available ? "Recording available" : "Preparing recording…"}</small>
+                    <small className={`event-recording-state ${event.recording_available ? "ready" : "pending"}`}>{event.recording_available ? "Recording available" : "Preparing recording…"}</small>
                   </button>
                 </li>
               ))}

@@ -659,6 +659,10 @@ export function CamerasScreen() {
     }
   }
 
+  const desiredRecordingCount = sortedCameras.filter((camera) => intent.camera_ids.includes(camera.camera_id)).length;
+  const eventMonitoringCount = sortedCameras.filter((camera) => eventStatuses.get(camera.camera_id)?.desired).length;
+  const configuredCount = sortedCameras.length;
+
   return (
     <section className="screen-stack" aria-label="Camera management">
       <div className="screen-toolbar">
@@ -669,7 +673,28 @@ export function CamerasScreen() {
         <button className="primary-button" onClick={openCreate} disabled={saving || onvifBusy}>Add camera</button>
       </div>
 
-      <p className="muted">Active {activeCount} camera{activeCount === 1 ? "" : "s"}{reconnectingCount ? ` · ${reconnectingCount} reconnecting` : ""}</p>
+      <div className="camera-summary" aria-label="Camera overview">
+        <div className="summary-stat">
+          <span className="summary-stat-label">Configured</span>
+          <strong>{configuredCount}</strong>
+          <small>camera{configuredCount === 1 ? "" : "s"}</small>
+        </div>
+        <div className="summary-stat">
+          <span className="summary-stat-label">Runtime active</span>
+          <strong>{activeCount}</strong>
+          <small>{reconnectingCount ? `${reconnectingCount} reconnecting` : `Active ${activeCount} camera${activeCount === 1 ? "" : "s"}`}</small>
+        </div>
+        <div className="summary-stat">
+          <span className="summary-stat-label">Manual recording</span>
+          <strong>{desiredRecordingCount}</strong>
+          <small>desired on</small>
+        </div>
+        <div className="summary-stat">
+          <span className="summary-stat-label">Motion monitoring</span>
+          <strong>{eventMonitoringCount}</strong>
+          <small>enabled</small>
+        </div>
+      </div>
 
       {error && <div className="error-banner" role="alert"><strong>{error.code}</strong>: {error.message}</div>}
 
@@ -700,62 +725,77 @@ export function CamerasScreen() {
                   </div>
                   <span className={`chip chip-${state}`}>{statusLabel(state)}</span>
                 </div>
-                <p className="camera-metrics muted">Desired: {desiredOn ? "On" : "Off"} · Runtime: {statusLabel(state)}</p>
-                {runtime && (
-                  <p className="camera-metrics muted">
-                    Segments: {runtime.finalized_segments} · Reconnect attempt: {runtime.reconnect_attempt}
-                    {runtime.failure_category ? ` · ${runtime.failure_category}` : ""}
-                  </p>
-                )}
-                <p className="camera-metrics muted">
-                  Motion Events: {events?.configured ? (events.desired ? "On" : "Off") : "Unpaired"}
-                  {events?.configured ? ` · Runtime: ${events.state.replaceAll("_", " ")}` : ""}
-                  {events?.motion_active === true ? " · Motion detected" : ""}
-                  {events?.last_error_code ? ` · ${events.last_error_code}` : ""}
-                </p>
-                <div className="button-row">
-                  <button
-                    className={desiredOn || desiredOffRuntimeActive ? "danger-button" : "primary-button"}
-                    disabled={recordingControlDisabled}
-                    onClick={() => void toggleRecording(camera)}
-                  >
-                    {recordingControlLabel}
-                  </button>
-                  <button onClick={() => openEdit(camera)} disabled={busyCamera !== null || rowBusy}>Edit</button>
-                  <button
-                    onClick={() => void (
-                      ptzConfigured.get(camera.camera_id)
-                        ? startOnvifDiscovery(camera, "ptz")
-                        : pairPtz(camera)
+                <div className="camera-status-grid">
+                  <div className="camera-status-item">
+                    <span className="camera-status-label">Recording</span>
+                    <strong>{desiredOn ? "Manual on" : "Manual off"}</strong>
+                    <small>Runtime {statusLabel(state)}</small>
+                  </div>
+                  <div className={`camera-status-item ${events?.motion_active === true ? "is-motion-active" : ""}`}>
+                    <span className="camera-status-label">Motion monitoring</span>
+                    <strong>Motion Events: {events?.configured ? (events.desired ? "On" : "Off") : "Unpaired"}</strong>
+                    <small>
+                      {events?.configured ? events.state.replaceAll("_", " ") : "Pair ONVIF events"}
+                      {events?.motion_active === true ? " · Motion detected" : ""}
+                      {events?.last_error_code ? ` · ${events.last_error_code}` : ""}
+                    </small>
+                  </div>
+                  <div className="camera-status-item">
+                    <span className="camera-status-label">Stream health</span>
+                    <strong>{runtime?.failure_category ?? (ownActive ? "Healthy" : "Idle")}</strong>
+                    <small>{runtime ? `${runtime.finalized_segments} segments · retry ${runtime.reconnect_attempt}` : "No active recorder"}</small>
+                  </div>
+                </div>
+                <div className="camera-actions">
+                  <div className="camera-actions-primary">
+                    <button
+                      className={desiredOn || desiredOffRuntimeActive ? "danger-button" : "primary-button"}
+                      disabled={recordingControlDisabled}
+                      onClick={() => void toggleRecording(camera)}
+                    >
+                      {recordingControlLabel}
+                    </button>
+                    <button onClick={() => openEdit(camera)} disabled={busyCamera !== null || rowBusy}>Edit</button>
+                  </div>
+                  <div className="camera-actions-secondary" aria-label={`${camera.display_name} integrations`}>
+                    <button
+                      onClick={() => void (
+                        ptzConfigured.get(camera.camera_id)
+                          ? startOnvifDiscovery(camera, "ptz")
+                          : pairPtz(camera)
+                      )}
+                      disabled={busyCamera !== null || rowBusy || onvifBusy}
+                    >{ptzConfigured.get(camera.camera_id) ? "Replace PTZ" : "Pair PTZ"}</button>
+                    {ptzConfigured.get(camera.camera_id) && (
+                      <button onClick={() => void unpairPtz(camera)} disabled={busyCamera !== null || rowBusy}>Unpair PTZ</button>
                     )}
-                    disabled={busyCamera !== null || rowBusy || onvifBusy}
-                  >{ptzConfigured.get(camera.camera_id) ? "Replace PTZ" : "Pair PTZ"}</button>
-                  {ptzConfigured.get(camera.camera_id) && (
-                    <button onClick={() => void unpairPtz(camera)} disabled={busyCamera !== null || rowBusy}>Unpair PTZ</button>
-                  )}
-                  <button
-                    onClick={() => void (
-                      events?.configured
-                        ? startOnvifDiscovery(camera, "events")
-                        : pairEvents(camera)
+                    <button
+                      onClick={() => void (
+                        events?.configured
+                          ? startOnvifDiscovery(camera, "events")
+                          : pairEvents(camera)
+                      )}
+                      disabled={busyCamera !== null || rowBusy || onvifBusy}
+                    >{events?.configured ? "Replace Motion Events" : "Pair Motion Events"}</button>
+                    {events?.configured && (
+                      <>
+                        <button
+                          className={events.desired ? "danger-button" : undefined}
+                          onClick={() => void toggleEvents(camera)}
+                          disabled={busyCamera !== null || rowBusy || events.state === "stopping"}
+                        >{events.desired ? "Disable Events" : "Enable Events"}</button>
+                        <button onClick={() => void unpairEvents(camera)} disabled={busyCamera !== null || rowBusy}>Unpair Events</button>
+                      </>
                     )}
-                    disabled={busyCamera !== null || rowBusy || onvifBusy}
-                  >{events?.configured ? "Replace Motion Events" : "Pair Motion Events"}</button>
-                  {events?.configured && (
-                    <>
-                      <button
-                        className={events.desired ? "danger-button" : undefined}
-                        onClick={() => void toggleEvents(camera)}
-                        disabled={busyCamera !== null || rowBusy || events.state === "stopping"}
-                      >{events.desired ? "Disable Events" : "Enable Events"}</button>
-                      <button onClick={() => void unpairEvents(camera)} disabled={busyCamera !== null || rowBusy}>Unpair Events</button>
-                    </>
-                  )}
-                  <button
-                    onClick={() => setDeleteTarget(camera)}
-                    disabled={busyCamera !== null || rowBusy || ownActive || desiredOn}
-                    title={ownActive || desiredOn ? "Turn off recording intent before deleting this camera" : undefined}
-                  >Delete</button>
+                  </div>
+                  <div className="camera-actions-danger">
+                    <button
+                      className="subtle-danger-button"
+                      onClick={() => setDeleteTarget(camera)}
+                      disabled={busyCamera !== null || rowBusy || ownActive || desiredOn}
+                      title={ownActive || desiredOn ? "Turn off recording intent before deleting this camera" : undefined}
+                    >Delete</button>
+                  </div>
                 </div>
               </article>
             );
