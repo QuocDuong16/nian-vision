@@ -9,8 +9,11 @@ const snapshot = {
   sample_ready: true,
   process_count: 4,
   app_cpu_percent: 6.25,
+  root_process_cpu_percent: 1.5,
   system_cpu_percent: 31.5,
   app_memory_bytes: 512 * 1024 * 1024,
+  root_process_memory_bytes: 128 * 1024 * 1024,
+  child_process_memory_bytes: 384 * 1024 * 1024,
   system_memory_used_bytes: 8 * 1024 ** 3,
   system_memory_total_bytes: 16 * 1024 ** 3,
   system_network_rx_bps: 4 * 1024 * 1024,
@@ -44,6 +47,7 @@ describe("PerformanceMonitor", () => {
 
     expect(screen.getByRole("region", { name: "Performance details" })).toBeTruthy();
     expect(screen.getByText("4 processes")).toBeTruthy();
+    expect(screen.getByText(/Desktop 128 MB · children 384 MB/)).toBeTruthy();
     expect(screen.getByText(/system 32%/)).toBeTruthy();
     expect(screen.getByText(/Per-process network accounting/)).toBeTruthy();
     expect(screen.getByText("GPU accounting unavailable")).toBeTruthy();

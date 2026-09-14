@@ -710,4 +710,29 @@ describe("LiveViewScreen", () => {
       expect(closesAfterUnmount).toBeGreaterThan(closesBeforeUnmount);
     });
   });
+  it("renders every zone in a multi-camera layout and focuses a camera without changing layout or session", async () => {
+    installDesktop();
+    render(<LiveViewScreen />);
+
+    await screen.findByText("No live cameras selected");
+    fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+    const tile = await screen.findByRole("article", { name: "Front door live camera" });
+    await waitFor(() => expect(tile.querySelector("video")).toBeTruthy());
+
+    expect(screen.getByLabelText("Empty live view slot 2")).toBeTruthy();
+    expect(screen.getByLabelText("Empty live view slot 3")).toBeTruthy();
+    expect(screen.getByLabelText("Empty live view slot 4")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "4 camera layout" }).getAttribute("aria-pressed")).toBe("true");
+
+    const opensBeforeFocus = vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open").length;
+    fireEvent.doubleClick(tile);
+    expect(await screen.findByRole("dialog", { name: "Front door live camera" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "4 camera layout" }).getAttribute("aria-pressed")).toBe("true");
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open")).toHaveLength(opensBeforeFocus);
+    expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "live_close")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Front door focus view" }));
+    expect(await screen.findByRole("article", { name: "Front door live camera" })).toBeTruthy();
+  });
+
 });

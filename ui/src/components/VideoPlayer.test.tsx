@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { VideoPlayer } from "./VideoPlayer";
 
@@ -8,7 +8,7 @@ afterEach(() => {
 });
 
 describe("VideoPlayer", () => {
-  it("uses application controls instead of native browser controls and exposes metadata", () => {
+  it("mounts the Sutro Media Chrome theme instead of native browser controls and exposes NVR metadata", async () => {
     render(
       <VideoPlayer
         src="http://127.0.0.1:43100/playback/test"
@@ -19,42 +19,70 @@ describe("VideoPlayer", () => {
       />,
     );
 
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
     const video = document.querySelector("video") as HTMLVideoElement;
-    expect(video).toBeTruthy();
+    const theme = document.querySelector("media-theme-sutro");
+    expect(theme).toBeTruthy();
+    expect(video.closest("media-theme-sutro")).toBe(theme);
     expect(video.hasAttribute("controls")).toBe(false);
-    expect(screen.getAllByRole("button", { name: "Play video" })).toHaveLength(2);
-    expect(screen.getByRole("slider", { name: "Video position" })).toBeTruthy();
-    expect(screen.getByRole("slider", { name: "Video volume" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Enter fullscreen" })).toBeTruthy();
+    expect(video.getAttribute("slot")).toBe("media");
 
-    fireEvent.click(screen.getByRole("button", { name: "Video metadata" }));
+    fireEvent.click(screen.getByRole("button", { name: "Metadata" }));
     expect(screen.getAllByRole("definition").some((entry) => entry.textContent === "Front door")).toBe(true);
     expect(screen.getByText("H264")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Close video metadata" })).toBeTruthy();
   });
 
-  it("seeks to event pre-roll on loaded metadata and supports keyboard seeking", () => {
+  it("seeks to the event start after dedicated pre-roll metadata loads", async () => {
     render(<VideoPlayer src="http://127.0.0.1:43100/playback/event" initialTimeSeconds={5} />);
-    const player = screen.getByLabelText("Video playback");
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
     const video = document.querySelector("video") as HTMLVideoElement;
     Object.defineProperty(video, "duration", { configurable: true, value: 30 });
     video.currentTime = 0;
 
     fireEvent.loadedMetadata(video);
     expect(video.currentTime).toBe(5);
-
-    fireEvent.keyDown(player, { key: "ArrowRight" });
-    expect(video.currentTime).toBe(10);
-    fireEvent.keyDown(player, { key: "ArrowLeft" });
-    expect(video.currentTime).toBe(5);
+    expect(screen.getByText("Motion begins at 0:05")).toBeTruthy();
+    expect(screen.getByText("0:30 clip")).toBeTruthy();
   });
 
-  it("requests fullscreen from the player surface", async () => {
-    render(<VideoPlayer src="http://127.0.0.1:43100/playback/fullscreen" />);
-    const player = screen.getByLabelText("Video playback") as HTMLDivElement & { requestFullscreen: () => Promise<void> };
-    const requestFullscreen = vi.fn().mockResolvedValue(undefined);
-    player.requestFullscreen = requestFullscreen;
-    fireEvent.click(screen.getByRole("button", { name: "Enter fullscreen" }));
-    await Promise.resolve();
-    expect(requestFullscreen).toHaveBeenCalledTimes(1);
+  it("forwards ended and error events from the media element", async () => {
+    const onEnded = vi.fn();
+    const onError = vi.fn();
+    render(
+      <VideoPlayer
+        src="http://127.0.0.1:43100/playback/events"
+        onEnded={onEnded}
+        onError={onError}
+      />,
+    );
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+    const video = document.querySelector("video") as HTMLVideoElement;
+
+    fireEvent.ended(video);
+    fireEvent.error(video);
+    expect(onEnded).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
+
+  it("resets clip-specific metadata UI when the source changes", async () => {
+    const view = render(
+      <VideoPlayer
+        src="http://127.0.0.1:43100/playback/first"
+        metadata={[{ label: "Camera", value: "Front door" }]}
+      />,
+    );
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Metadata" }));
+    expect(screen.getByRole("region", { name: "Video metadata" })).toBeTruthy();
+
+    view.rerender(
+      <VideoPlayer
+        src="http://127.0.0.1:43100/playback/second"
+        metadata={[{ label: "Camera", value: "Garage" }]}
+      />,
+    );
+    expect(screen.queryByRole("region", { name: "Video metadata" })).toBeNull();
+    await waitFor(() => expect((document.querySelector("video") as HTMLVideoElement | null)?.src).toContain("/playback/second"));
   });
 });

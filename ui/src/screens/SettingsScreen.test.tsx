@@ -60,13 +60,12 @@ describe("SettingsScreen updates", () => {
     expect(await screen.findByText(/no production update channel configured/i)).toBeTruthy();
   });
 
-  it("requires explicit confirmation before update installation", async () => {
+  it("uses an application confirmation dialog before update installation", async () => {
     installDesktop({
       configured: true,
       current_version: "0.1.0",
       available: { version: "0.2.0", notes: "Release notes", date: null },
     });
-    vi.spyOn(window, "confirm").mockReturnValue(false);
     render(<SettingsScreen />);
     await screen.findByText(/Current version:/);
 
@@ -74,8 +73,11 @@ describe("SettingsScreen updates", () => {
     const install = await screen.findByRole("button", { name: "Download and install 0.2.0" });
     fireEvent.click(install);
 
-    expect(window.confirm).toHaveBeenCalledOnce();
+    expect(screen.getByRole("dialog", { name: "Install update confirmation" })).toBeTruthy();
+    expect(screen.getByText("Install Nian Vision 0.2.0?")).toBeTruthy();
     expect(vi.mocked(invoke).mock.calls.some(([name]) => name === "update_install")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog", { name: "Install update confirmation" })).toBeNull();
   });
 
   it("passes the checked version to the Rust lifecycle install command", async () => {
@@ -84,12 +86,12 @@ describe("SettingsScreen updates", () => {
       current_version: "0.1.0",
       available: { version: "0.2.0", notes: null, date: "2026-08-31T00:00:00Z" },
     });
-    vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<SettingsScreen />);
     await screen.findByText(/Current version:/);
 
     fireEvent.click(screen.getByRole("button", { name: "Check for updates" }));
     fireEvent.click(await screen.findByRole("button", { name: "Download and install 0.2.0" }));
+    fireEvent.click(screen.getByRole("button", { name: "Install and restart" }));
 
     await waitFor(() => {
       expect(vi.mocked(invoke)).toHaveBeenCalledWith("update_install", { expectedVersion: "0.2.0" });

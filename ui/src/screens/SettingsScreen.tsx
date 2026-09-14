@@ -11,6 +11,7 @@ export function SettingsScreen() {
   const [notificationSaving, setNotificationSaving] = useState(false);
   const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
+  const [confirmingInstall, setConfirmingInstall] = useState(false);
   const [error, setError] = useState<DesktopError | null>(null);
 
   useEffect(() => {
@@ -69,15 +70,17 @@ export function SettingsScreen() {
 
   async function installUpdate() {
     if (!update?.available || installing || !isTauri()) return;
-    const approved = window.confirm(
-      `Install Nian Vision ${update.available.version}? Active recording will stop cleanly and resume after the application restarts.`,
-    );
-    if (!approved) return;
+    setConfirmingInstall(true);
+  }
 
+  async function confirmInstallUpdate() {
+    if (!update?.available || installing || !isTauri()) return;
+    const expectedVersion = update.available.version;
+    setConfirmingInstall(false);
     setInstalling(true);
     setError(null);
     try {
-      await invokeDesktop<void>("update_install", { expectedVersion: update.available.version });
+      await invokeDesktop<void>("update_install", { expectedVersion });
     } catch (cause) {
       setError(desktopError(cause));
       setInstalling(false);
@@ -159,6 +162,19 @@ export function SettingsScreen() {
         <p>Closing the main window hides Nian Vision to the tray. Recording continues. Use tray Quit for a graceful process shutdown.</p>
       </div>
       </div>
+      {confirmingInstall && update?.available && (
+        <div className="panel confirmation" role="dialog" aria-modal="true" aria-label="Install update confirmation">
+          <span className="dialog-kicker">Application update</span>
+          <h3>Install Nian Vision {update.available.version}?</h3>
+          <p>Active recording will stop cleanly before the update. Recording intent is preserved and restored after the application restarts.</p>
+          <div className="button-row">
+            <button type="button" onClick={() => setConfirmingInstall(false)}>Cancel</button>
+            <button type="button" className="primary-button" onClick={() => void confirmInstallUpdate()}>
+              Install and restart
+            </button>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

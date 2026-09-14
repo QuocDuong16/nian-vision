@@ -429,6 +429,7 @@ export function LiveViewScreen() {
   const [layoutSize, setLayoutSize] = useState<LiveLayoutSize>(initialPreferences.layoutSize);
   const [page, setPage] = useState(initialPreferences.page);
   const [showVideoDiagnostics, setShowVideoDiagnostics] = useState(false);
+  const [focusedCameraId, setFocusedCameraId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<Map<string, LiveOpenDto>>(() => new Map());
   const [statuses, setStatuses] = useState<LiveStatus[]>([]);
   const [recordings, setRecordings] = useState<RecordingStatus[]>([]);
@@ -446,6 +447,10 @@ export function LiveViewScreen() {
   const visibleCameraIds = useMemo(
     () => selected.slice(effectivePage * layoutSize, (effectivePage + 1) * layoutSize),
     [effectivePage, layoutSize, selected],
+  );
+  const visibleSlots = useMemo(
+    () => Array.from({ length: layoutSize }, (_, index) => visibleCameraIds[index] ?? null),
+    [layoutSize, visibleCameraIds],
   );
   const sessionsRef = useRef(sessions);
   const selectedRef = useRef<Set<string>>(new Set(initialPreferences.cameraIds));
@@ -467,6 +472,19 @@ export function LiveViewScreen() {
   useEffect(() => {
     if (page !== effectivePage) setPage(effectivePage);
   }, [effectivePage, page]);
+
+  useEffect(() => {
+    if (!focusedCameraId) return;
+    if (!visibleCameraIds.includes(focusedCameraId)) {
+      setFocusedCameraId(null);
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setFocusedCameraId(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [focusedCameraId, visibleCameraIds]);
 
   const setSessionForCamera = useCallback((cameraId: string, session: LiveOpenDto | null) => {
     const next = new Map(sessionsRef.current);
@@ -777,6 +795,7 @@ export function LiveViewScreen() {
     });
     const nextSelected = new Set(selectedRef.current);
     nextSelected.delete(cameraId);
+    if (focusedCameraId === cameraId) setFocusedCameraId(null);
     selectedRef.current = nextSelected;
     nextGeneration(cameraId);
     const session = sessionsRef.current.get(cameraId);
@@ -875,10 +894,8 @@ export function LiveViewScreen() {
   }
 
   function focusCamera(cameraId: string) {
-    const index = selected.indexOf(cameraId);
-    if (index < 0) return;
-    setLayoutSize(1);
-    setPage(index);
+    if (!visibleCameraIds.includes(cameraId)) return;
+    setFocusedCameraId(cameraId);
   }
 
   async function toggleRecording(cameraId: string) {
@@ -908,7 +925,7 @@ export function LiveViewScreen() {
       <div className="screen-toolbar">
         <div>
           <h2>Live View</h2>
-          <p className="muted">1/4/8/{MAX_LIVE_VIEWS_PER_PAGE}-camera pages. Only the current page opens live sessions; recording remains separate.</p>
+          <p className="muted">1/4/8/{MAX_LIVE_VIEWS_PER_PAGE}-zone layouts. Double-click a camera for focus view; only the current page opens live sessions.</p>
         </div>
         <div className="live-picker">
           <div className="live-layout-controls" role="group" aria-label="Live view layout">
@@ -983,6 +1000,7 @@ export function LiveViewScreen() {
           <div className="live-pagebar" aria-label="Live view pages">
             <div className="live-page-summary">
               <strong>{selected.length}</strong> camera{selected.length === 1 ? "" : "s"}
+              <span>{layoutSize}-zone layout</span>
               <span>Page {effectivePage + 1} / {pageCount}</span>
             </div>
             <div className="live-page-actions">
@@ -990,8 +1008,27 @@ export function LiveViewScreen() {
               <button type="button" aria-label="Next live page" onClick={() => setPage((current) => Math.min(pageCount - 1, current + 1))} disabled={effectivePage >= pageCount - 1}>→</button>
             </div>
           </div>
+          {focusedCameraId && (
+            <button
+              type="button"
+              className="live-focus-backdrop"
+              aria-label="Close focused camera"
+              onClick={() => setFocusedCameraId(null)}
+            />
+          )}
           <div className={`live-grid live-grid-layout-${layoutSize} ${layoutSize > 1 ? "live-grid-multi" : "live-grid-single"}`}>
-          {visibleCameraIds.map((cameraId) => {
+          {visibleSlots.map((cameraId, slotIndex) => {
+            if (!cameraId) {
+              return (
+                <div className="live-empty-slot" key={`empty-${effectivePage}-${slotIndex}`} aria-label={`Empty live view slot ${slotIndex + 1}`}>
+                  <span className="live-empty-slot-number">{slotIndex + 1}</span>
+                  <div className="live-empty-slot-copy">
+                    <strong>Empty view</strong>
+                    <span>Add a camera to use this zone</span>
+                  </div>
+                </div>
+              );
+            }
             const camera = cameraById.get(cameraId);
             if (!camera) return null;
             const session = sessions.get(cameraId);
@@ -1004,74 +1041,117 @@ export function LiveViewScreen() {
             const recordingActive = recording ? ACTIVE_RECORDING_STATES.has(recording.state) : false;
             const recordingConvergingOff = !desiredOn && recordingActive;
             const events = eventStatuses.get(cameraId);
+            const isFocused = focusedCameraId === cameraId;
             const canRenderVideo = Boolean(
               session && !tileError && state !== "failed" && state !== "stopping",
             );
-            const detailMode = layoutSize === 1 || visibleCameraIds.length === 1;
+            const motionLabel = events?.motion_active === true
+              ? "Motion detected"
+              : events?.configured
+                ? `Motion ${events.desired ? events.state : "off"}`
+                : "Motion unpaired";
             return (
               <article
-                className="live-tile"
+                className={`live-tile${isFocused ? " is-focus-viewer" : ""}`}
                 key={cameraId}
+                role={isFocused ? "dialog" : undefined}
+                aria-modal={isFocused ? true : undefined}
                 aria-label={`${camera.display_name} live camera`}
-                title={layoutSize > 1 ? "Double-click to focus this camera" : undefined}
-                onDoubleClick={() => { if (layoutSize > 1) focusCamera(cameraId); }}
+                title={!isFocused ? "Double-click to open focus view" : undefined}
+                onDoubleClick={() => { if (!isFocused) focusCamera(cameraId); }}
               >
-                <div className="live-tile-head">
-                  <div>
+                <div className="live-tile-head" onDoubleClick={(event) => event.stopPropagation()}>
+                  <div className="live-tile-identity">
                     <h3>{camera.display_name}</h3>
                     <span className={`chip ${liveChipClass(tileError ? "failed" : state)}`}>
                       {tileError ? "Failed" : isOpening ? "Starting" : stateLabel(state)}
                     </span>
                   </div>
-                  <button type="button" onClick={() => void removeCamera(cameraId)}>Remove</button>
+                  <div className="live-tile-head-actions">
+                    <button
+                      type="button"
+                      className="live-focus-button"
+                      aria-label={isFocused ? `Close ${camera.display_name} focus view` : `Open ${camera.display_name} focus view`}
+                      title={isFocused ? "Close focus view" : "Open focus view"}
+                      onClick={() => setFocusedCameraId(isFocused ? null : cameraId)}
+                    >
+                      <span aria-hidden="true">{isFocused ? "×" : "↗"}</span>
+                    </button>
+                    {!isFocused && <button type="button" onClick={() => void removeCamera(cameraId)}>Remove</button>}
+                  </div>
                 </div>
 
-                <div className="live-media-frame">
-                  {canRenderVideo && session ? (
-                    <LiveMedia
-                      key={session.session_id}
-                      session={session}
-                      scaleMode={scaleMode}
-                      showDiagnostics={showVideoDiagnostics}
-                      onError={(failure) => void handleMediaError(cameraId, failure)}
-                      onStable={() => markLiveStable(cameraId)}
-                    />
-                  ) : (
-                    <div className="live-placeholder">
-                      {tileError
-                        ? tileError.message
-                        : state === "backoff"
-                          ? `Reconnecting · attempt ${backendStatus?.reconnect_attempt ?? 0}`
-                          : state === "failed"
-                            ? backendStatus?.failure_category ?? "Live stream failed"
-                            : "Connecting to camera…"}
-                    </div>
+                <div className="live-tile-body">
+                  <div className="live-media-frame">
+                    {canRenderVideo && session ? (
+                      <LiveMedia
+                        key={session.session_id}
+                        session={session}
+                        scaleMode={scaleMode}
+                        showDiagnostics={showVideoDiagnostics}
+                        onError={(failure) => void handleMediaError(cameraId, failure)}
+                        onStable={() => markLiveStable(cameraId)}
+                      />
+                    ) : (
+                      <div className="live-placeholder">
+                        {tileError
+                          ? tileError.message
+                          : state === "backoff"
+                            ? `Reconnecting · attempt ${backendStatus?.reconnect_attempt ?? 0}`
+                            : state === "failed"
+                              ? backendStatus?.failure_category ?? "Live stream failed"
+                              : "Connecting to camera…"}
+                      </div>
+                    )}
+                  </div>
+
+                  {isFocused && (
+                    <aside className="live-focus-inspector" onDoubleClick={(event) => event.stopPropagation()}>
+                      <div className="live-focus-inspector-head">
+                        <strong>Camera controls</strong>
+                        <span>Live session stays on the current page</span>
+                      </div>
+                      <PtzControls
+                        cameraId={cameraId}
+                        capabilities={ptzCapabilities.get(cameraId) ?? null}
+                        error={ptzErrors.get(cameraId) ?? null}
+                        onError={(nextError) => setPtzErrors((current) => {
+                          const next = new Map(current);
+                          if (nextError) next.set(cameraId, nextError);
+                          else next.delete(cameraId);
+                          return next;
+                        })}
+                      />
+                      <div className="live-focus-status-grid">
+                        <div><span>Recording</span><strong>{desiredOn ? "Desired on" : "Manual off"}</strong><small>{recording?.state ?? "stopped"}</small></div>
+                        <div className={events?.motion_active === true ? "is-motion-active" : ""}><span>Motion</span><strong>{motionLabel}</strong><small>{events?.last_error_code ?? "No event error"}</small></div>
+                      </div>
+                      <div className="live-focus-actions">
+                        <button
+                          type="button"
+                          onClick={() => void toggleRecording(cameraId)}
+                          disabled={recordingBusy.has(cameraId) || recordingConvergingOff}
+                        >
+                          {desiredOn ? "Stop recording" : recordingConvergingOff ? "Stopping…" : "Start recording"}
+                        </button>
+                        {(tileError || state === "failed") && (
+                          <button type="button" className="primary-button" onClick={() => void retryCamera(cameraId)} disabled={isOpening}>
+                            Retry live
+                          </button>
+                        )}
+                      </div>
+                    </aside>
                   )}
                 </div>
 
-                {detailMode && (
-                  <>
-                    <PtzControls
-                      cameraId={cameraId}
-                      capabilities={ptzCapabilities.get(cameraId) ?? null}
-                      error={ptzErrors.get(cameraId) ?? null}
-                      onError={(nextError) => setPtzErrors((current) => {
-                        const next = new Map(current);
-                        if (nextError) next.set(cameraId, nextError);
-                        else next.delete(cameraId);
-                        return next;
-                      })}
-                    />
-
+                {!isFocused && (
+                  <div className="live-tile-quickbar" onDoubleClick={(event) => event.stopPropagation()}>
                     <div className="live-tile-meta">
-                      <span>Recording desired: <strong>{desiredOn ? "On" : "Off"}</strong></span>
-                      <span>Runtime: <strong>{recording?.state ?? "stopped"}</strong></span>
-                      <span>Motion events: <strong>{events?.configured ? (events.desired ? events.state : "off") : "unpaired"}</strong></span>
-                      {events?.motion_active === true && <span className="motion-indicator">Motion detected</span>}
+                      <span>Rec <strong>{recording?.state ?? "stopped"}</strong></span>
+                      <span className={events?.motion_active === true ? "motion-indicator" : ""}>{motionLabel}</span>
                       {events?.last_error_code && <span>Event error: <strong>{events.last_error_code}</strong></span>}
                     </div>
-
-                    <div className="button-row">
+                    <div className="live-tile-quick-actions">
                       <button
                         type="button"
                         onClick={() => void toggleRecording(cameraId)}
@@ -1085,7 +1165,7 @@ export function LiveViewScreen() {
                         </button>
                       )}
                     </div>
-                  </>
+                  </div>
                 )}
               </article>
             );

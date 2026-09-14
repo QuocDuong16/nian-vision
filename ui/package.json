@@ -1,7 +1,7 @@
 {
   "name": "nian-ui",
   "private": true,
-  "version": "1.0.0-rc.53",
+  "version": "1.0.0-rc.54",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,8 +12,10 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@player.style/sutro": "0.2.1",
     "@tauri-apps/api": "2.11.1",
     "@tauri-apps/plugin-dialog": "2.7.3",
+    "media-chrome": "4.19.2",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },

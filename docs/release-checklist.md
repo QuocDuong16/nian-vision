@@ -2,11 +2,11 @@
 
 Record the exact tag, commit SHA, OS image/VM and result for every run. A checkbox is evidence only when the step was actually executed. Do not reuse a tag after changing source.
 
-Current retry candidate: `1.0.0-rc.53` / `v1.0.0-rc.53`. RC1 through RC52 remain immutable. RC53 continues the desktop usability tranche with 1/4/8/16 Live View paging, application-owned title/playback controls, PTZ transport recovery, camera-level motion-event aggregation, storage-capacity telemetry and a lightweight local performance monitor.
+Current retry candidate: `1.0.0-rc.54` / `v1.0.0-rc.54`. RC1 through RC53 remain immutable. RC54 refines the desktop usability tranche with fixed 1/4/8/16 Live View zones, a non-destructive focus viewer, clearer process-tree performance telemetry, Media Chrome/Sutro playback, viewport-correct camera dialogs and application-owned update confirmation.
 
 ## Pre-tag authority
 
-- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.53`.
+- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.54`.
 - [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
@@ -16,7 +16,7 @@ Current retry candidate: `1.0.0-rc.53` / `v1.0.0-rc.53`. RC1 through RC52 remain
 
 ## GitHub RC workflow
 
-- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.53`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.52`; source/tag cross-pairing is forbidden.
+- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.54`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.53`; source/tag cross-pairing is forbidden.
 - [ ] GitHub tag resolves to exactly the same commit as Forgejo.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.

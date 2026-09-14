@@ -261,8 +261,11 @@ export interface PerformanceSnapshot {
   sample_ready: boolean;
   process_count: number;
   app_cpu_percent: number;
+  root_process_cpu_percent: number;
   system_cpu_percent: number;
   app_memory_bytes: number;
+  root_process_memory_bytes: number;
+  child_process_memory_bytes: number;
   system_memory_used_bytes: number;
   system_memory_total_bytes: number;
   system_network_rx_bps: number;

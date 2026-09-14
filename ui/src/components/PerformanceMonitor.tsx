@@ -70,6 +70,7 @@ export function PerformanceMonitor() {
   const footerLabel = snapshot?.sample_ready
     ? `CPU ${formatPercent(snapshot.app_cpu_percent)} · RAM ${formatBytes(snapshot.app_memory_bytes)}`
     : available ? "Performance warming up…" : "Performance unavailable";
+  const childProcessCount = Math.max(0, (snapshot?.process_count ?? 1) - 1);
 
   return (
     <div className="performance-monitor">
@@ -78,6 +79,9 @@ export function PerformanceMonitor() {
         className="performance-monitor-trigger"
         aria-label="Nian Vision performance"
         aria-expanded={open}
+        title={snapshot?.sample_ready
+          ? `Nian Vision process tree: desktop host + ${childProcessCount} child process${childProcessCount === 1 ? "" : "es"}`
+          : undefined}
         onClick={() => setOpen((current) => !current)}
       >
         <span className={`sidebar-health-dot${available ? "" : " is-muted"}`} aria-hidden="true" />
@@ -87,7 +91,7 @@ export function PerformanceMonitor() {
       {open && (
         <div className="performance-popover" role="region" aria-label="Performance details">
           <div className="performance-popover-head">
-            <div><strong>Performance</strong><span>1 second live sample</span></div>
+            <div><strong>Performance</strong><span>Desktop host + WebView/media child processes</span></div>
             <span className="performance-process-count">{snapshot?.process_count ?? 0} processes</span>
           </div>
           {snapshot ? (
@@ -95,13 +99,14 @@ export function PerformanceMonitor() {
               <div className="performance-card">
                 <span>CPU</span>
                 <strong>{formatPercent(snapshot.app_cpu_percent)}</strong>
-                <small>Nian · system {formatPercent(snapshot.system_cpu_percent)}</small>
+                <small>Process tree · desktop {formatPercent(snapshot.root_process_cpu_percent)} · system {formatPercent(snapshot.system_cpu_percent)}</small>
                 <div className="performance-bar"><span style={{ width: `${Math.min(100, snapshot.app_cpu_percent)}%` }} /></div>
               </div>
               <div className="performance-card">
                 <span>Memory</span>
                 <strong>{formatBytes(snapshot.app_memory_bytes)}</strong>
-                <small>{formatPercent(memoryPercent)} of {formatBytes(snapshot.system_memory_total_bytes)} · system {formatPercent(systemMemoryPercent)}</small>
+                <small>Tree {formatPercent(memoryPercent)} of {formatBytes(snapshot.system_memory_total_bytes)} · system {formatPercent(systemMemoryPercent)}</small>
+                <em>Desktop {formatBytes(snapshot.root_process_memory_bytes)} · children {formatBytes(snapshot.child_process_memory_bytes)}</em>
                 <div className="performance-bar"><span style={{ width: `${memoryPercent}%` }} /></div>
               </div>
               <div className="performance-card">

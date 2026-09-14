@@ -10,8 +10,11 @@ pub(crate) struct PerformanceSnapshotDto {
     pub sample_ready: bool,
     pub process_count: usize,
     pub app_cpu_percent: f32,
+    pub root_process_cpu_percent: f32,
     pub system_cpu_percent: f32,
     pub app_memory_bytes: u64,
+    pub root_process_memory_bytes: u64,
+    pub child_process_memory_bytes: u64,
     pub system_memory_used_bytes: u64,
     pub system_memory_total_bytes: u64,
     pub system_network_rx_bps: u64,
@@ -54,6 +57,11 @@ impl PerformanceSampler {
         let root_pid = Pid::from_u32(std::process::id());
         let process_tree = process_tree(&self.system, root_pid);
         let logical_cpu_count = self.system.cpus().len().max(1) as f32;
+        let root_process_cpu_percent = self
+            .system
+            .process(root_pid)
+            .map(|process| process.cpu_usage() / logical_cpu_count)
+            .unwrap_or(0.0);
         let app_cpu_percent = process_tree
             .iter()
             .filter_map(|pid| self.system.process(*pid))
@@ -66,6 +74,12 @@ impl PerformanceSampler {
             .fold(0_u64, |total, process| {
                 total.saturating_add(process.memory())
             });
+        let root_process_memory_bytes = self
+            .system
+            .process(root_pid)
+            .map(|process| process.memory())
+            .unwrap_or(0);
+        let child_process_memory_bytes = app_memory_bytes.saturating_sub(root_process_memory_bytes);
 
         let (received, transmitted) =
             self.networks
@@ -81,8 +95,11 @@ impl PerformanceSampler {
             sample_ready: self.samples > 1,
             process_count: process_tree.len(),
             app_cpu_percent: app_cpu_percent.clamp(0.0, 100.0),
+            root_process_cpu_percent: root_process_cpu_percent.clamp(0.0, 100.0),
             system_cpu_percent: self.system.global_cpu_usage().clamp(0.0, 100.0),
             app_memory_bytes,
+            root_process_memory_bytes,
+            child_process_memory_bytes,
             system_memory_used_bytes: self.system.used_memory(),
             system_memory_total_bytes: self.system.total_memory(),
             system_network_rx_bps: (received as f64 / elapsed).round() as u64,

@@ -1,3 +1,8 @@
+# Nian Vision 1.0.0-rc.54
+Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
+
+RC54 is a focused desktop UX refinement after physical RC53 Windows review. Live View now renders the selected 1/4/8/16 layout as fixed zones, including explicit empty slots, while camera detail opens in a dedicated focus viewer without changing the active layout, page or live-session ownership; tile status/actions are compact overlays instead of consuming vertical video space. Performance telemetry now distinguishes the desktop host from WebView/media child-process memory and CPU so process-tree totals are understandable instead of appearing as an unexplained single-process footprint. Timeline and Event Review replace the hand-built playback chrome with Media Chrome 4.19.2 plus the player.style Sutro theme, lazy-loaded as a separate chunk, while Nian-specific event pre-roll positioning and clip metadata remain intact. Camera/ONVIF dialogs are again centered against the real desktop viewport by removing the transformed screen ancestor that broke fixed-position geometry, and Settings replaces the native browser update-confirm prompt with an application dialog. RC54 does not change the accepted H.264 packet-copy recording/event-capture contract or add H.265/G711 support.
+
 # Nian Vision 1.0.0-rc.53
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 
