@@ -159,8 +159,10 @@ mod imp {
         if handle.is_null() {
             return None;
         }
-        let mut counters = PROCESS_MEMORY_COUNTERS_EX2::default();
-        counters.cb = counter_size;
+        let mut counters = PROCESS_MEMORY_COUNTERS_EX2 {
+            cb: counter_size,
+            ..Default::default()
+        };
         let ok = unsafe {
             GetProcessMemoryInfo(
                 handle,

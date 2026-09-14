@@ -102,6 +102,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           rustup component add rustfmt clippy
+          rustup target add x86_64-pc-windows-msvc
           rustc --version
           cargo --version
           cargo fmt --version
@@ -178,6 +179,7 @@ jobs:
           export NIAN_FFMPEG_LIB_DIR="$PWD/dist/ffmpeg-linux-x86_64/lib"
           export LD_LIBRARY_PATH="$NIAN_FFMPEG_LIB_DIR"
           cargo fmt --all --check
+          cargo clippy -p nian-platform-windows --target x86_64-pc-windows-msvc --all-targets -- -D warnings
           cargo clippy --all-targets -- -D warnings
           cargo test --workspace
 

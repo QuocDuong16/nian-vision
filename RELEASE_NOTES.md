@@ -1,3 +1,8 @@
+# Nian Vision 1.0.0-rc.56
+Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
+
+RC56 is a narrow release-pipeline correction after hosted RC55 Windows quality failed before packaging. The Win32 `PROCESS_MEMORY_COUNTERS_EX2` value used by performance telemetry is now initialized with its `cb` field in the struct initializer, satisfying Rust 1.98.0 Clippy's Windows-only `field_reassign_with_default` lint under `-D warnings` without changing the RC55 private-working-set telemetry behavior. Normal Forgejo quality and the Linux side of the GitHub release workflow now install the Windows MSVC Rust target and cross-Clippy the lightweight `nian-platform-windows` crate, catching cfg(windows)-only lint regressions before a release tag reaches the hosted Windows job. RC55 telemetry, recording reconnect diagnostics, H.264 packet-copy recording/event capture, Live View behavior and Media Chrome/Sutro playback are otherwise unchanged.
+
 # Nian Vision 1.0.0-rc.55
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 

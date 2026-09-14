@@ -67,6 +67,12 @@ jobs:
       - name: Build pinned FFmpeg 8.0.3 (ABI 62)
         run: scripts/ci-install-ffmpeg.sh
 
+      - name: Windows-only platform Clippy smoke
+        run: |
+          set -Eeuo pipefail
+          rustup target add x86_64-pc-windows-msvc
+          cargo clippy -p nian-platform-windows --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+
       - name: cargo fmt --check
         run: cargo fmt --all --check
 

@@ -47,7 +47,16 @@ test("Forgejo production release workflow is removed while normal quality CI rem
   assert.match(quality, /pull_request:/);
   assert.match(quality, /cargo check --workspace/);
   assert.match(quality, /cargo clippy --workspace --all-targets --all-features -- -D warnings/);
+  assert.match(quality, /rustup target add x86_64-pc-windows-msvc/);
+  assert.match(quality, /cargo clippy -p nian-platform-windows --target x86_64-pc-windows-msvc --all-targets -- -D warnings/);
   assert.match(quality, /cargo test --workspace/);
+});
+
+test("Linux release quality cross-lints the Windows-only platform crate before hosted Windows", () => {
+  const provision = stepBody("build-linux", "Provision Rust quality components");
+  const quality = stepBody("build-linux", "Rust quality against release FFmpeg");
+  assert.match(provision, /rustup target add x86_64-pc-windows-msvc/);
+  assert.match(quality, /cargo clippy -p nian-platform-windows --target x86_64-pc-windows-msvc --all-targets -- -D warnings/);
 });
 
 test("workflow contract parsing is identical for LF and CRLF source text", () => {
