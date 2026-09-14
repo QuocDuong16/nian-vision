@@ -160,7 +160,7 @@ describe("CamerasScreen", () => {
     await screen.findByText("No cameras configured");
     fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
     fireEvent.click(screen.getByRole("button", { name: "Add RTSP manually" }));
-    fireEvent.click(screen.getByRole("button", { name: "Save camera" }));
+    fireEvent.click(within(screen.getByRole("dialog", { name: "Add RTSP camera" })).getByRole("button", { name: "Add camera" }));
     expect(screen.getByRole("alert").textContent).toContain("Display name is required");
     expect(vi.mocked(invoke).mock.calls.some(([name]) => name === "camera_create")).toBe(false);
   });
@@ -189,7 +189,7 @@ describe("CamerasScreen", () => {
     await screen.findByText("No cameras configured");
     fillNewCamera();
     fireEvent.click(screen.getByRole("button", { name: "Test connection" }));
-    expect(screen.getByRole("button", { name: "Testing…" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Testing connection…" })).toBeTruthy();
     resolveProbe?.({
       reachable: true,
       video_stream_found: true,
@@ -264,7 +264,7 @@ describe("CamerasScreen", () => {
       expect((within(frontCard).getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(true);
     });
     expect((within(backCard).getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(false);
-    expect((within(backCard).getByRole("button", { name: "Edit" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((within(backCard).getByRole("button", { name: "Edit settings" }) as HTMLButtonElement).disabled).toBe(false);
 
     fireEvent.click(within(backCard).getByRole("button", { name: "Start" }));
     await waitFor(() => {
@@ -383,10 +383,10 @@ describe("CamerasScreen", () => {
     });
     render(<CamerasScreen />);
     await screen.findByText("Front door");
-    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete camera" }));
     const dialog = screen.getByRole("dialog", { name: "Delete camera confirmation" });
     expect(dialog.textContent).toContain("Existing footage stays on disk");
-    fireEvent.click(screen.getByRole("button", { name: "Delete camera" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete camera" }));
     await waitFor(() => expect(vi.mocked(invoke).mock.calls.some(([name]) => name === "camera_delete")).toBe(true));
   });
 
@@ -401,13 +401,13 @@ describe("CamerasScreen", () => {
     installDesktop([camera], recording);
     render(<CamerasScreen />);
     await screen.findByText("Front door");
-    const deleteButton = screen.getByRole("button", { name: "Delete" }) as HTMLButtonElement;
+    const deleteButton = screen.getByRole("button", { name: "Delete camera" }) as HTMLButtonElement;
     expect(deleteButton.disabled).toBe(true);
-    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit settings" }));
     expect((screen.getByLabelText("Display name") as HTMLInputElement).disabled).toBe(false);
     expect((screen.getByLabelText("Host / IP") as HTMLInputElement).disabled).toBe(true);
     expect((screen.getByLabelText("Password") as HTMLInputElement).disabled).toBe(true);
-    expect(screen.getByText(/Endpoint, credentials and audio policy are locked/)).toBeTruthy();
+    expect(screen.getByText(/Stream endpoint, credentials and audio policy are locked/)).toBeTruthy();
   });
 
   it("shows an empty ONVIF discovery result without adopting a camera", async () => {
@@ -426,7 +426,7 @@ describe("CamerasScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
     fireEvent.click(screen.getByRole("button", { name: "Discover ONVIF cameras" }));
 
-    expect(await screen.findByText("No ONVIF cameras found.")).toBeTruthy();
+    expect(await screen.findByText("No ONVIF cameras found")).toBeTruthy();
     expect(vi.mocked(invoke).mock.calls.some(([name]) => name === "camera_create")).toBe(false);
     expect(vi.mocked(invoke).mock.calls.some(([name]) => name === "onvif_add_camera")).toBe(false);
   });
@@ -450,10 +450,10 @@ describe("CamerasScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
     fireEvent.click(screen.getByRole("button", { name: "Discover ONVIF cameras" }));
     await screen.findByText("Front ONVIF");
-    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use device" }));
     fireEvent.change(screen.getByLabelText("ONVIF username"), { target: { value: "admin" } });
     fireEvent.change(screen.getByLabelText("ONVIF password"), { target: { value: "SENTINEL-onvif-password" } });
-    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
     await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("ONVIF authentication failed"));
     expect((screen.getByLabelText("ONVIF password") as HTMLInputElement).value).toBe("");
@@ -477,7 +477,7 @@ describe("CamerasScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
     fireEvent.click(screen.getByRole("button", { name: "Discover ONVIF cameras" }));
     await screen.findByText("Front ONVIF");
-    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use device" }));
     fireEvent.change(screen.getByLabelText("ONVIF username"), { target: { value: "admin" } });
     fireEvent.change(screen.getByLabelText("ONVIF password"), {
       target: { value: "SENTINEL-close-password" },
@@ -525,22 +525,22 @@ describe("CamerasScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
     fireEvent.click(screen.getByRole("button", { name: "Discover ONVIF cameras" }));
     await screen.findByText("Front ONVIF");
-    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use device" }));
     fireEvent.change(screen.getByLabelText("ONVIF username"), { target: { value: "admin" } });
     fireEvent.change(screen.getByLabelText("ONVIF password"), { target: { value: "SENTINEL-onvif-password" } });
-    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
     const h264 = await screen.findByText("Main H264");
     const h264Card = h264.closest("article") as HTMLElement;
     const h265Card = screen.getByText("Main H265").closest("article") as HTMLElement;
-    expect((within(h265Card).getByRole("button", { name: "Use profile" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((within(h265Card).getByRole("button", { name: "Unavailable" }) as HTMLButtonElement).disabled).toBe(true);
     expect(document.body.textContent).not.toContain("SENTINEL-onvif-password");
-    fireEvent.click(within(h264Card).getByRole("button", { name: "Use profile" }));
+    fireEvent.click(within(h264Card).getByRole("button", { name: "Use stream" }));
 
     expect(await screen.findByText("192.168.1.80:8554/live/main")).toBeTruthy();
     expect(document.body.textContent).not.toContain("rtsp://");
     expect(document.body.textContent).not.toContain("SENTINEL-onvif-password");
-    fireEvent.click(screen.getByRole("button", { name: "Test & Add" }));
+    fireEvent.click(screen.getByRole("button", { name: "Test & add camera" }));
 
     await screen.findByText("Front provisioned");
     const serialized = JSON.stringify(addArgs);
@@ -572,17 +572,17 @@ describe("CamerasScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
     fireEvent.click(screen.getByRole("button", { name: "Discover ONVIF cameras" }));
     await screen.findByText("Front ONVIF");
-    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use device" }));
     fireEvent.change(screen.getByLabelText("ONVIF username"), { target: { value: "admin" } });
     fireEvent.change(screen.getByLabelText("ONVIF password"), { target: { value: "secret" } });
-    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
     const h264Card = (await screen.findByText("Main H264")).closest("article") as HTMLElement;
-    fireEvent.click(within(h264Card).getByRole("button", { name: "Use profile" }));
+    fireEvent.click(within(h264Card).getByRole("button", { name: "Use stream" }));
     await screen.findByText("192.168.1.80:8554/live/main");
-    fireEvent.click(screen.getByRole("button", { name: "Test & Add" }));
+    fireEvent.click(screen.getByRole("button", { name: "Test & add camera" }));
 
     await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("camera source could not be opened"));
-    expect(screen.getByRole("button", { name: "Test & Add" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Test & add camera" })).toBeTruthy();
   });
 
   it("refreshes discovery into a new session and removes stale device choices", async () => {
@@ -614,7 +614,7 @@ describe("CamerasScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
     fireEvent.click(screen.getByRole("button", { name: "Discover ONVIF cameras" }));
     await screen.findByText("Front ONVIF");
-    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    fireEvent.click(screen.getByRole("button", { name: "Scan again" }));
 
     expect(await screen.findByText("Garage ONVIF")).toBeTruthy();
     expect(screen.queryByText("Front ONVIF")).toBeNull();
@@ -723,7 +723,7 @@ describe("CamerasScreen", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Enable Events" }));
     expect(await screen.findByRole("button", { name: "Disable Events" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Unpair Events" }));
+    fireEvent.click(screen.getByRole("button", { name: "Unpair Motion Events" }));
     expect(await screen.findByRole("button", { name: "Pair Motion Events" })).toBeTruthy();
   });
 

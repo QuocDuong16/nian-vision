@@ -6,6 +6,13 @@ import type { CameraSummary, PlaybackOpenDto, RecordingDto } from "../lib/tauri"
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
+function chooseCombobox(label: string, option: string) {
+  fireEvent.click(screen.getByRole("combobox", { name: label }));
+  const target = screen.getAllByRole("option").find((candidate) => candidate.textContent?.startsWith(option));
+  if (!target) throw new Error(`option not found: ${option}`);
+  fireEvent.click(target);
+}
+
 const camera: CameraSummary = {
   camera_id: "front-door",
   display_name: "Front door",
@@ -222,16 +229,14 @@ describe("TimelineScreen", () => {
 
     render(<TimelineScreen />);
     await screen.findByText("1 finalized recording");
-    fireEvent.change(screen.getByRole("combobox", { name: "Recording day" }), {
-      target: { value: "2026-08-29" },
-    });
+    chooseCombobox("Recording day", "2026-08-29");
     await screen.findByRole("button", { name: /23:59:00/ });
     fireEvent.click(screen.getByRole("button", { name: /23:59:00/ }));
     fireEvent.click(screen.getByRole("button", { name: "Open recording" }));
     await waitFor(() => expect(document.querySelector("video")?.getAttribute("src")).toBe(lateOpen.url));
     fireEvent.click(screen.getByRole("button", { name: "Next recording" }));
     await waitFor(() => expect(document.querySelector("video")?.getAttribute("src")).toBe(earlyOpen.url));
-    expect((screen.getByRole("combobox", { name: "Recording day" }) as HTMLSelectElement).value).toBe("2026-08-30");
+    expect(screen.getByRole("combobox", { name: "Recording day" }).textContent).toContain("2026-08-30");
     expect(screen.getByRole("button", { name: /00:01:00/ }).className).toContain("selected");
     expect(closed).toContain(lateOpen.session_id);
     expect(closed).not.toContain(earlyOpen.session_id);
@@ -266,7 +271,7 @@ describe("TimelineScreen", () => {
     await waitFor(() => expect(document.querySelector("video")?.getAttribute("src")).toBe(earlyOpen.url));
     fireEvent.click(screen.getByRole("button", { name: "Previous recording" }));
     await waitFor(() => expect(document.querySelector("video")?.getAttribute("src")).toBe(lateOpen.url));
-    expect((screen.getByRole("combobox", { name: "Recording day" }) as HTMLSelectElement).value).toBe("2026-08-29");
+    expect(screen.getByRole("combobox", { name: "Recording day" }).textContent).toContain("2026-08-29");
     expect(screen.getByRole("button", { name: /23:59:00/ }).className).toContain("selected");
     expect(closed).toContain(earlyOpen.session_id);
     expect(closed).not.toContain(lateOpen.session_id);

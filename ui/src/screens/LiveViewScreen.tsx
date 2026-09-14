@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EmptyState } from "../components/EmptyState";
 import { PtzControls } from "../components/PtzControls";
+import { SelectControl } from "../components/SelectControl";
 import { splitLiveMp4ForMse } from "../lib/liveMp4";
 import { desktopError, invokeDesktop, isTauri } from "../lib/tauri";
 import type {
@@ -882,16 +883,14 @@ export function LiveViewScreen() {
             </label>
           </div>
           <div className="live-add-control">
-            <select
-              aria-label="Camera to add"
+            <SelectControl
+              ariaLabel="Camera to add"
               value={pickerCameraId}
-              onChange={(event) => setPickerCameraId(event.target.value)}
+              onChange={setPickerCameraId}
               disabled={!availableCameras.length || selected.length >= MAX_LIVE_VIEWS}
-            >
-              {availableCameras.map((camera) => (
-                <option key={camera.camera_id} value={camera.camera_id}>{camera.display_name}</option>
-              ))}
-            </select>
+              options={availableCameras.map((camera) => ({ value: camera.camera_id, label: camera.display_name, description: `${camera.host}:${camera.port}${camera.path}` }))}
+              placeholder="Choose camera"
+            />
             <button
               className="primary-button"
               type="button"

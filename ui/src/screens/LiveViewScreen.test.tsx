@@ -13,6 +13,13 @@ import type {
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
+function chooseCombobox(label: string, option: string) {
+  fireEvent.click(screen.getByRole("combobox", { name: label }));
+  const target = screen.getAllByRole("option").find((candidate) => candidate.textContent?.startsWith(option));
+  if (!target) throw new Error(`option not found: ${option}`);
+  fireEvent.click(target);
+}
+
 const front: CameraSummary = {
   camera_id: "front-door",
   display_name: "Front door",
@@ -427,8 +434,7 @@ describe("LiveViewScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
     await screen.findByRole("article", { name: "Front door live camera" });
     await waitFor(() => {
-      const picker = screen.getByRole("combobox", { name: "Camera to add" }) as HTMLSelectElement;
-      expect(picker.value).toBe(garage.camera_id);
+      expect(screen.getByRole("combobox", { name: "Camera to add" }).textContent).toContain(garage.display_name);
     });
     fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
     await screen.findByRole("article", { name: "Garage live camera" });
@@ -462,9 +468,8 @@ describe("LiveViewScreen", () => {
     await screen.findByRole("article", { name: "Front door live camera" });
     fireEvent.click(screen.getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(screen.queryByRole("article", { name: "Front door live camera" })).toBeNull());
-    const picker = screen.getByRole("combobox", { name: "Camera to add" }) as HTMLSelectElement;
-    fireEvent.change(picker, { target: { value: front.camera_id } });
-    expect(picker.value).toBe(front.camera_id);
+    chooseCombobox("Camera to add", front.display_name);
+    expect(screen.getByRole("combobox", { name: "Camera to add" }).textContent).toContain(front.display_name);
     fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
     await screen.findByRole("article", { name: "Front door live camera" });
     expect(opens).toBe(1);

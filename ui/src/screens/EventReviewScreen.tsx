@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SelectControl } from "../components/SelectControl";
 import {
   desktopError,
   invokeDesktop,
@@ -376,21 +377,21 @@ export function EventReviewScreen() {
       <div className="panel event-review-filters">
         <label>
           Camera
-          <select value={cameraId} onChange={(event) => setCameraId(event.target.value)}>
-            <option value="all">All cameras</option>
-            {cameras.map((camera) => (
-              <option key={camera.camera_id} value={camera.camera_id}>{camera.display_name}</option>
-            ))}
-          </select>
+          <SelectControl
+            ariaLabel="Event camera filter"
+            value={cameraId}
+            onChange={setCameraId}
+            options={[{ value: "all", label: "All cameras" }, ...cameras.map((camera) => ({ value: camera.camera_id, label: camera.display_name }))]}
+          />
         </label>
         <label>
           Time range
-          <select value={rangePreset} onChange={(event) => setRangePreset(event.target.value as RangePreset)}>
-            <option value="hour">Last hour</option>
-            <option value="day">Last 24 hours</option>
-            <option value="week">Last 7 days</option>
-            <option value="custom">Custom range</option>
-          </select>
+          <SelectControl
+            ariaLabel="Event time range"
+            value={rangePreset}
+            onChange={(value) => setRangePreset(value as RangePreset)}
+            options={[{ value: "hour", label: "Last hour" }, { value: "day", label: "Last 24 hours" }, { value: "week", label: "Last 7 days" }, { value: "custom", label: "Custom range" }]}
+          />
         </label>
         {rangePreset === "custom" && (
           <>

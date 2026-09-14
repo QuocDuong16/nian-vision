@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SelectControl } from "../components/SelectControl";
 import {
   desktopError,
   invokeDesktop,
@@ -355,17 +356,23 @@ export function TimelineScreen() {
       <div className="panel timeline-filters">
         <label>
           Camera
-          <select value={cameraId} onChange={(event) => setCameraId(event.target.value)}>
-            {cameras.map((camera) => (
-              <option key={camera.camera_id} value={camera.camera_id}>{camera.display_name}</option>
-            ))}
-          </select>
+          <SelectControl
+            ariaLabel="Timeline camera"
+            value={cameraId}
+            onChange={setCameraId}
+            options={cameras.map((camera) => ({ value: camera.camera_id, label: camera.display_name }))}
+            disabled={cameras.length === 0}
+          />
         </label>
         <label>
           Recording day
-          <select value={day} onChange={(event) => void selectDay(event.target.value)} disabled={days.length === 0}>
-            {days.map((availableDay) => <option key={availableDay} value={availableDay}>{availableDay}</option>)}
-          </select>
+          <SelectControl
+            ariaLabel="Recording day"
+            value={day}
+            onChange={(value) => void selectDay(value)}
+            options={days.map((availableDay) => ({ value: availableDay, label: availableDay }))}
+            disabled={days.length === 0}
+          />
         </label>
         <div className="button-row timeline-day-nav">
           <button type="button" disabled={!previousDay} onClick={() => previousDay && void selectDay(previousDay)}>Previous day</button>

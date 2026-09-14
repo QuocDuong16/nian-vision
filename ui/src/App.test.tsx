@@ -24,21 +24,17 @@ describe("App shell", () => {
     expect(screen.getByText(/Add an RTSP camera/)).toBeTruthy();
   });
 
-  it("keeps the live workspace mounted after the first visit", () => {
+  it("unmounts live view when navigating away so a later visit reloads camera state", () => {
     render(<App />);
 
     fireEvent.click(screen.getByRole("button", { name: "Live View" }));
     const liveHeading = screen.getByRole("heading", { name: "Live View" });
-    const resident = liveHeading.closest('[data-resident-screen="live"]');
-    expect(resident).not.toBeNull();
-    expect(resident?.hasAttribute("hidden")).toBe(false);
 
     fireEvent.click(screen.getByRole("button", { name: "Cameras" }));
-    expect(liveHeading.isConnected).toBe(true);
-    expect(resident?.hasAttribute("hidden")).toBe(true);
+    expect(liveHeading.isConnected).toBe(false);
 
     fireEvent.click(screen.getByRole("button", { name: "Live View" }));
-    expect(screen.getByRole("heading", { name: "Live View" })).toBe(liveHeading);
+    expect(screen.getByRole("heading", { name: "Live View" })).not.toBe(liveHeading);
   });
 
   it("switches screens when navigation is clicked", () => {

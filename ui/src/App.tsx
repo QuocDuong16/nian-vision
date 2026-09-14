@@ -22,7 +22,6 @@ export function isDesktopReloadShortcut(event: Pick<KeyboardEvent, "key" | "ctrl
 
 export function App() {
   const [screen, setScreen] = useState<ScreenId>("cameras");
-  const [liveVisited, setLiveVisited] = useState(false);
   const appInfo = useTauriCommand<AppInfo>("app_info", FALLBACK_APP_INFO);
   const activeScreenLabel = SCREENS.find((entry) => entry.id === screen)?.label ?? "Cameras";
 
@@ -44,7 +43,6 @@ export function App() {
   }, []);
 
   const navigate = (next: ScreenId) => {
-    if (next === "live") setLiveVisited(true);
     setScreen(next);
   };
 
@@ -64,11 +62,7 @@ export function App() {
           </div>
         </header>
         {screen === "cameras" && <CamerasScreen />}
-        {liveVisited && (
-          <section data-resident-screen="live" hidden={screen !== "live"}>
-            <LiveViewScreen />
-          </section>
-        )}
+        {screen === "live" && <LiveViewScreen />}
         {screen === "events" && <EventReviewScreen />}
         {screen === "timeline" && <TimelineScreen />}
         {screen === "storage" && <StorageScreen />}
