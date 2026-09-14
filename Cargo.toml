@@ -39,7 +39,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "1.0.0-rc.51"
+version = "1.0.0-rc.52"
 edition = "2024"
 rust-version = "1.98.0"
 authors = ["Nian Vision contributors"]

@@ -1,3 +1,8 @@
+# Nian Vision 1.0.0-rc.52
+Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
+
+RC52 continues the RC51 desktop UI/UX overhaul while keeping the accepted recording/Event/PTZ/Live backend semantics unchanged. Camera onboarding and editing now use clearer staged flows, custom password/select controls replace inconsistent native presentation where appropriate, dropdown menus are viewport-aware through a portal-based control, Storage adds a native folder picker and tighter settings layout, camera actions receive clearer hierarchy and accessibility labels, and Live View refreshes camera availability cleanly after configuration changes. The release also aligns dialog/storage/ONVIF styling with the current JSX contracts and adds regression coverage for the custom select behavior and revised interaction flows.
+
 # Nian Vision 1.0.0-rc.51
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 
