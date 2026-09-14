@@ -799,6 +799,14 @@ fn prune_event_clip_retention(state: &DesktopState) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn event_clip_usage(storage_root: &Path) -> io::Result<(u64, usize)> {
+    let candidates = inventory_event_clip_candidates(storage_root)?;
+    let bytes = candidates.iter().fold(0_u64, |total, candidate| {
+        total.saturating_add(candidate.size_bytes)
+    });
+    Ok((bytes, candidates.len()))
+}
+
 fn inventory_event_clip_candidates(
     storage_root: &Path,
 ) -> io::Result<Vec<EventClipRetentionCandidate>> {

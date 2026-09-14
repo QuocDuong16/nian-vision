@@ -17,7 +17,9 @@ import type {
   RecordingStatus,
 } from "../lib/tauri";
 
-const MAX_LIVE_VIEWS = 4;
+const LIVE_LAYOUT_SIZES = [1, 4, 8, 16] as const;
+type LiveLayoutSize = (typeof LIVE_LAYOUT_SIZES)[number];
+const MAX_LIVE_VIEWS_PER_PAGE = 16;
 const STATUS_POLL_MS = 1_000;
 const EVENT_STATUS_POLL_MS = 5_000;
 const KEEPALIVE_MS = 30_000;
@@ -61,20 +63,25 @@ type LiveScaleMode = "fit" | "native";
 type LiveViewPreferences = {
   cameraIds: string[];
   scaleMode: LiveScaleMode;
+  layoutSize: LiveLayoutSize;
+  page: number;
 };
 
 function readLiveViewPreferences(): LiveViewPreferences {
-  const fallback: LiveViewPreferences = { cameraIds: [], scaleMode: "fit" };
+  const fallback: LiveViewPreferences = { cameraIds: [], scaleMode: "fit", layoutSize: 4, page: 0 };
   try {
     const raw = window.localStorage.getItem(LIVE_VIEW_PREFERENCES_KEY);
     if (!raw) return fallback;
     const parsed = JSON.parse(raw) as Partial<LiveViewPreferences>;
     const cameraIds = Array.isArray(parsed.cameraIds)
       ? [...new Set(parsed.cameraIds.filter((cameraId): cameraId is string => typeof cameraId === "string" && cameraId.length > 0))]
-          .slice(0, MAX_LIVE_VIEWS)
       : [];
     const scaleMode: LiveScaleMode = parsed.scaleMode === "native" ? "native" : "fit";
-    return { cameraIds, scaleMode };
+    const layoutSize = LIVE_LAYOUT_SIZES.includes(parsed.layoutSize as LiveLayoutSize)
+      ? parsed.layoutSize as LiveLayoutSize
+      : 4;
+    const page = Number.isSafeInteger(parsed.page) && (parsed.page ?? 0) >= 0 ? parsed.page as number : 0;
+    return { cameraIds, scaleMode, layoutSize, page };
   } catch {
     return fallback;
   }
@@ -419,6 +426,8 @@ export function LiveViewScreen() {
   const [selected, setSelected] = useState<string[]>(initialPreferences.cameraIds);
   const [pickerCameraId, setPickerCameraId] = useState("");
   const [scaleMode, setScaleMode] = useState<LiveScaleMode>(initialPreferences.scaleMode);
+  const [layoutSize, setLayoutSize] = useState<LiveLayoutSize>(initialPreferences.layoutSize);
+  const [page, setPage] = useState(initialPreferences.page);
   const [showVideoDiagnostics, setShowVideoDiagnostics] = useState(false);
   const [sessions, setSessions] = useState<Map<string, LiveOpenDto>>(() => new Map());
   const [statuses, setStatuses] = useState<LiveStatus[]>([]);
@@ -432,8 +441,16 @@ export function LiveViewScreen() {
   const [recordingBusy, setRecordingBusy] = useState<Set<string>>(() => new Set());
   const [loading, setLoading] = useState(isTauri());
   const [error, setError] = useState<DesktopError | null>(null);
+  const pageCount = Math.max(1, Math.ceil(selected.length / layoutSize));
+  const effectivePage = Math.min(page, pageCount - 1);
+  const visibleCameraIds = useMemo(
+    () => selected.slice(effectivePage * layoutSize, (effectivePage + 1) * layoutSize),
+    [effectivePage, layoutSize, selected],
+  );
   const sessionsRef = useRef(sessions);
   const selectedRef = useRef<Set<string>>(new Set(initialPreferences.cameraIds));
+  const activeCameraIdsRef = useRef<Set<string>>(new Set(visibleCameraIds));
+  activeCameraIdsRef.current = new Set(visibleCameraIds);
   const mountedRef = useRef(true);
   const generationRef = useRef<Map<string, number>>(new Map());
   const pendingOpenRef = useRef<Map<string, number>>(new Map());
@@ -444,8 +461,12 @@ export function LiveViewScreen() {
   const restoredSelectionOpenedRef = useRef(initialPreferences.cameraIds.length === 0);
 
   useEffect(() => {
-    persistLiveViewPreferences({ cameraIds: selected, scaleMode });
-  }, [scaleMode, selected]);
+    persistLiveViewPreferences({ cameraIds: selected, scaleMode, layoutSize, page: effectivePage });
+  }, [effectivePage, layoutSize, scaleMode, selected]);
+
+  useEffect(() => {
+    if (page !== effectivePage) setPage(effectivePage);
+  }, [effectivePage, page]);
 
   const setSessionForCamera = useCallback((cameraId: string, session: LiveOpenDto | null) => {
     const next = new Map(sessionsRef.current);
@@ -543,11 +564,11 @@ export function LiveViewScreen() {
   useEffect(() => {
     if (!isTauri()) return;
     let disposed = false;
-    for (const cameraId of selected) {
+    for (const cameraId of visibleCameraIds) {
       if (ptzCapabilities.has(cameraId)) continue;
       void invokeDesktop<PtzCapabilities>("ptz_capabilities", { cameraId })
         .then((capabilities) => {
-          if (disposed || !selectedRef.current.has(cameraId)) return;
+          if (disposed || !activeCameraIdsRef.current.has(cameraId)) return;
           setPtzCapabilities((current) => new Map(current).set(cameraId, capabilities));
           setPtzErrors((current) => {
             const next = new Map(current);
@@ -556,15 +577,15 @@ export function LiveViewScreen() {
           });
         })
         .catch((cause) => {
-          if (disposed || !selectedRef.current.has(cameraId)) return;
+          if (disposed || !activeCameraIdsRef.current.has(cameraId)) return;
           setPtzErrors((current) => new Map(current).set(cameraId, desktopError(cause)));
         });
     }
     return () => { disposed = true; };
-  }, [selected, ptzCapabilities]);
+  }, [ptzCapabilities, visibleCameraIds]);
 
   useEffect(() => {
-    if (!isTauri() || selected.length === 0) {
+    if (!isTauri() || visibleCameraIds.length === 0) {
       setEventStatuses(new Map());
       return;
     }
@@ -575,7 +596,7 @@ export function LiveViewScreen() {
       try {
         const rows = await invokeDesktop<EventStatus[]>("event_statuses");
         if (disposed) return;
-        const selectedIds = selectedRef.current;
+        const selectedIds = activeCameraIdsRef.current;
         setEventStatuses(
           new Map(
             rows
@@ -595,7 +616,7 @@ export function LiveViewScreen() {
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [selected]);
+  }, [visibleCameraIds]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -643,7 +664,7 @@ export function LiveViewScreen() {
   const ownsGeneration = useCallback((cameraId: string, generation: number) => {
     return (
       mountedRef.current &&
-      selectedRef.current.has(cameraId) &&
+      activeCameraIdsRef.current.has(cameraId) &&
       generationRef.current.get(cameraId) === generation
     );
   }, []);
@@ -677,7 +698,7 @@ export function LiveViewScreen() {
       const desiredGeneration = generationRef.current.get(cameraId);
       const shouldRestart =
         mountedRef.current &&
-        selectedRef.current.has(cameraId) &&
+        activeCameraIdsRef.current.has(cameraId) &&
         desiredGeneration !== undefined &&
         desiredGeneration !== generation &&
         !sessionsRef.current.has(cameraId) &&
@@ -705,24 +726,43 @@ export function LiveViewScreen() {
   useEffect(() => {
     if (!isTauri() || loading || restoredSelectionOpenedRef.current) return;
     const configured = new Set(cameras.map((camera) => camera.camera_id));
-    const restored = [...selectedRef.current]
-      .filter((cameraId) => configured.has(cameraId))
-      .slice(0, MAX_LIVE_VIEWS);
+    const restored = [...selectedRef.current].filter((cameraId) => configured.has(cameraId));
     selectedRef.current = new Set(restored);
     if (restored.length !== selected.length || restored.some((cameraId, index) => selected[index] !== cameraId)) {
       setSelected(restored);
     }
     restoredSelectionOpenedRef.current = true;
-    for (const cameraId of restored) requestOpen(cameraId);
-  }, [cameras, loading, requestOpen, selected]);
+  }, [cameras, loading, selected]);
+
+  useEffect(() => {
+    if (!isTauri() || loading || !restoredSelectionOpenedRef.current) return;
+    const desired = new Set(visibleCameraIds);
+
+    setOpening((current) => new Set([...current].filter((cameraId) => desired.has(cameraId))));
+    for (const [cameraId, session] of [...sessionsRef.current.entries()]) {
+      if (desired.has(cameraId)) continue;
+      const recoveryTimer = recoveryTimersRef.current.get(cameraId);
+      if (recoveryTimer !== undefined) window.clearTimeout(recoveryTimer);
+      recoveryTimersRef.current.delete(cameraId);
+      recoveryAttemptsRef.current.delete(cameraId);
+      nextGeneration(cameraId);
+      setSessionForCamera(cameraId, null);
+      void invokeDesktop<void>("live_close", { sessionId: session.session_id }).catch(() => undefined);
+    }
+
+    for (const cameraId of visibleCameraIds) {
+      if (!sessionsRef.current.has(cameraId) && !pendingOpenRef.current.has(cameraId)) requestOpen(cameraId);
+    }
+  }, [loading, nextGeneration, requestOpen, setSessionForCamera, visibleCameraIds]);
 
   function addSelectedCamera() {
-    if (!pickerCameraId || selectedRef.current.has(pickerCameraId) || selectedRef.current.size >= MAX_LIVE_VIEWS) return;
+    if (!pickerCameraId || selectedRef.current.has(pickerCameraId)) return;
     const nextSelected = new Set(selectedRef.current);
     nextSelected.add(pickerCameraId);
     selectedRef.current = nextSelected;
-    setSelected([...nextSelected]);
-    requestOpen(pickerCameraId);
+    const next = [...nextSelected];
+    setSelected(next);
+    setPage(Math.max(0, Math.ceil(next.length / layoutSize) - 1));
   }
 
   async function removeCamera(cameraId: string) {
@@ -788,7 +828,7 @@ export function LiveViewScreen() {
     if (session && isTauri()) {
       await invokeDesktop<void>("live_close", { sessionId: session.session_id }).catch(() => undefined);
     }
-    if (!mountedRef.current || !selectedRef.current.has(cameraId)) return;
+    if (!mountedRef.current || !activeCameraIdsRef.current.has(cameraId)) return;
 
     const attempt = (recoveryAttemptsRef.current.get(cameraId) ?? 0) + 1;
     if (attempt > MAX_LIVE_AUTO_RECOVERY_ATTEMPTS) {
@@ -815,7 +855,7 @@ export function LiveViewScreen() {
     const delay = LIVE_RECOVERY_BACKOFF_MS[attempt - 1] ?? LIVE_RECOVERY_BACKOFF_MS[LIVE_RECOVERY_BACKOFF_MS.length - 1];
     const timer = window.setTimeout(() => {
       recoveryTimersRef.current.delete(cameraId);
-      if (!mountedRef.current || !selectedRef.current.has(cameraId)) {
+      if (!mountedRef.current || !activeCameraIdsRef.current.has(cameraId)) {
         setOpening((current) => {
           const next = new Set(current);
           next.delete(cameraId);
@@ -826,6 +866,19 @@ export function LiveViewScreen() {
       void startOpenGeneration(cameraId, generation);
     }, delay);
     recoveryTimersRef.current.set(cameraId, timer);
+  }
+
+  function changeLayout(nextLayout: LiveLayoutSize) {
+    const anchorIndex = effectivePage * layoutSize;
+    setLayoutSize(nextLayout);
+    setPage(Math.floor(anchorIndex / nextLayout));
+  }
+
+  function focusCamera(cameraId: string) {
+    const index = selected.indexOf(cameraId);
+    if (index < 0) return;
+    setLayoutSize(1);
+    setPage(index);
   }
 
   async function toggleRecording(cameraId: string) {
@@ -855,9 +908,23 @@ export function LiveViewScreen() {
       <div className="screen-toolbar">
         <div>
           <h2>Live View</h2>
-          <p className="muted">Up to {MAX_LIVE_VIEWS} independent H.264 live sessions. Recording remains separate.</p>
+          <p className="muted">1/4/8/{MAX_LIVE_VIEWS_PER_PAGE}-camera pages. Only the current page opens live sessions; recording remains separate.</p>
         </div>
         <div className="live-picker">
+          <div className="live-layout-controls" role="group" aria-label="Live view layout">
+            <span className="live-control-label">Layout</span>
+            {LIVE_LAYOUT_SIZES.map((size) => (
+              <button
+                type="button"
+                key={size}
+                aria-label={`${size} camera layout`}
+                aria-pressed={layoutSize === size}
+                onClick={() => changeLayout(size)}
+              >
+                {size}
+              </button>
+            ))}
+          </div>
           <div className="live-quality-controls" role="group" aria-label="Live video quality">
             <button
               type="button"
@@ -887,7 +954,7 @@ export function LiveViewScreen() {
               ariaLabel="Camera to add"
               value={pickerCameraId}
               onChange={setPickerCameraId}
-              disabled={!availableCameras.length || selected.length >= MAX_LIVE_VIEWS}
+              disabled={!availableCameras.length}
               options={availableCameras.map((camera) => ({ value: camera.camera_id, label: camera.display_name, description: `${camera.host}:${camera.port}${camera.path}` }))}
               placeholder="Choose camera"
             />
@@ -895,7 +962,7 @@ export function LiveViewScreen() {
               className="primary-button"
               type="button"
               onClick={addSelectedCamera}
-              disabled={!pickerCameraId || selected.length >= MAX_LIVE_VIEWS}
+              disabled={!pickerCameraId}
             >
               Add to live view
             </button>
@@ -910,10 +977,21 @@ export function LiveViewScreen() {
       ) : !cameras.length ? (
         <EmptyState title="No cameras configured" hint="Add a camera first, then select it here for live viewing." />
       ) : !selected.length ? (
-        <EmptyState title="No live cameras selected" hint="Choose a configured camera above. Unselected cameras consume no live-view capacity." />
+        <EmptyState title="No live cameras selected" hint="Choose configured cameras above. Cameras on inactive pages consume no live-view capacity." />
       ) : (
-        <div className={`live-grid live-grid-${Math.min(selected.length, MAX_LIVE_VIEWS)}`}>
-          {selected.map((cameraId) => {
+        <>
+          <div className="live-pagebar" aria-label="Live view pages">
+            <div className="live-page-summary">
+              <strong>{selected.length}</strong> camera{selected.length === 1 ? "" : "s"}
+              <span>Page {effectivePage + 1} / {pageCount}</span>
+            </div>
+            <div className="live-page-actions">
+              <button type="button" aria-label="Previous live page" onClick={() => setPage((current) => Math.max(0, current - 1))} disabled={effectivePage === 0}>←</button>
+              <button type="button" aria-label="Next live page" onClick={() => setPage((current) => Math.min(pageCount - 1, current + 1))} disabled={effectivePage >= pageCount - 1}>→</button>
+            </div>
+          </div>
+          <div className={`live-grid live-grid-layout-${layoutSize} ${layoutSize > 1 ? "live-grid-multi" : "live-grid-single"}`}>
+          {visibleCameraIds.map((cameraId) => {
             const camera = cameraById.get(cameraId);
             if (!camera) return null;
             const session = sessions.get(cameraId);
@@ -929,8 +1007,15 @@ export function LiveViewScreen() {
             const canRenderVideo = Boolean(
               session && !tileError && state !== "failed" && state !== "stopping",
             );
+            const detailMode = layoutSize === 1 || visibleCameraIds.length === 1;
             return (
-              <article className="live-tile" key={cameraId} aria-label={`${camera.display_name} live camera`}>
+              <article
+                className="live-tile"
+                key={cameraId}
+                aria-label={`${camera.display_name} live camera`}
+                title={layoutSize > 1 ? "Double-click to focus this camera" : undefined}
+                onDoubleClick={() => { if (layoutSize > 1) focusCamera(cameraId); }}
+              >
                 <div className="live-tile-head">
                   <div>
                     <h3>{camera.display_name}</h3>
@@ -964,44 +1049,49 @@ export function LiveViewScreen() {
                   )}
                 </div>
 
-                <PtzControls
-                  cameraId={cameraId}
-                  capabilities={ptzCapabilities.get(cameraId) ?? null}
-                  error={ptzErrors.get(cameraId) ?? null}
-                  onError={(nextError) => setPtzErrors((current) => {
-                    const next = new Map(current);
-                    if (nextError) next.set(cameraId, nextError);
-                    else next.delete(cameraId);
-                    return next;
-                  })}
-                />
+                {detailMode && (
+                  <>
+                    <PtzControls
+                      cameraId={cameraId}
+                      capabilities={ptzCapabilities.get(cameraId) ?? null}
+                      error={ptzErrors.get(cameraId) ?? null}
+                      onError={(nextError) => setPtzErrors((current) => {
+                        const next = new Map(current);
+                        if (nextError) next.set(cameraId, nextError);
+                        else next.delete(cameraId);
+                        return next;
+                      })}
+                    />
 
-                <div className="live-tile-meta">
-                  <span>Recording desired: <strong>{desiredOn ? "On" : "Off"}</strong></span>
-                  <span>Runtime: <strong>{recording?.state ?? "stopped"}</strong></span>
-                  <span>Motion events: <strong>{events?.configured ? (events.desired ? events.state : "off") : "unpaired"}</strong></span>
-                  {events?.motion_active === true && <span className="motion-indicator">Motion detected</span>}
-                  {events?.last_error_code && <span>Event error: <strong>{events.last_error_code}</strong></span>}
-                </div>
+                    <div className="live-tile-meta">
+                      <span>Recording desired: <strong>{desiredOn ? "On" : "Off"}</strong></span>
+                      <span>Runtime: <strong>{recording?.state ?? "stopped"}</strong></span>
+                      <span>Motion events: <strong>{events?.configured ? (events.desired ? events.state : "off") : "unpaired"}</strong></span>
+                      {events?.motion_active === true && <span className="motion-indicator">Motion detected</span>}
+                      {events?.last_error_code && <span>Event error: <strong>{events.last_error_code}</strong></span>}
+                    </div>
 
-                <div className="button-row">
-                  <button
-                    type="button"
-                    onClick={() => void toggleRecording(cameraId)}
-                    disabled={recordingBusy.has(cameraId) || recordingConvergingOff}
-                  >
-                    {desiredOn ? "Stop recording" : recordingConvergingOff ? "Stopping…" : "Start recording"}
-                  </button>
-                  {(tileError || state === "failed") && (
-                    <button type="button" className="primary-button" onClick={() => void retryCamera(cameraId)} disabled={isOpening}>
-                      Retry live
-                    </button>
-                  )}
-                </div>
+                    <div className="button-row">
+                      <button
+                        type="button"
+                        onClick={() => void toggleRecording(cameraId)}
+                        disabled={recordingBusy.has(cameraId) || recordingConvergingOff}
+                      >
+                        {desiredOn ? "Stop recording" : recordingConvergingOff ? "Stopping…" : "Start recording"}
+                      </button>
+                      {(tileError || state === "failed") && (
+                        <button type="button" className="primary-button" onClick={() => void retryCamera(cameraId)} disabled={isOpening}>
+                          Retry live
+                        </button>
+                      )}
+                    </div>
+                  </>
+                )}
               </article>
             );
           })}
-        </div>
+          </div>
+        </>
       )}
     </section>
   );

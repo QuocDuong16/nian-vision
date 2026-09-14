@@ -243,6 +243,36 @@ export interface ApplicationSettings {
   launch_at_login: boolean;
 }
 
+export interface StorageUsage {
+  configured: boolean;
+  storage_root: string | null;
+  manual_recording_bytes: number;
+  event_clip_bytes: number;
+  managed_bytes: number;
+  manual_recording_count: number;
+  event_clip_count: number;
+  filesystem_total_bytes: number | null;
+  filesystem_available_bytes: number | null;
+  max_storage_bytes: number | null;
+  cleanup_target_bytes: number | null;
+}
+
+export interface PerformanceSnapshot {
+  sample_ready: boolean;
+  process_count: number;
+  app_cpu_percent: number;
+  system_cpu_percent: number;
+  app_memory_bytes: number;
+  system_memory_used_bytes: number;
+  system_memory_total_bytes: number;
+  system_network_rx_bps: number;
+  system_network_tx_bps: number;
+  app_network_rx_bps: number | null;
+  app_network_tx_bps: number | null;
+  app_gpu_percent: number | null;
+  system_gpu_percent: number | null;
+}
+
 export interface RecordingIntent {
   camera_ids: string[];
 }

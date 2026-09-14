@@ -1,0 +1,127 @@
+import { useEffect, useMemo, useState } from "react";
+import { invokeDesktop, isTauri } from "../lib/tauri";
+import type { PerformanceSnapshot } from "../lib/tauri";
+
+const SAMPLE_INTERVAL_MS = 1_000;
+
+function formatPercent(value: number): string {
+  if (!Number.isFinite(value)) return "—";
+  return `${value < 10 ? value.toFixed(1) : value.toFixed(0)}%`;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unit = units[0]!;
+  for (let index = 1; index < units.length && value >= 1024; index += 1) {
+    value /= 1024;
+    unit = units[index]!;
+  }
+  return `${value >= 100 ? value.toFixed(0) : value >= 10 ? value.toFixed(1) : value.toFixed(2)} ${unit}`;
+}
+
+function formatRate(bytesPerSecond: number): string {
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+export function PerformanceMonitor() {
+  const [snapshot, setSnapshot] = useState<PerformanceSnapshot | null>(null);
+  const [open, setOpen] = useState(false);
+  const [available, setAvailable] = useState(isTauri());
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let timer: number | null = null;
+
+    const poll = async () => {
+      try {
+        const next = await invokeDesktop<PerformanceSnapshot>("performance_snapshot");
+        if (!disposed) {
+          setSnapshot(next);
+          setAvailable(true);
+        }
+      } catch {
+        if (!disposed) setAvailable(false);
+      } finally {
+        if (!disposed) timer = window.setTimeout(() => void poll(), SAMPLE_INTERVAL_MS);
+      }
+    };
+
+    void poll();
+    return () => {
+      disposed = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, []);
+
+  const memoryPercent = useMemo(() => {
+    if (!snapshot || snapshot.system_memory_total_bytes <= 0) return 0;
+    return Math.min(100, (snapshot.app_memory_bytes / snapshot.system_memory_total_bytes) * 100);
+  }, [snapshot]);
+
+  const systemMemoryPercent = useMemo(() => {
+    if (!snapshot || snapshot.system_memory_total_bytes <= 0) return 0;
+    return Math.min(100, (snapshot.system_memory_used_bytes / snapshot.system_memory_total_bytes) * 100);
+  }, [snapshot]);
+
+  const footerLabel = snapshot?.sample_ready
+    ? `CPU ${formatPercent(snapshot.app_cpu_percent)} · RAM ${formatBytes(snapshot.app_memory_bytes)}`
+    : available ? "Performance warming up…" : "Performance unavailable";
+
+  return (
+    <div className="performance-monitor">
+      <button
+        type="button"
+        className="performance-monitor-trigger"
+        aria-label="Nian Vision performance"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span className={`sidebar-health-dot${available ? "" : " is-muted"}`} aria-hidden="true" />
+        <span className="performance-monitor-summary">{footerLabel}</span>
+      </button>
+
+      {open && (
+        <div className="performance-popover" role="region" aria-label="Performance details">
+          <div className="performance-popover-head">
+            <div><strong>Performance</strong><span>1 second live sample</span></div>
+            <span className="performance-process-count">{snapshot?.process_count ?? 0} processes</span>
+          </div>
+          {snapshot ? (
+            <div className="performance-grid">
+              <div className="performance-card">
+                <span>CPU</span>
+                <strong>{formatPercent(snapshot.app_cpu_percent)}</strong>
+                <small>Nian · system {formatPercent(snapshot.system_cpu_percent)}</small>
+                <div className="performance-bar"><span style={{ width: `${Math.min(100, snapshot.app_cpu_percent)}%` }} /></div>
+              </div>
+              <div className="performance-card">
+                <span>Memory</span>
+                <strong>{formatBytes(snapshot.app_memory_bytes)}</strong>
+                <small>{formatPercent(memoryPercent)} of {formatBytes(snapshot.system_memory_total_bytes)} · system {formatPercent(systemMemoryPercent)}</small>
+                <div className="performance-bar"><span style={{ width: `${memoryPercent}%` }} /></div>
+              </div>
+              <div className="performance-card">
+                <span>Network</span>
+                <strong>↓ {formatRate(snapshot.system_network_rx_bps)}</strong>
+                <small>System ↑ {formatRate(snapshot.system_network_tx_bps)}</small>
+                <em>Per-process network accounting is not exposed portably.</em>
+              </div>
+              <div className="performance-card">
+                <span>Graphics</span>
+                <strong>{snapshot.app_gpu_percent === null ? "—" : formatPercent(snapshot.app_gpu_percent)}</strong>
+                <small>{snapshot.system_gpu_percent === null ? "GPU accounting unavailable" : `System ${formatPercent(snapshot.system_gpu_percent)}`}</small>
+                <em>No vendor-specific estimate is shown as a fake universal value.</em>
+              </div>
+            </div>
+          ) : (
+            <p className="performance-unavailable">Performance telemetry is not available from the desktop host.</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

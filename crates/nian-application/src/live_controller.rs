@@ -20,7 +20,7 @@ use nian_ipc::{FramedReader, FramedWriter};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const MAX_SIMULTANEOUS_LIVE_VIEWS: usize = 4;
+pub const MAX_SIMULTANEOUS_LIVE_VIEWS: usize = 16;
 const LIVE_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const WORKER_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -31,7 +31,7 @@ pub const MAX_RETAINED_LIVE_FRAGMENTS: usize =
     (LIVE_FRAGMENT_RETENTION_MS / LIVE_FRAGMENT_TARGET_MS) as usize;
 pub const MAX_LIVE_FRAGMENT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RETAINED_LIVE_BYTES: u64 = 6 * MAX_LIVE_FRAGMENT_BYTES;
-pub const MAX_HTTP_REQUESTS: usize = 8;
+pub const MAX_HTTP_REQUESTS: usize = 32;
 pub const MAX_HTTP_READERS_PER_SESSION: usize = 2;
 pub const MAX_LIVE_CACHE_FRAGMENTS: usize =
     MAX_RETAINED_LIVE_FRAGMENTS + MAX_HTTP_READERS_PER_SESSION;
@@ -1998,20 +1998,26 @@ mod tests {
         let controller =
             LiveViewController::with_factory(Arc::new(FakeFactory), temp.path().to_path_buf())
                 .unwrap();
-        let first = controller.open(prepared("a")).unwrap();
+        let cameras = (0..MAX_SIMULTANEOUS_LIVE_VIEWS)
+            .map(|index| format!("camera-{index}"))
+            .collect::<Vec<_>>();
+        let first = controller.open(prepared(&cameras[0])).unwrap();
         assert!(matches!(
-            controller.open(prepared("a")),
+            controller.open(prepared(&cameras[0])),
             Err(LiveError::AlreadyOpen)
         ));
-        for camera in ["b", "c", "d"] {
+        for camera in cameras.iter().skip(1) {
             controller.open(prepared(camera)).unwrap();
         }
         assert!(matches!(
-            controller.open(prepared("e")),
+            controller.open(prepared("overflow")),
             Err(LiveError::Capacity)
         ));
         controller.close(&first.session_id).unwrap();
-        assert_eq!(controller.statuses().unwrap().len(), 3);
+        assert_eq!(
+            controller.statuses().unwrap().len(),
+            MAX_SIMULTANEOUS_LIVE_VIEWS - 1
+        );
     }
 
     #[test]
@@ -2093,17 +2099,23 @@ mod tests {
             LiveViewController::with_factory(Arc::new(FakeFactory), temp.path().to_path_buf())
                 .unwrap();
 
-        let started: Vec<_> = ["a", "b", "c", "d"]
-            .into_iter()
-            .map(|camera| controller.admit(prepared(camera)).unwrap().start().unwrap())
+        let started: Vec<_> = (0..MAX_SIMULTANEOUS_LIVE_VIEWS)
+            .map(|index| format!("camera-{index}"))
+            .map(|camera| {
+                controller
+                    .admit(prepared(&camera))
+                    .unwrap()
+                    .start()
+                    .unwrap()
+            })
             .collect();
         assert!(matches!(
-            controller.admit(prepared("e")),
+            controller.admit(prepared("overflow")),
             Err(LiveError::Capacity)
         ));
 
         drop(started);
-        controller.open(prepared("e")).unwrap();
+        controller.open(prepared("overflow")).unwrap();
     }
 
     #[test]
@@ -2893,21 +2905,23 @@ mod tests {
         let controller =
             LiveViewController::with_factory(Arc::new(FakeFactory), temp.path().to_path_buf())
                 .unwrap();
-        for camera in ["a", "b", "c", "d"] {
-            controller.open(prepared(camera)).unwrap();
+        for index in 0..MAX_SIMULTANEOUS_LIVE_VIEWS {
+            controller
+                .open(prepared(&format!("camera-{index}")))
+                .unwrap();
         }
 
         controller.stop_accepting();
         let hide_batch = controller.begin_close_all();
         controller.resume_accepting();
         assert!(matches!(
-            controller.open(prepared("e")),
+            controller.open(prepared("overflow")),
             Err(LiveError::Capacity)
         ));
 
         controller.finish_close_all(hide_batch);
-        let fresh = controller.open(prepared("e")).unwrap();
-        assert_eq!(fresh.camera_id, "e");
+        let fresh = controller.open(prepared("overflow")).unwrap();
+        assert_eq!(fresh.camera_id, "overflow");
     }
 
     #[test]

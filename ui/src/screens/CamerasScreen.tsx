@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { EmptyState } from "../components/EmptyState";
 import { PasswordInput } from "../components/PasswordInput";
 import { SelectControl } from "../components/SelectControl";
@@ -182,13 +183,11 @@ export function CamerasScreen() {
     if (!isTauri()) return;
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    void import("@tauri-apps/api/window")
-      .then(({ getCurrentWindow }) =>
-        getCurrentWindow().onCloseRequested(() => {
-          resetOnvifLocal();
-          setError(null);
-        }),
-      )
+    void getCurrentWindow()
+      .onCloseRequested(() => {
+        resetOnvifLocal();
+        setError(null);
+      })
       .then((cleanup) => {
         if (disposed) cleanup();
         else unlisten = cleanup;

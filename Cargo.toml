@@ -39,7 +39,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "1.0.0-rc.52"
+version = "1.0.0-rc.53"
 edition = "2024"
 rust-version = "1.98.0"
 authors = ["Nian Vision contributors"]
@@ -100,6 +100,8 @@ tauri-plugin-single-instance = "=2.4.3"
 tauri-plugin-updater = "=2.10.1"
 base64 = "=0.22.1"
 minisign-verify = "=0.2.5"
+fs2 = "=0.4.3"
+sysinfo = "=0.39.6"
 if-addrs = "=0.15.0"
 md-5 = "=0.11.0"
 quick-xml = "=0.42.0"

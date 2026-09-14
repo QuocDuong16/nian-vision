@@ -3,6 +3,7 @@ import type { AppInfo } from "./lib/tauri";
 import { isTauri, useTauriCommand } from "./lib/tauri";
 import { SCREENS, type ScreenId } from "./navigation";
 import { Sidebar } from "./components/Sidebar";
+import { WindowTitleBar } from "./components/WindowTitleBar";
 import { CamerasScreen } from "./screens/CamerasScreen";
 import { LiveViewScreen } from "./screens/LiveViewScreen";
 import { EventReviewScreen } from "./screens/EventReviewScreen";
@@ -47,27 +48,30 @@ export function App() {
   };
 
   return (
-    <div className="app-shell">
-      <Sidebar active={screen} onNavigate={navigate} />
-      <main className="app-content">
-        <header className="app-header">
-          <div className="app-header-context">
-            <span className="app-header-eyebrow">{appInfo.name}</span>
-            <span className="app-header-separator" aria-hidden="true">/</span>
-            <span className="app-header-section">{activeScreenLabel}</span>
-          </div>
-          <div className="app-header-meta">
-            <span className="app-runtime-badge"><span className="app-runtime-dot" aria-hidden="true" /> Desktop</span>
-            <span className="app-version">v{appInfo.version}</span>
-          </div>
-        </header>
-        {screen === "cameras" && <CamerasScreen />}
-        {screen === "live" && <LiveViewScreen />}
-        {screen === "events" && <EventReviewScreen />}
-        {screen === "timeline" && <TimelineScreen />}
-        {screen === "storage" && <StorageScreen />}
-        {screen === "settings" && <SettingsScreen />}
-      </main>
+    <div className="desktop-frame">
+      <WindowTitleBar title={appInfo.name} />
+      <div className="app-shell">
+        <Sidebar active={screen} onNavigate={navigate} />
+        <main className="app-content">
+          <header className="app-header">
+            <div className="app-header-context">
+              <span className="app-header-eyebrow">{appInfo.name}</span>
+              <span className="app-header-separator" aria-hidden="true">/</span>
+              <span className="app-header-section">{activeScreenLabel}</span>
+            </div>
+            <div className="app-header-meta">
+              <span className="app-runtime-badge"><span className="app-runtime-dot" aria-hidden="true" /> Desktop</span>
+              <span className="app-version">v{appInfo.version}</span>
+            </div>
+          </header>
+          {screen === "cameras" && <CamerasScreen />}
+          {screen === "live" && <LiveViewScreen />}
+          {screen === "events" && <EventReviewScreen />}
+          {screen === "timeline" && <TimelineScreen />}
+          {screen === "storage" && <StorageScreen />}
+          {screen === "settings" && <SettingsScreen />}
+        </main>
+      </div>
     </div>
   );
 }

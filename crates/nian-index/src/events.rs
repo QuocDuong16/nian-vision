@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::V
 
 use crate::{BUSY_TIMEOUT, IndexError, enable_and_verify_wal, verify_foreign_keys};
 
-const EVENT_SCHEMA_VERSION: i32 = 1;
+const EVENT_SCHEMA_VERSION: i32 = 2;
 pub const DEFAULT_EVENT_RETENTION_DAYS: u32 = 30;
 pub const MAX_EVENT_ROWS: u64 = 250_000;
 pub const EVENT_CLEANUP_BATCH: u32 = 500;
@@ -48,6 +48,9 @@ pub struct EventInsert {
     pub device_time_utc: Option<DateTime<Utc>>,
     pub received_time_utc: DateTime<Utc>,
     pub fingerprint: Option<[u8; 32]>,
+    /// Raw source transitions stay durable for audit/debug. Event Review only
+    /// exposes aggregate camera-level transitions marked user-visible.
+    pub user_visible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,13 +160,24 @@ impl EventIndex {
                     source_key TEXT NULL,\
                     device_time_utc_ms INTEGER NULL,\
                     received_time_utc_ms INTEGER NOT NULL,\
-                    fingerprint BLOB NULL UNIQUE\
+                    fingerprint BLOB NULL UNIQUE,\
+                    user_visible INTEGER NOT NULL CHECK(user_visible IN (0,1))\
                  );\
                  CREATE INDEX events_camera_received \
                     ON events(camera_id, received_time_utc_ms DESC, event_id DESC);\
                  CREATE INDEX events_received \
                     ON events(received_time_utc_ms, event_id);\
-                 PRAGMA user_version=1;\
+                 PRAGMA user_version=2;\
+                 COMMIT;",
+            )?;
+        } else if version == 1 {
+            // Existing rows were historically user-facing, so migration keeps
+            // them visible. New raw ONVIF source transitions are inserted hidden.
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;\
+                 ALTER TABLE events ADD COLUMN user_visible INTEGER NOT NULL DEFAULT 1 \
+                    CHECK(user_visible IN (0,1));\
+                 PRAGMA user_version=2;\
                  COMMIT;",
             )?;
         }
@@ -217,8 +231,8 @@ impl EventIndex {
         let fingerprint = event.fingerprint.map(|value| value.to_vec());
         let changed = self.connection.execute(
             "INSERT OR IGNORE INTO events \
-             (camera_id, kind, source_key, device_time_utc_ms, received_time_utc_ms, fingerprint) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (camera_id, kind, source_key, device_time_utc_ms, received_time_utc_ms, fingerprint, user_visible) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 event.camera_id.as_str(),
                 event.kind.as_str(),
@@ -226,6 +240,7 @@ impl EventIndex {
                 device_ms,
                 received_ms,
                 fingerprint,
+                i64::from(event.user_visible),
             ],
         )?;
         if changed == 0 {
@@ -265,8 +280,8 @@ impl EventIndex {
         let transaction = self.connection.transaction()?;
         let changed = transaction.execute(
             "INSERT OR IGNORE INTO events \
-             (camera_id, kind, source_key, device_time_utc_ms, received_time_utc_ms, fingerprint) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (camera_id, kind, source_key, device_time_utc_ms, received_time_utc_ms, fingerprint, user_visible) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 event.camera_id.as_str(),
                 event.kind.as_str(),
@@ -274,6 +289,7 @@ impl EventIndex {
                 device_ms,
                 received_ms,
                 fingerprint,
+                i64::from(event.user_visible),
             ],
         )?;
         let inserted_id = if changed == 0 {
@@ -363,7 +379,7 @@ impl EventIndex {
 
         let mut sql = String::from(
             "SELECT event_id, camera_id, kind, source_key, device_time_utc_ms, received_time_utc_ms \
-             FROM events WHERE received_time_utc_ms >= ? AND received_time_utc_ms <= ?",
+             FROM events WHERE user_visible=1 AND received_time_utc_ms >= ? AND received_time_utc_ms <= ?",
         );
         let mut values = vec![
             Value::Integer(query.from_utc.timestamp_millis()),
@@ -582,6 +598,7 @@ mod tests {
             device_time_utc: DateTime::from_timestamp(second, 0),
             received_time_utc: DateTime::from_timestamp(second + 1, 0).unwrap(),
             fingerprint: Some([u8::from(active); 32]),
+            user_visible: true,
         }
     }
 
@@ -645,6 +662,86 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, EventKind::MotionStarted);
+    }
+
+    #[test]
+    fn review_query_hides_raw_audit_rows_but_recent_retains_them() {
+        let temp = tempdir().unwrap();
+        let mut index = EventIndex::open(temp.path().join("event-index.sqlite3")).unwrap();
+        let mut raw = event("front-door", true, 10);
+        raw.user_visible = false;
+        raw.fingerprint = Some([7; 32]);
+        let mut aggregate = event("front-door", true, 11);
+        aggregate.user_visible = true;
+        aggregate.fingerprint = Some([8; 32]);
+        index.insert(&raw).unwrap();
+        index.insert(&aggregate).unwrap();
+
+        assert_eq!(
+            index
+                .recent(&CameraId::parse("front-door").unwrap(), 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        let review = index
+            .query(&EventQuery {
+                camera_ids: vec![CameraId::parse("front-door").unwrap()],
+                kind: None,
+                from_utc: DateTime::from_timestamp(0, 0).unwrap(),
+                to_utc: DateTime::from_timestamp(100, 0).unwrap(),
+                limit: 10,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(review.rows.len(), 1);
+        assert_eq!(review.rows[0].received_time_utc.timestamp(), 12);
+    }
+
+    #[test]
+    fn v1_event_schema_migrates_existing_rows_as_user_visible() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("event-index.sqlite3");
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE events (\
+                         event_id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                         camera_id TEXT NOT NULL,\
+                         kind TEXT NOT NULL CHECK(kind IN ('motion_started','motion_ended')),\
+                         source_key TEXT NULL,\
+                         device_time_utc_ms INTEGER NULL,\
+                         received_time_utc_ms INTEGER NOT NULL,\
+                         fingerprint BLOB NULL UNIQUE\
+                     );\
+                     CREATE INDEX events_camera_received \
+                        ON events(camera_id, received_time_utc_ms DESC, event_id DESC);\
+                     CREATE INDEX events_received \
+                        ON events(received_time_utc_ms, event_id);\
+                     INSERT INTO events \
+                        (camera_id, kind, source_key, device_time_utc_ms, received_time_utc_ms, fingerprint) \
+                        VALUES ('front-door', 'motion_started', 'legacy-source', 100000, 101000, NULL);\
+                     PRAGMA user_version=1;",
+                )
+                .unwrap();
+        }
+
+        let index = EventIndex::open(&path).unwrap();
+        assert_eq!(index.schema_version().unwrap(), EVENT_SCHEMA_VERSION);
+        let page = index
+            .query(&EventQuery {
+                camera_ids: vec![CameraId::parse("front-door").unwrap()],
+                kind: None,
+                from_utc: DateTime::from_timestamp(90, 0).unwrap(),
+                to_utc: DateTime::from_timestamp(110, 0).unwrap(),
+                limit: 10,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].kind, EventKind::MotionStarted);
+        assert_eq!(page.rows[0].source_key.as_deref(), Some("legacy-source"));
     }
 
     #[test]

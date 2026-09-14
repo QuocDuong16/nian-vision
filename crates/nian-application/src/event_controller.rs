@@ -1547,6 +1547,7 @@ enum MotionState {
     Active,
 }
 
+#[derive(Clone)]
 struct MotionDecision {
     source_key: Option<String>,
     next: MotionState,
@@ -1555,7 +1556,7 @@ struct MotionDecision {
     overflowed: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MotionNormalizer {
     sources: HashMap<Option<String>, MotionState>,
     overflowed: bool,
@@ -1616,6 +1617,7 @@ impl MotionNormalizer {
                 fingerprint: notification.device_time_utc.map(|device_time| {
                     event_fingerprint(camera_id, kind, key.as_deref(), device_time)
                 }),
+                user_visible: false,
             })
         };
 
@@ -1677,6 +1679,16 @@ struct MotionNotificationProjection<'a> {
     persisted_event_sink: &'a dyn PersistedEventSink,
 }
 
+const AGGREGATE_MOTION_SOURCE_KEY: &str = "__aggregate_motion__";
+
+fn aggregate_transition(before: Option<bool>, after: Option<bool>) -> Option<EventKind> {
+    match (before, after) {
+        (Some(true), Some(false)) => Some(EventKind::MotionEnded),
+        (before, Some(true)) if before != Some(true) => Some(EventKind::MotionStarted),
+        _ => None,
+    }
+}
+
 fn apply_motion_notification_with_sink(
     normalizer: &mut MotionNormalizer,
     camera_id: &CameraId,
@@ -1686,15 +1698,46 @@ fn apply_motion_notification_with_sink(
     projection: MotionNotificationProjection<'_>,
     retention_days: Option<u32>,
 ) -> Result<(), ()> {
+    let before = normalizer.aggregate_motion();
     let decision = normalizer.prepare(camera_id, notification, received_time_utc);
-    let transition = decision.transition.clone();
-    let persisted_event_id = transition
+    let raw_transition = decision.transition.clone();
+    let mut candidate = normalizer.clone();
+    candidate.commit(decision);
+    let after = candidate.aggregate_motion();
+
+    // Keep exact per-source transitions durable for audit/debug, but do not let
+    // vendor topic fan-out create duplicate user-facing episodes or clips.
+    if let Some(insert) = raw_transition.as_ref() {
+        persist_motion_transition(event_index, insert, retention_days)?;
+    }
+
+    let aggregate_insert = (!notification.synchronization_baseline)
+        .then(|| aggregate_transition(before, after))
+        .flatten()
+        .map(|kind| EventInsert {
+            camera_id: camera_id.clone(),
+            kind,
+            source_key: Some(AGGREGATE_MOTION_SOURCE_KEY.to_owned()),
+            device_time_utc: notification.device_time_utc,
+            received_time_utc,
+            fingerprint: notification.device_time_utc.map(|device_time| {
+                event_fingerprint(
+                    camera_id,
+                    kind,
+                    Some(AGGREGATE_MOTION_SOURCE_KEY),
+                    device_time,
+                )
+            }),
+            user_visible: true,
+        });
+    let persisted_event_id = aggregate_insert
         .as_ref()
         .map(|insert| persist_motion_transition(event_index, insert, retention_days))
         .transpose()?
         .flatten();
-    normalizer.commit(decision);
-    if let (Some(insert), Some(event_id)) = (transition.as_ref(), persisted_event_id) {
+
+    *normalizer = candidate;
+    if let (Some(insert), Some(event_id)) = (aggregate_insert.as_ref(), persisted_event_id) {
         projection
             .persisted_event_sink
             .try_publish(PersistedEventSignal {
@@ -1702,7 +1745,7 @@ fn apply_motion_notification_with_sink(
                 camera_id: camera_id.as_str().to_owned(),
                 camera_display_name: projection.camera_display_name.to_owned(),
                 kind: history_kind(insert.kind),
-                motion_active: normalizer.aggregate_motion(),
+                motion_active: after,
                 received_time_utc: insert.received_time_utc,
             });
     }
@@ -2547,8 +2590,8 @@ mod tests {
             .unwrap()
             .recent(&camera_id, 10)
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, EventKind::MotionStarted);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.kind == EventKind::MotionStarted));
 
         apply_motion_notification(
             &mut normalizer,
@@ -2566,7 +2609,7 @@ mod tests {
             .unwrap()
             .recent(&camera_id, 10)
             .unwrap();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]
@@ -2630,8 +2673,8 @@ mod tests {
             .unwrap()
             .recent(&camera_id, 10)
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, EventKind::MotionEnded);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.kind == EventKind::MotionEnded));
     }
 
     #[test]
@@ -2693,8 +2736,8 @@ mod tests {
             .unwrap()
             .recent(&camera_id, 10)
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, EventKind::MotionStarted);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.kind == EventKind::MotionStarted));
     }
 
     #[test]
@@ -2736,12 +2779,14 @@ mod tests {
             .unwrap()
             .recent(&camera_id, 10)
             .unwrap();
-        assert_eq!(rows.len(), 3);
+        // Three physical transitions produce three raw audit rows plus three
+        // aggregate user-visible rows. Event Review queries only the latter.
+        assert_eq!(rows.len(), 6);
         assert_eq!(
             rows.iter()
                 .filter(|row| row.kind == EventKind::MotionStarted)
                 .count(),
-            2
+            4
         );
         assert!(rows.iter().all(|row| row.device_time_utc.is_none()));
     }
@@ -2887,11 +2932,11 @@ mod tests {
         }
 
         let signals = sink.signals.lock().unwrap();
-        assert_eq!(signals.len(), 4);
+        assert_eq!(signals.len(), 2);
+        assert_eq!(signals[0].kind, EventHistoryKind::MotionStarted);
         assert_eq!(signals[0].motion_active, Some(true));
-        assert_eq!(signals[1].motion_active, Some(true));
-        assert_eq!(signals[2].motion_active, Some(true));
-        assert_eq!(signals[3].motion_active, Some(false));
+        assert_eq!(signals[1].kind, EventHistoryKind::MotionEnded);
+        assert_eq!(signals[1].motion_active, Some(false));
     }
 
     #[test]

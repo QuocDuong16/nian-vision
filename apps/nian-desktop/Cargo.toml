@@ -19,6 +19,8 @@ nian-onvif = { workspace = true }
 nian-platform-windows = { workspace = true }
 nian-settings = { workspace = true }
 nian-storage = { workspace = true }
+fs2 = { workspace = true }
+sysinfo = { workspace = true }
 keyring = { workspace = true }
 notify-rust = { workspace = true }
 serde = { workspace = true }

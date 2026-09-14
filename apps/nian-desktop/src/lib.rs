@@ -7,8 +7,10 @@
 #![forbid(unsafe_code)]
 
 mod event_capture;
+mod performance;
 
-use event_capture::{EventCaptureDispatcher, event_clips_for_event};
+use event_capture::{EventCaptureDispatcher, event_clip_usage, event_clips_for_event};
+use performance::PerformanceSnapshotDto;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -38,7 +40,7 @@ use nian_domain::{
 use nian_index::EventIndex;
 use nian_onvif::OnvifError;
 use nian_settings::SettingsStore;
-use nian_storage::RecordingsLayout;
+use nian_storage::{RecordingsLayout, inventory_recordings};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -77,6 +79,21 @@ pub struct UpdateCheckDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecordingIntentDto {
     pub camera_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StorageUsageDto {
+    pub configured: bool,
+    pub storage_root: Option<String>,
+    pub manual_recording_bytes: u64,
+    pub event_clip_bytes: u64,
+    pub managed_bytes: u64,
+    pub manual_recording_count: usize,
+    pub event_clip_count: usize,
+    pub filesystem_total_bytes: Option<u64>,
+    pub filesystem_available_bytes: Option<u64>,
+    pub max_storage_bytes: Option<u64>,
+    pub cleanup_target_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2183,6 +2200,81 @@ fn settings_get(
 }
 
 #[tauri::command]
+fn performance_snapshot() -> Result<PerformanceSnapshotDto, DesktopErrorDto> {
+    performance::performance_snapshot().map_err(|_| {
+        DesktopErrorDto::new(
+            "performance_unavailable",
+            "performance telemetry is unavailable",
+        )
+    })
+}
+
+#[tauri::command]
+async fn storage_usage(
+    state: tauri::State<'_, Arc<DesktopState>>,
+) -> Result<StorageUsageDto, DesktopErrorDto> {
+    admit_running(&state)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = lock(&state.camera_service)?
+            .application_settings()
+            .map_err(map_camera_error)?;
+        let Some(root) = settings.storage_root.as_ref().map(PathBuf::from) else {
+            return Ok(StorageUsageDto {
+                configured: false,
+                storage_root: None,
+                manual_recording_bytes: 0,
+                event_clip_bytes: 0,
+                managed_bytes: 0,
+                manual_recording_count: 0,
+                event_clip_count: 0,
+                filesystem_total_bytes: None,
+                filesystem_available_bytes: None,
+                max_storage_bytes: settings.max_storage_bytes,
+                cleanup_target_bytes: settings.cleanup_target_bytes,
+            });
+        };
+
+        let layout = RecordingsLayout::new(root.clone()).map_err(|_| {
+            DesktopErrorDto::new("storage_usage_failed", "recording storage root is invalid")
+        })?;
+        let inventory = inventory_recordings(&layout).map_err(|_| {
+            DesktopErrorDto::new(
+                "storage_usage_failed",
+                "could not inventory recording storage",
+            )
+        })?;
+        let manual_recording_count = inventory.recordings.len();
+        let manual_recording_bytes = inventory.recordings.iter().fold(0_u64, |total, recording| {
+            total.saturating_add(recording.size_bytes)
+        });
+        let (event_clip_bytes, event_clip_count) = event_clip_usage(&root).map_err(|_| {
+            DesktopErrorDto::new(
+                "storage_usage_failed",
+                "could not inventory motion event clips",
+            )
+        })?;
+        let managed_bytes = manual_recording_bytes.saturating_add(event_clip_bytes);
+
+        Ok(StorageUsageDto {
+            configured: true,
+            storage_root: Some(root.to_string_lossy().into_owned()),
+            manual_recording_bytes,
+            event_clip_bytes,
+            managed_bytes,
+            manual_recording_count,
+            event_clip_count,
+            filesystem_total_bytes: fs2::total_space(&root).ok(),
+            filesystem_available_bytes: fs2::available_space(&root).ok(),
+            max_storage_bytes: settings.max_storage_bytes,
+            cleanup_target_bytes: settings.cleanup_target_bytes,
+        })
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("storage_usage_failed", "storage usage task failed"))?
+}
+
+#[tauri::command]
 async fn settings_update(
     app: AppHandle,
     state: tauri::State<'_, Arc<DesktopState>>,
@@ -4134,6 +4226,8 @@ pub fn run() {
             playback_keepalive,
             playback_status,
             settings_get,
+            performance_snapshot,
+            storage_usage,
             settings_update,
             notification_settings_get,
             notification_settings_update,

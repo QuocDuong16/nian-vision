@@ -1,5 +1,6 @@
 import type { ScreenId } from "../navigation";
 import { SCREENS } from "../navigation";
+import { PerformanceMonitor } from "./PerformanceMonitor";
 
 function NavigationIcon({ id }: { id: ScreenId }) {
   const common = {
@@ -55,10 +56,7 @@ export function Sidebar(props: {
           </li>
         ))}
       </ul>
-      <div className="sidebar-footer">
-        <span className="sidebar-health-dot" aria-hidden="true" />
-        <span>Local desktop</span>
-      </div>
+      <PerformanceMonitor />
     </nav>
   );
 }

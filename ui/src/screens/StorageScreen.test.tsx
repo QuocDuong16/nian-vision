@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StorageScreen } from "./StorageScreen";
-import type { ApplicationSettings } from "../lib/tauri";
+import type { ApplicationSettings, StorageUsage } from "../lib/tauri";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
@@ -18,10 +18,25 @@ const initial: ApplicationSettings = {
   launch_at_login: false,
 };
 
+const usage: StorageUsage = {
+  configured: true,
+  storage_root: initial.storage_root,
+  manual_recording_bytes: GIB,
+  event_clip_bytes: GIB / 2,
+  managed_bytes: GIB * 1.5,
+  manual_recording_count: 6,
+  event_clip_count: 3,
+  filesystem_total_bytes: GIB * 10,
+  filesystem_available_bytes: GIB * 8,
+  max_storage_bytes: null,
+  cleanup_target_bytes: null,
+};
+
 function installDesktop() {
   Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
   vi.mocked(invoke).mockImplementation(async (command, args) => {
     if (command === "settings_get") return initial;
+    if (command === "storage_usage") return usage;
     if (command === "settings_update") return (args as { settings: ApplicationSettings }).settings;
     throw new Error(`unexpected command ${command}`);
   });
@@ -38,6 +53,17 @@ afterEach(() => {
 });
 
 describe("StorageScreen", () => {
+  it("shows real managed footage and filesystem capacity statistics", async () => {
+    installDesktop();
+    render(<StorageScreen />);
+
+    expect(await screen.findByText("1.50 GB")).toBeTruthy();
+    expect(screen.getByText("8.00 GB")).toBeTruthy();
+    expect(screen.getByText("6 finalized segments")).toBeTruthy();
+    expect(screen.getByText("3 event clips")).toBeTruthy();
+    expect(screen.getByRole("progressbar", { name: "Disk used" }).getAttribute("aria-valuenow")).toBe("20");
+  });
+
   it("requires HIGH and LOW watermarks to be configured together", async () => {
     installDesktop();
     render(<StorageScreen />);

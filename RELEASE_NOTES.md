@@ -1,3 +1,8 @@
+# Nian Vision 1.0.0-rc.53
+Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
+
+RC53 extends the desktop usability overhaul into the operational surfaces used during day-to-day monitoring. Live View now supports 1/4/8/16-camera layouts with paging across an unbounded configured selection while only the current page owns live sessions, preserving bounded backend capacity. The desktop owns its title bar and window controls, and Timeline/Event Review share an application-styled playback surface with seek, volume, keyboard shortcuts, fullscreen and clip metadata instead of native WebView controls. PTZ continuous movement rebuilds its ONVIF control session once after a transient transport failure, including a dead command channel, while authentication/protocol failures remain fail-closed. Motion persistence now separates raw source transitions from camera-level aggregate events so multiple near-simultaneous Tapo/ONVIF detector topics remain available for audit but produce one user-facing motion episode, notification and event-capture trigger. Storage adds managed/manual/event footage counts and byte totals plus filesystem/quota capacity telemetry. A lightweight local performance monitor samples the Nian process tree CPU/RAM and system CPU/RAM/network once per second; per-process network and GPU fields remain explicitly unavailable until a trustworthy platform provider exists. RC53 preserves the H.264 packet-copy media contract and does not add H.265/G711 recording support.
+
 # Nian Vision 1.0.0-rc.52
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 
@@ -48,7 +53,7 @@ RC1 through RC9 remain immutable historical release attempts. RC7 proved the det
 
 - Manual RTSP camera configuration and ONVIF discovery/provisioning.
 - Up to 8 simultaneous H.264 stream-copy recording sessions with local retention and crash/partial recovery.
-- Up to 4 independent Live View sessions and local playback/timeline review.
+- Up to 16 independent Live View sessions per active page, with paged camera selection and local playback/timeline review.
 - Optional ONVIF PTZ continuous pan/tilt and capability-gated zoom.
 - Up to 16 optional ONVIF PullPoint Event-monitoring sessions with normalized local Event history.
 - Event Review with dedicated immutable event clips, about five seconds of real buffered pre-roll, five-second post-roll, automatic availability refresh, and bounded multi-part playback for long motion.

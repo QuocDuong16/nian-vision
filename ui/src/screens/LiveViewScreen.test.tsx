@@ -53,15 +53,16 @@ function installDesktop(
   openOverride?: (cameraId: string) => Promise<LiveOpenDto>,
   liveStatusesOverride?: () => Promise<LiveStatus[]>,
   eventStatusOverride?: (cameraId: string) => EventStatus | Promise<EventStatus>,
+  cameraRows: CameraSummary[] = [front, garage],
 ) {
   Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
   let live: LiveStatus[] = [];
-  let recording: RecordingStatus[] = [stopped(front.camera_id), stopped(garage.camera_id)];
+  let recording: RecordingStatus[] = cameraRows.map((camera) => stopped(camera.camera_id));
   let intent: RecordingIntent = { camera_ids: [] };
   let sequence = 0;
 
   vi.mocked(invoke).mockImplementation(async (command, args) => {
-    if (command === "camera_list") return [front, garage];
+    if (command === "camera_list") return cameraRows;
     if (command === "live_statuses") return liveStatusesOverride ? await liveStatusesOverride() : live;
     if (command === "recording_statuses") return recording;
     if (command === "recording_intent") return intent;
@@ -75,14 +76,15 @@ function installDesktop(
     }
     if (command === "event_statuses") {
       return await Promise.all(
-        [front.camera_id, garage.camera_id].map(async (cameraId) =>
-          eventStatusOverride
+        cameraRows.map(async (camera) => {
+          const cameraId = camera.camera_id;
+          return eventStatusOverride
             ? await eventStatusOverride(cameraId)
             : {
                 camera_id: cameraId, configured: false, desired: false, state: "disabled",
                 motion_active: null, last_event_at: null, last_error_code: null,
-              },
-        ),
+              };
+        }),
       );
     }
     if (command === "live_open") {
@@ -222,6 +224,46 @@ describe("LiveViewScreen", () => {
       expect(video?.src).toContain("http://127.0.0.1:43100/live/");
       expect(video?.src).not.toContain("rtsp://");
       expect(document.body.textContent).not.toContain("192.168.1.50");
+    });
+  });
+
+  it("pages an unlimited camera selection in 16-up views while keeping sessions page-scoped", async () => {
+    const many = Array.from({ length: 17 }, (_, index): CameraSummary => ({
+      camera_id: `camera-${String(index + 1).padStart(2, "0")}`,
+      display_name: `Camera ${String(index + 1).padStart(2, "0")}`,
+      host: `192.168.2.${index + 1}`,
+      port: 554,
+      path: "/stream1",
+      audio_policy: "exclude",
+    }));
+    installDesktop(undefined, undefined, undefined, undefined, many);
+    render(<LiveViewScreen />);
+
+    await screen.findByText("No live cameras selected");
+    fireEvent.click(screen.getByRole("button", { name: "16 camera layout" }));
+    for (const camera of many) {
+      chooseCombobox("Camera to add", camera.display_name);
+      fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+      await waitFor(() => {
+        const opens = vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open");
+        expect(opens.some(([, args]) => (args as { cameraId?: string })?.cameraId === camera.camera_id)).toBe(true);
+      });
+    }
+
+    expect(await screen.findByText("Page 2 / 2")).toBeTruthy();
+    expect(await screen.findByRole("article", { name: "Camera 17 live camera" })).toBeTruthy();
+    expect(screen.queryByRole("article", { name: "Camera 01 live camera" })).toBeNull();
+    await waitFor(() => {
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_close").length).toBeGreaterThanOrEqual(16);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Previous live page" }));
+    expect(await screen.findByText("Page 1 / 2")).toBeTruthy();
+    expect(await screen.findByRole("article", { name: "Camera 01 live camera" })).toBeTruthy();
+    expect(screen.queryByRole("article", { name: "Camera 17 live camera" })).toBeNull();
+    await waitFor(() => {
+      const opens = vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open");
+      expect(opens.length).toBeGreaterThanOrEqual(33);
     });
   });
 

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SelectControl } from "../components/SelectControl";
+import { VideoPlayer } from "../components/VideoPlayer";
 import {
   desktopError,
   invokeDesktop,
@@ -29,6 +30,24 @@ function durationLabel(durationMs: number | null): string {
   const minutes = Math.floor(seconds / 60);
   const rest = seconds % 60;
   return minutes > 0 ? `${minutes}m ${rest}s` : `${rest}s`;
+}
+
+function sizeLabel(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unit = units[0]!;
+  for (let index = 1; index < units.length && value >= 1024; index += 1) {
+    value /= 1024;
+    unit = units[index]!;
+  }
+  return `${value >= 100 ? value.toFixed(0) : value >= 10 ? value.toFixed(1) : value.toFixed(2)} ${unit}`;
+}
+
+function dateTimeLabel(value: string | null): string {
+  if (!value) return "Unknown";
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed.toLocaleString() : value;
 }
 
 function gapLabel(ms: number): string {
@@ -442,14 +461,27 @@ export function TimelineScreen() {
 
         {playback ? (
           <>
-            <video
+            <VideoPlayer
               key={playback.session_id}
-              className="playback-video"
               src={playback.url}
-              controls
-              preload="metadata"
+              ariaLabel={`Playback ${playback.recording.recording_id}`}
               onEnded={() => setEnded(true)}
               onError={handlePlaybackMediaError}
+              metadata={[
+                { label: "Camera", value: playback.recording.camera_id },
+                { label: "Started", value: dateTimeLabel(playback.recording.started_at) },
+                { label: "Ended", value: dateTimeLabel(playback.recording.end_at) },
+                { label: "Duration", value: durationLabel(playback.inspect.duration_ms) },
+                { label: "File size", value: sizeLabel(playback.recording.size_bytes) },
+                { label: "Video", value: playback.inspect.video_codec.toUpperCase() },
+                { label: "Resolution", value: playback.inspect.width && playback.inspect.height ? `${playback.inspect.width}×${playback.inspect.height}` : "Unknown" },
+                { label: "Audio", value: playback.inspect.audio_available ? "Available" : "Video only" },
+                { label: "Container", value: playback.inspect.container_compatibility },
+                { label: "Seek", value: playback.inspect.seekable ? "Seekable" : "Sequential only" },
+                { label: "Recording kind", value: playback.recording.kind === "recovered" ? "Recovered" : "Normal" },
+                { label: "Sequence", value: String(playback.recording.sequence) },
+                { label: "Recording ID", value: playback.recording.recording_id },
+              ]}
             />
             <div className="playback-meta">
               <span>{playback.inspect.video_codec.toUpperCase()}</span>

@@ -642,39 +642,73 @@ impl PtzController {
     ) -> Result<PtzMovementDto, PtzError> {
         self.require_accepting()?;
         let camera_id = CameraId::parse(camera_id).map_err(|_| PtzError::CameraNotFound)?;
-        let session = self.ensure_session(&camera_id)?;
-        if matches!(direction, PtzDirection::ZoomIn | PtzDirection::ZoomOut)
-            && !session.zoom_supported
-        {
-            return Err(PtzError::Unsupported);
-        }
         let generation = self
             .generation
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
-        let (tx, rx) = mpsc::channel();
-        send_bounded(
-            &session.tx,
-            PtzCommand::Move {
-                generation,
-                direction,
-                reply: tx,
-            },
-        )?;
-        let result = rx
-            .recv_timeout(Duration::from_secs(6))
-            .map_err(|_| PtzError::ControlTimeout)?;
-        if let Err(error) = result {
-            let mapped = map_protocol_error(error);
-            self.retire_session(&camera_id);
-            return Err(mapped);
+
+        // Embedded ONVIF stacks can accept pairing/interrogation and then reset the
+        // first PTZ control request. Rebuild the control session exactly once for
+        // transport-only failures. Protocol/auth/unsupported failures remain fail-closed.
+        for attempt in 0..2 {
+            let session = self.ensure_session(&camera_id)?;
+            if matches!(direction, PtzDirection::ZoomIn | PtzDirection::ZoomOut)
+                && !session.zoom_supported
+            {
+                return Err(PtzError::Unsupported);
+            }
+            let (tx, rx) = mpsc::channel();
+            if let Err(error) = send_bounded(
+                &session.tx,
+                PtzCommand::Move {
+                    generation,
+                    direction,
+                    reply: tx,
+                },
+            ) {
+                // A dead worker leaves a disconnected sender in the registry
+                // until the next caller touches it. Treat that like a transport
+                // failure: retire the stale session and rebuild exactly once.
+                if matches!(error, PtzError::ControlFailed) {
+                    self.retire_session(&camera_id);
+                    if attempt == 0 {
+                        continue;
+                    }
+                }
+                return Err(error);
+            }
+            let result = match rx.recv_timeout(Duration::from_secs(6)) {
+                Ok(result) => result,
+                Err(_) => {
+                    self.retire_session(&camera_id);
+                    if attempt == 0 {
+                        continue;
+                    }
+                    return Err(PtzError::ControlTimeout);
+                }
+            };
+            match result {
+                Ok(()) => {
+                    return Ok(PtzMovementDto {
+                        camera_id: camera_id.as_str().to_owned(),
+                        generation,
+                        lease_ms: PTZ_MOVEMENT_LEASE_MS,
+                        renew_after_ms: PTZ_RENEW_INTERVAL_MS,
+                    });
+                }
+                Err(error) => {
+                    let retryable =
+                        matches!(error, OnvifError::DeviceUnreachable | OnvifError::Timeout);
+                    let mapped = map_protocol_error(error);
+                    self.retire_session(&camera_id);
+                    if attempt == 0 && retryable {
+                        continue;
+                    }
+                    return Err(mapped);
+                }
+            }
         }
-        Ok(PtzMovementDto {
-            camera_id: camera_id.as_str().to_owned(),
-            generation,
-            lease_ms: PTZ_MOVEMENT_LEASE_MS,
-            renew_after_ms: PTZ_RENEW_INTERVAL_MS,
-        })
+        Err(PtzError::ControlFailed)
     }
 
     pub fn renew(&self, camera_id: &str, generation: u64) -> Result<(), PtzError> {
@@ -2414,6 +2448,39 @@ mod tests {
     }
 
     #[test]
+    fn transient_move_failure_rebuilds_session_once_and_retries_same_movement() {
+        let fixture = fixture(true, false);
+        fixture.backend.fail_moves.store(1, Ordering::Release);
+
+        let movement = fixture
+            .controller
+            .move_camera("front-door", PtzDirection::Left)
+            .unwrap();
+        fixture
+            .controller
+            .stop("front-door", movement.generation)
+            .unwrap();
+
+        let events = fixture.backend.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.as_str() == "control")
+                .count(),
+            2,
+            "retry must rebuild the PTZ control session exactly once"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.as_str() == "move_pan_tilt")
+                .count(),
+            2,
+            "the same movement is retried once after transient transport failure"
+        );
+    }
+
+    #[test]
     fn one_camera_failure_does_not_block_another_camera() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("settings.sqlite3");
@@ -2445,7 +2512,7 @@ mod tests {
                 .unwrap();
         }
         let backend = Arc::new(FakeBackend::with_zoom(false));
-        backend.fail_moves.store(1, Ordering::Release);
+        backend.fail_moves.store(2, Ordering::Release);
         let controller = PtzController::with_backend(Box::new(store), credentials, backend.clone());
         assert!(matches!(
             controller.move_camera("camera-a", PtzDirection::Left),

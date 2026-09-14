@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SelectControl } from "../components/SelectControl";
+import { VideoPlayer } from "../components/VideoPlayer";
 import {
   desktopError,
   invokeDesktop,
@@ -64,6 +65,18 @@ function eventKindLabel(): string {
   return "Motion event";
 }
 
+function sizeLabel(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unit = units[0]!;
+  for (let index = 1; index < units.length && value >= 1024; index += 1) {
+    value /= 1024;
+    unit = units[index]!;
+  }
+  return `${value >= 100 ? value.toFixed(0) : value >= 10 ? value.toFixed(1) : value.toFixed(2)} ${unit}`;
+}
+
 export function EventReviewScreen() {
   const initialNow = useMemo(() => new Date(), []);
   const [cameras, setCameras] = useState<CameraSummary[]>([]);
@@ -90,7 +103,6 @@ export function EventReviewScreen() {
   const queuedReloadRef = useRef<EventDatasetSnapshot | null>(null);
   const paginationInFlightRef = useRef<number | null>(null);
   const playbackSessionRef = useRef<string | null>(null);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
 
   const closePlayback = useCallback(async () => {
     const sessionId = playbackSessionRef.current;
@@ -483,20 +495,28 @@ export function EventReviewScreen() {
 
           {playback && (
             <div className="event-playback">
-              <video
-                ref={videoRef}
+              <VideoPlayer
                 key={playback.playback.session_id}
-                className="playback-video"
                 src={playback.playback.url}
-                controls
-                preload="metadata"
-                onLoadedMetadata={() => {
-                  if (videoRef.current) videoRef.current.currentTime = playback.seek_offset_ms / 1000;
-                }}
+                ariaLabel={`Event ${selected?.event_id ?? ""} playback`}
+                initialTimeSeconds={playback.seek_offset_ms / 1000}
                 onError={() => {
                   setSelectionMessage("Playback could not be loaded by the desktop webview.");
                   void closePlayback();
                 }}
+                metadata={[
+                  { label: "Event", value: selected ? String(selected.event_id) : "Unknown" },
+                  { label: "Camera", value: playback.playback.recording.camera_id },
+                  { label: "Clip", value: `${playback.clip_index + 1} of ${playback.clip_count}` },
+                  { label: "File size", value: sizeLabel(playback.playback.recording.size_bytes) },
+                  { label: "Duration", value: playback.playback.inspect.duration_ms === null ? "Unknown" : `${(playback.playback.inspect.duration_ms / 1000).toFixed(1)} s` },
+                  { label: "Video", value: playback.playback.inspect.video_codec.toUpperCase() },
+                  { label: "Resolution", value: playback.playback.inspect.width && playback.playback.inspect.height ? `${playback.playback.inspect.width}×${playback.playback.inspect.height}` : "Unknown" },
+                  { label: "Audio", value: playback.playback.inspect.audio_available ? "Available" : "Video only" },
+                  { label: "Container", value: playback.playback.inspect.container_compatibility },
+                  { label: "Pre-roll seek", value: `${(playback.seek_offset_ms / 1000).toFixed(1)} s` },
+                  { label: "Recording ID", value: playback.playback.recording.recording_id },
+                ]}
               />
               <div className="playback-meta">
                 <span>{playback.playback.inspect.video_codec.toUpperCase()}</span>

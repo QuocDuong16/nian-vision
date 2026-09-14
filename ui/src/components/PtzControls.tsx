@@ -7,6 +7,13 @@ type OwnedMovement = {
   backend: PtzMovement;
 };
 
+function ptzErrorMessage(error: DesktopError): string {
+  if (error.code === "device_unreachable") {
+    return "PTZ control became unreachable after pairing. On Tapo cameras, turn off Privacy Mode and keep ONVIF enabled, then try again.";
+  }
+  return error.message;
+}
+
 export function PtzControls({
   cameraId,
   capabilities,
@@ -186,7 +193,7 @@ export function PtzControls({
           {button("Zoom in", "zoom_in")}
         </div>
       )}
-      {error ? <div className="ptz-error" role="alert">PTZ: {error.message}</div> : (
+      {error ? <div className="ptz-error" role="alert">PTZ: {ptzErrorMessage(error)}</div> : (
         <div className="ptz-status muted">PTZ: {capabilities.state ?? "ready"}</div>
       )}
     </div>
