@@ -186,7 +186,7 @@ describe("CamerasScreen", () => {
     const title = await screen.findByText("Front door");
     const card = title.closest("article") as HTMLElement;
     expect(within(card).getAllByText("Reconnecting").length).toBeGreaterThanOrEqual(1);
-    expect(card.textContent).toContain("Cannot open the camera stream");
+    expect(card.textContent).toContain("Recorder could not open the camera stream");
     expect(card.textContent).toContain("retry 2");
     expect(card.textContent).not.toContain("source_open_failed");
     expect(card.textContent).not.toContain("backoff");

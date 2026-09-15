@@ -2,11 +2,11 @@
 
 Record the exact tag, commit SHA, OS image/VM and result for every run. A checkbox is evidence only when the step was actually executed. Do not reuse a tag after changing source.
 
-Current retry candidate: `1.0.0-rc.56` / `v1.0.0-rc.56`. RC1 through RC55 remain immutable. Hosted RC55 exposed a Windows-only `clippy::field_reassign_with_default` failure in native process-memory counter initialization before packaging could proceed. RC56 initializes the Win32 counter structure directly and adds a Linux-hosted cross-target Clippy smoke for `nian-platform-windows`, so cfg(windows)-only lint regressions fail in normal quality/release checks before consuming another Windows RC tag.
+Current retry candidate: `1.0.0-rc.57` / `v1.0.0-rc.57`. RC1 through RC56 remain immutable. Physical RC56 review exposed viewport clipping on the performance/focus overlays and a practical RTSP-session conflict where Live View could retain a camera connection while recording was trying to establish its own source. RC57 renders performance and focus overlays at the viewport root, preserves the underlying multi-camera grid while focused, and gives recording priority by temporarily yielding the camera's live session when recording starts or reconnects after a source-open failure; Live View is restored automatically once the recorder reaches an established or terminal state.
 
 ## Pre-tag authority
 
-- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.56`.
+- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.57`.
 - [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
@@ -16,7 +16,7 @@ Current retry candidate: `1.0.0-rc.56` / `v1.0.0-rc.56`. RC1 through RC55 remain
 
 ## GitHub RC workflow
 
-- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.56`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.55`; source/tag cross-pairing is forbidden.
+- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.57`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.56`; source/tag cross-pairing is forbidden.
 - [ ] GitHub tag resolves to exactly the same commit as Forgejo.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.

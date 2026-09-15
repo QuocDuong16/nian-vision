@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { EmptyState } from "../components/EmptyState";
 import { PtzControls } from "../components/PtzControls";
 import { SelectControl } from "../components/SelectControl";
@@ -61,7 +62,7 @@ function recordingStateLabel(state: RecordingState): string {
 
 function recordingFailureLabel(category: string | null | undefined): string | null {
   switch (category) {
-    case "source_open_failed": return "stream unavailable";
+    case "source_open_failed": return "recording stream unavailable";
     case "source_read_failed": return "stream disconnected";
     case "source_timed_out": return "stream timeout";
     case "output_write_failed": return "output write failed";
@@ -476,6 +477,7 @@ export function LiveViewScreen() {
   const [ptzErrors, setPtzErrors] = useState<Map<string, DesktopError>>(() => new Map());
   const [eventStatuses, setEventStatuses] = useState<Map<string, EventStatus>>(() => new Map());
   const [recordingBusy, setRecordingBusy] = useState<Set<string>>(() => new Set());
+  const [livePausedForRecording, setLivePausedForRecording] = useState<Set<string>>(() => new Set());
   const [loading, setLoading] = useState(isTauri());
   const [error, setError] = useState<DesktopError | null>(null);
   const pageCount = Math.max(1, Math.ceil(selected.length / layoutSize));
@@ -497,6 +499,7 @@ export function LiveViewScreen() {
   const pendingOpenRef = useRef<Map<string, number>>(new Map());
   const recoveryAttemptsRef = useRef<Map<string, number>>(new Map());
   const recoveryTimersRef = useRef<Map<string, number>>(new Map());
+  const livePausedForRecordingRef = useRef<Set<string>>(new Set());
   const refreshInFlightRef = useRef(false);
   const eventStatusInFlightRef = useRef(false);
   const restoredSelectionOpenedRef = useRef(initialPreferences.cameraIds.length === 0);
@@ -777,6 +780,61 @@ export function LiveViewScreen() {
     return generation;
   }, [nextGeneration, startOpenGeneration]);
 
+  const pauseLiveForRecorder = useCallback(async (cameraId: string) => {
+    if (livePausedForRecordingRef.current.has(cameraId)) return false;
+    const session = sessionsRef.current.get(cameraId);
+    if (!session) return false;
+
+    const recoveryTimer = recoveryTimersRef.current.get(cameraId);
+    if (recoveryTimer !== undefined) window.clearTimeout(recoveryTimer);
+    recoveryTimersRef.current.delete(cameraId);
+    recoveryAttemptsRef.current.delete(cameraId);
+    const nextPaused = new Set(livePausedForRecordingRef.current).add(cameraId);
+    livePausedForRecordingRef.current = nextPaused;
+    setLivePausedForRecording(nextPaused);
+    nextGeneration(cameraId);
+    setSessionForCamera(cameraId, null);
+    await invokeDesktop<void>("live_close", { sessionId: session.session_id }).catch(() => undefined);
+    return true;
+  }, [nextGeneration, setSessionForCamera]);
+
+  useEffect(() => {
+    for (const runtime of recordings) {
+      if (
+        runtime.camera_id
+        && runtime.state === "backoff"
+        && runtime.failure_category === "source_open_failed"
+        && activeCameraIdsRef.current.has(runtime.camera_id)
+        && sessionsRef.current.has(runtime.camera_id)
+      ) {
+        void pauseLiveForRecorder(runtime.camera_id);
+      }
+    }
+  }, [pauseLiveForRecorder, recordings, sessions]);
+
+  useEffect(() => {
+    if (!livePausedForRecordingRef.current.size) return;
+    const nextPaused = new Set(livePausedForRecordingRef.current);
+    let changed = false;
+    for (const cameraId of livePausedForRecordingRef.current) {
+      const runtime = recordings.find((status) => status.camera_id === cameraId);
+      if (!runtime || !["recording", "failed", "stopped"].includes(runtime.state)) continue;
+      nextPaused.delete(cameraId);
+      changed = true;
+      if (
+        activeCameraIdsRef.current.has(cameraId)
+        && !sessionsRef.current.has(cameraId)
+        && !pendingOpenRef.current.has(cameraId)
+      ) {
+        requestOpen(cameraId);
+      }
+    }
+    if (changed) {
+      livePausedForRecordingRef.current = nextPaused;
+      setLivePausedForRecording(nextPaused);
+    }
+  }, [recordings, requestOpen]);
+
   useEffect(() => {
     if (!isTauri() || loading || restoredSelectionOpenedRef.current) return;
     const configured = new Set(cameras.map((camera) => camera.camera_id));
@@ -805,6 +863,7 @@ export function LiveViewScreen() {
     }
 
     for (const cameraId of visibleCameraIds) {
+      if (livePausedForRecordingRef.current.has(cameraId)) continue;
       if (!sessionsRef.current.has(cameraId) && !pendingOpenRef.current.has(cameraId)) requestOpen(cameraId);
     }
   }, [loading, nextGeneration, requestOpen, setSessionForCamera, visibleCameraIds]);
@@ -941,10 +1000,20 @@ export function LiveViewScreen() {
     if (!desiredOn && runtime && ACTIVE_RECORDING_STATES.has(runtime.state)) return;
     setRecordingBusy((current) => new Set(current).add(cameraId));
     setError(null);
+
+    const pausedLiveSession = !desiredOn && await pauseLiveForRecorder(cameraId);
+
     try {
       await invokeDesktop<RecordingStatus>(desiredOn ? "recording_stop" : "recording_start", { cameraId });
       await refreshStatuses();
     } catch (cause) {
+      if (pausedLiveSession) {
+        const nextPaused = new Set(livePausedForRecordingRef.current);
+        nextPaused.delete(cameraId);
+        livePausedForRecordingRef.current = nextPaused;
+        setLivePausedForRecording(nextPaused);
+        if (activeCameraIdsRef.current.has(cameraId)) requestOpen(cameraId);
+      }
       setError(desktopError(cause));
       await refreshStatuses();
     } finally {
@@ -1044,13 +1113,14 @@ export function LiveViewScreen() {
               <button type="button" aria-label="Next live page" onClick={() => setPage((current) => Math.min(pageCount - 1, current + 1))} disabled={effectivePage >= pageCount - 1}>→</button>
             </div>
           </div>
-          {focusedCameraId && (
+          {focusedCameraId && typeof document !== "undefined" && createPortal(
             <button
               type="button"
               className="live-focus-backdrop"
               aria-label="Close focused camera"
               onClick={() => setFocusedCameraId(null)}
-            />
+            />,
+            document.body,
           )}
           <div className={`live-grid live-grid-layout-${layoutSize} ${layoutSize > 1 ? "live-grid-multi" : "live-grid-single"}`}>
           {visibleSlots.map((cameraId, slotIndex) => {
@@ -1089,7 +1159,7 @@ export function LiveViewScreen() {
               : events?.configured
                 ? `Motion ${events.desired ? events.state : "off"}`
                 : "Motion unpaired";
-            return (
+            const tile = (
               <article
                 className={`live-tile${isFocused ? " is-focus-viewer" : ""}`}
                 key={cameraId}
@@ -1133,9 +1203,11 @@ export function LiveViewScreen() {
                       />
                     ) : (
                       <div className="live-placeholder">
-                        {tileError
-                          ? tileError.message
-                          : state === "backoff"
+                        {livePausedForRecording.has(cameraId)
+                          ? "Prioritizing recording · live view will resume when recording is established…"
+                          : tileError
+                            ? tileError.message
+                            : state === "backoff"
                             ? `Reconnecting${liveReason ? ` · ${liveReason}` : ""} · attempt ${backendStatus?.reconnect_attempt ?? 0}`
                             : state === "failed"
                               ? liveReason ?? "Live stream failed"
@@ -1208,6 +1280,12 @@ export function LiveViewScreen() {
                 )}
               </article>
             );
+            return isFocused && typeof document !== "undefined"
+              ? [
+                  <div className="live-focus-origin-placeholder" key={`${cameraId}-focus-origin`} aria-hidden="true" />,
+                  createPortal(tile, document.body, `${cameraId}-focus-viewer`),
+                ]
+              : tile;
           })}
           </div>
         </>

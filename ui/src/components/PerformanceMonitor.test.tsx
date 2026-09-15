@@ -48,9 +48,13 @@ describe("PerformanceMonitor", () => {
     render(<PerformanceMonitor />);
 
     await waitFor(() => expect(screen.getByText(/CPU 1.5% · Host 128 MB/)).toBeTruthy());
-    fireEvent.click(screen.getByRole("button", { name: "Nian Vision performance" }));
+    const trigger = screen.getByRole("button", { name: "Nian Vision performance" });
+    fireEvent.click(trigger);
 
-    expect(screen.getByRole("region", { name: "Performance details" })).toBeTruthy();
+    const popover = screen.getByRole("region", { name: "Performance details" });
+    expect(popover).toBeTruthy();
+    expect(document.body.contains(popover)).toBe(true);
+    expect(trigger.parentElement?.contains(popover)).toBe(false);
     expect(screen.getByText("3 processes")).toBeTruthy();
     expect(screen.getByText(/Desktop 128 MB · child processes 384 MB/)).toBeTruthy();
     expect(screen.getByText("WebView2 renderer")).toBeTruthy();
@@ -60,5 +64,13 @@ describe("PerformanceMonitor", () => {
     expect(screen.getByText(/system 32%/)).toBeTruthy();
     expect(screen.getByText(/Per-process network accounting/)).toBeTruthy();
     expect(screen.getByText("GPU accounting unavailable")).toBeTruthy();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("region", { name: "Performance details" })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+
+    fireEvent.click(trigger);
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole("region", { name: "Performance details" })).toBeNull();
   });
 });

@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "bindgen-gen"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "bindgen",
 ]
@@ -2630,7 +2630,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nian-application"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "chrono",
  "nian-domain",
@@ -2652,7 +2652,7 @@ dependencies = [
 
 [[package]]
 name = "nian-desktop"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "chrono",
  "fs2",
@@ -2683,7 +2683,7 @@ dependencies = [
 
 [[package]]
 name = "nian-domain"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -2691,11 +2691,11 @@ dependencies = [
 
 [[package]]
 name = "nian-ffmpeg-sys"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 
 [[package]]
 name = "nian-index"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "chrono",
  "nian-domain",
@@ -2707,7 +2707,7 @@ dependencies = [
 
 [[package]]
 name = "nian-ipc"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "serde",
  "serde_json",
@@ -2717,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "nian-media"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "nian-domain",
  "thiserror 2.0.20",
@@ -2725,7 +2725,7 @@ dependencies = [
 
 [[package]]
 name = "nian-media-ffmpeg"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "nian-domain",
  "nian-ffmpeg-sys",
@@ -2737,7 +2737,7 @@ dependencies = [
 
 [[package]]
 name = "nian-media-worker"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "chrono",
  "ctrlc",
@@ -2757,7 +2757,7 @@ dependencies = [
 
 [[package]]
 name = "nian-onvif"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2775,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "nian-platform-windows"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "thiserror 2.0.20",
  "windows-sys 0.61.2",
@@ -2783,7 +2783,7 @@ dependencies = [
 
 [[package]]
 name = "nian-recorder"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "chrono",
  "nian-domain",
@@ -2796,7 +2796,7 @@ dependencies = [
 
 [[package]]
 name = "nian-release-verifier"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "base64 0.22.1",
  "minisign-verify",
@@ -2804,7 +2804,7 @@ dependencies = [
 
 [[package]]
 name = "nian-settings"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "nian-domain",
  "rusqlite",
@@ -2814,7 +2814,7 @@ dependencies = [
 
 [[package]]
 name = "nian-settings-fixture"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "nian-domain",
  "nian-settings",
@@ -2823,7 +2823,7 @@ dependencies = [
 
 [[package]]
 name = "nian-storage"
-version = "1.0.0-rc.56"
+version = "1.0.0-rc.57"
 dependencies = [
  "chrono",
  "nian-domain",
@@ -3935,9 +3935,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -5066,7 +5066,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

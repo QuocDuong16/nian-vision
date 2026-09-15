@@ -362,7 +362,7 @@ describe("LiveViewScreen", () => {
     ).toHaveLength(1);
   });
 
-  it("uses existing recording commands without closing a healthy live session", async () => {
+  it("gives recording the RTSP slot first, then restores live view after recording is established", async () => {
     installDesktop();
     render(<LiveViewScreen />);
 
@@ -370,20 +370,27 @@ describe("LiveViewScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
     const tile = await screen.findByRole("article", { name: "Front door live camera" });
     await waitFor(() => expect(tile.querySelector("video")).toBeTruthy());
+    const opensBeforeRecording = vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open").length;
 
     fireEvent.click(screen.getByRole("button", { name: "Start recording" }));
     await waitFor(() => {
+      expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "live_close")).toBe(true);
       expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "recording_start")).toBe(true);
       expect(screen.getByRole("button", { name: "Stop recording" })).toBeTruthy();
     });
-    expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "live_close")).toBe(false);
-    expect(tile.querySelector("video")).toBeTruthy();
+    const closeIndex = vi.mocked(invoke).mock.calls.findIndex(([command]) => command === "live_close");
+    const startIndex = vi.mocked(invoke).mock.calls.findIndex(([command]) => command === "recording_start");
+    expect(closeIndex).toBeGreaterThanOrEqual(0);
+    expect(startIndex).toBeGreaterThan(closeIndex);
+    await waitFor(() => {
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open").length).toBeGreaterThan(opensBeforeRecording);
+      expect(screen.getByRole("article", { name: "Front door live camera" }).querySelector("video")).toBeTruthy();
+    });
 
     fireEvent.click(screen.getByRole("button", { name: "Stop recording" }));
     await waitFor(() => {
       expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "recording_stop")).toBe(true);
     });
-    expect(tile.querySelector("video")).toBeTruthy();
   });
 
   it("shows recorder reconnecting reason in live view instead of raw backoff", async () => {
@@ -396,7 +403,9 @@ describe("LiveViewScreen", () => {
     const tile = await screen.findByRole("article", { name: "Front door live camera" });
 
     await waitFor(() => {
-      expect(tile.textContent).toContain("Rec Reconnecting · stream unavailable");
+      expect(tile.textContent).toContain("Rec Reconnecting · recording stream unavailable");
+      expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "live_close")).toBe(true);
+      expect(tile.textContent).toContain("Prioritizing recording");
     });
     expect(tile.textContent).not.toContain("source_open_failed");
     expect(tile.textContent).not.toContain("backoff");
@@ -757,7 +766,10 @@ describe("LiveViewScreen", () => {
 
     const opensBeforeFocus = vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open").length;
     fireEvent.doubleClick(tile);
-    expect(await screen.findByRole("dialog", { name: "Front door live camera" })).toBeTruthy();
+    const focusDialog = await screen.findByRole("dialog", { name: "Front door live camera" });
+    expect(focusDialog).toBeTruthy();
+    expect(focusDialog.parentElement).toBe(document.body);
+    expect(screen.getByRole("button", { name: "Close focused camera" }).parentElement).toBe(document.body);
     expect(screen.getByRole("button", { name: "4 camera layout" }).getAttribute("aria-pressed")).toBe("true");
     expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open")).toHaveLength(opensBeforeFocus);
     expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "live_close")).toBe(false);

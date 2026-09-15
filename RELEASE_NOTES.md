@@ -1,3 +1,8 @@
+# Nian Vision 1.0.0-rc.57
+Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
+
+RC57 fixes three interaction failures found during physical RC56 review. The sidebar performance control now renders its detailed process telemetry through a viewport portal, so the sidebar's intentional overflow clipping cannot make the popover invisible; Escape and outside-click dismissal are also explicit. Live View focus mode now portals both its backdrop and focused camera surface to the viewport root while leaving a placeholder in the original grid slot, preventing the sidebar/content scroll containers from clipping the focused camera or causing the 1/4/8/16 layout to reflow behind it. Recording is also prioritized over Live View when both consumers compete for a camera RTSP connection: starting a recorder temporarily yields that camera's live session, recorder source-open backoff can trigger the same self-healing yield, and Live View is restored automatically after recording establishes or reaches a terminal state. Recorder source-open diagnostics now explicitly identify the recording stream so a healthy Live View no longer makes the status wording appear contradictory. The lockfile also updates `rustls` from 0.23.43 to 0.23.45 to remediate RUSTSEC-2026-0285, which was detected by the pre-tag advisory gate. The RC56 Windows Clippy guard and telemetry behavior remain unchanged.
+
 # Nian Vision 1.0.0-rc.56
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 

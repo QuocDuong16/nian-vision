@@ -89,7 +89,7 @@ function statusLabel(state: RecordingState): string {
 
 function recordingFailureLabel(category: string | null | undefined): string | null {
   switch (category) {
-    case "source_open_failed": return "Cannot open the camera stream";
+    case "source_open_failed": return "Recorder could not open the camera stream";
     case "source_read_failed": return "Camera stream disconnected";
     case "source_timed_out": return "Camera stream timed out";
     case "output_write_failed": return "Could not write recording output";

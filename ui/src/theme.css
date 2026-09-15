@@ -763,6 +763,14 @@ input[type="checkbox"] {
 .live-tile-quick-actions { display: flex; flex: 0 0 auto; gap: 5px; }
 .live-tile-quick-actions button { min-height: 27px; padding: 3px 7px; font-size: 9px; }
 
+.live-focus-origin-placeholder {
+  min-width: 0;
+  aspect-ratio: 16 / 9;
+  border: 1px solid rgb(148 163 184 / 8%);
+  border-radius: 12px;
+  background: #020712;
+}
+
 .live-focus-backdrop {
   position: fixed;
   z-index: 130;
@@ -2259,11 +2267,13 @@ input[type="checkbox"] {
 }
 
 .performance-popover {
-  position: absolute;
-  z-index: 80;
-  bottom: 8px;
-  left: calc(100% + 12px);
+  position: fixed;
+  z-index: 900;
+  bottom: 18px;
+  left: 244px;
   width: min(430px, calc(100vw - 270px));
+  max-height: calc(100vh - 72px);
+  overflow-y: auto;
   padding: 14px;
   border: 1px solid var(--border-strong);
   border-radius: 14px;
@@ -2377,7 +2387,7 @@ input[type="checkbox"] {
   .performance-monitor { width: auto; padding-inline: 0; }
   .performance-monitor-trigger { width: 42px; justify-content: center; padding-inline: 0; }
   .performance-monitor-summary { display: none; }
-  .performance-popover { left: calc(100% + 10px); width: min(420px, calc(100vw - 120px)); }
+  .performance-popover { left: 92px; width: min(420px, calc(100vw - 120px)); }
 }
 
 @media (max-width: 720px) {

@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { invokeDesktop, isTauri } from "../lib/tauri";
 import type { PerformanceSnapshot } from "../lib/tauri";
 
@@ -29,6 +30,8 @@ function formatRate(bytesPerSecond: number): string {
 export function PerformanceMonitor() {
   const [snapshot, setSnapshot] = useState<PerformanceSnapshot | null>(null);
   const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
   const [available, setAvailable] = useState(isTauri());
 
   useEffect(() => {
@@ -57,6 +60,28 @@ export function PerformanceMonitor() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!open) return;
+
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && (triggerRef.current?.contains(target) || popoverRef.current?.contains(target))) return;
+      setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setOpen(false);
+      triggerRef.current?.focus();
+    };
+
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
   const memoryPercent = useMemo(() => {
     if (!snapshot || snapshot.system_memory_total_bytes <= 0) return 0;
     return Math.min(100, (snapshot.app_memory_bytes / snapshot.system_memory_total_bytes) * 100);
@@ -75,10 +100,12 @@ export function PerformanceMonitor() {
   return (
     <div className="performance-monitor">
       <button
+        ref={triggerRef}
         type="button"
         className="performance-monitor-trigger"
         aria-label="Nian Vision performance"
         aria-expanded={open}
+        aria-controls="performance-details"
         title={snapshot?.sample_ready
           ? `Nian Vision process tree: desktop host + ${childProcessCount} child process${childProcessCount === 1 ? "" : "es"}`
           : undefined}
@@ -88,8 +115,14 @@ export function PerformanceMonitor() {
         <span className="performance-monitor-summary">{footerLabel}</span>
       </button>
 
-      {open && (
-        <div className="performance-popover" role="region" aria-label="Performance details">
+      {open && typeof document !== "undefined" && createPortal(
+        <div
+          id="performance-details"
+          ref={popoverRef}
+          className="performance-popover"
+          role="region"
+          aria-label="Performance details"
+        >
           <div className="performance-popover-head">
             <div><strong>Performance</strong><span>Desktop host + WebView/media child processes</span></div>
             <span className="performance-process-count">{snapshot?.process_count ?? 0} processes</span>
@@ -140,7 +173,8 @@ export function PerformanceMonitor() {
           ) : (
             <p className="performance-unavailable">Performance telemetry is not available from the desktop host.</p>
           )}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

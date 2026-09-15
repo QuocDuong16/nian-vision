@@ -1,7 +1,7 @@
 {
   "name": "nian-ui",
   "private": true,
-  "version": "1.0.0-rc.56",
+  "version": "1.0.0-rc.57",
   "type": "module",
   "scripts": {
     "dev": "vite",
