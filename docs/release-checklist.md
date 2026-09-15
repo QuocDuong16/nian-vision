@@ -2,11 +2,11 @@
 
 Record the exact tag, commit SHA, OS image/VM and result for every run. A checkbox is evidence only when the step was actually executed. Do not reuse a tag after changing source.
 
-Current retry candidate: `1.0.0-rc.57` / `v1.0.0-rc.57`. RC1 through RC56 remain immutable. Physical RC56 review exposed viewport clipping on the performance/focus overlays and a practical RTSP-session conflict where Live View could retain a camera connection while recording was trying to establish its own source. RC57 renders performance and focus overlays at the viewport root, preserves the underlying multi-camera grid while focused, and gives recording priority by temporarily yielding the camera's live session when recording starts or reconnects after a source-open failure; Live View is restored automatically once the recorder reaches an established or terminal state.
+Current retry candidate: `1.0.0-rc.58` / `v1.0.0-rc.58`. RC1 through RC57 remain immutable. RC57 reached the Windows installer smoke but a hosted-runner cold start remained alive without entering Tauri setup before the fixed 45-second readiness deadline. RC58 separates the pre-setup/bootstrap budget from the backend startup budget: the installer smoke now records an explicit Tauri-setup marker, allows a bounded 120 seconds for the pre-setup/bootstrap phase, then still requires power subscription, Job Object containment and full desktop readiness within 45 seconds after Rust setup begins.
 
 ## Pre-tag authority
 
-- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.57`.
+- [ ] RC commit is on authoritative Forgejo default branch and every version surface is the same prerelease SemVer, currently `1.0.0-rc.58`.
 - [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
@@ -16,7 +16,7 @@ Current retry candidate: `1.0.0-rc.57` / `v1.0.0-rc.57`. RC1 through RC56 remain
 
 ## GitHub RC workflow
 
-- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.57`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.56`; source/tag cross-pairing is forbidden.
+- [ ] Create a new immutable prerelease tag exactly matching the RC source version, currently `v1.0.0-rc.58`. Never move, delete or reuse any consumed tag `v1.0.0-rc.1` through `v1.0.0-rc.57`; source/tag cross-pairing is forbidden.
 - [ ] GitHub tag resolves to exactly the same commit as Forgejo.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.

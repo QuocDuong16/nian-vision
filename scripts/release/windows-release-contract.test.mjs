@@ -436,8 +436,13 @@ test("Windows desktop smoke proves native power subscription and Job Object hard
   assert.match(windowsInstallerSmoke, /\[void\]\$info\.Environment\.Remove\('LD_LIBRARY_PATH'\)/);
   assert.match(windowsInstallerSmoke, /\$WebViewData = Join-Path \$LocalAppData "webview2"/);
   assert.match(windowsInstallerSmoke, /\$info\.Environment\['WEBVIEW2_USER_DATA_FOLDER'\] = \$WebViewData/);
-  assert.match(windowsInstallerSmoke, /AddSeconds\(45\)/);
-  assert.match(windowsInstallerSmoke, /startup=\$startupReady, power=\$powerReady, containment=\$containmentReady/);
+  assert.match(desktop, /NIAN_DESKTOP_SETUP_SMOKE_FILE/);
+  assert.match(desktop, /tauri_setup_entered/);
+  assert.match(windowsInstallerSmoke, /\$info\.Environment\['NIAN_DESKTOP_SETUP_SMOKE_FILE'\] = \$setup/);
+  assert.match(windowsInstallerSmoke, /\$preSetupDeadline = \[DateTime\]::UtcNow\.AddSeconds\(120\)/);
+  assert.match(windowsInstallerSmoke, /\$setupDeadline = \$now\.AddSeconds\(45\)/);
+  assert.match(windowsInstallerSmoke, /did not enter Tauri setup within 120s/);
+  assert.match(windowsInstallerSmoke, /timed out 45s after Tauri setup entered/);
   assert.match(windowsInstallerSmoke, /Windows Job Object did not reap the installed media worker/);
   assert.match(windowsInstallerSmoke, /did not prove the native Windows power subscription/);
 });

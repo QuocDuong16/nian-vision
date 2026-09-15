@@ -1,3 +1,8 @@
+# Nian Vision 1.0.0-rc.58
+Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
+
+RC58 hardens the Windows installed-desktop smoke after RC57 exposed an ambiguous startup timeout on a hosted runner. The RC57 process remained alive for the full deadline while none of the post-setup readiness markers appeared, so the old smoke could not distinguish a slow hosted-runner pre-setup/bootstrap path from a backend startup hang. The smoke now emits and verifies a dedicated `tauri_setup_entered` marker, allows up to 120 seconds only for the pre-setup/bootstrap phase, and then enforces the original tight 45-second budget for native power subscription, Job Object containment and full desktop readiness after Rust setup begins. This preserves fail-closed backend startup validation instead of merely inflating one undifferentiated timeout.
+
 # Nian Vision 1.0.0-rc.57
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 

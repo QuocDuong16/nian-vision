@@ -48,6 +48,7 @@ function Get-OptionalRegistryValue([string]$Path, [string]$Name) {
 
 function Start-DesktopContainmentSmoke([string]$Desktop) {
     $marker = Join-Path $Isolation ("desktop-ready-" + [Guid]::NewGuid().ToString("N") + ".txt")
+    $setup = Join-Path $Isolation ("desktop-setup-" + [Guid]::NewGuid().ToString("N") + ".txt")
     $containment = Join-Path $Isolation ("containment-worker-" + [Guid]::NewGuid().ToString("N") + ".txt")
     $power = Join-Path $Isolation ("power-subscription-" + [Guid]::NewGuid().ToString("N") + ".txt")
     $info = [Diagnostics.ProcessStartInfo]::new()
@@ -57,26 +58,42 @@ function Start-DesktopContainmentSmoke([string]$Desktop) {
     $info.Environment['LOCALAPPDATA'] = $LocalAppData
     $info.Environment['USERPROFILE'] = $Isolation
     $info.Environment['WEBVIEW2_USER_DATA_FOLDER'] = $WebViewData
+    $info.Environment['NIAN_DESKTOP_SETUP_SMOKE_FILE'] = $setup
     $info.Environment['NIAN_DESKTOP_STARTUP_SMOKE_FILE'] = $marker
     $info.Environment['NIAN_DESKTOP_CONTAINMENT_SMOKE_FILE'] = $containment
     $info.Environment['NIAN_DESKTOP_POWER_SMOKE_FILE'] = $power
     [void]$info.Environment.Remove('NIAN_FFMPEG_LIB_DIR')
     [void]$info.Environment.Remove('LD_LIBRARY_PATH')
     $process = [Diagnostics.Process]::Start($info)
-    # Hosted Windows can cold-start the evergreen WebView2 runtime substantially
-    # slower than a warm developer machine. Keep the smoke bounded, but do not
-    # make release correctness depend on an unrealistically tight 15 second race.
-    $deadline = [DateTime]::UtcNow.AddSeconds(45)
+    # Hosted Windows can spend substantially longer in the pre-setup desktop
+    # bootstrap (including a cold evergreen WebView2 path) than a warm machine.
+    # Give only that external/bootstrap phase a wider bounded budget, then keep
+    # the backend setup/readiness budget tight once Rust setup has definitely begun.
+    $preSetupDeadline = [DateTime]::UtcNow.AddSeconds(120)
+    $setupDeadline = $null
     while (-not (Test-Path $marker) -or -not (Test-Path $containment) -or -not (Test-Path $power)) {
         if ($process.HasExited) { throw "installed desktop exited before startup readiness (code $($process.ExitCode))" }
-        if ([DateTime]::UtcNow -ge $deadline) {
+        $now = [DateTime]::UtcNow
+        $setupReady = Test-Path $setup
+        if ($setupReady -and $null -eq $setupDeadline) {
+            $setupDeadline = $now.AddSeconds(45)
+        }
+        $deadline = if ($null -ne $setupDeadline) { $setupDeadline } else { $preSetupDeadline }
+        if ($now -ge $deadline) {
             $startupReady = Test-Path $marker
             $containmentReady = Test-Path $containment
             $powerReady = Test-Path $power
             try { $process.Kill($true) } catch {}
-            throw "installed desktop startup readiness timed out after 45s (startup=$startupReady, power=$powerReady, containment=$containmentReady)"
+            if (-not $setupReady) {
+                throw "installed desktop did not enter Tauri setup within 120s (startup=$startupReady, power=$powerReady, containment=$containmentReady)"
+            }
+            throw "installed desktop startup readiness timed out 45s after Tauri setup entered (startup=$startupReady, power=$powerReady, containment=$containmentReady)"
         }
         Start-Sleep -Milliseconds 100
+    }
+    if ((Get-Content $setup -Raw).Trim() -ne 'tauri_setup_entered') {
+        try { $process.Kill($true) } catch {}
+        throw "installed desktop wrote an invalid Tauri setup marker"
     }
     if ((Get-Content $marker -Raw).Trim() -ne 'desktop_startup_ready') {
         try { $process.Kill($true) } catch {}

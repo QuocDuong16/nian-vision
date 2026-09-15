@@ -3846,6 +3846,13 @@ fn emit_startup_smoke_marker() -> std::io::Result<()> {
     Ok(())
 }
 
+fn emit_setup_smoke_marker() -> std::io::Result<()> {
+    if let Some(path) = std::env::var_os("NIAN_DESKTOP_SETUP_SMOKE_FILE") {
+        std::fs::write(path, b"tauri_setup_entered\n")?;
+    }
+    Ok(())
+}
+
 #[cfg(any(windows, test))]
 fn absolute_app_data_fallback(
     root: Option<std::ffi::OsString>,
@@ -3967,6 +3974,7 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            emit_setup_smoke_marker()?;
             nian_platform_windows::initialize_worker_process_containment().map_err(|_| {
                 std::io::Error::other("media worker process containment could not be initialized")
             })?;
