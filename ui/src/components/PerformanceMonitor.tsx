@@ -126,7 +126,8 @@ export function PerformanceMonitor() {
   const [warmBaselineMarkedAtMs, setWarmBaselineMarkedAtMs] = useState<number | null>(null);
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
-  const popoverRef = useRef<HTMLDivElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const closeRef = useRef<HTMLButtonElement | null>(null);
   const snapshotRef = useRef<PerformanceSnapshot | null>(null);
   const snapshotUpdatedAtMsRef = useRef<number | null>(null);
   const mediaDiagnosticsRef = useRef<CameraMediaDiagnostics[] | null>(null);
@@ -256,25 +257,45 @@ export function PerformanceMonitor() {
 
   useEffect(() => {
     if (!open) return;
-
-    const onPointerDown = (event: PointerEvent) => {
-      const target = event.target as Node | null;
-      if (target && (triggerRef.current?.contains(target) || popoverRef.current?.contains(target))) return;
-      setOpen(false);
-    };
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    closeRef.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      setOpen(false);
-      triggerRef.current?.focus();
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setOpen(false);
+        triggerRef.current?.focus();
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ));
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!first || !last) {
+        event.preventDefault();
+        dialogRef.current.focus();
+      } else if (event.shiftKey && (document.activeElement === first || !dialogRef.current.contains(document.activeElement))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !dialogRef.current.contains(document.activeElement))) {
+        event.preventDefault();
+        first.focus();
+      }
     };
-
-    document.addEventListener("pointerdown", onPointerDown);
     document.addEventListener("keydown", onKeyDown);
     return () => {
-      document.removeEventListener("pointerdown", onPointerDown);
       document.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = previousOverflow;
+      triggerRef.current?.focus();
     };
   }, [open]);
+
+  const closeDialog = () => {
+    setOpen(false);
+    triggerRef.current?.focus();
+  };
 
   const markSoakCheckpoint = (kind: "warm" | "idle") => {
     const current = snapshotRef.current;
@@ -334,16 +355,27 @@ export function PerformanceMonitor() {
 
       {open && typeof document !== "undefined" && createPortal(
         <div
-          id="performance-details"
-          ref={popoverRef}
-          className="performance-popover"
-          role="region"
-          aria-label="Performance details"
+          className="performance-modal-backdrop"
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget) closeDialog();
+          }}
         >
+          <div
+            id="performance-details"
+            ref={dialogRef}
+            className="performance-popover"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="performance-dialog-title"
+            tabIndex={-1}
+          >
           {!available && <small role="status">Process telemetry unavailable. Displayed process values are last known and excluded from soak capture.</small>}
           <div className="performance-popover-head">
-            <div><strong>Performance</strong><span>Desktop host + WebView/media child processes</span></div>
-            <span className="performance-process-count">{snapshot?.process_count ?? 0} processes</span>
+            <div><strong id="performance-dialog-title">Performance</strong><span>Desktop host + WebView/media child processes</span></div>
+            <div className="performance-popover-head-actions">
+              <span className="performance-process-count">{snapshot?.process_count ?? 0} processes</span>
+              <button ref={closeRef} type="button" onClick={closeDialog} aria-label="Close performance monitor">Close</button>
+            </div>
           </div>
           {snapshot ? (
             <div className="performance-grid">
@@ -504,6 +536,7 @@ export function PerformanceMonitor() {
           ) : (
             <p className="performance-unavailable">Performance telemetry is not available from the desktop host.</p>
           )}
+          </div>
         </div>,
         document.body,
       )}

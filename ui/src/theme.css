@@ -2272,22 +2272,28 @@ input[type="checkbox"] {
   white-space: nowrap;
 }
 
-.performance-popover {
+.performance-modal-backdrop {
   position: fixed;
   z-index: 900;
-  top: 18px;
-  right: 18px;
-  bottom: 18px;
-  left: auto;
-  width: min(960px, calc(100vw - 36px));
-  max-height: calc(100vh - 36px);
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgb(2 8 18 / 74%);
+  backdrop-filter: blur(5px);
+}
+.performance-popover {
+  box-sizing: border-box;
+  width: 80vw;
+  height: 80vh;
+  min-width: 0;
+  min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 14px;
   border: 1px solid var(--border-strong);
   border-radius: 14px;
-  background: rgb(8 18 32 / 98%);
-  box-shadow: 0 20px 55px rgb(0 0 0 / 36%);
-  backdrop-filter: blur(18px);
+  background: #081220;
+  box-shadow: 0 20px 55px rgb(0 0 0 / 48%);
 }
 
 .performance-popover-head {
@@ -2315,6 +2321,16 @@ input[type="checkbox"] {
   font-size: 10px;
 }
 
+.performance-popover-head > .performance-popover-head-actions {
+  display: flex;
+  align-items: center;
+  flex-direction: row;
+  gap: 10px;
+}
+.performance-popover-head-actions button {
+  min-height: 30px;
+  padding: 4px 12px;
+}
 .performance-process-count {
   padding: 3px 7px;
   border: 1px solid rgb(148 163 184 / 12%);
@@ -2418,9 +2434,12 @@ input[type="checkbox"] {
   .performance-monitor { width: auto; padding-inline: 0; }
   .performance-monitor-trigger { width: 42px; justify-content: center; padding-inline: 0; }
   .performance-monitor-summary { display: none; }
-  .performance-popover { right: 12px; width: min(960px, calc(100vw - 24px)); }
 }
 
+@media (max-width: 900px) {
+  .performance-grid { grid-template-columns: minmax(0, 1fr); }
+  .performance-popover-head { flex-wrap: wrap; }
+}
 @media (max-width: 720px) {
   .performance-monitor { display: none; }
 }

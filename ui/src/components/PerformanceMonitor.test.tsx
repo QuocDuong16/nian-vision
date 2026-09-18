@@ -86,6 +86,30 @@ afterEach(() => {
 });
 
 describe("PerformanceMonitor", () => {
+  it("opens an accessible modal instead of a sidebar popover", async () => {
+    render(<PerformanceMonitor />);
+    const trigger = screen.getByRole("button", { name: "Nian Vision performance" });
+    fireEvent.click(trigger);
+    const dialog = screen.getByRole("dialog", { name: "Performance" });
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(document.body.contains(dialog)).toBe(true);
+    expect(document.body.style.overflow).toBe("hidden");
+    const close = screen.getByRole("button", { name: "Close performance monitor" });
+    await waitFor(() => expect(document.activeElement).toBe(close));
+    fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(Array.from(dialog.querySelectorAll("button:not([disabled])")).at(-1));
+    fireEvent.click(close);
+    expect(screen.queryByRole("dialog", { name: "Performance" })).toBeNull();
+    expect(document.body.style.overflow).toBe("");
+    expect(document.activeElement).toBe(trigger);
+    fireEvent.click(trigger);
+    const reopened = screen.getByRole("dialog", { name: "Performance" });
+    const backdrop = reopened.parentElement!;
+    fireEvent.pointerDown(backdrop);
+    expect(screen.queryByRole("dialog", { name: "Performance" })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
   it("does not display a media-diagnostics RPC failure as zero active workers", async () => {
     vi.mocked(invoke).mockImplementation(async (command) => {
       if (command === "performance_snapshot") return snapshot;
@@ -125,7 +149,7 @@ describe("PerformanceMonitor", () => {
     const trigger = screen.getByRole("button", { name: "Nian Vision performance" });
     fireEvent.click(trigger);
 
-    const popover = screen.getByRole("region", { name: "Performance details" });
+    const popover = screen.getByRole("dialog", { name: "Performance" });
     expect(popover).toBeTruthy();
     expect(document.body.contains(popover)).toBe(true);
     expect(trigger.parentElement?.contains(popover)).toBe(false);
@@ -177,11 +201,11 @@ describe("PerformanceMonitor", () => {
     anchorClick.mockRestore();
 
     fireEvent.keyDown(document, { key: "Escape" });
-    expect(screen.queryByRole("region", { name: "Performance details" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Performance" })).toBeNull();
     expect(document.activeElement).toBe(trigger);
 
     fireEvent.click(trigger);
-    fireEvent.pointerDown(document.body);
-    expect(screen.queryByRole("region", { name: "Performance details" })).toBeNull();
+    fireEvent.pointerDown(screen.getByRole("dialog", { name: "Performance" }).parentElement!);
+    expect(screen.queryByRole("dialog", { name: "Performance" })).toBeNull();
   });
 });
