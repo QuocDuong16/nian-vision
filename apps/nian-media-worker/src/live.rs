@@ -5,6 +5,7 @@
 //! application owns retention; the worker enforces a hard per-chunk size bound.
 
 use std::fs::OpenOptions;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,12 +13,17 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use nian_domain::{MediaRational, MediaType};
-use nian_media::{MediaSource, RtspUrl};
-use nian_media_ffmpeg::{InterruptHandle, MatroskaMuxer, MediaInput};
+use nian_media_ffmpeg::{
+    InterruptHandle, MatroskaMuxer, MediaStreamTemplate, PacketConsumerKind, PacketDeliveryPolicy,
+    PacketQueueLimits,
+};
 use serde::Serialize;
+
+use crate::ingest::{IngestProfile, PacketSubscriptionOptions, SharedIngestManager};
 
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
+const SUBSCRIBE_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const RECONNECT_STABLE_RESET_AFTER: Duration = Duration::from_secs(10);
 const BACKOFF_SECONDS: [u64; 4] = [1, 2, 4, 8];
 const MIN_FRAGMENT_TARGET: Duration = Duration::from_millis(500);
@@ -38,6 +44,7 @@ pub mod code {
 
 pub struct LiveSpec {
     source_url: String,
+    source_profile: IngestProfile,
     output_dir: PathBuf,
     fragment_target: Duration,
     max_fragment_bytes: u64,
@@ -54,6 +61,8 @@ impl LiveSpec {
             .get("url")
             .and_then(serde_json::Value::as_str)
             .ok_or("missing source.url")?;
+        let source_profile =
+            IngestProfile::from_wire(source.get("profile").and_then(serde_json::Value::as_str));
         if !(source_url.starts_with("rtsp://") || source_url.starts_with("rtsps://")) {
             return Err("invalid rtsp source");
         }
@@ -90,6 +99,7 @@ impl LiveSpec {
         }
         Ok(Self {
             source_url: source_url.to_owned(),
+            source_profile,
             output_dir,
             fragment_target,
             max_fragment_bytes,
@@ -116,6 +126,7 @@ impl Default for LiveStatus {
 }
 
 pub struct LiveJobManager {
+    ingests: SharedIngestManager,
     status: Arc<Mutex<LiveStatus>>,
     stop: Arc<AtomicBool>,
     interrupt: Arc<Mutex<Option<InterruptHandle>>>,
@@ -123,8 +134,9 @@ pub struct LiveJobManager {
 }
 
 impl LiveJobManager {
-    pub fn new() -> Self {
+    pub fn with_ingest_manager(ingests: SharedIngestManager) -> Self {
         Self {
+            ingests,
             status: Arc::new(Mutex::new(LiveStatus::default())),
             stop: Arc::new(AtomicBool::new(false)),
             interrupt: Arc::new(Mutex::new(None)),
@@ -150,10 +162,11 @@ impl LiveJobManager {
         let status = self.status.clone();
         let stop = self.stop.clone();
         let interrupt = self.interrupt.clone();
+        let ingests = self.ingests.clone();
         self.handle = Some(
             std::thread::Builder::new()
                 .name("live-view-job".to_owned())
-                .spawn(move || run_live(spec, status, stop, interrupt))
+                .spawn(move || run_live(spec, status, stop, interrupt, ingests))
                 .map_err(|_| code::WORKER_UNAVAILABLE)?,
         );
         Ok(())
@@ -222,6 +235,7 @@ fn run_live(
     status: Arc<Mutex<LiveStatus>>,
     stop: Arc<AtomicBool>,
     current_interrupt: Arc<Mutex<Option<InterruptHandle>>>,
+    ingests: SharedIngestManager,
 ) {
     let mut next_fragment = 0_u64;
     let mut attempt = 0_u32;
@@ -236,11 +250,19 @@ fn run_live(
         if let Ok(mut slot) = current_interrupt.lock() {
             *slot = Some(interrupt.clone());
         }
-        let source = MediaSource::Rtsp {
-            url: RtspUrl::new(spec.source_url.clone()),
-        };
-        let mut input = match MediaInput::open(&source, &interrupt) {
-            Ok(input) => input,
+        let subscription = match ingests.subscribe_rtsp_with_options(
+            &spec.source_url,
+            PacketSubscriptionOptions {
+                profile: spec.source_profile,
+                limits: live_queue_limits(),
+                policy: PacketDeliveryPolicy::Realtime,
+                consumer: PacketConsumerKind::Live,
+                pre_roll: Duration::ZERO,
+                ready_timeout: SUBSCRIBE_READY_TIMEOUT,
+            },
+            Some(&interrupt),
+        ) {
+            Ok(subscription) => subscription,
             Err(error) => {
                 clear_interrupt(&current_interrupt);
                 if stop.load(Ordering::Acquire) || error.is_interrupted() {
@@ -254,7 +276,7 @@ fn run_live(
                 continue;
             }
         };
-        let streams = input.streams();
+        let streams = subscription.stream_template().streams();
         let Some(video) = streams
             .iter()
             .find(|stream| stream.media_type == MediaType::Video)
@@ -264,7 +286,7 @@ fn run_live(
             set_status(&status, "failed", Some("unsupported_codec"), attempt);
             return;
         };
-        if !video.codec_name.eq_ignore_ascii_case("h264") {
+        if !matches!(video.codec_name.as_str(), "h264" | "hevc") {
             clear_interrupt(&current_interrupt);
             set_status(&status, "failed", Some("unsupported_codec"), attempt);
             return;
@@ -284,10 +306,7 @@ fn run_live(
             if stop.load(Ordering::Acquire) {
                 interrupt.cancel();
             }
-            let packet = {
-                let _deadline = interrupt.scoped_deadline(READ_TIMEOUT);
-                input.next_packet()
-            };
+            let packet = subscription.receive_interruptible(READ_TIMEOUT, &interrupt);
             let packet = match packet {
                 Ok(Some(packet)) => packet,
                 Ok(None) => break,
@@ -328,7 +347,7 @@ fn run_live(
                     }
                 }
                 match create_fragment(
-                    &mut input,
+                    subscription.stream_template(),
                     &spec,
                     &interrupt,
                     video_index,
@@ -385,7 +404,7 @@ fn run_live(
                     }
                 }
                 match create_fragment(
-                    &mut input,
+                    subscription.stream_template(),
                     &spec,
                     &interrupt,
                     video_index,
@@ -458,8 +477,16 @@ fn reconnect_attempt_after_stable(attempt: u32, stable_for: Duration) -> u32 {
     }
 }
 
+fn live_queue_limits() -> PacketQueueLimits {
+    PacketQueueLimits::new(
+        NonZeroUsize::new(128).unwrap_or(NonZeroUsize::MIN),
+        NonZeroUsize::new(4 * 1024 * 1024).unwrap_or(NonZeroUsize::MIN),
+        Duration::from_secs(2),
+    )
+}
+
 fn create_fragment(
-    input: &mut MediaInput,
+    template: &MediaStreamTemplate,
     spec: &LiveSpec,
     interrupt: &InterruptHandle,
     video_index: u32,
@@ -478,8 +505,8 @@ fn create_fragment(
         .open(&partial_path)
         .map_err(|_| ())?;
     drop(claim);
-    let muxer = MatroskaMuxer::create_live_fragmented_mp4_with_selection(
-        input,
+    let muxer = MatroskaMuxer::create_live_fragmented_mp4_from_template_with_selection(
+        template,
         &partial_path,
         interrupt,
         |stream| stream.stream_index == video_index,

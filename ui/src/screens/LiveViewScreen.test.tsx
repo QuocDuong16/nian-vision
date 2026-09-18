@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { invoke } from "@tauri-apps/api/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LiveViewScreen } from "./LiveViewScreen";
+import { readFrontendMediaDiagnostics } from "../lib/mediaTelemetry";
 import type {
   CameraSummary,
   EventStatus,
@@ -27,6 +28,13 @@ const front: CameraSummary = {
   port: 554,
   path: "/stream1",
   audio_policy: "exclude",
+};
+
+const frontWithSubstream: CameraSummary = {
+  ...front,
+  sub_host: "192.168.1.50",
+  sub_port: 554,
+  sub_path: "/stream2",
 };
 
 const garage: CameraSummary = {
@@ -276,7 +284,136 @@ describe("LiveViewScreen", () => {
       const opens = vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open");
       expect(opens.length).toBeGreaterThanOrEqual(33);
     });
-  });
+  }, 15_000);
+
+  it("releases every MSE session across 20 repeated live-view mount cycles", async () => {
+    const originalMediaSource = Object.getOwnPropertyDescriptor(window, "MediaSource");
+    const originalCreateObjectUrl = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const originalRevokeObjectUrl = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    const endOfStream = vi.fn();
+    const revokeObjectUrl = vi.fn();
+    class FakeMediaSource extends EventTarget {
+      readyState = "open";
+      sourceBuffers = { length: 0 };
+      static isTypeSupported() { return true; }
+      endOfStream = endOfStream;
+    }
+    Object.defineProperty(window, "MediaSource", { configurable: true, value: FakeMediaSource });
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: () => "blob:nian-live-test" });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectUrl });
+    installDesktop();
+
+    try {
+      for (let cycle = 0; cycle < 20; cycle += 1) {
+        const view = render(<LiveViewScreen />);
+        if (cycle === 0) {
+          await screen.findByText("No live cameras selected");
+          fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+        }
+        await screen.findByRole("article", { name: "Front door live camera" });
+        await waitFor(() => expect(readFrontendMediaDiagnostics().activeMseSessions).toBe(1));
+        view.unmount();
+        await waitFor(() => {
+          expect(readFrontendMediaDiagnostics().activeMseSessions).toBe(0);
+          expect(endOfStream).toHaveBeenCalledTimes(cycle + 1);
+          expect(revokeObjectUrl).toHaveBeenCalledTimes(cycle + 1);
+        });
+      }
+    } finally {
+      if (originalMediaSource) Object.defineProperty(window, "MediaSource", originalMediaSource);
+      else Reflect.deleteProperty(window, "MediaSource");
+      if (originalCreateObjectUrl) Object.defineProperty(URL, "createObjectURL", originalCreateObjectUrl);
+      else Reflect.deleteProperty(URL, "createObjectURL");
+      if (originalRevokeObjectUrl) Object.defineProperty(URL, "revokeObjectURL", originalRevokeObjectUrl);
+      else Reflect.deleteProperty(URL, "revokeObjectURL");
+    }
+  }, 20_000);
+
+  it("reopens the live session before appending changed decoder parameters", async () => {
+    const oldMediaSource = Object.getOwnPropertyDescriptor(window, "MediaSource");
+    const oldCreateUrl = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const oldRevokeUrl = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    const oldFetch = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+    const appended = vi.fn();
+    const revoked = vi.fn();
+    const box = (type: string, payload: Uint8Array): Uint8Array => {
+      const bytes = new Uint8Array(payload.length + 8);
+      new DataView(bytes.buffer).setUint32(0, bytes.length, false);
+      for (let i = 0; i < 4; i += 1) bytes[i + 4] = type.charCodeAt(i);
+      bytes.set(payload, 8);
+      return bytes;
+    };
+    const join = (...parts: Uint8Array[]): Uint8Array => {
+      const bytes = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
+      let offset = 0;
+      for (const part of parts) { bytes.set(part, offset); offset += part.length; }
+      return bytes;
+    };
+    const fragment = (parameter: number) => {
+      const entry = box("avc1", join(new Uint8Array(78), box("avcC", Uint8Array.from([1, 100, 0, 31, parameter]))));
+      const stsd = box("stsd", join(Uint8Array.from([0, 0, 0, 0, 0, 0, 0, 1]), entry));
+      const moov = box("moov", box("trak", box("mdia", box("minf", box("stbl", stsd)))));
+      return join(box("ftyp", new Uint8Array()), moov,
+        box("moof", box("mfhd", Uint8Array.from([0, 0, 0, 0, 0, 0, 0, 1]))),
+        box("mdat", Uint8Array.from([1])));
+    };
+    const original = fragment(0xaa);
+    const changed = fragment(0xbb);
+    class FakeSourceBuffer extends EventTarget {
+      updating = false;
+      buffered = { length: 0 };
+      mode = "segments";
+      timestampOffset = 0;
+      appendBuffer(bytes: Uint8Array) {
+        appended(bytes);
+        this.updating = true;
+        queueMicrotask(() => { this.updating = false; this.dispatchEvent(new Event("updateend")); });
+      }
+    }
+    class FakeMediaSource extends EventTarget {
+      readyState = "open";
+      sourceBuffers: FakeSourceBuffer[] = [];
+      static isTypeSupported() { return true; }
+      constructor() { super(); queueMicrotask(() => this.dispatchEvent(new Event("sourceopen"))); }
+      addSourceBuffer() { const buffer = new FakeSourceBuffer(); this.sourceBuffers.push(buffer); return buffer; }
+      removeSourceBuffer(buffer: FakeSourceBuffer) { this.sourceBuffers = this.sourceBuffers.filter((item) => item !== buffer); }
+      endOfStream() { this.readyState = "ended"; }
+    }
+    Object.defineProperty(window, "MediaSource", { configurable: true, value: FakeMediaSource });
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: () => "blob:live-config-test" });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revoked });
+    Object.defineProperty(globalThis, "fetch", { configurable: true, value: vi.fn(async (url: string) => {
+      if (url.endsWith("/manifest")) {
+        const first = url.includes("00000000-0000-4000-8000-000000000001");
+        return { ok: true, json: async () => ({ session_id: url.split("/").at(-2), fragments: first ? [0, 1] : [] }) };
+      }
+      const bytes = url.endsWith("fragment-000000000000.mp4") ? original : changed;
+      return { ok: true, status: 200, arrayBuffer: async () => bytes.slice().buffer };
+    }) });
+    installDesktop();
+    const view = render(<LiveViewScreen />);
+    try {
+      await screen.findByText("No live cameras selected");
+      fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+      await waitFor(() => {
+        expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_close")).toHaveLength(1);
+        expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open")).toHaveLength(2);
+      }, { timeout: 5_000 });
+      expect(appended).toHaveBeenCalledTimes(2); // Original init and media only.
+      expect(revoked).toHaveBeenCalledTimes(1);
+      expect(readFrontendMediaDiagnostics().activeMseSessions).toBe(1);
+    } finally {
+      view.unmount();
+      for (const [target, name, descriptor] of [
+        [window, "MediaSource", oldMediaSource], [URL, "createObjectURL", oldCreateUrl],
+        [URL, "revokeObjectURL", oldRevokeUrl], [globalThis, "fetch", oldFetch],
+      ] as const) {
+        if (descriptor) Object.defineProperty(target, name, descriptor);
+        else Reflect.deleteProperty(target, name);
+      }
+    }
+    expect(readFrontendMediaDiagnostics().activeMseSessions).toBe(0);
+  }, 10_000);
 
   it("restores the selected live layout after the screen is remounted", async () => {
     installDesktop();
@@ -362,38 +499,38 @@ describe("LiveViewScreen", () => {
     ).toHaveLength(1);
   });
 
-  it("gives recording the RTSP slot first, then restores live view after recording is established", async () => {
+  it("keeps live view mounted while recording starts and stops on the shared camera worker", async () => {
     installDesktop();
     render(<LiveViewScreen />);
 
     await screen.findByText("No live cameras selected");
     fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
     const tile = await screen.findByRole("article", { name: "Front door live camera" });
-    await waitFor(() => expect(tile.querySelector("video")).toBeTruthy());
+    const video = await waitFor(() => {
+      const current = tile.querySelector("video");
+      expect(current).toBeTruthy();
+      return current as HTMLVideoElement;
+    });
     const opensBeforeRecording = vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open").length;
+    const closesBeforeRecording = vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_close").length;
 
     fireEvent.click(screen.getByRole("button", { name: "Start recording" }));
     await waitFor(() => {
-      expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "live_close")).toBe(true);
       expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "recording_start")).toBe(true);
       expect(screen.getByRole("button", { name: "Stop recording" })).toBeTruthy();
     });
-    const closeIndex = vi.mocked(invoke).mock.calls.findIndex(([command]) => command === "live_close");
-    const startIndex = vi.mocked(invoke).mock.calls.findIndex(([command]) => command === "recording_start");
-    expect(closeIndex).toBeGreaterThanOrEqual(0);
-    expect(startIndex).toBeGreaterThan(closeIndex);
-    await waitFor(() => {
-      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open").length).toBeGreaterThan(opensBeforeRecording);
-      expect(screen.getByRole("article", { name: "Front door live camera" }).querySelector("video")).toBeTruthy();
-    });
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_close")).toHaveLength(closesBeforeRecording);
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open")).toHaveLength(opensBeforeRecording);
+    expect(tile.querySelector("video")).toBe(video);
 
     fireEvent.click(screen.getByRole("button", { name: "Stop recording" }));
     await waitFor(() => {
       expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "recording_stop")).toBe(true);
     });
+    expect(tile.querySelector("video")).toBe(video);
   });
 
-  it("shows recorder reconnecting reason in live view instead of raw backoff", async () => {
+  it("shows recorder reconnecting reason without sacrificing a healthy live session", async () => {
     const desktop = installDesktop();
     desktop.setRecordingState(front.camera_id, "backoff", "source_open_failed", 2);
     render(<LiveViewScreen />);
@@ -404,9 +541,9 @@ describe("LiveViewScreen", () => {
 
     await waitFor(() => {
       expect(tile.textContent).toContain("Rec Reconnecting · recording stream unavailable");
-      expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "live_close")).toBe(true);
-      expect(tile.textContent).toContain("Prioritizing recording");
+      expect(tile.querySelector("video")).toBeTruthy();
     });
+    expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "live_close")).toBe(false);
     expect(tile.textContent).not.toContain("source_open_failed");
     expect(tile.textContent).not.toContain("backoff");
   });
@@ -777,5 +914,111 @@ describe("LiveViewScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close Front door focus view" }));
     expect(await screen.findByRole("article", { name: "Front door live camera" })).toBeTruthy();
   });
+
+  it("switches a substream grid session to main for focus without double-decoding", async () => {
+    installDesktop(undefined, undefined, undefined, undefined, [frontWithSubstream]);
+    render(<LiveViewScreen />);
+
+    await screen.findByText("No live cameras selected");
+    fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+    const tile = await screen.findByRole("article", { name: "Front door live camera" });
+    await waitFor(() => expect(tile.querySelector("video")).toBeTruthy());
+
+    const initialOpen = vi.mocked(invoke).mock.calls.find(([command]) => command === "live_open");
+    expect((initialOpen?.[1] as { profile?: string } | undefined)?.profile).toBe("grid");
+
+    fireEvent.doubleClick(tile);
+    const focusDialog = await screen.findByRole("dialog", { name: "Front door live camera" });
+    await waitFor(() => expect(focusDialog.querySelector("video")).toBeTruthy());
+    await waitFor(() => {
+      const calls = vi.mocked(invoke).mock.calls;
+      const focusOpenIndex = calls.findIndex(([command, args]) =>
+        command === "live_open" && (args as { profile?: string } | undefined)?.profile === "focus",
+      );
+      const closeIndex = calls.findIndex(([command]) => command === "live_close");
+      expect(closeIndex).toBeGreaterThanOrEqual(0);
+      expect(focusOpenIndex).toBeGreaterThan(closeIndex);
+    });
+    expect(document.querySelectorAll("video")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Front door focus view" }));
+    await waitFor(() => {
+      const gridOpens = vi.mocked(invoke).mock.calls.filter(([command, args]) =>
+        command === "live_open" && (args as { profile?: string } | undefined)?.profile === "grid",
+      );
+      expect(gridOpens.length).toBeGreaterThanOrEqual(2);
+    });
+    const restored = await screen.findByRole("article", { name: "Front door live camera" });
+    await waitFor(() => expect(restored.querySelector("video")).toBeTruthy());
+    expect(document.querySelectorAll("video")).toHaveLength(1);
+  });
+
+  it("repeatedly switches substream grid and focus without accumulating media sessions", async () => {
+    const originalMediaSource = Object.getOwnPropertyDescriptor(window, "MediaSource");
+    const originalCreateObjectUrl = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const originalRevokeObjectUrl = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    class FakeMediaSource extends EventTarget {
+      readyState = "open";
+      sourceBuffers = { length: 0 };
+      static isTypeSupported() { return true; }
+    }
+    Object.defineProperty(window, "MediaSource", { configurable: true, value: FakeMediaSource });
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: () => "blob:nian-focus-cycle" });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: () => undefined });
+    installDesktop(undefined, undefined, undefined, undefined, [frontWithSubstream]);
+    const view = render(<LiveViewScreen />);
+    let unmounted = false;
+
+    try {
+      await screen.findByText("No live cameras selected");
+      fireEvent.click(screen.getByRole("button", { name: "Add to live view" }));
+
+      for (let cycle = 0; cycle < 10; cycle += 1) {
+        const tile = await screen.findByRole("article", { name: "Front door live camera" });
+        await waitFor(() => {
+          expect(tile.querySelector("video")).toBeTruthy();
+          expect(readFrontendMediaDiagnostics().activeMseSessions).toBe(1);
+          expect(document.querySelectorAll("video")).toHaveLength(1);
+        });
+
+        fireEvent.doubleClick(tile);
+        const focusDialog = await screen.findByRole("dialog", { name: "Front door live camera" });
+        await waitFor(() => {
+          expect(focusDialog.querySelector("video")).toBeTruthy();
+          expect(readFrontendMediaDiagnostics().activeMseSessions).toBe(1);
+          expect(document.querySelectorAll("video")).toHaveLength(1);
+        });
+
+        fireEvent.click(screen.getByRole("button", { name: "Close Front door focus view" }));
+        await screen.findByRole("article", { name: "Front door live camera" });
+        await waitFor(() => {
+          expect(readFrontendMediaDiagnostics().activeMseSessions).toBe(1);
+          expect(document.querySelectorAll("video")).toHaveLength(1);
+        });
+      }
+
+      const opens = vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_open");
+      const gridOpens = opens.filter(([, args]) => (args as { profile?: string } | undefined)?.profile === "grid");
+      const focusOpens = opens.filter(([, args]) => (args as { profile?: string } | undefined)?.profile === "focus");
+      expect(gridOpens).toHaveLength(11);
+      expect(focusOpens).toHaveLength(10);
+
+      view.unmount();
+      unmounted = true;
+      await waitFor(() => {
+        expect(readFrontendMediaDiagnostics().activeMseSessions).toBe(0);
+        const closes = vi.mocked(invoke).mock.calls.filter(([command]) => command === "live_close");
+        expect(closes.length).toBeGreaterThanOrEqual(opens.length);
+      });
+    } finally {
+      if (!unmounted) view.unmount();
+      if (originalMediaSource) Object.defineProperty(window, "MediaSource", originalMediaSource);
+      else Reflect.deleteProperty(window, "MediaSource");
+      if (originalCreateObjectUrl) Object.defineProperty(URL, "createObjectURL", originalCreateObjectUrl);
+      else Reflect.deleteProperty(URL, "createObjectURL");
+      if (originalRevokeObjectUrl) Object.defineProperty(URL, "revokeObjectURL", originalRevokeObjectUrl);
+      else Reflect.deleteProperty(URL, "revokeObjectURL");
+    }
+  }, 20_000);
 
 });

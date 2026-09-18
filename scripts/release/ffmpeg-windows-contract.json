@@ -1,5 +1,5 @@
 {
-  "buildContractVersion": 4,
+  "buildContractVersion": 5,
   "outputRuntimeContractVersion": 1,
   "toolchain": "msvc",
   "architecture": "x86_64",
@@ -73,7 +73,7 @@
     "--enable-protocol=file,tcp,rtp,udp",
     "--enable-demuxer=matroska,mov,rtsp",
     "--enable-muxer=matroska,mov,mp4",
-    "--enable-parser=h264,mpeg4video,mpegaudio,aac",
-    "--enable-decoder=mpeg4,aac"
+    "--enable-parser=h264,hevc,mpeg4video,mpegaudio,aac",
+    "--enable-decoder=h264,hevc,mpeg4,aac,pcm_alaw,pcm_mulaw"
   ]
 }

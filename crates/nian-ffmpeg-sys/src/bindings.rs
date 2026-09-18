@@ -37,6 +37,24 @@ unsafe extern "C" {
     #[doc = " Return a string describing the media_type enum, NULL if media_type\n is unknown."]
     pub fn av_get_media_type_string(media_type: AVMediaType) -> *const ::std::os::raw::c_char;
 }
+#[doc = "< Undefined"]
+pub const AV_PICTURE_TYPE_NONE: AVPictureType = 0;
+#[doc = "< Intra"]
+pub const AV_PICTURE_TYPE_I: AVPictureType = 1;
+#[doc = "< Predicted"]
+pub const AV_PICTURE_TYPE_P: AVPictureType = 2;
+#[doc = "< Bi-dir predicted"]
+pub const AV_PICTURE_TYPE_B: AVPictureType = 3;
+#[doc = "< S(GMC)-VOP MPEG-4"]
+pub const AV_PICTURE_TYPE_S: AVPictureType = 4;
+#[doc = "< Switching Intra"]
+pub const AV_PICTURE_TYPE_SI: AVPictureType = 5;
+#[doc = "< Switching Predicted"]
+pub const AV_PICTURE_TYPE_SP: AVPictureType = 6;
+#[doc = "< BI type"]
+pub const AV_PICTURE_TYPE_BI: AVPictureType = 7;
+#[doc = " @}\n @}\n @defgroup lavu_picture Image related\n\n AVPicture types, pixel formats and basic image planes manipulation.\n\n @{"]
+pub type AVPictureType = ::std::os::raw::c_uint;
 unsafe extern "C" {
     #[doc = " Put a description of the AVERROR code errnum in errbuf.\n In case of failure the global variable errno is set to indicate the\n error. Even in case of failure av_strerror() will print a generic\n error message indicating the errnum provided to errbuf.\n\n @param errnum      error code to describe\n @param errbuf      buffer to which description is written\n @param errbuf_size the size in bytes of errbuf\n @return 0 on success, a negative value if a description for errnum\n cannot be found"]
     pub fn av_strerror(
@@ -101,6 +119,549 @@ unsafe extern "C" {
     #[doc = " Set the log level\n\n @see lavu_log_constants\n\n @param level Logging level"]
     pub fn av_log_set_level(level: ::std::os::raw::c_int);
 }
+pub const AV_PIX_FMT_NONE: AVPixelFormat = -1;
+#[doc = "< planar YUV 4:2:0, 12bpp, (1 Cr & Cb sample per 2x2 Y samples)"]
+pub const AV_PIX_FMT_YUV420P: AVPixelFormat = 0;
+#[doc = "< packed YUV 4:2:2, 16bpp, Y0 Cb Y1 Cr"]
+pub const AV_PIX_FMT_YUYV422: AVPixelFormat = 1;
+#[doc = "< packed RGB 8:8:8, 24bpp, RGBRGB..."]
+pub const AV_PIX_FMT_RGB24: AVPixelFormat = 2;
+#[doc = "< packed RGB 8:8:8, 24bpp, BGRBGR..."]
+pub const AV_PIX_FMT_BGR24: AVPixelFormat = 3;
+#[doc = "< planar YUV 4:2:2, 16bpp, (1 Cr & Cb sample per 2x1 Y samples)"]
+pub const AV_PIX_FMT_YUV422P: AVPixelFormat = 4;
+#[doc = "< planar YUV 4:4:4, 24bpp, (1 Cr & Cb sample per 1x1 Y samples)"]
+pub const AV_PIX_FMT_YUV444P: AVPixelFormat = 5;
+#[doc = "< planar YUV 4:1:0,  9bpp, (1 Cr & Cb sample per 4x4 Y samples)"]
+pub const AV_PIX_FMT_YUV410P: AVPixelFormat = 6;
+#[doc = "< planar YUV 4:1:1, 12bpp, (1 Cr & Cb sample per 4x1 Y samples)"]
+pub const AV_PIX_FMT_YUV411P: AVPixelFormat = 7;
+#[doc = "<        Y        ,  8bpp"]
+pub const AV_PIX_FMT_GRAY8: AVPixelFormat = 8;
+#[doc = "<        Y        ,  1bpp, 0 is white, 1 is black, in each byte pixels are ordered from the msb to the lsb"]
+pub const AV_PIX_FMT_MONOWHITE: AVPixelFormat = 9;
+#[doc = "<        Y        ,  1bpp, 0 is black, 1 is white, in each byte pixels are ordered from the msb to the lsb"]
+pub const AV_PIX_FMT_MONOBLACK: AVPixelFormat = 10;
+#[doc = "< 8 bits with AV_PIX_FMT_RGB32 palette"]
+pub const AV_PIX_FMT_PAL8: AVPixelFormat = 11;
+#[doc = "< planar YUV 4:2:0, 12bpp, full scale (JPEG), deprecated in favor of AV_PIX_FMT_YUV420P and setting color_range"]
+pub const AV_PIX_FMT_YUVJ420P: AVPixelFormat = 12;
+#[doc = "< planar YUV 4:2:2, 16bpp, full scale (JPEG), deprecated in favor of AV_PIX_FMT_YUV422P and setting color_range"]
+pub const AV_PIX_FMT_YUVJ422P: AVPixelFormat = 13;
+#[doc = "< planar YUV 4:4:4, 24bpp, full scale (JPEG), deprecated in favor of AV_PIX_FMT_YUV444P and setting color_range"]
+pub const AV_PIX_FMT_YUVJ444P: AVPixelFormat = 14;
+#[doc = "< packed YUV 4:2:2, 16bpp, Cb Y0 Cr Y1"]
+pub const AV_PIX_FMT_UYVY422: AVPixelFormat = 15;
+#[doc = "< packed YUV 4:1:1, 12bpp, Cb Y0 Y1 Cr Y2 Y3"]
+pub const AV_PIX_FMT_UYYVYY411: AVPixelFormat = 16;
+#[doc = "< packed RGB 3:3:2,  8bpp, (msb)2B 3G 3R(lsb)"]
+pub const AV_PIX_FMT_BGR8: AVPixelFormat = 17;
+#[doc = "< packed RGB 1:2:1 bitstream,  4bpp, (msb)1B 2G 1R(lsb), a byte contains two pixels, the first pixel in the byte is the one composed by the 4 msb bits"]
+pub const AV_PIX_FMT_BGR4: AVPixelFormat = 18;
+#[doc = "< packed RGB 1:2:1,  8bpp, (msb)1B 2G 1R(lsb)"]
+pub const AV_PIX_FMT_BGR4_BYTE: AVPixelFormat = 19;
+#[doc = "< packed RGB 3:3:2,  8bpp, (msb)3R 3G 2B(lsb)"]
+pub const AV_PIX_FMT_RGB8: AVPixelFormat = 20;
+#[doc = "< packed RGB 1:2:1 bitstream,  4bpp, (msb)1R 2G 1B(lsb), a byte contains two pixels, the first pixel in the byte is the one composed by the 4 msb bits"]
+pub const AV_PIX_FMT_RGB4: AVPixelFormat = 21;
+#[doc = "< packed RGB 1:2:1,  8bpp, (msb)1R 2G 1B(lsb)"]
+pub const AV_PIX_FMT_RGB4_BYTE: AVPixelFormat = 22;
+#[doc = "< planar YUV 4:2:0, 12bpp, 1 plane for Y and 1 plane for the UV components, which are interleaved (first byte U and the following byte V)"]
+pub const AV_PIX_FMT_NV12: AVPixelFormat = 23;
+#[doc = "< as above, but U and V bytes are swapped"]
+pub const AV_PIX_FMT_NV21: AVPixelFormat = 24;
+#[doc = "< packed ARGB 8:8:8:8, 32bpp, ARGBARGB..."]
+pub const AV_PIX_FMT_ARGB: AVPixelFormat = 25;
+#[doc = "< packed RGBA 8:8:8:8, 32bpp, RGBARGBA..."]
+pub const AV_PIX_FMT_RGBA: AVPixelFormat = 26;
+#[doc = "< packed ABGR 8:8:8:8, 32bpp, ABGRABGR..."]
+pub const AV_PIX_FMT_ABGR: AVPixelFormat = 27;
+#[doc = "< packed BGRA 8:8:8:8, 32bpp, BGRABGRA..."]
+pub const AV_PIX_FMT_BGRA: AVPixelFormat = 28;
+#[doc = "<        Y        , 16bpp, big-endian"]
+pub const AV_PIX_FMT_GRAY16BE: AVPixelFormat = 29;
+#[doc = "<        Y        , 16bpp, little-endian"]
+pub const AV_PIX_FMT_GRAY16LE: AVPixelFormat = 30;
+#[doc = "< planar YUV 4:4:0 (1 Cr & Cb sample per 1x2 Y samples)"]
+pub const AV_PIX_FMT_YUV440P: AVPixelFormat = 31;
+#[doc = "< planar YUV 4:4:0 full scale (JPEG), deprecated in favor of AV_PIX_FMT_YUV440P and setting color_range"]
+pub const AV_PIX_FMT_YUVJ440P: AVPixelFormat = 32;
+#[doc = "< planar YUV 4:2:0, 20bpp, (1 Cr & Cb sample per 2x2 Y & A samples)"]
+pub const AV_PIX_FMT_YUVA420P: AVPixelFormat = 33;
+#[doc = "< packed RGB 16:16:16, 48bpp, 16R, 16G, 16B, the 2-byte value for each R/G/B component is stored as big-endian"]
+pub const AV_PIX_FMT_RGB48BE: AVPixelFormat = 34;
+#[doc = "< packed RGB 16:16:16, 48bpp, 16R, 16G, 16B, the 2-byte value for each R/G/B component is stored as little-endian"]
+pub const AV_PIX_FMT_RGB48LE: AVPixelFormat = 35;
+#[doc = "< packed RGB 5:6:5, 16bpp, (msb)   5R 6G 5B(lsb), big-endian"]
+pub const AV_PIX_FMT_RGB565BE: AVPixelFormat = 36;
+#[doc = "< packed RGB 5:6:5, 16bpp, (msb)   5R 6G 5B(lsb), little-endian"]
+pub const AV_PIX_FMT_RGB565LE: AVPixelFormat = 37;
+#[doc = "< packed RGB 5:5:5, 16bpp, (msb)1X 5R 5G 5B(lsb), big-endian   , X=unused/undefined"]
+pub const AV_PIX_FMT_RGB555BE: AVPixelFormat = 38;
+#[doc = "< packed RGB 5:5:5, 16bpp, (msb)1X 5R 5G 5B(lsb), little-endian, X=unused/undefined"]
+pub const AV_PIX_FMT_RGB555LE: AVPixelFormat = 39;
+#[doc = "< packed BGR 5:6:5, 16bpp, (msb)   5B 6G 5R(lsb), big-endian"]
+pub const AV_PIX_FMT_BGR565BE: AVPixelFormat = 40;
+#[doc = "< packed BGR 5:6:5, 16bpp, (msb)   5B 6G 5R(lsb), little-endian"]
+pub const AV_PIX_FMT_BGR565LE: AVPixelFormat = 41;
+#[doc = "< packed BGR 5:5:5, 16bpp, (msb)1X 5B 5G 5R(lsb), big-endian   , X=unused/undefined"]
+pub const AV_PIX_FMT_BGR555BE: AVPixelFormat = 42;
+#[doc = "< packed BGR 5:5:5, 16bpp, (msb)1X 5B 5G 5R(lsb), little-endian, X=unused/undefined"]
+pub const AV_PIX_FMT_BGR555LE: AVPixelFormat = 43;
+#[doc = "  Hardware acceleration through VA-API, data[3] contains a\n  VASurfaceID."]
+pub const AV_PIX_FMT_VAAPI: AVPixelFormat = 44;
+#[doc = "< planar YUV 4:2:0, 24bpp, (1 Cr & Cb sample per 2x2 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV420P16LE: AVPixelFormat = 45;
+#[doc = "< planar YUV 4:2:0, 24bpp, (1 Cr & Cb sample per 2x2 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV420P16BE: AVPixelFormat = 46;
+#[doc = "< planar YUV 4:2:2, 32bpp, (1 Cr & Cb sample per 2x1 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV422P16LE: AVPixelFormat = 47;
+#[doc = "< planar YUV 4:2:2, 32bpp, (1 Cr & Cb sample per 2x1 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV422P16BE: AVPixelFormat = 48;
+#[doc = "< planar YUV 4:4:4, 48bpp, (1 Cr & Cb sample per 1x1 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV444P16LE: AVPixelFormat = 49;
+#[doc = "< planar YUV 4:4:4, 48bpp, (1 Cr & Cb sample per 1x1 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV444P16BE: AVPixelFormat = 50;
+#[doc = "< HW decoding through DXVA2, Picture.data[3] contains a LPDIRECT3DSURFACE9 pointer"]
+pub const AV_PIX_FMT_DXVA2_VLD: AVPixelFormat = 51;
+#[doc = "< packed RGB 4:4:4, 16bpp, (msb)4X 4R 4G 4B(lsb), little-endian, X=unused/undefined"]
+pub const AV_PIX_FMT_RGB444LE: AVPixelFormat = 52;
+#[doc = "< packed RGB 4:4:4, 16bpp, (msb)4X 4R 4G 4B(lsb), big-endian,    X=unused/undefined"]
+pub const AV_PIX_FMT_RGB444BE: AVPixelFormat = 53;
+#[doc = "< packed BGR 4:4:4, 16bpp, (msb)4X 4B 4G 4R(lsb), little-endian, X=unused/undefined"]
+pub const AV_PIX_FMT_BGR444LE: AVPixelFormat = 54;
+#[doc = "< packed BGR 4:4:4, 16bpp, (msb)4X 4B 4G 4R(lsb), big-endian,    X=unused/undefined"]
+pub const AV_PIX_FMT_BGR444BE: AVPixelFormat = 55;
+#[doc = "< 8 bits gray, 8 bits alpha"]
+pub const AV_PIX_FMT_YA8: AVPixelFormat = 56;
+#[doc = "< alias for AV_PIX_FMT_YA8"]
+pub const AV_PIX_FMT_Y400A: AVPixelFormat = 56;
+#[doc = "< alias for AV_PIX_FMT_YA8"]
+pub const AV_PIX_FMT_GRAY8A: AVPixelFormat = 56;
+#[doc = "< packed RGB 16:16:16, 48bpp, 16B, 16G, 16R, the 2-byte value for each R/G/B component is stored as big-endian"]
+pub const AV_PIX_FMT_BGR48BE: AVPixelFormat = 57;
+#[doc = "< packed RGB 16:16:16, 48bpp, 16B, 16G, 16R, the 2-byte value for each R/G/B component is stored as little-endian"]
+pub const AV_PIX_FMT_BGR48LE: AVPixelFormat = 58;
+#[doc = "< planar YUV 4:2:0, 13.5bpp, (1 Cr & Cb sample per 2x2 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV420P9BE: AVPixelFormat = 59;
+#[doc = "< planar YUV 4:2:0, 13.5bpp, (1 Cr & Cb sample per 2x2 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV420P9LE: AVPixelFormat = 60;
+#[doc = "< planar YUV 4:2:0, 15bpp, (1 Cr & Cb sample per 2x2 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV420P10BE: AVPixelFormat = 61;
+#[doc = "< planar YUV 4:2:0, 15bpp, (1 Cr & Cb sample per 2x2 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV420P10LE: AVPixelFormat = 62;
+#[doc = "< planar YUV 4:2:2, 20bpp, (1 Cr & Cb sample per 2x1 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV422P10BE: AVPixelFormat = 63;
+#[doc = "< planar YUV 4:2:2, 20bpp, (1 Cr & Cb sample per 2x1 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV422P10LE: AVPixelFormat = 64;
+#[doc = "< planar YUV 4:4:4, 27bpp, (1 Cr & Cb sample per 1x1 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV444P9BE: AVPixelFormat = 65;
+#[doc = "< planar YUV 4:4:4, 27bpp, (1 Cr & Cb sample per 1x1 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV444P9LE: AVPixelFormat = 66;
+#[doc = "< planar YUV 4:4:4, 30bpp, (1 Cr & Cb sample per 1x1 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV444P10BE: AVPixelFormat = 67;
+#[doc = "< planar YUV 4:4:4, 30bpp, (1 Cr & Cb sample per 1x1 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV444P10LE: AVPixelFormat = 68;
+#[doc = "< planar YUV 4:2:2, 18bpp, (1 Cr & Cb sample per 2x1 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV422P9BE: AVPixelFormat = 69;
+#[doc = "< planar YUV 4:2:2, 18bpp, (1 Cr & Cb sample per 2x1 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV422P9LE: AVPixelFormat = 70;
+#[doc = "< planar GBR 4:4:4 24bpp"]
+pub const AV_PIX_FMT_GBRP: AVPixelFormat = 71;
+pub const AV_PIX_FMT_GBR24P: AVPixelFormat = 71;
+#[doc = "< planar GBR 4:4:4 27bpp, big-endian"]
+pub const AV_PIX_FMT_GBRP9BE: AVPixelFormat = 72;
+#[doc = "< planar GBR 4:4:4 27bpp, little-endian"]
+pub const AV_PIX_FMT_GBRP9LE: AVPixelFormat = 73;
+#[doc = "< planar GBR 4:4:4 30bpp, big-endian"]
+pub const AV_PIX_FMT_GBRP10BE: AVPixelFormat = 74;
+#[doc = "< planar GBR 4:4:4 30bpp, little-endian"]
+pub const AV_PIX_FMT_GBRP10LE: AVPixelFormat = 75;
+#[doc = "< planar GBR 4:4:4 48bpp, big-endian"]
+pub const AV_PIX_FMT_GBRP16BE: AVPixelFormat = 76;
+#[doc = "< planar GBR 4:4:4 48bpp, little-endian"]
+pub const AV_PIX_FMT_GBRP16LE: AVPixelFormat = 77;
+#[doc = "< planar YUV 4:2:2 24bpp, (1 Cr & Cb sample per 2x1 Y & A samples)"]
+pub const AV_PIX_FMT_YUVA422P: AVPixelFormat = 78;
+#[doc = "< planar YUV 4:4:4 32bpp, (1 Cr & Cb sample per 1x1 Y & A samples)"]
+pub const AV_PIX_FMT_YUVA444P: AVPixelFormat = 79;
+#[doc = "< planar YUV 4:2:0 22.5bpp, (1 Cr & Cb sample per 2x2 Y & A samples), big-endian"]
+pub const AV_PIX_FMT_YUVA420P9BE: AVPixelFormat = 80;
+#[doc = "< planar YUV 4:2:0 22.5bpp, (1 Cr & Cb sample per 2x2 Y & A samples), little-endian"]
+pub const AV_PIX_FMT_YUVA420P9LE: AVPixelFormat = 81;
+#[doc = "< planar YUV 4:2:2 27bpp, (1 Cr & Cb sample per 2x1 Y & A samples), big-endian"]
+pub const AV_PIX_FMT_YUVA422P9BE: AVPixelFormat = 82;
+#[doc = "< planar YUV 4:2:2 27bpp, (1 Cr & Cb sample per 2x1 Y & A samples), little-endian"]
+pub const AV_PIX_FMT_YUVA422P9LE: AVPixelFormat = 83;
+#[doc = "< planar YUV 4:4:4 36bpp, (1 Cr & Cb sample per 1x1 Y & A samples), big-endian"]
+pub const AV_PIX_FMT_YUVA444P9BE: AVPixelFormat = 84;
+#[doc = "< planar YUV 4:4:4 36bpp, (1 Cr & Cb sample per 1x1 Y & A samples), little-endian"]
+pub const AV_PIX_FMT_YUVA444P9LE: AVPixelFormat = 85;
+#[doc = "< planar YUV 4:2:0 25bpp, (1 Cr & Cb sample per 2x2 Y & A samples, big-endian)"]
+pub const AV_PIX_FMT_YUVA420P10BE: AVPixelFormat = 86;
+#[doc = "< planar YUV 4:2:0 25bpp, (1 Cr & Cb sample per 2x2 Y & A samples, little-endian)"]
+pub const AV_PIX_FMT_YUVA420P10LE: AVPixelFormat = 87;
+#[doc = "< planar YUV 4:2:2 30bpp, (1 Cr & Cb sample per 2x1 Y & A samples, big-endian)"]
+pub const AV_PIX_FMT_YUVA422P10BE: AVPixelFormat = 88;
+#[doc = "< planar YUV 4:2:2 30bpp, (1 Cr & Cb sample per 2x1 Y & A samples, little-endian)"]
+pub const AV_PIX_FMT_YUVA422P10LE: AVPixelFormat = 89;
+#[doc = "< planar YUV 4:4:4 40bpp, (1 Cr & Cb sample per 1x1 Y & A samples, big-endian)"]
+pub const AV_PIX_FMT_YUVA444P10BE: AVPixelFormat = 90;
+#[doc = "< planar YUV 4:4:4 40bpp, (1 Cr & Cb sample per 1x1 Y & A samples, little-endian)"]
+pub const AV_PIX_FMT_YUVA444P10LE: AVPixelFormat = 91;
+#[doc = "< planar YUV 4:2:0 40bpp, (1 Cr & Cb sample per 2x2 Y & A samples, big-endian)"]
+pub const AV_PIX_FMT_YUVA420P16BE: AVPixelFormat = 92;
+#[doc = "< planar YUV 4:2:0 40bpp, (1 Cr & Cb sample per 2x2 Y & A samples, little-endian)"]
+pub const AV_PIX_FMT_YUVA420P16LE: AVPixelFormat = 93;
+#[doc = "< planar YUV 4:2:2 48bpp, (1 Cr & Cb sample per 2x1 Y & A samples, big-endian)"]
+pub const AV_PIX_FMT_YUVA422P16BE: AVPixelFormat = 94;
+#[doc = "< planar YUV 4:2:2 48bpp, (1 Cr & Cb sample per 2x1 Y & A samples, little-endian)"]
+pub const AV_PIX_FMT_YUVA422P16LE: AVPixelFormat = 95;
+#[doc = "< planar YUV 4:4:4 64bpp, (1 Cr & Cb sample per 1x1 Y & A samples, big-endian)"]
+pub const AV_PIX_FMT_YUVA444P16BE: AVPixelFormat = 96;
+#[doc = "< planar YUV 4:4:4 64bpp, (1 Cr & Cb sample per 1x1 Y & A samples, little-endian)"]
+pub const AV_PIX_FMT_YUVA444P16LE: AVPixelFormat = 97;
+#[doc = "< HW acceleration through VDPAU, Picture.data[3] contains a VdpVideoSurface"]
+pub const AV_PIX_FMT_VDPAU: AVPixelFormat = 98;
+#[doc = "< packed XYZ 4:4:4, 36 bpp, (msb) 12X, 12Y, 12Z (lsb), the 2-byte value for each X/Y/Z is stored as little-endian, the 4 lower bits are set to 0"]
+pub const AV_PIX_FMT_XYZ12LE: AVPixelFormat = 99;
+#[doc = "< packed XYZ 4:4:4, 36 bpp, (msb) 12X, 12Y, 12Z (lsb), the 2-byte value for each X/Y/Z is stored as big-endian, the 4 lower bits are set to 0"]
+pub const AV_PIX_FMT_XYZ12BE: AVPixelFormat = 100;
+#[doc = "< interleaved chroma YUV 4:2:2, 16bpp, (1 Cr & Cb sample per 2x1 Y samples)"]
+pub const AV_PIX_FMT_NV16: AVPixelFormat = 101;
+#[doc = "< interleaved chroma YUV 4:2:2, 20bpp, (1 Cr & Cb sample per 2x1 Y samples), little-endian"]
+pub const AV_PIX_FMT_NV20LE: AVPixelFormat = 102;
+#[doc = "< interleaved chroma YUV 4:2:2, 20bpp, (1 Cr & Cb sample per 2x1 Y samples), big-endian"]
+pub const AV_PIX_FMT_NV20BE: AVPixelFormat = 103;
+#[doc = "< packed RGBA 16:16:16:16, 64bpp, 16R, 16G, 16B, 16A, the 2-byte value for each R/G/B/A component is stored as big-endian"]
+pub const AV_PIX_FMT_RGBA64BE: AVPixelFormat = 104;
+#[doc = "< packed RGBA 16:16:16:16, 64bpp, 16R, 16G, 16B, 16A, the 2-byte value for each R/G/B/A component is stored as little-endian"]
+pub const AV_PIX_FMT_RGBA64LE: AVPixelFormat = 105;
+#[doc = "< packed RGBA 16:16:16:16, 64bpp, 16B, 16G, 16R, 16A, the 2-byte value for each R/G/B/A component is stored as big-endian"]
+pub const AV_PIX_FMT_BGRA64BE: AVPixelFormat = 106;
+#[doc = "< packed RGBA 16:16:16:16, 64bpp, 16B, 16G, 16R, 16A, the 2-byte value for each R/G/B/A component is stored as little-endian"]
+pub const AV_PIX_FMT_BGRA64LE: AVPixelFormat = 107;
+#[doc = "< packed YUV 4:2:2, 16bpp, Y0 Cr Y1 Cb"]
+pub const AV_PIX_FMT_YVYU422: AVPixelFormat = 108;
+#[doc = "< 16 bits gray, 16 bits alpha (big-endian)"]
+pub const AV_PIX_FMT_YA16BE: AVPixelFormat = 109;
+#[doc = "< 16 bits gray, 16 bits alpha (little-endian)"]
+pub const AV_PIX_FMT_YA16LE: AVPixelFormat = 110;
+#[doc = "< planar GBRA 4:4:4:4 32bpp"]
+pub const AV_PIX_FMT_GBRAP: AVPixelFormat = 111;
+#[doc = "< planar GBRA 4:4:4:4 64bpp, big-endian"]
+pub const AV_PIX_FMT_GBRAP16BE: AVPixelFormat = 112;
+#[doc = "< planar GBRA 4:4:4:4 64bpp, little-endian"]
+pub const AV_PIX_FMT_GBRAP16LE: AVPixelFormat = 113;
+#[doc = " HW acceleration through QSV, data[3] contains a pointer to the\n mfxFrameSurface1 structure.\n\n Before FFmpeg 5.0:\n mfxFrameSurface1.Data.MemId contains a pointer when importing\n the following frames as QSV frames:\n\n VAAPI:\n mfxFrameSurface1.Data.MemId contains a pointer to VASurfaceID\n\n DXVA2:\n mfxFrameSurface1.Data.MemId contains a pointer to IDirect3DSurface9\n\n FFmpeg 5.0 and above:\n mfxFrameSurface1.Data.MemId contains a pointer to the mfxHDLPair\n structure when importing the following frames as QSV frames:\n\n VAAPI:\n mfxHDLPair.first contains a VASurfaceID pointer.\n mfxHDLPair.second is always MFX_INFINITE.\n\n DXVA2:\n mfxHDLPair.first contains IDirect3DSurface9 pointer.\n mfxHDLPair.second is always MFX_INFINITE.\n\n D3D11:\n mfxHDLPair.first contains a ID3D11Texture2D pointer.\n mfxHDLPair.second contains the texture array index of the frame if the\n ID3D11Texture2D is an array texture, or always MFX_INFINITE if it is a\n normal texture."]
+pub const AV_PIX_FMT_QSV: AVPixelFormat = 114;
+#[doc = " HW acceleration though MMAL, data[3] contains a pointer to the\n MMAL_BUFFER_HEADER_T structure."]
+pub const AV_PIX_FMT_MMAL: AVPixelFormat = 115;
+#[doc = "< HW decoding through Direct3D11 via old API, Picture.data[3] contains a ID3D11VideoDecoderOutputView pointer"]
+pub const AV_PIX_FMT_D3D11VA_VLD: AVPixelFormat = 116;
+#[doc = " HW acceleration through CUDA. data[i] contain CUdeviceptr pointers\n exactly as for system memory frames."]
+pub const AV_PIX_FMT_CUDA: AVPixelFormat = 117;
+#[doc = "< packed RGB 8:8:8, 32bpp, XRGBXRGB...   X=unused/undefined"]
+pub const AV_PIX_FMT_0RGB: AVPixelFormat = 118;
+#[doc = "< packed RGB 8:8:8, 32bpp, RGBXRGBX...   X=unused/undefined"]
+pub const AV_PIX_FMT_RGB0: AVPixelFormat = 119;
+#[doc = "< packed BGR 8:8:8, 32bpp, XBGRXBGR...   X=unused/undefined"]
+pub const AV_PIX_FMT_0BGR: AVPixelFormat = 120;
+#[doc = "< packed BGR 8:8:8, 32bpp, BGRXBGRX...   X=unused/undefined"]
+pub const AV_PIX_FMT_BGR0: AVPixelFormat = 121;
+#[doc = "< planar YUV 4:2:0,18bpp, (1 Cr & Cb sample per 2x2 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV420P12BE: AVPixelFormat = 122;
+#[doc = "< planar YUV 4:2:0,18bpp, (1 Cr & Cb sample per 2x2 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV420P12LE: AVPixelFormat = 123;
+#[doc = "< planar YUV 4:2:0,21bpp, (1 Cr & Cb sample per 2x2 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV420P14BE: AVPixelFormat = 124;
+#[doc = "< planar YUV 4:2:0,21bpp, (1 Cr & Cb sample per 2x2 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV420P14LE: AVPixelFormat = 125;
+#[doc = "< planar YUV 4:2:2,24bpp, (1 Cr & Cb sample per 2x1 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV422P12BE: AVPixelFormat = 126;
+#[doc = "< planar YUV 4:2:2,24bpp, (1 Cr & Cb sample per 2x1 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV422P12LE: AVPixelFormat = 127;
+#[doc = "< planar YUV 4:2:2,28bpp, (1 Cr & Cb sample per 2x1 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV422P14BE: AVPixelFormat = 128;
+#[doc = "< planar YUV 4:2:2,28bpp, (1 Cr & Cb sample per 2x1 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV422P14LE: AVPixelFormat = 129;
+#[doc = "< planar YUV 4:4:4,36bpp, (1 Cr & Cb sample per 1x1 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV444P12BE: AVPixelFormat = 130;
+#[doc = "< planar YUV 4:4:4,36bpp, (1 Cr & Cb sample per 1x1 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV444P12LE: AVPixelFormat = 131;
+#[doc = "< planar YUV 4:4:4,42bpp, (1 Cr & Cb sample per 1x1 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV444P14BE: AVPixelFormat = 132;
+#[doc = "< planar YUV 4:4:4,42bpp, (1 Cr & Cb sample per 1x1 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV444P14LE: AVPixelFormat = 133;
+#[doc = "< planar GBR 4:4:4 36bpp, big-endian"]
+pub const AV_PIX_FMT_GBRP12BE: AVPixelFormat = 134;
+#[doc = "< planar GBR 4:4:4 36bpp, little-endian"]
+pub const AV_PIX_FMT_GBRP12LE: AVPixelFormat = 135;
+#[doc = "< planar GBR 4:4:4 42bpp, big-endian"]
+pub const AV_PIX_FMT_GBRP14BE: AVPixelFormat = 136;
+#[doc = "< planar GBR 4:4:4 42bpp, little-endian"]
+pub const AV_PIX_FMT_GBRP14LE: AVPixelFormat = 137;
+#[doc = "< planar YUV 4:1:1, 12bpp, (1 Cr & Cb sample per 4x1 Y samples) full scale (JPEG), deprecated in favor of AV_PIX_FMT_YUV411P and setting color_range"]
+pub const AV_PIX_FMT_YUVJ411P: AVPixelFormat = 138;
+#[doc = "< bayer, BGBG..(odd line), GRGR..(even line), 8-bit samples"]
+pub const AV_PIX_FMT_BAYER_BGGR8: AVPixelFormat = 139;
+#[doc = "< bayer, RGRG..(odd line), GBGB..(even line), 8-bit samples"]
+pub const AV_PIX_FMT_BAYER_RGGB8: AVPixelFormat = 140;
+#[doc = "< bayer, GBGB..(odd line), RGRG..(even line), 8-bit samples"]
+pub const AV_PIX_FMT_BAYER_GBRG8: AVPixelFormat = 141;
+#[doc = "< bayer, GRGR..(odd line), BGBG..(even line), 8-bit samples"]
+pub const AV_PIX_FMT_BAYER_GRBG8: AVPixelFormat = 142;
+#[doc = "< bayer, BGBG..(odd line), GRGR..(even line), 16-bit samples, little-endian"]
+pub const AV_PIX_FMT_BAYER_BGGR16LE: AVPixelFormat = 143;
+#[doc = "< bayer, BGBG..(odd line), GRGR..(even line), 16-bit samples, big-endian"]
+pub const AV_PIX_FMT_BAYER_BGGR16BE: AVPixelFormat = 144;
+#[doc = "< bayer, RGRG..(odd line), GBGB..(even line), 16-bit samples, little-endian"]
+pub const AV_PIX_FMT_BAYER_RGGB16LE: AVPixelFormat = 145;
+#[doc = "< bayer, RGRG..(odd line), GBGB..(even line), 16-bit samples, big-endian"]
+pub const AV_PIX_FMT_BAYER_RGGB16BE: AVPixelFormat = 146;
+#[doc = "< bayer, GBGB..(odd line), RGRG..(even line), 16-bit samples, little-endian"]
+pub const AV_PIX_FMT_BAYER_GBRG16LE: AVPixelFormat = 147;
+#[doc = "< bayer, GBGB..(odd line), RGRG..(even line), 16-bit samples, big-endian"]
+pub const AV_PIX_FMT_BAYER_GBRG16BE: AVPixelFormat = 148;
+#[doc = "< bayer, GRGR..(odd line), BGBG..(even line), 16-bit samples, little-endian"]
+pub const AV_PIX_FMT_BAYER_GRBG16LE: AVPixelFormat = 149;
+#[doc = "< bayer, GRGR..(odd line), BGBG..(even line), 16-bit samples, big-endian"]
+pub const AV_PIX_FMT_BAYER_GRBG16BE: AVPixelFormat = 150;
+#[doc = "< planar YUV 4:4:0,20bpp, (1 Cr & Cb sample per 1x2 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV440P10LE: AVPixelFormat = 151;
+#[doc = "< planar YUV 4:4:0,20bpp, (1 Cr & Cb sample per 1x2 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV440P10BE: AVPixelFormat = 152;
+#[doc = "< planar YUV 4:4:0,24bpp, (1 Cr & Cb sample per 1x2 Y samples), little-endian"]
+pub const AV_PIX_FMT_YUV440P12LE: AVPixelFormat = 153;
+#[doc = "< planar YUV 4:4:0,24bpp, (1 Cr & Cb sample per 1x2 Y samples), big-endian"]
+pub const AV_PIX_FMT_YUV440P12BE: AVPixelFormat = 154;
+#[doc = "< packed AYUV 4:4:4,64bpp (1 Cr & Cb sample per 1x1 Y & A samples), little-endian"]
+pub const AV_PIX_FMT_AYUV64LE: AVPixelFormat = 155;
+#[doc = "< packed AYUV 4:4:4,64bpp (1 Cr & Cb sample per 1x1 Y & A samples), big-endian"]
+pub const AV_PIX_FMT_AYUV64BE: AVPixelFormat = 156;
+#[doc = "< hardware decoding through Videotoolbox"]
+pub const AV_PIX_FMT_VIDEOTOOLBOX: AVPixelFormat = 157;
+#[doc = "< like NV12, with 10bpp per component, data in the high bits, zeros in the low bits, little-endian"]
+pub const AV_PIX_FMT_P010LE: AVPixelFormat = 158;
+#[doc = "< like NV12, with 10bpp per component, data in the high bits, zeros in the low bits, big-endian"]
+pub const AV_PIX_FMT_P010BE: AVPixelFormat = 159;
+#[doc = "< planar GBR 4:4:4:4 48bpp, big-endian"]
+pub const AV_PIX_FMT_GBRAP12BE: AVPixelFormat = 160;
+#[doc = "< planar GBR 4:4:4:4 48bpp, little-endian"]
+pub const AV_PIX_FMT_GBRAP12LE: AVPixelFormat = 161;
+#[doc = "< planar GBR 4:4:4:4 40bpp, big-endian"]
+pub const AV_PIX_FMT_GBRAP10BE: AVPixelFormat = 162;
+#[doc = "< planar GBR 4:4:4:4 40bpp, little-endian"]
+pub const AV_PIX_FMT_GBRAP10LE: AVPixelFormat = 163;
+#[doc = "< hardware decoding through MediaCodec"]
+pub const AV_PIX_FMT_MEDIACODEC: AVPixelFormat = 164;
+#[doc = "<        Y        , 12bpp, big-endian"]
+pub const AV_PIX_FMT_GRAY12BE: AVPixelFormat = 165;
+#[doc = "<        Y        , 12bpp, little-endian"]
+pub const AV_PIX_FMT_GRAY12LE: AVPixelFormat = 166;
+#[doc = "<        Y        , 10bpp, big-endian"]
+pub const AV_PIX_FMT_GRAY10BE: AVPixelFormat = 167;
+#[doc = "<        Y        , 10bpp, little-endian"]
+pub const AV_PIX_FMT_GRAY10LE: AVPixelFormat = 168;
+#[doc = "< like NV12, with 16bpp per component, little-endian"]
+pub const AV_PIX_FMT_P016LE: AVPixelFormat = 169;
+#[doc = "< like NV12, with 16bpp per component, big-endian"]
+pub const AV_PIX_FMT_P016BE: AVPixelFormat = 170;
+#[doc = " Hardware surfaces for Direct3D11.\n\n This is preferred over the legacy AV_PIX_FMT_D3D11VA_VLD. The new D3D11\n hwaccel API and filtering support AV_PIX_FMT_D3D11 only.\n\n data[0] contains a ID3D11Texture2D pointer, and data[1] contains the\n texture array index of the frame as intptr_t if the ID3D11Texture2D is\n an array texture (or always 0 if it's a normal texture)."]
+pub const AV_PIX_FMT_D3D11: AVPixelFormat = 171;
+#[doc = "<        Y        , 9bpp, big-endian"]
+pub const AV_PIX_FMT_GRAY9BE: AVPixelFormat = 172;
+#[doc = "<        Y        , 9bpp, little-endian"]
+pub const AV_PIX_FMT_GRAY9LE: AVPixelFormat = 173;
+#[doc = "< IEEE-754 single precision planar GBR 4:4:4,     96bpp, big-endian"]
+pub const AV_PIX_FMT_GBRPF32BE: AVPixelFormat = 174;
+#[doc = "< IEEE-754 single precision planar GBR 4:4:4,     96bpp, little-endian"]
+pub const AV_PIX_FMT_GBRPF32LE: AVPixelFormat = 175;
+#[doc = "< IEEE-754 single precision planar GBRA 4:4:4:4, 128bpp, big-endian"]
+pub const AV_PIX_FMT_GBRAPF32BE: AVPixelFormat = 176;
+#[doc = "< IEEE-754 single precision planar GBRA 4:4:4:4, 128bpp, little-endian"]
+pub const AV_PIX_FMT_GBRAPF32LE: AVPixelFormat = 177;
+#[doc = " DRM-managed buffers exposed through PRIME buffer sharing.\n\n data[0] points to an AVDRMFrameDescriptor."]
+pub const AV_PIX_FMT_DRM_PRIME: AVPixelFormat = 178;
+#[doc = " Hardware surfaces for OpenCL.\n\n data[i] contain 2D image objects (typed in C as cl_mem, used\n in OpenCL as image2d_t) for each plane of the surface."]
+pub const AV_PIX_FMT_OPENCL: AVPixelFormat = 179;
+#[doc = "<        Y        , 14bpp, big-endian"]
+pub const AV_PIX_FMT_GRAY14BE: AVPixelFormat = 180;
+#[doc = "<        Y        , 14bpp, little-endian"]
+pub const AV_PIX_FMT_GRAY14LE: AVPixelFormat = 181;
+#[doc = "< IEEE-754 single precision Y, 32bpp, big-endian"]
+pub const AV_PIX_FMT_GRAYF32BE: AVPixelFormat = 182;
+#[doc = "< IEEE-754 single precision Y, 32bpp, little-endian"]
+pub const AV_PIX_FMT_GRAYF32LE: AVPixelFormat = 183;
+#[doc = "< planar YUV 4:2:2,24bpp, (1 Cr & Cb sample per 2x1 Y samples), 12b alpha, big-endian"]
+pub const AV_PIX_FMT_YUVA422P12BE: AVPixelFormat = 184;
+#[doc = "< planar YUV 4:2:2,24bpp, (1 Cr & Cb sample per 2x1 Y samples), 12b alpha, little-endian"]
+pub const AV_PIX_FMT_YUVA422P12LE: AVPixelFormat = 185;
+#[doc = "< planar YUV 4:4:4,36bpp, (1 Cr & Cb sample per 1x1 Y samples), 12b alpha, big-endian"]
+pub const AV_PIX_FMT_YUVA444P12BE: AVPixelFormat = 186;
+#[doc = "< planar YUV 4:4:4,36bpp, (1 Cr & Cb sample per 1x1 Y samples), 12b alpha, little-endian"]
+pub const AV_PIX_FMT_YUVA444P12LE: AVPixelFormat = 187;
+#[doc = "< planar YUV 4:4:4, 24bpp, 1 plane for Y and 1 plane for the UV components, which are interleaved (first byte U and the following byte V)"]
+pub const AV_PIX_FMT_NV24: AVPixelFormat = 188;
+#[doc = "< as above, but U and V bytes are swapped"]
+pub const AV_PIX_FMT_NV42: AVPixelFormat = 189;
+#[doc = " Vulkan hardware images.\n\n data[0] points to an AVVkFrame"]
+pub const AV_PIX_FMT_VULKAN: AVPixelFormat = 190;
+#[doc = "< packed YUV 4:2:2 like YUYV422, 20bpp, data in the high bits, big-endian"]
+pub const AV_PIX_FMT_Y210BE: AVPixelFormat = 191;
+#[doc = "< packed YUV 4:2:2 like YUYV422, 20bpp, data in the high bits, little-endian"]
+pub const AV_PIX_FMT_Y210LE: AVPixelFormat = 192;
+#[doc = "< packed RGB 10:10:10, 30bpp, (msb)2X 10R 10G 10B(lsb), little-endian, X=unused/undefined"]
+pub const AV_PIX_FMT_X2RGB10LE: AVPixelFormat = 193;
+#[doc = "< packed RGB 10:10:10, 30bpp, (msb)2X 10R 10G 10B(lsb), big-endian, X=unused/undefined"]
+pub const AV_PIX_FMT_X2RGB10BE: AVPixelFormat = 194;
+#[doc = "< packed BGR 10:10:10, 30bpp, (msb)2X 10B 10G 10R(lsb), little-endian, X=unused/undefined"]
+pub const AV_PIX_FMT_X2BGR10LE: AVPixelFormat = 195;
+#[doc = "< packed BGR 10:10:10, 30bpp, (msb)2X 10B 10G 10R(lsb), big-endian, X=unused/undefined"]
+pub const AV_PIX_FMT_X2BGR10BE: AVPixelFormat = 196;
+#[doc = "< interleaved chroma YUV 4:2:2, 20bpp, data in the high bits, big-endian"]
+pub const AV_PIX_FMT_P210BE: AVPixelFormat = 197;
+#[doc = "< interleaved chroma YUV 4:2:2, 20bpp, data in the high bits, little-endian"]
+pub const AV_PIX_FMT_P210LE: AVPixelFormat = 198;
+#[doc = "< interleaved chroma YUV 4:4:4, 30bpp, data in the high bits, big-endian"]
+pub const AV_PIX_FMT_P410BE: AVPixelFormat = 199;
+#[doc = "< interleaved chroma YUV 4:4:4, 30bpp, data in the high bits, little-endian"]
+pub const AV_PIX_FMT_P410LE: AVPixelFormat = 200;
+#[doc = "< interleaved chroma YUV 4:2:2, 32bpp, big-endian"]
+pub const AV_PIX_FMT_P216BE: AVPixelFormat = 201;
+#[doc = "< interleaved chroma YUV 4:2:2, 32bpp, little-endian"]
+pub const AV_PIX_FMT_P216LE: AVPixelFormat = 202;
+#[doc = "< interleaved chroma YUV 4:4:4, 48bpp, big-endian"]
+pub const AV_PIX_FMT_P416BE: AVPixelFormat = 203;
+#[doc = "< interleaved chroma YUV 4:4:4, 48bpp, little-endian"]
+pub const AV_PIX_FMT_P416LE: AVPixelFormat = 204;
+#[doc = "< packed VUYA 4:4:4:4, 32bpp (1 Cr & Cb sample per 1x1 Y & A samples), VUYAVUYA..."]
+pub const AV_PIX_FMT_VUYA: AVPixelFormat = 205;
+#[doc = "< IEEE-754 half precision packed RGBA 16:16:16:16, 64bpp, RGBARGBA..., big-endian"]
+pub const AV_PIX_FMT_RGBAF16BE: AVPixelFormat = 206;
+#[doc = "< IEEE-754 half precision packed RGBA 16:16:16:16, 64bpp, RGBARGBA..., little-endian"]
+pub const AV_PIX_FMT_RGBAF16LE: AVPixelFormat = 207;
+#[doc = "< packed VUYX 4:4:4:4, 32bpp, Variant of VUYA where alpha channel is left undefined"]
+pub const AV_PIX_FMT_VUYX: AVPixelFormat = 208;
+#[doc = "< like NV12, with 12bpp per component, data in the high bits, zeros in the low bits, little-endian"]
+pub const AV_PIX_FMT_P012LE: AVPixelFormat = 209;
+#[doc = "< like NV12, with 12bpp per component, data in the high bits, zeros in the low bits, big-endian"]
+pub const AV_PIX_FMT_P012BE: AVPixelFormat = 210;
+#[doc = "< packed YUV 4:2:2 like YUYV422, 24bpp, data in the high bits, zeros in the low bits, big-endian"]
+pub const AV_PIX_FMT_Y212BE: AVPixelFormat = 211;
+#[doc = "< packed YUV 4:2:2 like YUYV422, 24bpp, data in the high bits, zeros in the low bits, little-endian"]
+pub const AV_PIX_FMT_Y212LE: AVPixelFormat = 212;
+#[doc = "< packed XVYU 4:4:4, 32bpp, (msb)2X 10V 10Y 10U(lsb), big-endian, variant of Y410 where alpha channel is left undefined"]
+pub const AV_PIX_FMT_XV30BE: AVPixelFormat = 213;
+#[doc = "< packed XVYU 4:4:4, 32bpp, (msb)2X 10V 10Y 10U(lsb), little-endian, variant of Y410 where alpha channel is left undefined"]
+pub const AV_PIX_FMT_XV30LE: AVPixelFormat = 214;
+#[doc = "< packed XVYU 4:4:4, 48bpp, data in the high bits, zeros in the low bits, big-endian, variant of Y412 where alpha channel is left undefined"]
+pub const AV_PIX_FMT_XV36BE: AVPixelFormat = 215;
+#[doc = "< packed XVYU 4:4:4, 48bpp, data in the high bits, zeros in the low bits, little-endian, variant of Y412 where alpha channel is left undefined"]
+pub const AV_PIX_FMT_XV36LE: AVPixelFormat = 216;
+#[doc = "< IEEE-754 single precision packed RGB 32:32:32, 96bpp, RGBRGB..., big-endian"]
+pub const AV_PIX_FMT_RGBF32BE: AVPixelFormat = 217;
+#[doc = "< IEEE-754 single precision packed RGB 32:32:32, 96bpp, RGBRGB..., little-endian"]
+pub const AV_PIX_FMT_RGBF32LE: AVPixelFormat = 218;
+#[doc = "< IEEE-754 single precision packed RGBA 32:32:32:32, 128bpp, RGBARGBA..., big-endian"]
+pub const AV_PIX_FMT_RGBAF32BE: AVPixelFormat = 219;
+#[doc = "< IEEE-754 single precision packed RGBA 32:32:32:32, 128bpp, RGBARGBA..., little-endian"]
+pub const AV_PIX_FMT_RGBAF32LE: AVPixelFormat = 220;
+#[doc = "< interleaved chroma YUV 4:2:2, 24bpp, data in the high bits, big-endian"]
+pub const AV_PIX_FMT_P212BE: AVPixelFormat = 221;
+#[doc = "< interleaved chroma YUV 4:2:2, 24bpp, data in the high bits, little-endian"]
+pub const AV_PIX_FMT_P212LE: AVPixelFormat = 222;
+#[doc = "< interleaved chroma YUV 4:4:4, 36bpp, data in the high bits, big-endian"]
+pub const AV_PIX_FMT_P412BE: AVPixelFormat = 223;
+#[doc = "< interleaved chroma YUV 4:4:4, 36bpp, data in the high bits, little-endian"]
+pub const AV_PIX_FMT_P412LE: AVPixelFormat = 224;
+#[doc = "< planar GBR 4:4:4:4 56bpp, big-endian"]
+pub const AV_PIX_FMT_GBRAP14BE: AVPixelFormat = 225;
+#[doc = "< planar GBR 4:4:4:4 56bpp, little-endian"]
+pub const AV_PIX_FMT_GBRAP14LE: AVPixelFormat = 226;
+#[doc = " Hardware surfaces for Direct3D 12.\n\n data[0] points to an AVD3D12VAFrame"]
+pub const AV_PIX_FMT_D3D12: AVPixelFormat = 227;
+#[doc = "< packed AYUV 4:4:4:4, 32bpp (1 Cr & Cb sample per 1x1 Y & A samples), AYUVAYUV..."]
+pub const AV_PIX_FMT_AYUV: AVPixelFormat = 228;
+#[doc = "< packed UYVA 4:4:4:4, 32bpp (1 Cr & Cb sample per 1x1 Y & A samples), UYVAUYVA..."]
+pub const AV_PIX_FMT_UYVA: AVPixelFormat = 229;
+#[doc = "< packed VYU 4:4:4, 24bpp (1 Cr & Cb sample per 1x1 Y), VYUVYU..."]
+pub const AV_PIX_FMT_VYU444: AVPixelFormat = 230;
+#[doc = "< packed VYUX 4:4:4 like XV30, 32bpp, (msb)10V 10Y 10U 2X(lsb), big-endian"]
+pub const AV_PIX_FMT_V30XBE: AVPixelFormat = 231;
+#[doc = "< packed VYUX 4:4:4 like XV30, 32bpp, (msb)10V 10Y 10U 2X(lsb), little-endian"]
+pub const AV_PIX_FMT_V30XLE: AVPixelFormat = 232;
+#[doc = "< IEEE-754 half precision packed RGB 16:16:16, 48bpp, RGBRGB..., big-endian"]
+pub const AV_PIX_FMT_RGBF16BE: AVPixelFormat = 233;
+#[doc = "< IEEE-754 half precision packed RGB 16:16:16, 48bpp, RGBRGB..., little-endian"]
+pub const AV_PIX_FMT_RGBF16LE: AVPixelFormat = 234;
+#[doc = "< packed RGBA 32:32:32:32, 128bpp, RGBARGBA..., big-endian"]
+pub const AV_PIX_FMT_RGBA128BE: AVPixelFormat = 235;
+#[doc = "< packed RGBA 32:32:32:32, 128bpp, RGBARGBA..., little-endian"]
+pub const AV_PIX_FMT_RGBA128LE: AVPixelFormat = 236;
+#[doc = "< packed RGBA 32:32:32, 96bpp, RGBRGB..., big-endian"]
+pub const AV_PIX_FMT_RGB96BE: AVPixelFormat = 237;
+#[doc = "< packed RGBA 32:32:32, 96bpp, RGBRGB..., little-endian"]
+pub const AV_PIX_FMT_RGB96LE: AVPixelFormat = 238;
+#[doc = "< packed YUV 4:2:2 like YUYV422, 32bpp, big-endian"]
+pub const AV_PIX_FMT_Y216BE: AVPixelFormat = 239;
+#[doc = "< packed YUV 4:2:2 like YUYV422, 32bpp, little-endian"]
+pub const AV_PIX_FMT_Y216LE: AVPixelFormat = 240;
+#[doc = "< packed XVYU 4:4:4, 64bpp, big-endian, variant of Y416 where alpha channel is left undefined"]
+pub const AV_PIX_FMT_XV48BE: AVPixelFormat = 241;
+#[doc = "< packed XVYU 4:4:4, 64bpp, little-endian, variant of Y416 where alpha channel is left undefined"]
+pub const AV_PIX_FMT_XV48LE: AVPixelFormat = 242;
+#[doc = "< IEEE-754 half precision planer GBR 4:4:4, 48bpp, big-endian"]
+pub const AV_PIX_FMT_GBRPF16BE: AVPixelFormat = 243;
+#[doc = "< IEEE-754 half precision planer GBR 4:4:4, 48bpp, little-endian"]
+pub const AV_PIX_FMT_GBRPF16LE: AVPixelFormat = 244;
+#[doc = "< IEEE-754 half precision planar GBRA 4:4:4:4, 64bpp, big-endian"]
+pub const AV_PIX_FMT_GBRAPF16BE: AVPixelFormat = 245;
+#[doc = "< IEEE-754 half precision planar GBRA 4:4:4:4, 64bpp, little-endian"]
+pub const AV_PIX_FMT_GBRAPF16LE: AVPixelFormat = 246;
+#[doc = "< IEEE-754 half precision Y, 16bpp, big-endian"]
+pub const AV_PIX_FMT_GRAYF16BE: AVPixelFormat = 247;
+#[doc = "< IEEE-754 half precision Y, 16bpp, little-endian"]
+pub const AV_PIX_FMT_GRAYF16LE: AVPixelFormat = 248;
+#[doc = " HW acceleration through AMF. data[0] contain AMFSurface pointer"]
+pub const AV_PIX_FMT_AMF_SURFACE: AVPixelFormat = 249;
+#[doc = "<         Y        , 32bpp, big-endian"]
+pub const AV_PIX_FMT_GRAY32BE: AVPixelFormat = 250;
+#[doc = "<         Y        , 32bpp, little-endian"]
+pub const AV_PIX_FMT_GRAY32LE: AVPixelFormat = 251;
+#[doc = "< IEEE-754 single precision packed YA, 32 bits gray, 32 bits alpha, 64bpp, big-endian"]
+pub const AV_PIX_FMT_YAF32BE: AVPixelFormat = 252;
+#[doc = "< IEEE-754 single precision packed YA, 32 bits gray, 32 bits alpha, 64bpp, little-endian"]
+pub const AV_PIX_FMT_YAF32LE: AVPixelFormat = 253;
+#[doc = "< IEEE-754 half precision packed YA, 16 bits gray, 16 bits alpha, 32bpp, big-endian"]
+pub const AV_PIX_FMT_YAF16BE: AVPixelFormat = 254;
+#[doc = "< IEEE-754 half precision packed YA, 16 bits gray, 16 bits alpha, 32bpp, little-endian"]
+pub const AV_PIX_FMT_YAF16LE: AVPixelFormat = 255;
+#[doc = "< planar GBRA 4:4:4:4 128bpp, big-endian"]
+pub const AV_PIX_FMT_GBRAP32BE: AVPixelFormat = 256;
+#[doc = "< planar GBRA 4:4:4:4 128bpp, little-endian"]
+pub const AV_PIX_FMT_GBRAP32LE: AVPixelFormat = 257;
+#[doc = "< planar YUV 4:4:4, 30bpp, (1 Cr & Cb sample per 1x1 Y samples), lowest bits zero, big-endian"]
+pub const AV_PIX_FMT_YUV444P10MSBBE: AVPixelFormat = 258;
+#[doc = "< planar YUV 4:4:4, 30bpp, (1 Cr & Cb sample per 1x1 Y samples), lowest bits zero, little-endian"]
+pub const AV_PIX_FMT_YUV444P10MSBLE: AVPixelFormat = 259;
+#[doc = "< planar YUV 4:4:4, 30bpp, (1 Cr & Cb sample per 1x1 Y samples), lowest bits zero, big-endian"]
+pub const AV_PIX_FMT_YUV444P12MSBBE: AVPixelFormat = 260;
+#[doc = "< planar YUV 4:4:4, 30bpp, (1 Cr & Cb sample per 1x1 Y samples), lowest bits zero, little-endian"]
+pub const AV_PIX_FMT_YUV444P12MSBLE: AVPixelFormat = 261;
+#[doc = "< planar GBR 4:4:4 30bpp, lowest bits zero, big-endian"]
+pub const AV_PIX_FMT_GBRP10MSBBE: AVPixelFormat = 262;
+#[doc = "< planar GBR 4:4:4 30bpp, lowest bits zero, little-endian"]
+pub const AV_PIX_FMT_GBRP10MSBLE: AVPixelFormat = 263;
+#[doc = "< planar GBR 4:4:4 36bpp, lowest bits zero, big-endian"]
+pub const AV_PIX_FMT_GBRP12MSBBE: AVPixelFormat = 264;
+#[doc = "< planar GBR 4:4:4 36bpp, lowest bits zero, little-endian"]
+pub const AV_PIX_FMT_GBRP12MSBLE: AVPixelFormat = 265;
+pub const AV_PIX_FMT_OHCODEC: AVPixelFormat = 266;
+#[doc = "< number of pixel formats, DO NOT USE THIS if you want to link with shared libav* because the number of formats might differ between versions"]
+pub const AV_PIX_FMT_NB: AVPixelFormat = 267;
+#[doc = " Pixel format.\n\n @note\n AV_PIX_FMT_RGB32 is handled in an endian-specific manner. An RGBA\n color is put together as:\n  (A << 24) | (R << 16) | (G << 8) | B\n This is stored as BGRA on little-endian CPU architectures and ARGB on\n big-endian CPUs.\n\n @note\n If the resolution is not a multiple of the chroma subsampling factor\n then the chroma plane resolution must be rounded up.\n\n @par\n When the pixel format is palettized RGB32 (AV_PIX_FMT_PAL8), the palettized\n image data is stored in AVFrame.data[0]. The palette is transported in\n AVFrame.data[1], is 1024 bytes long (256 4-byte entries) and is\n formatted the same as in AV_PIX_FMT_RGB32 described above (i.e., it is\n also endian-specific). Note also that the individual RGB32 palette\n components stored in AVFrame.data[1] should be in the range 0..255.\n This is important as many custom PAL8 video codecs that were designed\n to run on the IBM VGA graphics adapter use 6-bit palette components.\n\n @par\n For all the 8 bits per pixel formats, an RGB32 palette is in data[1] like\n for pal8. This palette is filled in automatically by the function\n allocating the picture."]
+pub type AVPixelFormat = ::std::os::raw::c_int;
 pub const AVCOL_PRI_RESERVED0: AVColorPrimaries = 0;
 #[doc = "< also ITU-R BT1361 / IEC 61966-2-4 / SMPTE RP 177 Annex B"]
 pub const AVCOL_PRI_BT709: AVColorPrimaries = 1;
@@ -1214,6 +1775,14 @@ pub struct AVCodecParameters {
     pub seek_preroll: ::std::os::raw::c_int,
 }
 unsafe extern "C" {
+    #[doc = " Allocate a new AVCodecParameters and set its fields to default values\n (unknown/invalid/0). The returned struct must be freed with\n avcodec_parameters_free()."]
+    pub fn avcodec_parameters_alloc() -> *mut AVCodecParameters;
+}
+unsafe extern "C" {
+    #[doc = " Free an AVCodecParameters instance and everything associated with it and\n write NULL to the supplied pointer."]
+    pub fn avcodec_parameters_free(par: *mut *mut AVCodecParameters);
+}
+unsafe extern "C" {
     #[doc = " Copy the contents of src to dst. Any allocated fields in dst are freed and\n replaced with newly allocated duplicates of the corresponding fields in src.\n\n @return >= 0 on success, a negative AVERROR code on failure."]
     pub fn avcodec_parameters_copy(
         dst: *mut AVCodecParameters,
@@ -1258,12 +1827,177 @@ unsafe extern "C" {
     #[doc = " Close the resource accessed by the AVIOContext *s, free it\n and set the pointer pointing to it to NULL.\n This function can only be used if s was opened by avio_open().\n\n The internal buffer is automatically flushed before closing the\n resource.\n\n @return 0 on success, an AVERROR < 0 on error.\n @see avio_close"]
     pub fn avio_closep(s: *mut *mut AVIOContext) -> ::std::os::raw::c_int;
 }
+#[doc = " The data is the AVPanScan struct defined in libavcodec."]
+pub const AV_FRAME_DATA_PANSCAN: AVFrameSideDataType = 0;
+#[doc = " ATSC A53 Part 4 Closed Captions.\n A53 CC bitstream is stored as uint8_t in AVFrameSideData.data.\n The number of bytes of CC data is AVFrameSideData.size."]
+pub const AV_FRAME_DATA_A53_CC: AVFrameSideDataType = 1;
+#[doc = " Stereoscopic 3d metadata.\n The data is the AVStereo3D struct defined in libavutil/stereo3d.h."]
+pub const AV_FRAME_DATA_STEREO3D: AVFrameSideDataType = 2;
+#[doc = " The data is the AVMatrixEncoding enum defined in libavutil/channel_layout.h."]
+pub const AV_FRAME_DATA_MATRIXENCODING: AVFrameSideDataType = 3;
+#[doc = " Metadata relevant to a downmix procedure.\n The data is the AVDownmixInfo struct defined in libavutil/downmix_info.h."]
+pub const AV_FRAME_DATA_DOWNMIX_INFO: AVFrameSideDataType = 4;
+#[doc = " ReplayGain information in the form of the AVReplayGain struct."]
+pub const AV_FRAME_DATA_REPLAYGAIN: AVFrameSideDataType = 5;
+#[doc = " This side data contains a 3x3 transformation matrix describing an affine\n transformation that needs to be applied to the frame for correct\n presentation.\n\n See libavutil/display.h for a detailed description of the data."]
+pub const AV_FRAME_DATA_DISPLAYMATRIX: AVFrameSideDataType = 6;
+#[doc = " Active Format Description data consisting of a single byte as specified\n in ETSI TS 101 154 using AVActiveFormatDescription enum."]
+pub const AV_FRAME_DATA_AFD: AVFrameSideDataType = 7;
+#[doc = " Motion vectors exported by some codecs (on demand through the export_mvs\n flag set in the libavcodec AVCodecContext flags2 option).\n The data is the AVMotionVector struct defined in\n libavutil/motion_vector.h."]
+pub const AV_FRAME_DATA_MOTION_VECTORS: AVFrameSideDataType = 8;
+#[doc = " Recommends skipping the specified number of samples. This is exported\n only if the \"skip_manual\" AVOption is set in libavcodec.\n This has the same format as AV_PKT_DATA_SKIP_SAMPLES.\n @code\n u32le number of samples to skip from start of this packet\n u32le number of samples to skip from end of this packet\n u8    reason for start skip\n u8    reason for end   skip (0=padding silence, 1=convergence)\n @endcode"]
+pub const AV_FRAME_DATA_SKIP_SAMPLES: AVFrameSideDataType = 9;
+#[doc = " This side data must be associated with an audio frame and corresponds to\n enum AVAudioServiceType defined in avcodec.h."]
+pub const AV_FRAME_DATA_AUDIO_SERVICE_TYPE: AVFrameSideDataType = 10;
+#[doc = " Mastering display metadata associated with a video frame. The payload is\n an AVMasteringDisplayMetadata type and contains information about the\n mastering display color volume."]
+pub const AV_FRAME_DATA_MASTERING_DISPLAY_METADATA: AVFrameSideDataType = 11;
+#[doc = " The GOP timecode in 25 bit timecode format. Data format is 64-bit integer.\n This is set on the first frame of a GOP that has a temporal reference of 0."]
+pub const AV_FRAME_DATA_GOP_TIMECODE: AVFrameSideDataType = 12;
+#[doc = " The data represents the AVSphericalMapping structure defined in\n libavutil/spherical.h."]
+pub const AV_FRAME_DATA_SPHERICAL: AVFrameSideDataType = 13;
+#[doc = " Content light level (based on CTA-861.3). This payload contains data in\n the form of the AVContentLightMetadata struct."]
+pub const AV_FRAME_DATA_CONTENT_LIGHT_LEVEL: AVFrameSideDataType = 14;
+#[doc = " The data contains an ICC profile as an opaque octet buffer following the\n format described by ISO 15076-1 with an optional name defined in the\n metadata key entry \"name\"."]
+pub const AV_FRAME_DATA_ICC_PROFILE: AVFrameSideDataType = 15;
+#[doc = " Timecode which conforms to SMPTE ST 12-1. The data is an array of 4 uint32_t\n where the first uint32_t describes how many (1-3) of the other timecodes are used.\n The timecode format is described in the documentation of av_timecode_get_smpte_from_framenum()\n function in libavutil/timecode.h."]
+pub const AV_FRAME_DATA_S12M_TIMECODE: AVFrameSideDataType = 16;
+#[doc = " HDR dynamic metadata associated with a video frame. The payload is\n an AVDynamicHDRPlus type and contains information for color\n volume transform - application 4 of SMPTE 2094-40:2016 standard."]
+pub const AV_FRAME_DATA_DYNAMIC_HDR_PLUS: AVFrameSideDataType = 17;
+#[doc = " Regions Of Interest, the data is an array of AVRegionOfInterest type, the number of\n array element is implied by AVFrameSideData.size / AVRegionOfInterest.self_size."]
+pub const AV_FRAME_DATA_REGIONS_OF_INTEREST: AVFrameSideDataType = 18;
+#[doc = " Encoding parameters for a video frame, as described by AVVideoEncParams."]
+pub const AV_FRAME_DATA_VIDEO_ENC_PARAMS: AVFrameSideDataType = 19;
+#[doc = " User data unregistered metadata associated with a video frame.\n This is the H.26[45] UDU SEI message, and shouldn't be used for any other purpose\n The data is stored as uint8_t in AVFrameSideData.data which is 16 bytes of\n uuid_iso_iec_11578 followed by AVFrameSideData.size - 16 bytes of user_data_payload_byte."]
+pub const AV_FRAME_DATA_SEI_UNREGISTERED: AVFrameSideDataType = 20;
+#[doc = " Film grain parameters for a frame, described by AVFilmGrainParams.\n Must be present for every frame which should have film grain applied.\n\n May be present multiple times, for example when there are multiple\n alternative parameter sets for different video signal characteristics.\n The user should select the most appropriate set for the application."]
+pub const AV_FRAME_DATA_FILM_GRAIN_PARAMS: AVFrameSideDataType = 21;
+#[doc = " Bounding boxes for object detection and classification,\n as described by AVDetectionBBoxHeader."]
+pub const AV_FRAME_DATA_DETECTION_BBOXES: AVFrameSideDataType = 22;
+#[doc = " Dolby Vision RPU raw data, suitable for passing to x265\n or other libraries. Array of uint8_t, with NAL emulation\n bytes intact."]
+pub const AV_FRAME_DATA_DOVI_RPU_BUFFER: AVFrameSideDataType = 23;
+#[doc = " Parsed Dolby Vision metadata, suitable for passing to a software\n implementation. The payload is the AVDOVIMetadata struct defined in\n libavutil/dovi_meta.h."]
+pub const AV_FRAME_DATA_DOVI_METADATA: AVFrameSideDataType = 24;
+#[doc = " HDR Vivid dynamic metadata associated with a video frame. The payload is\n an AVDynamicHDRVivid type and contains information for color\n volume transform - CUVA 005.1-2021."]
+pub const AV_FRAME_DATA_DYNAMIC_HDR_VIVID: AVFrameSideDataType = 25;
+#[doc = " Ambient viewing environment metadata, as defined by H.274."]
+pub const AV_FRAME_DATA_AMBIENT_VIEWING_ENVIRONMENT: AVFrameSideDataType = 26;
+#[doc = " Provide encoder-specific hinting information about changed/unchanged\n portions of a frame.  It can be used to pass information about which\n macroblocks can be skipped because they didn't change from the\n corresponding ones in the previous frame. This could be useful for\n applications which know this information in advance to speed up\n encoding."]
+pub const AV_FRAME_DATA_VIDEO_HINT: AVFrameSideDataType = 27;
+#[doc = " Raw LCEVC payload data, as a uint8_t array, with NAL emulation\n bytes intact."]
+pub const AV_FRAME_DATA_LCEVC: AVFrameSideDataType = 28;
+#[doc = " This side data must be associated with a video frame.\n The presence of this side data indicates that the video stream is\n composed of multiple views (e.g. stereoscopic 3D content,\n cf. H.264 Annex H or H.265 Annex G).\n The data is an int storing the view ID."]
+pub const AV_FRAME_DATA_VIEW_ID: AVFrameSideDataType = 29;
+#[doc = " This side data contains information about the reference display width(s)\n and reference viewing distance(s) as well as information about the\n corresponding reference stereo pair(s), i.e., the pair(s) of views to be\n displayed for the viewer's left and right eyes on the reference display\n at the reference viewing distance.\n The payload is the AV3DReferenceDisplaysInfo struct defined in\n libavutil/tdrdi.h."]
+pub const AV_FRAME_DATA_3D_REFERENCE_DISPLAYS: AVFrameSideDataType = 30;
+#[doc = " @defgroup lavu_frame AVFrame\n @ingroup lavu_data\n\n @{\n AVFrame is an abstraction for reference-counted raw multimedia data."]
+pub type AVFrameSideDataType = ::std::os::raw::c_uint;
+#[doc = " Structure to hold side data for an AVFrame.\n\n sizeof(AVFrameSideData) is not a part of the public ABI, so new fields may be added\n to the end with a minor bump."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct AVFrameSideData {
+    pub type_: AVFrameSideDataType,
+    pub data: *mut u8,
+    pub size: usize,
+    pub metadata: *mut AVDictionary,
+    pub buf: *mut AVBufferRef,
+}
+#[doc = " This structure describes decoded (raw) audio or video data.\n\n AVFrame must be allocated using av_frame_alloc(). Note that this only\n allocates the AVFrame itself, the buffers for the data must be managed\n through other means (see below).\n AVFrame must be freed with av_frame_free().\n\n AVFrame is typically allocated once and then reused multiple times to hold\n different data (e.g. a single AVFrame to hold frames received from a\n decoder). In such a case, av_frame_unref() will free any references held by\n the frame and reset it to its original clean state before it\n is reused again.\n\n The data described by an AVFrame is usually reference counted through the\n AVBuffer API. The underlying buffer references are stored in AVFrame.buf /\n AVFrame.extended_buf. An AVFrame is considered to be reference counted if at\n least one reference is set, i.e. if AVFrame.buf[0] != NULL. In such a case,\n every single data plane must be contained in one of the buffers in\n AVFrame.buf or AVFrame.extended_buf.\n There may be a single buffer for all the data, or one separate buffer for\n each plane, or anything in between.\n\n sizeof(AVFrame) is not a part of the public ABI, so new fields may be added\n to the end with a minor bump.\n\n Fields can be accessed through AVOptions, the name string used, matches the\n C structure field name for fields accessible through AVOptions."]
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct AVFrame {
+    #[doc = " pointer to the picture/channel planes.\n This might be different from the first allocated byte. For video,\n it could even point to the end of the image data.\n\n All pointers in data and extended_data must point into one of the\n AVBufferRef in buf or extended_buf.\n\n Some decoders access areas outside 0,0 - width,height, please\n see avcodec_align_dimensions2(). Some filters and swscale can read\n up to 16 bytes beyond the planes, if these filters are to be used,\n then 16 extra bytes must be allocated.\n\n NOTE: Pointers not needed by the format MUST be set to NULL.\n\n @attention In case of video, the data[] pointers can point to the\n end of image data in order to reverse line order, when used in\n combination with negative values in the linesize[] array."]
+    pub data: [*mut u8; 8usize],
+    #[doc = " For video, a positive or negative value, which is typically indicating\n the size in bytes of each picture line, but it can also be:\n - the negative byte size of lines for vertical flipping\n   (with data[n] pointing to the end of the data\n - a positive or negative multiple of the byte size as for accessing\n   even and odd fields of a frame (possibly flipped)\n\n For audio, only linesize[0] may be set. For planar audio, each channel\n plane must be the same size.\n\n For video the linesizes should be multiples of the CPUs alignment\n preference, this is 16 or 32 for modern desktop CPUs.\n Some code requires such alignment other code can be slower without\n correct alignment, for yet other it makes no difference.\n\n @note The linesize may be larger than the size of usable data -- there\n may be extra padding present for performance reasons.\n\n @attention In case of video, line size values can be negative to achieve\n a vertically inverted iteration over image lines."]
+    pub linesize: [::std::os::raw::c_int; 8usize],
+    #[doc = " pointers to the data planes/channels.\n\n For video, this should simply point to data[].\n\n For planar audio, each channel has a separate data pointer, and\n linesize[0] contains the size of each channel buffer.\n For packed audio, there is just one data pointer, and linesize[0]\n contains the total size of the buffer for all channels.\n\n Note: Both data and extended_data should always be set in a valid frame,\n but for planar audio with more channels that can fit in data,\n extended_data must be used in order to access all channels."]
+    pub extended_data: *mut *mut u8,
+    #[doc = " @name Video dimensions\n Video frames only. The coded dimensions (in pixels) of the video frame,\n i.e. the size of the rectangle that contains some well-defined values.\n\n @note The part of the frame intended for display/presentation is further\n restricted by the @ref cropping \"Cropping rectangle\".\n @{"]
+    pub width: ::std::os::raw::c_int,
+    #[doc = " @name Video dimensions\n Video frames only. The coded dimensions (in pixels) of the video frame,\n i.e. the size of the rectangle that contains some well-defined values.\n\n @note The part of the frame intended for display/presentation is further\n restricted by the @ref cropping \"Cropping rectangle\".\n @{"]
+    pub height: ::std::os::raw::c_int,
+    #[doc = " number of audio samples (per channel) described by this frame"]
+    pub nb_samples: ::std::os::raw::c_int,
+    #[doc = " format of the frame, -1 if unknown or unset\n Values correspond to enum AVPixelFormat for video frames,\n enum AVSampleFormat for audio)"]
+    pub format: ::std::os::raw::c_int,
+    #[doc = " Picture type of the frame."]
+    pub pict_type: AVPictureType,
+    #[doc = " Sample aspect ratio for the video frame, 0/1 if unknown/unspecified."]
+    pub sample_aspect_ratio: AVRational,
+    #[doc = " Presentation timestamp in time_base units (time when frame should be shown to user)."]
+    pub pts: i64,
+    #[doc = " DTS copied from the AVPacket that triggered returning this frame. (if frame threading isn't used)\n This is also the Presentation time of this AVFrame calculated from\n only AVPacket.dts values without pts values."]
+    pub pkt_dts: i64,
+    #[doc = " Time base for the timestamps in this frame.\n In the future, this field may be set on frames output by decoders or\n filters, but its value will be by default ignored on input to encoders\n or filters."]
+    pub time_base: AVRational,
+    #[doc = " quality (between 1 (good) and FF_LAMBDA_MAX (bad))"]
+    pub quality: ::std::os::raw::c_int,
+    #[doc = " Frame owner's private data.\n\n This field may be set by the code that allocates/owns the frame data.\n It is then not touched by any library functions, except:\n - it is copied to other references by av_frame_copy_props() (and hence by\n   av_frame_ref());\n - it is set to NULL when the frame is cleared by av_frame_unref()\n - on the caller's explicit request. E.g. libavcodec encoders/decoders\n   will copy this field to/from @ref AVPacket \"AVPackets\" if the caller sets\n   @ref AV_CODEC_FLAG_COPY_OPAQUE.\n\n @see opaque_ref the reference-counted analogue"]
+    pub opaque: *mut ::std::os::raw::c_void,
+    #[doc = " Number of fields in this frame which should be repeated, i.e. the total\n duration of this frame should be repeat_pict + 2 normal field durations.\n\n For interlaced frames this field may be set to 1, which signals that this\n frame should be presented as 3 fields: beginning with the first field (as\n determined by AV_FRAME_FLAG_TOP_FIELD_FIRST being set or not), followed\n by the second field, and then the first field again.\n\n For progressive frames this field may be set to a multiple of 2, which\n signals that this frame's duration should be (repeat_pict + 2) / 2\n normal frame durations.\n\n @note This field is computed from MPEG2 repeat_first_field flag and its\n associated flags, H.264 pic_struct from picture timing SEI, and\n their analogues in other codecs. Typically it should only be used when\n higher-layer timing information is not available."]
+    pub repeat_pict: ::std::os::raw::c_int,
+    #[doc = " Sample rate of the audio data."]
+    pub sample_rate: ::std::os::raw::c_int,
+    #[doc = " AVBuffer references backing the data for this frame. All the pointers in\n data and extended_data must point inside one of the buffers in buf or\n extended_buf. This array must be filled contiguously -- if buf[i] is\n non-NULL then buf[j] must also be non-NULL for all j < i.\n\n There may be at most one AVBuffer per data plane, so for video this array\n always contains all the references. For planar audio with more than\n AV_NUM_DATA_POINTERS channels, there may be more buffers than can fit in\n this array. Then the extra AVBufferRef pointers are stored in the\n extended_buf array."]
+    pub buf: [*mut AVBufferRef; 8usize],
+    #[doc = " For planar audio which requires more than AV_NUM_DATA_POINTERS\n AVBufferRef pointers, this array will hold all the references which\n cannot fit into AVFrame.buf.\n\n Note that this is different from AVFrame.extended_data, which always\n contains all the pointers. This array only contains the extra pointers,\n which cannot fit into AVFrame.buf.\n\n This array is always allocated using av_malloc() by whoever constructs\n the frame. It is freed in av_frame_unref()."]
+    pub extended_buf: *mut *mut AVBufferRef,
+    #[doc = " Number of elements in extended_buf."]
+    pub nb_extended_buf: ::std::os::raw::c_int,
+    pub side_data: *mut *mut AVFrameSideData,
+    pub nb_side_data: ::std::os::raw::c_int,
+    #[doc = " Frame flags, a combination of @ref lavu_frame_flags"]
+    pub flags: ::std::os::raw::c_int,
+    #[doc = " MPEG vs JPEG YUV range.\n - encoding: Set by user\n - decoding: Set by libavcodec"]
+    pub color_range: AVColorRange,
+    pub color_primaries: AVColorPrimaries,
+    pub color_trc: AVColorTransferCharacteristic,
+    #[doc = " YUV colorspace type.\n - encoding: Set by user\n - decoding: Set by libavcodec"]
+    pub colorspace: AVColorSpace,
+    pub chroma_location: AVChromaLocation,
+    #[doc = " frame timestamp estimated using various heuristics, in stream time base\n - encoding: unused\n - decoding: set by libavcodec, read by user."]
+    pub best_effort_timestamp: i64,
+    #[doc = " metadata.\n - encoding: Set by user.\n - decoding: Set by libavcodec."]
+    pub metadata: *mut AVDictionary,
+    #[doc = " decode error flags of the frame, set to a combination of\n FF_DECODE_ERROR_xxx flags if the decoder produced a frame, but there\n were errors during the decoding.\n - encoding: unused\n - decoding: set by libavcodec, read by user."]
+    pub decode_error_flags: ::std::os::raw::c_int,
+    #[doc = " For hwaccel-format frames, this should be a reference to the\n AVHWFramesContext describing the frame."]
+    pub hw_frames_ctx: *mut AVBufferRef,
+    #[doc = " Frame owner's private data.\n\n This field may be set by the code that allocates/owns the frame data.\n It is then not touched by any library functions, except:\n - a new reference to the underlying buffer is propagated by\n   av_frame_copy_props() (and hence by av_frame_ref());\n - it is unreferenced in av_frame_unref();\n - on the caller's explicit request. E.g. libavcodec encoders/decoders\n   will propagate a new reference to/from @ref AVPacket \"AVPackets\" if the\n   caller sets @ref AV_CODEC_FLAG_COPY_OPAQUE.\n\n @see opaque the plain pointer analogue"]
+    pub opaque_ref: *mut AVBufferRef,
+    #[doc = " @anchor cropping\n @name Cropping\n Video frames only. The number of pixels to discard from the the\n top/bottom/left/right border of the frame to obtain the sub-rectangle of\n the frame intended for presentation.\n @{"]
+    pub crop_top: usize,
+    pub crop_bottom: usize,
+    pub crop_left: usize,
+    pub crop_right: usize,
+    #[doc = " RefStruct reference for internal use by a single libav* library.\n Must not be used to transfer data between libraries.\n Has to be NULL when ownership of the frame leaves the respective library.\n\n Code outside the FFmpeg libs must never check or change private_ref."]
+    pub private_ref: *mut ::std::os::raw::c_void,
+    #[doc = " Channel layout of the audio data."]
+    pub ch_layout: AVChannelLayout,
+    #[doc = " Duration of the frame, in the same units as pts. 0 if unknown."]
+    pub duration: i64,
+}
+unsafe extern "C" {
+    #[doc = " Allocate an AVFrame and set its fields to default values.  The resulting\n struct must be freed using av_frame_free().\n\n @return An AVFrame filled with default values or NULL on failure.\n\n @note this only allocates the AVFrame itself, not the data buffers. Those\n must be allocated through other means, e.g. with av_frame_get_buffer() or\n manually."]
+    pub fn av_frame_alloc() -> *mut AVFrame;
+}
+unsafe extern "C" {
+    #[doc = " Free the frame and any dynamically allocated objects in it,\n e.g. extended_data. If the frame is reference counted, it will be\n unreferenced first.\n\n @param frame frame to be freed. The pointer will be set to NULL."]
+    pub fn av_frame_free(frame: *mut *mut AVFrame);
+}
+unsafe extern "C" {
+    #[doc = " Unreference all the buffers referenced by frame and reset the frame fields."]
+    pub fn av_frame_unref(frame: *mut AVFrame);
+}
 #[doc = " AVCodec."]
 #[repr(C)]
 #[repr(align(8))]
 #[derive(Debug, Copy, Clone)]
 pub struct AVCodec {
     pub _bindgen_opaque_blob: [u64; 12usize],
+}
+unsafe extern "C" {
+    #[doc = " Find a registered decoder with a matching codec ID.\n\n @param id AVCodecID of the requested decoder\n @return A decoder if one was found, NULL otherwise."]
+    pub fn avcodec_find_decoder(id: AVCodecID) -> *const AVCodec;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1736,7 +2470,51 @@ unsafe extern "C" {
 }
 pub const NIAN_AV_NOPTS_VALUE: i64 = -9223372036854775808;
 pub const NIAN_AVERROR_EOF: ::std::os::raw::c_int = -541478725;
+pub const NIAN_AVERROR_EAGAIN: ::std::os::raw::c_int = -11;
+#[doc = " main external API structure.\n New fields can be added to the end with minor version bumps.\n Removal, reordering and changes to existing fields require a major\n version bump.\n You can use AVOptions (av_opt* / av_set/get*()) to access these fields from user\n applications.\n The name string for AVOptions options matches the associated command line\n parameter name and can be found in libavcodec/options_table.h\n The AVOption/command line parameter names differ in some cases from the C\n structure field names for historic reasons or brevity.\n sizeof(AVCodecContext) must not be used outside libav*."]
+#[repr(C)]
+#[repr(align(8))]
+pub struct AVCodecContext {
+    pub _bindgen_opaque_blob: [u64; 108usize],
+}
 unsafe extern "C" {
     #[doc = " Return the LIBAVCODEC_VERSION_INT constant."]
     pub fn avcodec_version() -> ::std::os::raw::c_uint;
+}
+unsafe extern "C" {
+    #[doc = " Allocate an AVCodecContext and set its fields to default values. The\n resulting struct should be freed with avcodec_free_context().\n\n @param codec if non-NULL, allocate private data and initialize defaults\n              for the given codec. It is illegal to then call avcodec_open2()\n              with a different codec.\n              If NULL, then the codec-specific defaults won't be initialized,\n              which may result in suboptimal default settings (this is\n              important mainly for encoders, e.g. libx264).\n\n @return An AVCodecContext filled with default values or NULL on failure."]
+    pub fn avcodec_alloc_context3(codec: *const AVCodec) -> *mut AVCodecContext;
+}
+unsafe extern "C" {
+    #[doc = " Free the codec context and everything associated with it and write NULL to\n the provided pointer."]
+    pub fn avcodec_free_context(avctx: *mut *mut AVCodecContext);
+}
+unsafe extern "C" {
+    #[doc = " Fill the codec context based on the values from the supplied codec\n parameters. Any allocated fields in codec that have a corresponding field in\n par are freed and replaced with duplicates of the corresponding field in par.\n Fields in codec that do not have a counterpart in par are not touched.\n\n @return >= 0 on success, a negative AVERROR code on failure."]
+    pub fn avcodec_parameters_to_context(
+        codec: *mut AVCodecContext,
+        par: *const AVCodecParameters,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    #[doc = " Initialize the AVCodecContext to use the given AVCodec. Prior to using this\n function the context has to be allocated with avcodec_alloc_context3().\n\n The functions avcodec_find_decoder_by_name(), avcodec_find_encoder_by_name(),\n avcodec_find_decoder() and avcodec_find_encoder() provide an easy way for\n retrieving a codec.\n\n Depending on the codec, you might need to set options in the codec context\n also for decoding (e.g. width, height, or the pixel or audio sample format in\n the case the information is not available in the bitstream, as when decoding\n raw audio or video).\n\n Options in the codec context can be set either by setting them in the options\n AVDictionary, or by setting the values in the context itself, directly or by\n using the av_opt_set() API before calling this function.\n\n Example:\n @code\n av_dict_set(&opts, \"b\", \"2.5M\", 0);\n codec = avcodec_find_decoder(AV_CODEC_ID_H264);\n if (!codec)\n     exit(1);\n\n context = avcodec_alloc_context3(codec);\n\n if (avcodec_open2(context, codec, opts) < 0)\n     exit(1);\n @endcode\n\n In the case AVCodecParameters are available (e.g. when demuxing a stream\n using libavformat, and accessing the AVStream contained in the demuxer), the\n codec parameters can be copied to the codec context using\n avcodec_parameters_to_context(), as in the following example:\n\n @code\n AVStream *stream = ...;\n context = avcodec_alloc_context3(codec);\n if (avcodec_parameters_to_context(context, stream->codecpar) < 0)\n     exit(1);\n if (avcodec_open2(context, codec, NULL) < 0)\n     exit(1);\n @endcode\n\n @note Always call this function before using decoding routines (such as\n @ref avcodec_receive_frame()).\n\n @param avctx The context to initialize.\n @param codec The codec to open this context for. If a non-NULL codec has been\n              previously passed to avcodec_alloc_context3() or\n              for this context, then this parameter MUST be either NULL or\n              equal to the previously passed codec.\n @param options A dictionary filled with AVCodecContext and codec-private\n                options, which are set on top of the options already set in\n                avctx, can be NULL. On return this object will be filled with\n                options that were not found in the avctx codec context.\n\n @return zero on success, a negative value on error\n @see avcodec_alloc_context3(), avcodec_find_decoder(), avcodec_find_encoder(),\n      av_dict_set(), av_opt_set(), av_opt_find(), avcodec_parameters_to_context()"]
+    pub fn avcodec_open2(
+        avctx: *mut AVCodecContext,
+        codec: *const AVCodec,
+        options: *mut *mut AVDictionary,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    #[doc = " Supply raw packet data as input to a decoder.\n\n Internally, this call will copy relevant AVCodecContext fields, which can\n influence decoding per-packet, and apply them when the packet is actually\n decoded. (For example AVCodecContext.skip_frame, which might direct the\n decoder to drop the frame contained by the packet sent with this function.)\n\n @warning The input buffer, avpkt->data must be AV_INPUT_BUFFER_PADDING_SIZE\n          larger than the actual read bytes because some optimized bitstream\n          readers read 32 or 64 bits at once and could read over the end.\n\n @note The AVCodecContext MUST have been opened with @ref avcodec_open2()\n       before packets may be fed to the decoder.\n\n @param avctx codec context\n @param[in] avpkt The input AVPacket. Usually, this will be a single video\n                  frame, or several complete audio frames.\n                  Ownership of the packet remains with the caller, and the\n                  decoder will not write to the packet. The decoder may create\n                  a reference to the packet data (or copy it if the packet is\n                  not reference-counted).\n                  Unlike with older APIs, the packet is always fully consumed,\n                  and if it contains multiple frames (e.g. some audio codecs),\n                  will require you to call avcodec_receive_frame() multiple\n                  times afterwards before you can send a new packet.\n                  It can be NULL (or an AVPacket with data set to NULL and\n                  size set to 0); in this case, it is considered a flush\n                  packet, which signals the end of the stream. Sending the\n                  first flush packet will return success. Subsequent ones are\n                  unnecessary and will return AVERROR_EOF. If the decoder\n                  still has frames buffered, it will return them after sending\n                  a flush packet.\n\n @retval 0                 success\n @retval AVERROR(EAGAIN)   input is not accepted in the current state - user\n                           must read output with avcodec_receive_frame() (once\n                           all output is read, the packet should be resent,\n                           and the call will not fail with EAGAIN).\n @retval AVERROR_EOF       the decoder has been flushed, and no new packets can be\n                           sent to it (also returned if more than 1 flush\n                           packet is sent)\n @retval AVERROR(EINVAL)   codec not opened, it is an encoder, or requires flush\n @retval AVERROR(ENOMEM)   failed to add packet to internal queue, or similar\n @retval \"another negative error code\" legitimate decoding errors"]
+    pub fn avcodec_send_packet(
+        avctx: *mut AVCodecContext,
+        avpkt: *const AVPacket,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    #[doc = " Return decoded output data from a decoder or encoder (when the\n @ref AV_CODEC_FLAG_RECON_FRAME flag is used).\n\n @param avctx codec context\n @param frame This will be set to a reference-counted video or audio\n              frame (depending on the decoder type) allocated by the\n              codec. Note that the function will always call\n              av_frame_unref(frame) before doing anything else.\n\n @retval 0                success, a frame was returned\n @retval AVERROR(EAGAIN)  output is not available in this state - user must\n                          try to send new input\n @retval AVERROR_EOF      the codec has been fully flushed, and there will be\n                          no more output frames\n @retval AVERROR(EINVAL)  codec not opened, or it is an encoder without the\n                          @ref AV_CODEC_FLAG_RECON_FRAME flag enabled\n @retval \"other negative error code\" legitimate decoding errors"]
+    pub fn avcodec_receive_frame(
+        avctx: *mut AVCodecContext,
+        frame: *mut AVFrame,
+    ) -> ::std::os::raw::c_int;
 }

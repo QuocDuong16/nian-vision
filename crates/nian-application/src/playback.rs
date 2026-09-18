@@ -146,6 +146,8 @@ pub struct PlaybackInspectDto {
 pub struct PlaybackOpenDto {
     pub session_id: String,
     pub url: String,
+    /// Session-bound audio endpoint for a G.711 PCM WAV sidecar, if present.
+    pub audio_url: Option<String>,
     pub recording: RecordingDto,
     pub inspect: PlaybackInspectDto,
     pub adjacent: AdjacentRecordingsDto,
@@ -579,6 +581,7 @@ impl PlaybackController {
         if !media_metadata.is_file() || media_metadata.file_type().is_symlink() {
             return Err(PlaybackError::MediaUnreadable);
         }
+        let audio_sidecar = playback_audio_sidecar_exists(&media_path, inspect.audio_available)?;
 
         let mut indexed = validated.indexed.clone();
         if let Some(duration_ms) = inspect.duration_ms {
@@ -630,6 +633,12 @@ impl PlaybackController {
         Ok(PlaybackOpenDto {
             session_id: token.clone(),
             url: format!("http://127.0.0.1:{}/playback/{token}", self.server.port),
+            audio_url: audio_sidecar.then(|| {
+                format!(
+                    "http://127.0.0.1:{}/playback/{token}/audio",
+                    self.server.port
+                )
+            }),
             recording: recording_dto(&indexed),
             inspect,
             adjacent,
@@ -689,6 +698,7 @@ impl PlaybackController {
         if !media_metadata.is_file() || media_metadata.file_type().is_symlink() {
             return Err(PlaybackError::MediaUnreadable);
         }
+        let audio_sidecar = playback_audio_sidecar_exists(&media_path, inspect.audio_available)?;
 
         let end_at = inspect.duration_ms.and_then(|duration_ms| {
             i64::try_from(duration_ms)
@@ -733,6 +743,12 @@ impl PlaybackController {
         Ok(PlaybackOpenDto {
             session_id: token.clone(),
             url: format!("http://127.0.0.1:{}/playback/{token}", self.server.port),
+            audio_url: audio_sidecar.then(|| {
+                format!(
+                    "http://127.0.0.1:{}/playback/{token}/audio",
+                    self.server.port
+                )
+            }),
             recording,
             inspect,
             adjacent: AdjacentRecordingsDto {
@@ -1095,6 +1111,28 @@ fn playback_source_is_stale(session: &PlaybackSession) -> bool {
     }
 }
 
+/// The session cache owns this fixed filename. Never derive it from URL input;
+/// reject missing, symlinked or invalid output before advertising an audio URL.
+fn playback_audio_sidecar_exists(
+    media_path: &Path,
+    audio_available: bool,
+) -> Result<bool, PlaybackError> {
+    let path = media_path.with_file_name("audio.wav");
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() >= 44
+                && audio_available =>
+        {
+            Ok(true)
+        }
+        Ok(_) => Err(PlaybackError::MediaUnreadable),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(PlaybackError::MediaUnreadable),
+    }
+}
+
 fn serve_request(
     mut stream: TcpStream,
     port: u16,
@@ -1112,8 +1150,12 @@ fn serve_request(
     if !host_allowed(request.header("host"), port) || !origin_allowed(request.header("origin")) {
         return write_empty(&mut stream, "403 Forbidden");
     }
-    let Some(token) = request.path.strip_prefix("/playback/") else {
+    let Some(path_token) = request.path.strip_prefix("/playback/") else {
         return write_empty(&mut stream, "404 Not Found");
+    };
+    let (token, audio_request) = match path_token.strip_suffix("/audio") {
+        Some(token) => (token, true),
+        None => (path_token, false),
     };
     if token.is_empty() || token.contains('/') || Uuid::parse_str(token).is_err() {
         return write_empty(&mut stream, "404 Not Found");
@@ -1141,8 +1183,19 @@ fn serve_request(
             }
             return write_empty(&mut stream, "410 Gone");
         }
+        let path = if audio_request {
+            if !matches!(
+                playback_audio_sidecar_exists(&session.media_path, true),
+                Ok(true)
+            ) {
+                return write_empty(&mut stream, "410 Gone");
+            }
+            session.media_path.with_file_name("audio.wav")
+        } else {
+            session.media_path.clone()
+        };
         session.last_activity = Instant::now();
-        let file = File::open(&session.media_path)?;
+        let file = File::open(path)?;
         let len = file.metadata()?.len();
         session.active_requests += 1;
         (file, len)
@@ -1179,8 +1232,13 @@ fn serve_request(
     } else {
         String::new()
     };
+    let content_type = if audio_request {
+        "audio/wav"
+    } else {
+        "video/mp4"
+    };
     let headers = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Length: {content_len}\r\n{content_range}{origin_header}Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nAccept-Ranges: bytes\r\nContent-Length: {content_len}\r\n{content_range}{origin_header}Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(headers.as_bytes())?;
     if request.method == "HEAD" || content_len == 0 {
@@ -1568,6 +1626,35 @@ mod tests {
                 width: Some(1920),
                 height: Some(1080),
                 audio_available: false,
+                container_compatibility: "fragmented_mp4".to_owned(),
+                seekable: true,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct SidecarBackend;
+
+    impl PlaybackBackend for SidecarBackend {
+        fn prepare(
+            &self,
+            _source_path: &Path,
+            output_path: &Path,
+        ) -> Result<PlaybackInspectDto, PlaybackError> {
+            std::fs::write(output_path, b"browser-video").map_err(|_| PlaybackError::Internal)?;
+            let mut wav = [0_u8; 48];
+            wav[..4].copy_from_slice(b"RIFF");
+            wav[8..12].copy_from_slice(b"WAVE");
+            wav[36..40].copy_from_slice(b"data");
+            wav[44..48].copy_from_slice(b"SND!");
+            std::fs::write(output_path.with_file_name("audio.wav"), wav)
+                .map_err(|_| PlaybackError::Internal)?;
+            Ok(PlaybackInspectDto {
+                duration_ms: Some(1_000),
+                video_codec: "hevc".to_owned(),
+                width: Some(160),
+                height: Some(120),
+                audio_available: true,
                 container_compatibility: "fragmented_mp4".to_owned(),
                 seekable: true,
             })
@@ -2145,6 +2232,60 @@ mod tests {
             &format!("GET /playback/{wrong} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
         );
         assert!(response_parts(&expired).0.starts_with("HTTP/1.1 410"));
+    }
+
+    #[test]
+    fn g711_audio_sidecar_is_session_scoped_range_served_and_revoked_on_close() {
+        let relative = "cam-a/2026/08/29/08-30-00.mkv";
+        let (temp, _) = controller_with_files(&[(relative, b"source")]);
+        let backend: Arc<dyn PlaybackBackend> = Arc::new(SidecarBackend);
+        let mut controller =
+            PlaybackController::with_backend(backend, temp.path().join("audio-playback-cache"))
+                .unwrap();
+        controller
+            .configure_storage(
+                Some(temp.path().join("recordings")),
+                RetentionPolicy::default(),
+                None,
+            )
+            .unwrap();
+        let opened = controller.open(relative).unwrap();
+        let token = opened.session_id;
+        let port = controller.server.port;
+        assert_eq!(
+            opened.audio_url.as_deref(),
+            Some(format!("http://127.0.0.1:{port}/playback/{token}/audio").as_str())
+        );
+        assert_eq!(opened.inspect.video_codec, "hevc");
+        let response = http(
+            port,
+            &format!(
+                "GET /playback/{token}/audio HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=44-47\r\n\r\n"
+            ),
+        );
+        let (headers, bytes) = response_parts(&response);
+        assert!(headers.starts_with("HTTP/1.1 206"));
+        assert!(headers.contains("Content-Type: audio/wav"));
+        assert!(headers.contains("Content-Range: bytes 44-47/48"));
+        assert_eq!(bytes, b"SND!");
+        let video = http(
+            port,
+            &format!("GET /playback/{token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+        );
+        assert_eq!(response_parts(&video).1, b"browser-video");
+        let traversal = http(
+            port,
+            &format!(
+                "GET /playback/{token}/audio/../media HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+            ),
+        );
+        assert!(response_parts(&traversal).0.starts_with("HTTP/1.1 404"));
+        controller.close(&token).unwrap();
+        let closed = http(
+            port,
+            &format!("GET /playback/{token}/audio HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+        );
+        assert!(response_parts(&closed).0.starts_with("HTTP/1.1 410"));
     }
 
     #[test]

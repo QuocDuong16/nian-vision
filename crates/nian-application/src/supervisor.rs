@@ -237,7 +237,7 @@ impl JobTerminal {
     /// * `Ok(Some(terminal))` — a terminal state with STABLE wire values;
     /// * `Err(TerminalParseError)` — the payload declared `finished: true`
     ///   but contradicts the canonical vocabulary: a protocol violation.
-    fn parse(status: &serde_json::Value) -> Result<Option<Self>, TerminalParseError> {
+    pub(crate) fn parse(status: &serde_json::Value) -> Result<Option<Self>, TerminalParseError> {
         let Some(finished) = status.get("finished") else {
             return Ok(None); // no finished flag: the running case
         };

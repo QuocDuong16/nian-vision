@@ -83,7 +83,7 @@ function quotePs(value) {
 }
 
 test("RC10 Windows FFmpeg uses one controlled MSYS environment and aggregate diagnostics", () => {
-  assert.equal(contract.buildContractVersion, 4);
+  assert.equal(contract.buildContractVersion, 5);
   assert.deepEqual(contract.msysBuildTools, expectedTools);
   for (const name of ["build", "preflight", "probe", "validator"]) {
     assert.match(source[name], /windows-ffmpeg-msys-environment\.ps1/);

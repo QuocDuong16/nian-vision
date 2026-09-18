@@ -11,8 +11,8 @@ const correctedFlags = [
   "--enable-protocol=file,tcp,rtp,udp",
   "--enable-demuxer=matroska,mov,rtsp",
   "--enable-muxer=matroska,mov,mp4",
-  "--enable-parser=h264,mpeg4video,mpegaudio,aac",
-  "--enable-decoder=mpeg4,aac",
+  "--enable-parser=h264,hevc,mpeg4video,mpegaudio,aac",
+  "--enable-decoder=h264,hevc,mpeg4,aac,pcm_alaw,pcm_mulaw",
 ];
 
 const resolvedComponentHeader = [
@@ -31,11 +31,16 @@ const resolvedComponentHeader = [
   "#define CONFIG_MOV_MUXER 1",
   "#define CONFIG_MP4_MUXER 1",
   "#define CONFIG_H264_PARSER 1",
+  "#define CONFIG_HEVC_PARSER 1",
   "#define CONFIG_MPEG4VIDEO_PARSER 1",
   "#define CONFIG_MPEGAUDIO_PARSER 1",
   "#define CONFIG_AAC_PARSER 1",
   "#define CONFIG_MPEG4_DECODER 1",
   "#define CONFIG_AAC_DECODER 1",
+  "#define CONFIG_H264_DECODER 1",
+  "#define CONFIG_HEVC_DECODER 1",
+  "#define CONFIG_PCM_ALAW_DECODER 1",
+  "#define CONFIG_PCM_MULAW_DECODER 1",
   "",
 ].join("\n");
 

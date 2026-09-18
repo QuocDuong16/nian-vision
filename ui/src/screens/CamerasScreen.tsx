@@ -13,6 +13,7 @@ import type {
   DesktopError,
   EventMutation,
   EventStatus,
+  LocalMotionPreference,
   OnvifConnection,
   OnvifDiscoveredDevice,
   OnvifDiscovery,
@@ -49,6 +50,9 @@ function blankCamera(): CameraFormState {
     host: "",
     port: 554,
     path: "/stream1",
+    sub_host: null,
+    sub_port: null,
+    sub_path: null,
     audio_policy: "copy_all",
     username: "",
     password: "",
@@ -66,12 +70,43 @@ function validateCamera(form: CameraFormState, creating: boolean): string | null
   if (!Number.isInteger(form.port) || form.port < 1 || form.port > 65535) return "RTSP port must be between 1 and 65535.";
   if (!form.path.startsWith("/") || /\s|@/.test(form.path)) return "RTSP path must start with / and contain no spaces or @.";
   if (form.path.length > 4096) return "RTSP path is too long.";
+  const subHost = form.sub_host?.trim() ?? "";
+  const subPath = form.sub_path?.trim() ?? "";
+  const subPort = form.sub_port ?? null;
+  const hasSubstream = Boolean(subHost || subPath || subPort !== null);
+  if (hasSubstream) {
+    if (!subHost || !subPath || subPort === null) return "Substream host, port and path must be supplied together.";
+    if (!Number.isInteger(subPort) || subPort < 1 || subPort > 65535) return "Substream RTSP port must be between 1 and 65535.";
+    if (!subPath.startsWith("/") || /\s|@/.test(subPath)) return "Substream path must start with / and contain no spaces or @.";
+    if (subPath.length > 4096) return "Substream path is too long.";
+  }
   if (form.username.length > 256) return "Username is too long.";
   if (form.password.length > 512) return "Password is too long.";
   if (creating && (!form.username.trim() || !form.password)) return "Username and password are required for a new camera.";
   if (form.password && !form.username.trim()) return "Username is required when replacing the password.";
   if (form.username.trim() && !form.password) return "Password is required when replacing the username.";
   return null;
+}
+
+function supportsOnvifAudioCopy(codec: string | null | undefined): boolean {
+  return codec != null && ["aac", "g711", "g.711", "pcma", "pcmu", "pcm_alaw", "pcm_mulaw"].includes(codec.trim().toLowerCase());
+}
+
+function localMotionRuntimeLabel(status: LocalMotionPreference | undefined, available: boolean): string {
+  if (!available) return "Runtime status unavailable";
+  if (!status) return "Waiting for main pre-roll / worker";
+  if (status.last_error_code === "motion_status_unavailable") return "Runtime status unavailable";
+  if (!status.runtime_state) return "Waiting for main pre-roll / worker";
+  if (status.runtime_state === "monitoring") {
+    const activity = status.motion_active === true ? "Motion detected" : status.motion_active === false ? "Idle" : "Initializing";
+    return `Monitoring · ${activity} · ${status.sampled_frames ?? 0} sampled frames`;
+  }
+  if (status.runtime_state === "backoff") return "Reconnecting to video stream";
+  if (status.last_error_code === "motion_unsupported_video") return "Unsupported stream: use 8-bit H.264/HEVC at 1080p or lower";
+  if (status.last_error_code === "motion_transition_capacity") return "Event backlog full; check event storage";
+  if (status.runtime_state === "failed") return "Detector failed; retry pending";
+  if (status.runtime_state === "connecting") return "Connecting to video stream";
+  return "Waiting for main pre-roll / detector";
 }
 
 function statusLabel(state: RecordingState): string {
@@ -133,8 +168,15 @@ export function CamerasScreen() {
   const [busyCamera, setBusyCamera] = useState<string | null>(null);
   const [ptzConfigured, setPtzConfigured] = useState<Map<string, boolean>>(() => new Map());
   const [eventStatuses, setEventStatuses] = useState<Map<string, EventStatus>>(() => new Map());
+  const [localMotionCameras, setLocalMotionCameras] = useState<Set<string> | null>(null);
+  const [localMotionRuntime, setLocalMotionRuntime] = useState<Map<string, LocalMotionPreference> | null>(null);
   const [ptzTarget, setPtzTarget] = useState<CameraSummary | null>(null);
   const [eventTarget, setEventTarget] = useState<CameraSummary | null>(null);
+  // Mutations invalidate pending reads; newer reads supersede older replies,
+  // including camera-load requests waiting for unrelated PTZ status.
+  const localMotionVersionRef = useRef(0);
+  const localMotionReadRef = useRef(0);
+  const localMotionMutationRef = useRef(false);
   const recordingBusyRef = useRef<Set<string>>(new Set());
   const [recordingBusyCameras, setRecordingBusyCameras] = useState<Set<string>>(() => new Set());
 
@@ -157,10 +199,13 @@ export function CamerasScreen() {
       setLoading(false);
       return;
     }
+    const version = localMotionVersionRef.current;
+    const read = ++localMotionReadRef.current;
     try {
-      const [rows, eventRows] = await Promise.all([
+      const [rows, eventRows, localMotionRows] = await Promise.all([
         invokeDesktop<CameraSummary[]>("camera_list"),
         invokeDesktop<EventStatus[]>("event_statuses").catch(() => []),
+        invokeDesktop<LocalMotionPreference[]>("local_motion_statuses").catch(() => null),
       ]);
       setCameras(rows);
       const configured = await Promise.all(
@@ -171,6 +216,10 @@ export function CamerasScreen() {
       );
       setPtzConfigured(new Map(configured));
       setEventStatuses(new Map(eventRows.map((status) => [status.camera_id, status])));
+      if (!localMotionMutationRef.current && version === localMotionVersionRef.current && read === localMotionReadRef.current) {
+        setLocalMotionCameras(localMotionRows === null ? null : new Set(localMotionRows.filter((row) => row.enabled).map((row) => row.camera_id)));
+        setLocalMotionRuntime(localMotionRows === null ? null : new Map(localMotionRows.map((row) => [row.camera_id, row])));
+      }
       setError(null);
     } catch (cause) {
       setError(desktopError(cause));
@@ -200,6 +249,38 @@ export function CamerasScreen() {
     const timer = window.setInterval(() => void refreshStatus(), 1_000);
     return () => window.clearInterval(timer);
   }, [loadCameras, refreshStatus]);
+
+  // Separate, bounded diagnostics cadence. Worker RPCs may be slow during
+  // reconnect: never overlap polls or confuse an RPC failure with Desired Off.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let inFlight = false;
+    const poll = async () => {
+      if (inFlight || localMotionMutationRef.current) return;
+      inFlight = true;
+      const version = localMotionVersionRef.current;
+      const read = ++localMotionReadRef.current;
+      try {
+        const rows = await invokeDesktop<LocalMotionPreference[]>("local_motion_statuses");
+        if (!disposed && !localMotionMutationRef.current && version === localMotionVersionRef.current && read === localMotionReadRef.current) {
+          setLocalMotionRuntime(new Map(rows.map((row) => [row.camera_id, row])));
+          setLocalMotionCameras(new Set(rows.filter((row) => row.enabled).map((row) => row.camera_id)));
+        }
+      } catch {
+        if (!disposed && !localMotionMutationRef.current && version === localMotionVersionRef.current && read === localMotionReadRef.current) {
+          setLocalMotionRuntime(null);
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+    const timer = window.setInterval(() => void poll(), 5_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -241,7 +322,7 @@ export function CamerasScreen() {
     [cameras],
   );
   const selectedOnvifProfile = onvifConnection?.profiles.find((profile) => profile.token === onvifProfileToken) ?? null;
-  const compatibleOnvifAudio = selectedOnvifProfile?.audio_codec?.toLowerCase() === "aac";
+  const compatibleOnvifAudio = supportsOnvifAudioCopy(selectedOnvifProfile?.audio_codec);
 
   function resetOnvifLocal() {
     setOnvifStep("idle");
@@ -432,7 +513,7 @@ export function CamerasScreen() {
         },
       });
       setOnvifPrepared(prepared);
-      setOnvifAudioPolicy(profile.audio_codec?.toLowerCase() === "aac" ? "copy_all" : "exclude");
+      setOnvifAudioPolicy(supportsOnvifAudioCopy(profile.audio_codec) ? "copy_all" : "exclude");
       setOnvifStep("ready");
     } catch (cause) {
       setError(desktopError(cause));
@@ -532,6 +613,38 @@ export function CamerasScreen() {
     } catch (cause) {
       setError(desktopError(cause));
     } finally {
+      setBusyCamera(null);
+    }
+  }
+
+  async function toggleLocalMotion(camera: CameraSummary) {
+    if (!isTauri() || busyCamera || localMotionCameras === null || localMotionMutationRef.current) return;
+    localMotionMutationRef.current = true;
+    localMotionVersionRef.current += 1;
+    localMotionReadRef.current += 1;
+    setBusyCamera(camera.camera_id);
+    setError(null);
+    try {
+      const enabled = !localMotionCameras.has(camera.camera_id);
+      const preference = await invokeDesktop<LocalMotionPreference>("local_motion_set", {
+        cameraId: camera.camera_id, enabled,
+      });
+      setLocalMotionCameras((current) => {
+        const next = new Set(current ?? []);
+        if (preference.enabled) next.add(preference.camera_id);
+        else next.delete(preference.camera_id);
+        return next;
+      });
+      setLocalMotionRuntime((current) => {
+        const next = new Map(current ?? []);
+        if (preference.enabled) next.set(preference.camera_id, preference);
+        else next.delete(preference.camera_id);
+        return next;
+      });
+    } catch (cause) {
+      setError(desktopError(cause));
+    } finally {
+      localMotionMutationRef.current = false;
       setBusyCamera(null);
     }
   }
@@ -735,6 +848,7 @@ export function CamerasScreen() {
             const desiredOffRuntimeActive = !desiredOn && ownActive;
             const rowBusy = recordingBusyCameras.has(camera.camera_id);
             const events = eventStatuses.get(camera.camera_id);
+            const localMotionOn = localMotionCameras?.has(camera.camera_id) ?? false;
             const failureLabel = recordingFailureLabel(runtime?.failure_category);
             const recordingControlDisabled = busyCamera !== null || rowBusy || state === "stopping" || desiredOffRuntimeActive;
             const recordingControlLabel = desiredOn
@@ -746,6 +860,9 @@ export function CamerasScreen() {
                   <div>
                     <h3>{camera.display_name}</h3>
                     <code>{camera.host}:{camera.port}{camera.path}</code>
+                    {camera.sub_host && camera.sub_port && camera.sub_path && (
+                      <small>Grid/motion · {camera.sub_host}:{camera.sub_port}{camera.sub_path}</small>
+                    )}
                   </div>
                   <span className={`chip chip-${state}`}>{statusLabel(state)}</span>
                 </div>
@@ -758,6 +875,7 @@ export function CamerasScreen() {
                   <div className={`camera-status-item ${events?.motion_active === true ? "is-motion-active" : ""}`}>
                     <span className="camera-status-label">Motion monitoring</span>
                     <strong>Motion Events: {events?.configured ? (events.desired ? "On" : "Off") : "Unpaired"}</strong>
+                    <small>Local scene motion: {localMotionCameras === null ? "Unavailable" : localMotionOn ? "On" : "Off"}</small>
                     <small>
                       {events?.configured ? events.state.replaceAll("_", " ") : "Pair ONVIF events"}
                       {events?.motion_active === true ? " · Motion detected" : ""}
@@ -823,11 +941,25 @@ export function CamerasScreen() {
                             className={events.desired ? "toggle-action-button is-on" : "toggle-action-button"}
                             aria-label={events.desired ? "Disable Events" : "Enable Events"}
                             onClick={() => void toggleEvents(camera)}
-                            disabled={busyCamera !== null || rowBusy || events.state === "stopping"}
+                            disabled={busyCamera !== null || rowBusy || events.state === "stopping" || (localMotionOn && !events.desired)}
                           >{events.desired ? "Turn off" : "Turn on"}</button>
                           <button className="quiet-button" aria-label="Unpair Motion Events" onClick={() => void unpairEvents(camera)} disabled={busyCamera !== null || rowBusy}>Remove</button>
                         </>
                       )}
+                    </div>
+                    <div className="integration-action-group">
+                      <span className="integration-label">
+                        <strong>Local scene motion</strong>
+                        <small>{localMotionCameras === null ? "Status unavailable" : localMotionOn ? "Desired on · substream preferred" : "Off · no ONVIF pairing needed"}</small>
+                        {localMotionOn && <small role="status">{localMotionRuntimeLabel(localMotionRuntime?.get(camera.camera_id), localMotionRuntime !== null)}</small>}
+                      </span>
+                      <button
+                        className={localMotionOn ? "toggle-action-button is-on" : "toggle-action-button"}
+                        aria-label={localMotionOn ? "Disable Local Motion" : "Enable Local Motion"}
+                        onClick={() => void toggleLocalMotion(camera)}
+                        disabled={busyCamera !== null || rowBusy || localMotionCameras === null || Boolean(events?.desired)}
+                        title={events?.desired ? "Disable ONVIF Events before enabling local motion" : undefined}
+                      >{localMotionOn ? "Turn off" : "Turn on"}</button>
                     </div>
                   </div>
 
@@ -973,8 +1105,11 @@ export function CamerasScreen() {
                         </div>
                         <span className="profile-spec">{profileSummary(profile)}</span>
                         <span className="profile-audio">Audio: {profile.audio_codec ?? "none / unknown"}</span>
+                        {profile.supported && profile.video_codec?.toUpperCase() === "H265" && (
+                          <p className="capability-note">H.265 recording copies the original video. Live View and playback require HEVC decoding support in the operating system and WebView.</p>
+                        )}
                         {!profile.supported && (
-                          <p className="capability-note"><strong>Recording unavailable for this profile.</strong> Nian Vision currently records H.264 video; this profile advertises {profile.video_codec ?? "an unsupported video codec"}.</p>
+                          <p className="capability-note"><strong>Recording unavailable for this profile.</strong> Nian Vision records H.264 and H.265 video; this profile advertises {profile.video_codec ?? "an unsupported video codec"}.</p>
                         )}
                       </div>
                       <button
@@ -996,7 +1131,14 @@ export function CamerasScreen() {
                 <p className="success-message" role="status">Stream verified. Review the camera details before adding it.</p>
                 <div className="onvif-review-summary">
                   <div><span>Stream endpoint</span><strong>{onvifPrepared.host}:{onvifPrepared.port}{onvifPrepared.path}</strong></div>
-                  <div><span>Selected profile</span><strong>{selectedOnvifProfile.name ?? selectedOnvifProfile.token}</strong><small>{profileSummary(selectedOnvifProfile)}</small></div>
+                  <div><span>Main profile</span><strong>{selectedOnvifProfile.name ?? selectedOnvifProfile.token}</strong><small>{profileSummary(selectedOnvifProfile)}</small></div>
+                  <div>
+                    <span>Grid / motion profile</span>
+                    <strong>{onvifPrepared.sub_profile_token ?? "Main profile fallback"}</strong>
+                    <small>{onvifPrepared.sub_host && onvifPrepared.sub_port && onvifPrepared.sub_path
+                      ? `${onvifPrepared.sub_host}:${onvifPrepared.sub_port}${onvifPrepared.sub_path}`
+                      : "Camera did not expose a lower H.264 profile; consumers will share main ingest."}</small>
+                  </div>
                 </div>
                 {onvifPrepared.host_mismatch && (
                   <p className="warning-message">The stream host differs from the ONVIF device-service host but is still a local address. Verify it before saving.</p>
@@ -1014,11 +1156,11 @@ export function CamerasScreen() {
                     ariaLabel="ONVIF audio policy"
                     value={onvifAudioPolicy}
                     onChange={(value) => setOnvifAudioPolicy(value as AudioPolicy)}
-                    options={[{ value: "exclude", label: "Video only", description: "Always available" }, { value: "copy_all", label: "Record AAC audio", description: compatibleOnvifAudio ? "Available for this profile" : "Camera profile is not AAC", disabled: !compatibleOnvifAudio }]}
+                    options={[{ value: "exclude", label: "Video only", description: "Always available" }, { value: "copy_all", label: "Record camera audio", description: compatibleOnvifAudio ? "Copy AAC or G.711 from this profile" : "Camera profile does not advertise AAC or G.711", disabled: !compatibleOnvifAudio }]}
                   />
                 </label>
                 {!compatibleOnvifAudio && selectedOnvifProfile.audio_codec && (
-                  <p className="capability-note"><strong>Video-only for this profile.</strong> The camera advertises {selectedOnvifProfile.audio_codec} audio. This onboarding path currently copies AAC audio only, so the video stream can still be added without audio.</p>
+                  <p className="capability-note"><strong>Video-only for this profile.</strong> The camera advertises {selectedOnvifProfile.audio_codec} audio. This onboarding path copies advertised AAC or G.711 audio only, so the video stream can still be added without audio.</p>
                 )}
                 <div className="dialog-inline-actions">
                   <button type="button" className="quiet-button" onClick={() => setOnvifStep("profiles")} disabled={onvifBusy}>Back</button>
@@ -1054,7 +1196,7 @@ export function CamerasScreen() {
             </section>
 
             <section className="form-section">
-              <div className="form-section-heading"><div><h4>RTSP stream</h4><p className="muted">Network endpoint used for recording and live view.</p></div></div>
+              <div className="form-section-heading"><div><h4>Main RTSP stream</h4><p className="muted">High-quality source used for recording, focused viewing and event archives.</p></div></div>
               <div className="camera-editor-grid endpoint-grid">
                 <label>Host / IP
                   <input aria-label="Host / IP" value={form.host} disabled={criticalFieldsDisabled} onChange={(e) => patchForm("host", e.target.value)} placeholder="192.168.1.20" />
@@ -1064,6 +1206,21 @@ export function CamerasScreen() {
                 </label>
                 <label className="full-width">RTSP path
                   <input aria-label="RTSP path" value={form.path} maxLength={4096} disabled={criticalFieldsDisabled} onChange={(e) => patchForm("path", e.target.value)} placeholder="/stream1" />
+                </label>
+              </div>
+            </section>
+
+            <section className="form-section">
+              <div className="form-section-heading"><div><h4>Substream</h4><p className="muted">Optional lower-cost RTSP profile for 4/8/16-grid Live View and motion analysis. Leave all fields blank to share the main ingest.</p></div></div>
+              <div className="camera-editor-grid endpoint-grid">
+                <label>Substream host / IP
+                  <input aria-label="Substream host / IP" value={form.sub_host ?? ""} disabled={criticalFieldsDisabled} onChange={(e) => patchForm("sub_host", e.target.value || null)} placeholder="192.168.1.20" />
+                </label>
+                <label className="port-field">Substream RTSP port
+                  <input aria-label="Substream RTSP port" type="number" min={1} max={65535} value={form.sub_port ?? ""} disabled={criticalFieldsDisabled} onChange={(e) => patchForm("sub_port", e.target.value ? Number(e.target.value) : null)} placeholder="554" />
+                </label>
+                <label className="full-width">Substream RTSP path
+                  <input aria-label="Substream RTSP path" value={form.sub_path ?? ""} maxLength={4096} disabled={criticalFieldsDisabled} onChange={(e) => patchForm("sub_path", e.target.value || null)} placeholder="/stream2" />
                 </label>
               </div>
             </section>

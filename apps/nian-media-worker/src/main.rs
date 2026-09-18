@@ -22,8 +22,12 @@
 // by writing logs through `tracing` instead.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod g711;
+mod ingest;
 mod job;
 mod live;
+mod motion;
+mod motion_job;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -225,22 +229,33 @@ fn cmd_run() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
 
+    let ingests = ingest::SharedIngestManager::new();
     let mut handler = WorkerHandler {
         versions,
-        jobs: job::RecordingJobManager::new(),
-        live: live::LiveJobManager::new(),
+        jobs: job::RecordingJobManager::with_ingest_manager(ingests.clone()),
+        event_buffer_jobs: job::RecordingJobManager::with_ingest_manager(ingests.clone()),
+        live: live::LiveJobManager::with_ingest_manager(ingests.clone()),
+        motion: motion_job::MotionJobManager::with_ingest_manager(ingests.clone()),
+        pre_roll_lease: None,
+        ingests,
         media,
     };
     serve(std::io::stdin().lock(), stdout.lock(), &mut handler)
         .map_err(|error| error.to_string())?;
 
     handler.live.stop();
+    handler.motion.stop();
     // M3 remediation §8: a REAL shutdown lifecycle replaces the old fixed
     // 5-second sleep. Graceful stop → bounded grace join (larger than any
     // normal bounded read + finalization headroom) → force-cancel only if
     // grace expires → absolute-bound join. Only the pathological forced
     // path may leave an active output partial — explicit, never a sleep.
-    match handler.jobs.shutdown() {
+    let recording_shutdown = handler.jobs.shutdown();
+    let event_buffer_shutdown = handler.event_buffer_jobs.shutdown();
+    handler.pre_roll_lease.take();
+    handler.ingests.shutdown();
+    let recording_shutdown = worst_shutdown(recording_shutdown, event_buffer_shutdown);
+    match recording_shutdown {
         job::ShutdownDisposition::CleanExit => Ok(()),
         job::ShutdownDisposition::ForcedCancellationSurvived => {
             eprintln!("shutdown required forced cancellation of blocking media I/O");
@@ -249,6 +264,20 @@ fn cmd_run() -> Result<(), String> {
         job::ShutdownDisposition::UnsafeTermination => {
             Err("forced-shutdown bound expired; active output left partial for recovery".to_owned())
         }
+    }
+}
+
+fn worst_shutdown(
+    left: job::ShutdownDisposition,
+    right: job::ShutdownDisposition,
+) -> job::ShutdownDisposition {
+    use job::ShutdownDisposition::{CleanExit, ForcedCancellationSurvived, UnsafeTermination};
+    match (left, right) {
+        (UnsafeTermination, _) | (_, UnsafeTermination) => UnsafeTermination,
+        (ForcedCancellationSurvived, _) | (_, ForcedCancellationSurvived) => {
+            ForcedCancellationSurvived
+        }
+        (CleanExit, CleanExit) => CleanExit,
     }
 }
 
@@ -664,7 +693,11 @@ fn print_recording_event(event: &nian_recorder::RecordingEvent) {
 struct WorkerHandler {
     versions: RuntimeVersions,
     jobs: job::RecordingJobManager,
+    event_buffer_jobs: job::RecordingJobManager,
     live: live::LiveJobManager,
+    motion: motion_job::MotionJobManager,
+    pre_roll_lease: Option<ingest::SharedIngestLease>,
+    ingests: ingest::SharedIngestManager,
     media: FfmpegBackend,
 }
 
@@ -673,6 +706,18 @@ pub mod recording_method {
     pub const START: &str = "recording.start";
     pub const STOP: &str = "recording.stop";
     pub const STATUS: &str = "recording.status";
+}
+
+pub mod event_buffer_method {
+    pub const START: &str = "event_buffer.start";
+    pub const STOP: &str = "event_buffer.stop";
+    pub const STATUS: &str = "event_buffer.status";
+}
+
+pub mod pre_roll_method {
+    pub const START: &str = "pre_roll.start";
+    pub const STOP: &str = "pre_roll.stop";
+    pub const STATUS: &str = "pre_roll.status";
 }
 
 pub mod camera_method {
@@ -685,6 +730,10 @@ pub mod playback_method {
 
 pub mod event_clip_method {
     pub const COMPOSE: &str = "event_clip.compose";
+}
+
+pub mod media_method {
+    pub const STATUS: &str = "media.status";
 }
 
 impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
@@ -703,7 +752,7 @@ impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
                 "protocol": nian_ipc::PROTOCOL_VERSION,
                 "ffmpeg": versions_json(self.versions),
                 "recording": {
-                    "one_job_per_worker": true,
+                    "namespaces": ["recording", "event_buffer"],
                     "reconnect_supervised": true,
                 },
             }))),
@@ -742,6 +791,99 @@ impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
                 // this serves.
                 nian_ipc::Dispatch::Reply(Ok(self.jobs.status().to_json()))
             }
+            event_buffer_method::START => match job::JobSpec::from_params(params) {
+                Err(reason) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(
+                    with_reason(job::code::INVALID_PARAMS, reason),
+                ))),
+                Ok(spec) => match self.event_buffer_jobs.start_event(spec) {
+                    Ok(()) => nian_ipc::Dispatch::Reply(Ok(json!({"started": true}))),
+                    Err(code) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(code))),
+                },
+            },
+            event_buffer_method::STOP => match self.event_buffer_jobs.stop() {
+                Ok(presses) => nian_ipc::Dispatch::Reply(Ok(json!({
+                    "stop_presses": presses,
+                    "graceful": presses == 1,
+                }))),
+                Err(code) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(code))),
+            },
+            event_buffer_method::STATUS => {
+                nian_ipc::Dispatch::Reply(Ok(self.event_buffer_jobs.status().to_json()))
+            }
+            pre_roll_method::START => {
+                if self
+                    .pre_roll_lease
+                    .as_ref()
+                    .is_some_and(ingest::SharedIngestLease::is_ready)
+                {
+                    nian_ipc::Dispatch::Reply(Ok(json!({"started": true})))
+                } else {
+                    self.pre_roll_lease.take();
+                    match pre_roll_source_url(params) {
+                        Err(reason) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(
+                            with_reason(job::code::INVALID_PARAMS, reason),
+                        ))),
+                        Ok(url) => match self.ingests.retain_rtsp(
+                            &url,
+                            ingest::IngestProfile::Main,
+                            Duration::from_secs(20),
+                            None,
+                        ) {
+                            Ok(lease) => {
+                                self.pre_roll_lease = Some(lease);
+                                nian_ipc::Dispatch::Reply(Ok(json!({"started": true})))
+                            }
+                            Err(error) => {
+                                let code = if error.is_timed_out() {
+                                    "source_timeout"
+                                } else if matches!(error, nian_media::MediaError::OpenFailed { .. })
+                                {
+                                    "source_open_failed"
+                                } else {
+                                    "source_unavailable"
+                                };
+                                nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(code)))
+                            }
+                        },
+                    }
+                }
+            }
+            pre_roll_method::STOP => {
+                self.pre_roll_lease.take();
+                nian_ipc::Dispatch::Reply(Ok(json!({"stopped": true})))
+            }
+            pre_roll_method::STATUS => {
+                let active = self.pre_roll_lease.is_some();
+                let ready = self
+                    .pre_roll_lease
+                    .as_ref()
+                    .is_some_and(ingest::SharedIngestLease::is_ready);
+                nian_ipc::Dispatch::Reply(Ok(json!({
+                    "active": active,
+                    "ready": ready,
+                })))
+            }
+            "motion.start" => match motion_job::MotionSpec::from_params(params) {
+                Err(reason) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(
+                    with_reason("invalid_params", reason),
+                ))),
+                Ok(spec) => match self.motion.start(spec) {
+                    Ok(()) => nian_ipc::Dispatch::Reply(Ok(json!({"started":true}))),
+                    Err(code) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(code))),
+                },
+            },
+            "motion.stop" => {
+                self.motion.stop();
+                nian_ipc::Dispatch::Reply(Ok(json!({"stopped":true})))
+            }
+            "motion.status" => nian_ipc::Dispatch::Reply(Ok(self.motion.status_json())),
+            "motion.ack" => match params.get("sequence").and_then(serde_json::Value::as_u64) {
+                Some(sequence) => match self.motion.acknowledge(sequence) {
+                    Ok(count) => nian_ipc::Dispatch::Reply(Ok(json!({"acknowledged": count}))),
+                    Err(code) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(code))),
+                },
+                None => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new("invalid_params"))),
+            },
             "live.start" => match live::LiveSpec::from_params(params) {
                 Err(reason) => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new(
                     with_reason(live::code::INVALID_PARAMS, reason),
@@ -752,6 +894,59 @@ impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
                 },
             },
             "live.status" => nian_ipc::Dispatch::Reply(Ok(self.live.status_json())),
+            media_method::STATUS => {
+                let diagnostics = self.ingests.diagnostics();
+                nian_ipc::Dispatch::Reply(Ok(json!({
+                    "source_count": diagnostics.source_count,
+                    "generation_starts": diagnostics.generation_starts,
+                    "main_sources": diagnostics.main_sources,
+                    "sub_sources": diagnostics.sub_sources,
+                    "connecting_sources": diagnostics.connecting_sources,
+                    "ready_sources": diagnostics.ready_sources,
+                    "failed_sources": diagnostics.failed_sources,
+                    "subscribers": diagnostics.subscribers,
+                    "reliable_subscribers": diagnostics.reliable_subscribers,
+                    "realtime_subscribers": diagnostics.realtime_subscribers,
+                    "consumers": {
+                        "recording": diagnostics.consumers.recording,
+                        "live": diagnostics.consumers.live,
+                        "motion": diagnostics.consumers.motion,
+                        "event": diagnostics.consumers.event,
+                        "other": diagnostics.consumers.other,
+                    },
+                    "queued_packets": diagnostics.queued_packets,
+                    "queued_bytes": diagnostics.queued_bytes,
+                    "dropped_packets": diagnostics.dropped_packets,
+                    "pre_roll_packets": diagnostics.pre_roll_packets,
+                    "pre_roll_bytes": diagnostics.pre_roll_bytes,
+                    "pre_roll_dropped_packets": diagnostics.pre_roll_dropped_packets,
+                    "sources": diagnostics.sources.iter().map(|source| json!({
+                        "profile": source.profile,
+                        "lifecycle": source.lifecycle,
+                        "retainers": source.retainers,
+                        "subscribers": source.subscribers,
+                        "reliable_subscribers": source.reliable_subscribers,
+                        "realtime_subscribers": source.realtime_subscribers,
+                        "consumers": {
+                            "recording": source.consumers.recording,
+                            "live": source.consumers.live,
+                            "motion": source.consumers.motion,
+                            "event": source.consumers.event,
+                            "other": source.consumers.other,
+                        },
+                        "queued_packets": source.queued_packets,
+                        "queued_bytes": source.queued_bytes,
+                        "dropped_packets": source.dropped_packets,
+                        "pre_roll_packets": source.pre_roll_packets,
+                        "pre_roll_bytes": source.pre_roll_bytes,
+                        "pre_roll_dropped_packets": source.pre_roll_dropped_packets,
+                        "video_frame_rate": source.video_frame_rate,
+                        "video_codec": source.video_codec,
+                        "video_width": source.video_width,
+                        "video_height": source.video_height,
+                    })).collect::<Vec<_>>(),
+                })))
+            }
             "live.stop" => {
                 self.live.stop();
                 nian_ipc::Dispatch::Reply(Ok(json!({"stopped": true})))
@@ -807,12 +1002,32 @@ impl<W: std::io::Write> nian_ipc::Handler<W> for WorkerHandler {
                 // is never consulted, so a shutdown can never escalate to a
                 // forced cancellation by itself.
                 self.live.stop();
+                self.motion.stop();
                 self.jobs.request_graceful_stop();
                 nian_ipc::Dispatch::ShutdownReply(Ok(json!({"bye": true})))
             }
             _ => nian_ipc::Dispatch::Reply(Err(nian_ipc::RpcFailure::new("method_not_found"))),
         }
     }
+}
+
+fn pre_roll_source_url(params: &serde_json::Value) -> Result<String, &'static str> {
+    let source = params.get("source").ok_or("missing 'source'")?;
+    let kind = source
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing 'source.kind'")?;
+    if kind != "rtsp" {
+        return Err("pre-roll requires an rtsp source");
+    }
+    let url = source
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing 'source.url'")?;
+    if !(url.starts_with("rtsp://") || url.starts_with("rtsps://")) {
+        return Err("invalid rtsp source");
+    }
+    Ok(url.to_owned())
 }
 
 fn probe_params(
@@ -911,7 +1126,7 @@ fn playback_prepare(params: &serde_json::Value) -> Result<serde_json::Value, &'s
         let _ = std::fs::remove_file(&output_path);
         return Err("unsupported_codec");
     };
-    if video.codec_name != "h264" {
+    if !matches!(video.codec_name.as_str(), "h264" | "hevc") {
         let _ = std::fs::remove_file(&output_path);
         return Err("unsupported_codec");
     }
@@ -922,6 +1137,28 @@ fn playback_prepare(params: &serde_json::Value) -> Result<serde_json::Value, &'s
         })
         .map(|stream| stream.stream_index)
         .collect();
+    // G.711 cannot be stored as browser-compatible MP4 audio. Retain it in
+    // archived Matroska and decode once into a session-owned PCM WAV sidecar.
+    // AAC, when available, stays packet-copied inside the MP4 instead.
+    let g711 = (audio_indices.is_empty())
+        .then(|| {
+            streams.iter().find(|stream| {
+                stream.media_type == nian_domain::MediaType::Audio
+                    && matches!(stream.codec_name.as_str(), "pcm_alaw" | "pcm_mulaw")
+            })
+        })
+        .flatten();
+    let mut audio_writer = if let Some(stream) = g711 {
+        let channels = input
+            .audio_channels(stream.stream_index)
+            .ok_or("unsupported_codec")?;
+        Some(
+            g711::G711WavWriter::create(&output_path.with_file_name("audio.wav"), stream, channels)
+                .map_err(|_| "unsupported_container")?,
+        )
+    } else {
+        None
+    };
     let video_index = video.stream_index;
     let mut muxer = MatroskaMuxer::create_fragmented_mp4_with_selection(
         &mut input,
@@ -938,11 +1175,20 @@ fn playback_prepare(params: &serde_json::Value) -> Result<serde_json::Value, &'s
             "media_unreadable"
         }
     })? {
+        if let Some(writer) = audio_writer.as_mut() {
+            writer
+                .write_packet(&packet)
+                .map_err(|_| "unsupported_container")?;
+        }
         muxer
             .write_packet(&packet)
             .map_err(|_| "unsupported_container")?;
     }
     muxer.finalize().map_err(|_| "unsupported_container")?;
+    let audio_sidecar_wav = audio_writer.is_some();
+    if let Some(writer) = audio_writer {
+        writer.finalize().map_err(|_| "unsupported_container")?;
+    }
 
     let duration_ms = input
         .duration()
@@ -952,7 +1198,8 @@ fn playback_prepare(params: &serde_json::Value) -> Result<serde_json::Value, &'s
         "video_codec": video.codec_name,
         "width": video.width,
         "height": video.height,
-        "audio_available": !audio_indices.is_empty(),
+        "audio_available": !audio_indices.is_empty() || audio_sidecar_wav,
+        "audio_sidecar_wav": audio_sidecar_wav,
         "container_compatibility": "fragmented_mp4",
         "seekable": true,
     }))
@@ -1034,7 +1281,7 @@ fn compose_event_clip(params: &serde_json::Value) -> Result<serde_json::Value, &
         let _ = std::fs::remove_file(&output_path);
         return Err("unsupported_codec");
     };
-    if video.codec_name != "h264" {
+    if !matches!(video.codec_name.as_str(), "h264" | "hevc") {
         let _ = std::fs::remove_file(&output_path);
         return Err("unsupported_codec");
     }
@@ -1043,7 +1290,7 @@ fn compose_event_clip(params: &serde_json::Value) -> Result<serde_json::Value, &
         .filter(|stream| {
             stream.stream_index == video.stream_index
                 || (stream.media_type == nian_domain::MediaType::Audio
-                    && stream.codec_name == "aac")
+                    && matches!(stream.codec_name.as_str(), "aac" | "pcm_alaw" | "pcm_mulaw"))
         })
         .map(|stream| {
             (

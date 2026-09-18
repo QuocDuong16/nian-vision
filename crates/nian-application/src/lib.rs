@@ -11,6 +11,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod camera_service;
+pub mod camera_worker;
 pub mod config;
 pub mod desktop_lifecycle;
 pub mod error;
@@ -29,9 +30,14 @@ mod worker_process;
 pub use camera_service::{
     ApplicationSettingsDto, CameraDraft, CameraMutation, CameraService, CameraServiceError,
     CameraSummary, CameraWarning, CredentialRefGenerator, CredentialRefGeneratorError,
-    CredentialStore, CredentialStoreError, MemoryCredentialStore, PreparedApplicationSettings,
-    PreparedOnvifCamera, PreparedProbe, RandomCredentialRefGenerator, SettingsRepository,
-    SettingsRepositoryError,
+    CredentialStore, CredentialStoreError, LiveStreamProfile, MemoryCredentialStore,
+    PreparedApplicationSettings, PreparedOnvifCamera, PreparedProbe, RandomCredentialRefGenerator,
+    SettingsRepository, SettingsRepositoryError,
+};
+pub use camera_worker::{
+    CameraMediaConsumerCounts, CameraMediaDiagnostics, CameraMediaSourceDiagnostics,
+    CameraMotionLease, CameraMotionStatus, CameraMotionTransition, CameraPreRollLease,
+    CameraWorkerBroker, CameraWorkerError,
 };
 pub use config::{AppConfig, SegmentTargetDuration};
 pub use desktop_lifecycle::{DesktopLifecycle, DesktopLifecycleError, DesktopLifecycleState};
@@ -42,9 +48,9 @@ pub use event_controller::{
     EventStatusDto, EventTeardownBatch, EventWarning, MAX_ACTIVE_EVENT_SESSIONS,
 };
 pub use live_controller::{
-    LiveError, LiveFailureCategory, LiveOpenDto, LiveRunner, LiveRunnerFactory, LiveState,
-    LiveStatus, LiveTeardownBatch, LiveViewController, LiveWorkerStatus,
-    MAX_SIMULTANEOUS_LIVE_VIEWS, PreparedLive, WorkerLiveRunnerFactory,
+    BrokerLiveRunnerFactory, LiveError, LiveFailureCategory, LiveOpenDto, LiveRunner,
+    LiveRunnerFactory, LiveState, LiveStatus, LiveTeardownBatch, LiveViewController,
+    LiveWorkerStatus, MAX_SIMULTANEOUS_LIVE_VIEWS, PreparedLive, WorkerLiveRunnerFactory,
 };
 pub use notification::{
     DesktopNotificationDelivery, DesktopNotifier, MAX_NOTIFICATION_RATE_LIMIT_ENTRIES,
@@ -74,10 +80,10 @@ pub use ptz_controller::{
     PtzWarning,
 };
 pub use recording_controller::{
-    MAX_SIMULTANEOUS_RECORDINGS, RecordingController, RecordingControllerError,
-    RecordingRunFailure, RecordingRunner, RecordingRunnerFactory, RecordingState, RecordingStatus,
-    RecordingThreadSpawner, StdRecordingThreadSpawner, SupervisorRecordingRunner,
-    SupervisorRecordingRunnerFactory,
+    BrokerEventBufferRunnerFactory, BrokerRecordingRunnerFactory, MAX_SIMULTANEOUS_RECORDINGS,
+    RecordingController, RecordingControllerError, RecordingRunFailure, RecordingRunner,
+    RecordingRunnerFactory, RecordingState, RecordingStatus, RecordingThreadSpawner,
+    StdRecordingThreadSpawner, SupervisorRecordingRunner, SupervisorRecordingRunnerFactory,
 };
 pub use storage_manager::{
     ArtifactCleanupReport, PlaybackPins, ReconciliationFailure, ReconciliationFailureKind,

@@ -44,7 +44,7 @@
 use std::ffi::{CString, c_int};
 use std::path::{Path, PathBuf};
 
-use nian_domain::MediaRational;
+use nian_domain::{MediaRational, MediaStreamInfo};
 use nian_ffmpeg_sys as sys;
 use nian_media::MediaError;
 
@@ -52,6 +52,32 @@ use crate::error_util::{ErrorKind, error_for, interrupt_error};
 use crate::input::MediaInput;
 use crate::interrupt::InterruptHandle;
 use crate::packet::FfmpegPacket;
+use crate::stream_template::MediaStreamTemplate;
+
+trait StreamDescriptorSource {
+    fn stream_infos(&self) -> Vec<MediaStreamInfo>;
+    fn codec_parameters(&self, index: usize) -> Option<*const sys::AVCodecParameters>;
+}
+
+impl StreamDescriptorSource for MediaInput {
+    fn stream_infos(&self) -> Vec<MediaStreamInfo> {
+        self.streams()
+    }
+
+    fn codec_parameters(&self, index: usize) -> Option<*const sys::AVCodecParameters> {
+        MediaInput::codec_parameters(self, index).map(|parameters| parameters.cast_const())
+    }
+}
+
+impl StreamDescriptorSource for MediaStreamTemplate {
+    fn stream_infos(&self) -> Vec<MediaStreamInfo> {
+        self.streams()
+    }
+
+    fn codec_parameters(&self, index: usize) -> Option<*const sys::AVCodecParameters> {
+        MediaStreamTemplate::codec_parameters(self, index)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimestampPolicy {
@@ -74,6 +100,10 @@ struct StreamMapping {
     timestamp_origin: Option<i64>,
     /// Last normalized segment DTS written for this output stream.
     last_dts: Option<i64>,
+    /// Greatest packet presentation end, including B-frames whose PTS follows DTS.
+    last_end: Option<i64>,
+    /// Persistent decode timestamp correction within the current segment.
+    segment_dts_shift: i64,
     /// Fixed output-time-base offset applied while concatenating one source
     /// segment. This advances only at explicit segment boundaries so packet
     /// spacing inside a segment is preserved.
@@ -132,32 +162,48 @@ fn normalize_concatenated_timestamp_pair(
         mapping.timestamp_origin = anchor;
     }
     let origin = mapping.timestamp_origin.unwrap_or(0);
-    let mut dts = dts.map(|value| {
-        value
-            .saturating_sub(origin)
-            .saturating_add(mapping.segment_offset)
-    });
     let mut pts = pts.map(|value| {
         value
             .saturating_sub(origin)
             .saturating_add(mapping.segment_offset)
+            .saturating_add(mapping.segment_dts_shift)
     });
-
-    match (dts, pts) {
-        (None, Some(value)) => dts = Some(value),
-        (Some(value), None) => pts = Some(value),
-        _ => {}
-    }
-
-    if let Some(current_dts) = dts {
-        if let Some(last_dts) = mapping.last_dts
-            && current_dts <= last_dts
+    let mut dts = if let Some(value) = dts {
+        let current = value
+            .saturating_sub(origin)
+            .saturating_add(mapping.segment_offset)
+            .saturating_add(mapping.segment_dts_shift);
+        if let Some(last) = mapping.last_dts
+            && current <= last
         {
-            let shift = last_dts.saturating_add(1).saturating_sub(current_dts);
-            dts = Some(current_dts.saturating_add(shift));
-            pts = pts.map(|value| value.saturating_add(shift));
+            // The first reordered frames may have no DTS, so their synthetic
+            // decode timestamps can initially precede the source's real DTS.
+            // Keep one cumulative correction for the REST of the segment:
+            // shifting only the current packet makes a later packet regress.
+            let correction = last.saturating_add(1).saturating_sub(current);
+            mapping.segment_dts_shift = mapping.segment_dts_shift.saturating_add(correction);
+            pts = pts.map(|time| time.saturating_add(correction));
+            Some(current.saturating_add(correction))
+        } else {
+            Some(current)
         }
-        mapping.last_dts = dts;
+    } else {
+        // Matroska requires DTS on output. For B-frame HEVC/H.264 the first
+        // packets can have only PTS; using their (out-of-order) presentation
+        // times as DTS would poison the next real decode timestamp.
+        pts.map(|time| {
+            mapping
+                .last_dts
+                .map_or(time, |last| last.saturating_add(1))
+                .max(mapping.segment_offset)
+        })
+    };
+    if pts.is_none() {
+        pts = dts;
+    }
+    if let Some(value) = dts.take() {
+        mapping.last_dts = Some(value);
+        dts = Some(value);
     }
     (dts, pts)
 }
@@ -244,6 +290,28 @@ impl MatroskaMuxer {
         )
     }
 
+    /// Creates a recording segment from an owned stream template rather than
+    /// directly from the demuxing context. Shared-ingest subscribers use this
+    /// so the RTSP owner remains isolated on its ingest thread.
+    pub fn create_recording_segment_from_template_with_selection<F>(
+        template: &MediaStreamTemplate,
+        output_path: &Path,
+        interrupt: &InterruptHandle,
+        selector: F,
+    ) -> Result<Self, MediaError>
+    where
+        F: FnMut(&nian_domain::MediaStreamInfo) -> bool,
+    {
+        Self::create_with_selection_for_format(
+            template,
+            output_path,
+            interrupt,
+            false,
+            TimestampPolicy::Repair,
+            selector,
+        )
+    }
+
     /// Creates one Matroska output intended to concatenate multiple compatible
     /// source segments without transcoding. Every source segment is rebased to
     /// zero and then shifted by a stable cumulative offset, preserving packet
@@ -279,7 +347,13 @@ impl MatroskaMuxer {
         }
         for mapping in &mut self.stream_map {
             mapping.timestamp_origin = None;
-            mapping.segment_offset = mapping.last_dts.map_or(0, |last| last.saturating_add(1));
+            mapping.segment_dts_shift = 0;
+            // End at the previous presentation tail, not the last decode
+            // timestamp: B-frames can display after the final DTS.
+            mapping.segment_offset = mapping
+                .last_end
+                .or_else(|| mapping.last_dts.map(|last| last.saturating_add(1)))
+                .unwrap_or(0);
         }
         Ok(())
     }
@@ -331,8 +405,30 @@ impl MatroskaMuxer {
         )
     }
 
-    fn create_with_selection_for_format<F>(
-        input: &mut MediaInput,
+    /// Creates a live fragmented-MP4 output from an owned stream template.
+    /// This is the live-view counterpart to
+    /// [`Self::create_recording_segment_from_template_with_selection`].
+    pub fn create_live_fragmented_mp4_from_template_with_selection<F>(
+        template: &MediaStreamTemplate,
+        output_path: &Path,
+        interrupt: &InterruptHandle,
+        selector: F,
+    ) -> Result<Self, MediaError>
+    where
+        F: FnMut(&nian_domain::MediaStreamInfo) -> bool,
+    {
+        Self::create_with_selection_for_format(
+            template,
+            output_path,
+            interrupt,
+            true,
+            TimestampPolicy::RebaseAndRepair,
+            selector,
+        )
+    }
+
+    fn create_with_selection_for_format<S, F>(
+        input: &S,
         output_path: &Path,
         interrupt: &InterruptHandle,
         fragmented_mp4: bool,
@@ -340,6 +436,7 @@ impl MatroskaMuxer {
         mut selector: F,
     ) -> Result<Self, MediaError>
     where
+        S: StreamDescriptorSource,
         F: FnMut(&nian_domain::MediaStreamInfo) -> bool,
     {
         crate::version::global_init()?;
@@ -350,7 +447,7 @@ impl MatroskaMuxer {
         // wrong playback speed/seeking. Failing the segment explicitly is the
         // only safe behavior for a recording pipeline.
         let selected: Vec<nian_domain::MediaStreamInfo> = input
-            .streams()
+            .stream_infos()
             .into_iter()
             .filter(|info| selector(info))
             .collect();
@@ -375,6 +472,8 @@ impl MatroskaMuxer {
                 input_time_base: time_base,
                 timestamp_origin: None,
                 last_dts: None,
+                last_end: None,
+                segment_dts_shift: 0,
                 segment_offset: 0,
             });
         }
@@ -438,10 +537,19 @@ impl MatroskaMuxer {
                         Some(interrupt),
                     ));
                 }
-                // The codec tag comes from the source container; Matroska
-                // assigns its own.
-                // SAFETY: codecpar is valid.
-                unsafe { (*(*out_stream).codecpar).codec_tag = 0 };
+                // Source-container tags must never leak into a different muxer.
+                // ISO BMFF HEVC uses hvc1 for samples whose VPS/SPS/PPS are
+                // provided in hvcC; WebView's HEVC codec probe targets hvc1.
+                // Keep Matroska tags automatic and H.264 behavior unchanged.
+                // SAFETY: codecpar is a valid output-stream-owned allocation.
+                unsafe {
+                    (*(*out_stream).codecpar).codec_tag =
+                        if fragmented_mp4 && info.codec_name == "hevc" {
+                            u32::from_le_bytes(*b"hvc1")
+                        } else {
+                            0
+                        };
+                }
             }
         }
 
@@ -704,6 +812,22 @@ impl MatroskaMuxer {
             }
         }
 
+        // Snapshot the final presentation end before FFmpeg consumes scratch.
+        // Advance only after a successful write so a failed packet cannot
+        // shift a later segment past an event that was never recorded.
+        let concat_end = if self.timestamp_policy == TimestampPolicy::Concatenate {
+            // SAFETY: scratch is our private packet, valid until the mux call.
+            unsafe {
+                let pts = ((*self.scratch).pts != sys::NIAN_AV_NOPTS_VALUE)
+                    .then_some((*self.scratch).pts);
+                let dts = ((*self.scratch).dts != sys::NIAN_AV_NOPTS_VALUE)
+                    .then_some((*self.scratch).dts);
+                pts.or(dts)
+                    .map(|time| time.saturating_add((*self.scratch).duration.max(1)))
+            }
+        } else {
+            None
+        };
         // SAFETY: context + scratch are valid. The call consumes the scratch
         // reference and blanks the packet even on error, so Drop's
         // av_packet_free always sees an unreferenced-or-blank packet and no
@@ -726,6 +850,10 @@ impl MatroskaMuxer {
                 ErrorKind::Write,
                 Some(&self.interrupt),
             ));
+        }
+        if let Some(end) = concat_end {
+            let mapping = &mut self.stream_map[output_index];
+            mapping.last_end = Some(mapping.last_end.map_or(end, |previous| previous.max(end)));
         }
         Ok(())
     }
@@ -821,6 +949,8 @@ mod tests {
             input_time_base: MediaRational::new(1, 90_000).unwrap(),
             timestamp_origin: None,
             last_dts: None,
+            last_end: None,
+            segment_dts_shift: 0,
             segment_offset: 0,
         }
     }

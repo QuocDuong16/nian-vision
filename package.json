@@ -12,6 +12,7 @@
     "lint": "pnpm --filter nian-ui lint",
     "typecheck": "pnpm --filter nian-ui typecheck",
     "test": "pnpm --filter nian-ui test",
+    "media:gate": "node scripts/media-release-gate.mjs",
     "release:test": "node --test scripts/release/*.test.mjs",
     "release:version": "node scripts/release/version-check.mjs"
   }

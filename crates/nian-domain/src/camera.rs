@@ -386,6 +386,7 @@ pub struct CameraConfig {
     camera_id: crate::CameraId,
     display_name: String,
     source: CameraSource,
+    sub_source: Option<CameraSource>,
     audio_policy: AudioPolicy,
     credential_ref: CredentialRef,
 }
@@ -405,6 +406,7 @@ impl CameraConfig {
             camera_id,
             display_name,
             source,
+            sub_source: None,
             audio_policy,
             credential_ref,
         })
@@ -433,9 +435,22 @@ impl CameraConfig {
     pub fn display_name(&self) -> &str {
         &self.display_name
     }
+    /// Primary/high-quality stream used for recording, focused viewing and archives.
     pub fn source(&self) -> &CameraSource {
         &self.source
     }
+
+    /// Optional lower-cost stream used for multiview and motion analysis.
+    pub fn sub_source(&self) -> Option<&CameraSource> {
+        self.sub_source.as_ref()
+    }
+
+    /// Attaches or replaces the optional lower-cost stream profile.
+    pub fn with_sub_source(mut self, sub_source: Option<CameraSource>) -> Self {
+        self.sub_source = sub_source;
+        self
+    }
+
     pub fn audio_policy(&self) -> AudioPolicy {
         self.audio_policy
     }

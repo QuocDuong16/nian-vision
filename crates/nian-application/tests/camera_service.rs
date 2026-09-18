@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use nian_application::{
     ApplicationSettingsDto, CameraDraft, CameraService, CameraServiceError, CameraWarning,
     CredentialRefGenerator, CredentialRefGeneratorError, CredentialStore, CredentialStoreError,
-    RandomCredentialRefGenerator, SettingsRepository, SettingsRepositoryError,
+    LiveStreamProfile, RandomCredentialRefGenerator, SettingsRepository, SettingsRepositoryError,
 };
 use nian_domain::{
     AudioPolicy, CameraConfig, CameraEndpoint, CameraId, CameraSource, CredentialRef, Credentials,
@@ -281,6 +281,9 @@ fn draft(name: &str, password: Option<&str>) -> CameraDraft {
         host: "192.168.1.50".to_owned(),
         port: 554,
         path: "/stream1".to_owned(),
+        sub_host: None,
+        sub_port: None,
+        sub_path: None,
         audio_policy: AudioPolicy::CopyAll,
         replacement_credentials: password.map(|password| Credentials::new("admin", password)),
     }
@@ -346,6 +349,35 @@ fn seeded() -> (CameraService, Arc<Mutex<RepoState>>, Arc<FakeSecrets>) {
         repo_state,
         secrets,
     )
+}
+
+#[test]
+fn live_profiles_route_grid_to_substream_and_focus_to_main() {
+    let (service, repo, _secrets) = seeded();
+    let sub_source = CameraSource::Rtsp(
+        CameraEndpoint::new(Host::parse("192.168.1.50").unwrap(), 554, "/stream2").unwrap(),
+    );
+    {
+        let mut state = repo.lock().unwrap();
+        let camera = state.cameras.remove("front-door").unwrap();
+        state.cameras.insert(
+            "front-door".to_owned(),
+            camera.with_sub_source(Some(sub_source)),
+        );
+    }
+
+    let grid = service
+        .prepare_live_profile("front-door", LiveStreamProfile::Grid)
+        .unwrap();
+    let focus = service
+        .prepare_live_profile("front-door", LiveStreamProfile::Focus)
+        .unwrap();
+    let grid_url = grid.source_json["url"].as_str().unwrap();
+    let focus_url = focus.source_json["url"].as_str().unwrap();
+    assert!(grid_url.ends_with("/stream2"));
+    assert!(focus_url.ends_with("/stream1"));
+    assert_eq!(grid.source_json["profile"], "sub");
+    assert_eq!(focus.source_json["profile"], "main");
 }
 
 #[test]

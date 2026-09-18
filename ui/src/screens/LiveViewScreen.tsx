@@ -3,7 +3,9 @@ import { createPortal } from "react-dom";
 import { EmptyState } from "../components/EmptyState";
 import { PtzControls } from "../components/PtzControls";
 import { SelectControl } from "../components/SelectControl";
-import { splitLiveMp4ForMse } from "../lib/liveMp4";
+import { detectLiveVideoConfiguration, splitLiveMp4ForMse } from "../lib/liveMp4";
+import { teardownLiveMse } from "../lib/mediaLifecycle";
+import { retainMseSession } from "../lib/mediaTelemetry";
 import { desktopError, invokeDesktop, isTauri } from "../lib/tauri";
 import type {
   CameraSummary,
@@ -21,13 +23,17 @@ import type {
 
 const LIVE_LAYOUT_SIZES = [1, 4, 8, 16] as const;
 type LiveLayoutSize = (typeof LIVE_LAYOUT_SIZES)[number];
+type LiveStreamProfile = "grid" | "focus";
 const MAX_LIVE_VIEWS_PER_PAGE = 16;
 const STATUS_POLL_MS = 1_000;
 const EVENT_STATUS_POLL_MS = 5_000;
 const KEEPALIVE_MS = 30_000;
 const MAX_LIVE_LATENCY_SECONDS = 2.5;
 const LIVE_EDGE_OFFSET_SECONDS = 0.75;
-const LIVE_BUFFER_HISTORY_SECONDS = 12;
+// Live View is a realtime surface, not a browser-side DVR. Keeping a long MSE
+// history pins decoded frames and GPU-backed surfaces for no visible benefit.
+// The backend retains a slightly larger compressed window to absorb poll jitter.
+const LIVE_BUFFER_HISTORY_SECONDS = 3;
 const LIVE_MANIFEST_POLL_MS = 250;
 const LIVE_STABLE_RESET_MS = 10_000;
 const MAX_LIVE_AUTO_RECOVERY_ATTEMPTS = 3;
@@ -88,6 +94,10 @@ function liveFailureLabel(category: LiveFailureCategory | null | undefined): str
     case "media_failed": return "Live media pipeline failed";
     default: return null;
   }
+}
+
+function hasDedicatedSubstream(camera: CameraSummary | undefined): boolean {
+  return Boolean(camera?.sub_host && camera.sub_port && camera.sub_path);
 }
 
 type LiveManifest = {
@@ -158,24 +168,13 @@ function livePipelineFailure(cause: unknown): DesktopError {
   return { code: "live_pipeline_failed", message: "The live media pipeline failed." };
 }
 
-function detectAvcMime(bytes: Uint8Array): string | null {
-  for (let index = 0; index + 8 < bytes.length; index += 1) {
-    if (
-      bytes[index] === 0x61 &&
-      bytes[index + 1] === 0x76 &&
-      bytes[index + 2] === 0x63 &&
-      bytes[index + 3] === 0x43
-    ) {
-      const profile = bytes[index + 5]!;
-      const compatibility = bytes[index + 6]!;
-      const level = bytes[index + 7]!;
-      const hex = [profile, compatibility, level]
-        .map((value) => value.toString(16).padStart(2, "0"))
-        .join("");
-      return `video/mp4; codecs="avc1.${hex}"`;
-    }
+function appendMseBytes(sourceBuffer: SourceBuffer, bytes: Uint8Array): void {
+  if (bytes.buffer instanceof ArrayBuffer) {
+    const arrayBufferView = bytes as Uint8Array<ArrayBuffer>;
+    sourceBuffer.appendBuffer(arrayBufferView);
+    return;
   }
-  return null;
+  sourceBuffer.appendBuffer(Uint8Array.from(bytes).buffer);
 }
 
 function waitForSourceBuffer(sourceBuffer: SourceBuffer): Promise<void> {
@@ -270,10 +269,12 @@ function LiveMedia({
 
     const mediaSource = new MediaSource();
     const objectUrl = URL.createObjectURL(mediaSource);
+    const releaseMseSession = retainMseSession();
     const abort = new AbortController();
     let disposed = false;
     let timer: number | null = null;
     let sourceBuffer: SourceBuffer | null = null;
+    let activeVideoSignature: string | null = null;
     let lastAppendedSequence = -1;
     let initializationAppended = false;
     let nextMovieFragmentSequence = 1;
@@ -324,23 +325,29 @@ function LiveMedia({
         throw new LivePipelineError("fragment_invalid", "A live fragment was not a valid fragmented MP4 stream.");
       }
 
+      const configuration = detectLiveVideoConfiguration(mseParts.initialization);
+      if (!configuration || !MediaSource.isTypeSupported(configuration.mime)) {
+        throw new LivePipelineError("unsupported_codec", "The WebView cannot decode this AVC/HEVC stream. For H.265, install the OS HEVC codec or select an H.264 substream.");
+      }
+      if (activeVideoSignature !== null && activeVideoSignature !== configuration.signature) {
+        // A codec, SPS/PPS/VPS or resolution switch needs a fresh MSE decoder.
+        // Preserve existing backend retry handling rather than appending corrupt media.
+        throw new LivePipelineError("stream_configuration_changed", "The camera video configuration changed. Reopening live with a fresh decoder.");
+      }
       if (!sourceBuffer) {
-        const mime = detectAvcMime(bytes);
-        if (!mime || !MediaSource.isTypeSupported(mime)) {
-          throw new LivePipelineError("unsupported_codec", "This H.264 stream is not supported by the WebView MediaSource decoder.");
-        }
-        sourceBuffer = mediaSource.addSourceBuffer(mime);
+        sourceBuffer = mediaSource.addSourceBuffer(configuration.mime);
+        activeVideoSignature = configuration.signature;
         sourceBuffer.mode = "segments";
       }
       if (!initializationAppended) {
         await waitForSourceBuffer(sourceBuffer);
-        sourceBuffer.appendBuffer(Uint8Array.from(mseParts.initialization).buffer);
+        appendMseBytes(sourceBuffer, mseParts.initialization);
         await waitForSourceBuffer(sourceBuffer);
         initializationAppended = true;
       }
       await waitForSourceBuffer(sourceBuffer);
       sourceBuffer.timestampOffset = nextTimestampOffset;
-      sourceBuffer.appendBuffer(Uint8Array.from(mseParts.media).buffer);
+      appendMseBytes(sourceBuffer, mseParts.media);
       await waitForSourceBuffer(sourceBuffer);
       nextMovieFragmentSequence += mseParts.movieFragmentCount;
       lastAppendedSequence = Math.max(lastAppendedSequence, sequence);
@@ -406,9 +413,8 @@ function LiveMedia({
       abort.abort();
       if (timer !== null) window.clearTimeout(timer);
       mediaSource.removeEventListener("sourceopen", onSourceOpen);
-      video.removeAttribute("src");
-      video.load();
-      URL.revokeObjectURL(objectUrl);
+      teardownLiveMse({ mediaSource, sourceBuffer, video, objectUrl });
+      releaseMseSession();
     };
   }, [session.session_id, session.url]);
 
@@ -477,7 +483,6 @@ export function LiveViewScreen() {
   const [ptzErrors, setPtzErrors] = useState<Map<string, DesktopError>>(() => new Map());
   const [eventStatuses, setEventStatuses] = useState<Map<string, EventStatus>>(() => new Map());
   const [recordingBusy, setRecordingBusy] = useState<Set<string>>(() => new Set());
-  const [livePausedForRecording, setLivePausedForRecording] = useState<Set<string>>(() => new Set());
   const [loading, setLoading] = useState(isTauri());
   const [error, setError] = useState<DesktopError | null>(null);
   const pageCount = Math.max(1, Math.ceil(selected.length / layoutSize));
@@ -491,6 +496,12 @@ export function LiveViewScreen() {
     [layoutSize, visibleCameraIds],
   );
   const sessionsRef = useRef(sessions);
+  const camerasRef = useRef(cameras);
+  camerasRef.current = cameras;
+  const focusedCameraIdRef = useRef<string | null>(focusedCameraId);
+  focusedCameraIdRef.current = focusedCameraId;
+  const previousFocusedCameraRef = useRef<string | null>(null);
+  const sessionProfileRef = useRef<Map<string, LiveStreamProfile>>(new Map());
   const selectedRef = useRef<Set<string>>(new Set(initialPreferences.cameraIds));
   const activeCameraIdsRef = useRef<Set<string>>(new Set(visibleCameraIds));
   activeCameraIdsRef.current = new Set(visibleCameraIds);
@@ -499,7 +510,6 @@ export function LiveViewScreen() {
   const pendingOpenRef = useRef<Map<string, number>>(new Map());
   const recoveryAttemptsRef = useRef<Map<string, number>>(new Map());
   const recoveryTimersRef = useRef<Map<string, number>>(new Map());
-  const livePausedForRecordingRef = useRef<Set<string>>(new Set());
   const refreshInFlightRef = useRef(false);
   const eventStatusInFlightRef = useRef(false);
   const restoredSelectionOpenedRef = useRef(initialPreferences.cameraIds.length === 0);
@@ -528,7 +538,10 @@ export function LiveViewScreen() {
   const setSessionForCamera = useCallback((cameraId: string, session: LiveOpenDto | null) => {
     const next = new Map(sessionsRef.current);
     if (session) next.set(cameraId, session);
-    else next.delete(cameraId);
+    else {
+      next.delete(cameraId);
+      sessionProfileRef.current.delete(cameraId);
+    }
     sessionsRef.current = next;
     if (mountedRef.current) setSessions(next);
   }, []);
@@ -728,6 +741,9 @@ export function LiveViewScreen() {
 
   const startOpenGeneration = useCallback(async (cameraId: string, generation: number) => {
     if (!isTauri() || !mountedRef.current || pendingOpenRef.current.has(cameraId)) return;
+    const camera = camerasRef.current.find((candidate) => candidate.camera_id === cameraId);
+    const profile: LiveStreamProfile =
+      focusedCameraIdRef.current === cameraId && hasDedicatedSubstream(camera) ? "focus" : "grid";
     pendingOpenRef.current.set(cameraId, generation);
     setOpening((current) => new Set(current).add(cameraId));
     setTileErrors((current) => {
@@ -737,11 +753,12 @@ export function LiveViewScreen() {
     });
 
     try {
-      const opened = await invokeDesktop<LiveOpenDto>("live_open", { cameraId });
+      const opened = await invokeDesktop<LiveOpenDto>("live_open", { cameraId, profile });
       if (!ownsGeneration(cameraId, generation)) {
         await invokeDesktop<void>("live_close", { sessionId: opened.session_id }).catch(() => undefined);
         return;
       }
+      sessionProfileRef.current.set(cameraId, profile);
       setSessionForCamera(cameraId, opened);
       await refreshStatuses();
     } catch (cause) {
@@ -780,60 +797,41 @@ export function LiveViewScreen() {
     return generation;
   }, [nextGeneration, startOpenGeneration]);
 
-  const pauseLiveForRecorder = useCallback(async (cameraId: string) => {
-    if (livePausedForRecordingRef.current.has(cameraId)) return false;
+  const switchLiveProfile = useCallback(async (cameraId: string) => {
+    if (!isTauri() || !mountedRef.current || !activeCameraIdsRef.current.has(cameraId)) return;
+    const camera = camerasRef.current.find((candidate) => candidate.camera_id === cameraId);
+    const desiredProfile: LiveStreamProfile =
+      focusedCameraIdRef.current === cameraId && hasDedicatedSubstream(camera) ? "focus" : "grid";
     const session = sessionsRef.current.get(cameraId);
-    if (!session) return false;
+    if (session && sessionProfileRef.current.get(cameraId) === desiredProfile) return;
 
     const recoveryTimer = recoveryTimersRef.current.get(cameraId);
     if (recoveryTimer !== undefined) window.clearTimeout(recoveryTimer);
     recoveryTimersRef.current.delete(cameraId);
     recoveryAttemptsRef.current.delete(cameraId);
-    const nextPaused = new Set(livePausedForRecordingRef.current).add(cameraId);
-    livePausedForRecordingRef.current = nextPaused;
-    setLivePausedForRecording(nextPaused);
-    nextGeneration(cameraId);
-    setSessionForCamera(cameraId, null);
-    await invokeDesktop<void>("live_close", { sessionId: session.session_id }).catch(() => undefined);
-    return true;
-  }, [nextGeneration, setSessionForCamera]);
+
+    const generation = nextGeneration(cameraId);
+    if (session) {
+      setSessionForCamera(cameraId, null);
+      await invokeDesktop<void>("live_close", { sessionId: session.session_id }).catch(() => undefined);
+    }
+    if (
+      mountedRef.current
+      && activeCameraIdsRef.current.has(cameraId)
+      && !pendingOpenRef.current.has(cameraId)
+    ) {
+      void startOpenGeneration(cameraId, generation);
+    }
+  }, [nextGeneration, setSessionForCamera, startOpenGeneration]);
 
   useEffect(() => {
-    for (const runtime of recordings) {
-      if (
-        runtime.camera_id
-        && runtime.state === "backoff"
-        && runtime.failure_category === "source_open_failed"
-        && activeCameraIdsRef.current.has(runtime.camera_id)
-        && sessionsRef.current.has(runtime.camera_id)
-      ) {
-        void pauseLiveForRecorder(runtime.camera_id);
-      }
-    }
-  }, [pauseLiveForRecorder, recordings, sessions]);
+    const previous = previousFocusedCameraRef.current;
+    if (previous === focusedCameraId) return;
+    previousFocusedCameraRef.current = focusedCameraId;
+    if (previous) void switchLiveProfile(previous);
+    if (focusedCameraId) void switchLiveProfile(focusedCameraId);
+  }, [focusedCameraId, switchLiveProfile]);
 
-  useEffect(() => {
-    if (!livePausedForRecordingRef.current.size) return;
-    const nextPaused = new Set(livePausedForRecordingRef.current);
-    let changed = false;
-    for (const cameraId of livePausedForRecordingRef.current) {
-      const runtime = recordings.find((status) => status.camera_id === cameraId);
-      if (!runtime || !["recording", "failed", "stopped"].includes(runtime.state)) continue;
-      nextPaused.delete(cameraId);
-      changed = true;
-      if (
-        activeCameraIdsRef.current.has(cameraId)
-        && !sessionsRef.current.has(cameraId)
-        && !pendingOpenRef.current.has(cameraId)
-      ) {
-        requestOpen(cameraId);
-      }
-    }
-    if (changed) {
-      livePausedForRecordingRef.current = nextPaused;
-      setLivePausedForRecording(nextPaused);
-    }
-  }, [recordings, requestOpen]);
 
   useEffect(() => {
     if (!isTauri() || loading || restoredSelectionOpenedRef.current) return;
@@ -863,7 +861,6 @@ export function LiveViewScreen() {
     }
 
     for (const cameraId of visibleCameraIds) {
-      if (livePausedForRecordingRef.current.has(cameraId)) continue;
       if (!sessionsRef.current.has(cameraId) && !pendingOpenRef.current.has(cameraId)) requestOpen(cameraId);
     }
   }, [loading, nextGeneration, requestOpen, setSessionForCamera, visibleCameraIds]);
@@ -1001,19 +998,10 @@ export function LiveViewScreen() {
     setRecordingBusy((current) => new Set(current).add(cameraId));
     setError(null);
 
-    const pausedLiveSession = !desiredOn && await pauseLiveForRecorder(cameraId);
-
     try {
       await invokeDesktop<RecordingStatus>(desiredOn ? "recording_stop" : "recording_start", { cameraId });
       await refreshStatuses();
     } catch (cause) {
-      if (pausedLiveSession) {
-        const nextPaused = new Set(livePausedForRecordingRef.current);
-        nextPaused.delete(cameraId);
-        livePausedForRecordingRef.current = nextPaused;
-        setLivePausedForRecording(nextPaused);
-        if (activeCameraIdsRef.current.has(cameraId)) requestOpen(cameraId);
-      }
       setError(desktopError(cause));
       await refreshStatuses();
     } finally {
@@ -1203,11 +1191,9 @@ export function LiveViewScreen() {
                       />
                     ) : (
                       <div className="live-placeholder">
-                        {livePausedForRecording.has(cameraId)
-                          ? "Prioritizing recording · live view will resume when recording is established…"
-                          : tileError
-                            ? tileError.message
-                            : state === "backoff"
+                        {tileError
+                          ? tileError.message
+                          : state === "backoff"
                             ? `Reconnecting${liveReason ? ` · ${liveReason}` : ""} · attempt ${backendStatus?.reconnect_attempt ?? 0}`
                             : state === "failed"
                               ? liveReason ?? "Live stream failed"

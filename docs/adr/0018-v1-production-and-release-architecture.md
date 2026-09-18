@@ -70,4 +70,4 @@ Automated source/release-contract tests are necessary but do not substitute for 
 
 ## Known limitations
 
-The normative v1 limitations are maintained in `docs/known-limitations.md`. In particular v1 is H.264 packet-copy only, has no transcoding/H.265/cloud/mobile/macOS, and retains the accepted 8 Recording / 4 Live / 16 Event-monitor capacity limits.
+The normative v1 limitations are maintained in `docs/known-limitations.md`. Recording packet-copies H.264/HEVC and retains original AAC/G.711; playback can prepare G.711 as PCM WAV. HEVC Live/playback requires OS/WebView decoder support, and no video transcoding/cloud/mobile/macOS is provided. Runtime capacity limits are 8 Recording / 16 Live / 16 Event-monitor sessions.

@@ -25,11 +25,11 @@ fn camera(name: &str, credential_ref: &str) -> CameraConfig {
 }
 
 #[test]
-fn fresh_database_creates_schema_v6() {
+fn fresh_database_creates_schema_v8() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.sqlite3");
     let store = SettingsStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), 8);
     assert!(path.exists());
 }
 
@@ -48,7 +48,7 @@ fn motion_notification_preference_defaults_off_and_persists_independently() {
 }
 
 #[test]
-fn schema_v5_migrates_to_v6_preserving_event_ptz_desired_and_storage_state() {
+fn schema_v5_migrates_to_v8_preserving_event_ptz_desired_and_storage_state() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.sqlite3");
     let storage_root = dir.path().join("recordings");
@@ -120,7 +120,7 @@ fn schema_v5_migrates_to_v6_preserving_event_ptz_desired_and_storage_state() {
 
     let store = SettingsStore::open(&path).unwrap();
     let camera_id = CameraId::parse("front-door").unwrap();
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), 8);
     assert_eq!(
         store
             .get_camera(&camera_id)
@@ -221,7 +221,7 @@ fn future_schema_fails_without_replacing_database() {
         error,
         SettingsError::FutureSchema {
             found: 99,
-            supported: 6
+            supported: 8
         }
     ));
     let after = fs::read(&path).unwrap();
@@ -464,13 +464,13 @@ fn schema_v1_migrates_through_v5_with_safe_lifecycle_defaults() {
     }
 
     let store = SettingsStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), 8);
     assert!(!store.application_settings().unwrap().launch_at_login);
     assert!(store.recording_enabled_cameras().unwrap().is_empty());
     drop(store);
 
     let reopened = SettingsStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 6);
+    assert_eq!(reopened.schema_version().unwrap(), 8);
 }
 
 #[test]
@@ -509,7 +509,7 @@ fn schema_v2_migrates_to_v6_preserving_desired_camera_and_removing_unique_index(
     }
 
     let mut store = SettingsStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), 8);
     assert_eq!(
         store.recording_enabled_cameras().unwrap(),
         vec![CameraId::parse("cam-a").unwrap()]
@@ -624,7 +624,7 @@ fn schema_v3_migrates_to_v6_without_mutating_existing_camera_rows() {
             .unwrap();
     }
     let store = SettingsStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), 8);
     let saved = store
         .get_camera(&CameraId::parse("front-door").unwrap())
         .unwrap()
@@ -696,7 +696,7 @@ fn schema_v4_migrates_to_v6_preserving_ptz_recording_and_storage_state() {
 
     let store = SettingsStore::open(&path).unwrap();
     let camera_id = CameraId::parse("front-door").unwrap();
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), 8);
     assert_eq!(
         store
             .get_camera(&camera_id)
@@ -808,4 +808,42 @@ fn event_binding_and_desired_monitoring_round_trip_independently() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn local_motion_preference_is_persistent_exclusive_with_onvif_and_cascades_with_camera() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.sqlite3");
+    let camera_id = CameraId::parse("front-door").unwrap();
+    {
+        let mut store = SettingsStore::open(&path).unwrap();
+        store
+            .insert_camera(&camera("Front door", "cred-local-motion"))
+            .unwrap();
+        assert!(!store.local_motion_enabled(&camera_id).unwrap());
+        assert!(store.set_local_motion_enabled(&camera_id, true).unwrap());
+        assert!(
+            !store
+                .set_event_monitoring_enabled(&camera_id, true)
+                .unwrap()
+        );
+        assert_eq!(
+            store.local_motion_enabled_cameras().unwrap(),
+            vec![camera_id.clone()]
+        );
+    }
+    {
+        let mut store = SettingsStore::open(&path).unwrap();
+        assert!(store.local_motion_enabled(&camera_id).unwrap());
+        assert!(store.set_local_motion_enabled(&camera_id, false).unwrap());
+        assert!(
+            store
+                .set_event_monitoring_enabled(&camera_id, true)
+                .unwrap()
+        );
+        assert!(!store.set_local_motion_enabled(&camera_id, true).unwrap());
+        assert!(!store.local_motion_enabled(&camera_id).unwrap());
+        store.delete_camera(&camera_id).unwrap();
+        assert!(store.local_motion_enabled_cameras().unwrap().is_empty());
+    }
 }

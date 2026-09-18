@@ -50,6 +50,10 @@ function parseBoxes(bytes: Uint8Array, start = 0, end = bytes.byteLength): Mp4Bo
 }
 
 function joinBoxes(bytes: Uint8Array, boxes: Mp4Box[]): Uint8Array {
+  if (boxes.length === 0) return new Uint8Array();
+  const contiguous = boxes.every((box, index) => index === 0 || boxes[index - 1]!.end === box.start);
+  if (contiguous) return bytes.subarray(boxes[0]!.start, boxes[boxes.length - 1]!.end);
+
   const total = boxes.reduce((sum, box) => sum + box.end - box.start, 0);
   const joined = new Uint8Array(total);
   let offset = 0;
@@ -69,7 +73,7 @@ function rewriteMovieFragmentSequenceNumbers(
     return null;
   }
 
-  const rewritten = Uint8Array.from(media);
+  const rewritten = media;
   const topLevel = parseBoxes(rewritten);
   if (!topLevel) return null;
   const view = new DataView(rewritten.buffer, rewritten.byteOffset, rewritten.byteLength);
@@ -92,9 +96,89 @@ function rewriteMovieFragmentSequenceNumbers(
   return count > 0 ? { media: rewritten, count } : null;
 }
 
+/** Read the codec from a VIDEO sample entry, not an arbitrary `avcC` byte pattern. */
+export type LiveVideoConfiguration = { mime: string; signature: string };
+
+/** Identify the decoder configuration independently of changing movie timing metadata. */
+export function detectLiveVideoConfiguration(initialization: Uint8Array): LiveVideoConfiguration | null {
+  const topLevel = parseBoxes(initialization);
+  const moov = topLevel?.find((box) => box.type === "moov");
+  if (!moov) return null;
+  const movieBoxes = parseBoxes(initialization, moov.start + moov.headerSize, moov.end);
+  if (!movieBoxes) return null;
+  for (const track of movieBoxes.filter((box) => box.type === "trak")) {
+    const tracks = parseBoxes(initialization, track.start + track.headerSize, track.end);
+    const mdia = tracks?.find((box) => box.type === "mdia");
+    if (!mdia) continue;
+    const media = parseBoxes(initialization, mdia.start + mdia.headerSize, mdia.end);
+    const minf = media?.find((box) => box.type === "minf");
+    if (!minf) continue;
+    const mediaInfo = parseBoxes(initialization, minf.start + minf.headerSize, minf.end);
+    const stbl = mediaInfo?.find((box) => box.type === "stbl");
+    if (!stbl) continue;
+    const sampleTable = parseBoxes(initialization, stbl.start + stbl.headerSize, stbl.end);
+    const stsd = sampleTable?.find((box) => box.type === "stsd");
+    if (!stsd || stsd.end - stsd.start < stsd.headerSize + 8) continue;
+    const data = new DataView(initialization.buffer, initialization.byteOffset, initialization.byteLength);
+    const count = data.getUint32(stsd.start + stsd.headerSize + 4, false);
+    if (count === 0 || count > 16) continue;
+    const entries = parseBoxes(initialization, stsd.start + stsd.headerSize + 8, stsd.end);
+    if (!entries || entries.length !== count) continue;
+    for (const entry of entries) {
+      if (!["avc1", "avc3", "hvc1", "hev1"].includes(entry.type) || entry.end - entry.start < entry.headerSize + 78) continue;
+      // Compare the sample entry (including dimensions and SPS/PPS/VPS), not
+      // the entire moov, whose timing metadata may legitimately differ.
+      const sampleEntry = initialization.subarray(entry.start, entry.end);
+      if (sampleEntry.byteLength > 16 * 1024) return null;
+      const signature = Array.from(sampleEntry, (value) => value.toString(16).padStart(2, "0")).join("");
+      const children = parseBoxes(initialization, entry.start + entry.headerSize + 78, entry.end);
+      if (!children) continue;
+      if (entry.type === "avc1" || entry.type === "avc3") {
+        const box = children.find((child) => child.type === "avcC");
+        if (!box || box.end - box.start < box.headerSize + 4) continue;
+        const offset = box.start + box.headerSize;
+        if (initialization[offset] !== 1) continue;
+        const hex = [initialization[offset + 1], initialization[offset + 2], initialization[offset + 3]]
+          .map((value) => value!.toString(16).padStart(2, "0")).join("");
+        return { mime: `video/mp4; codecs="${entry.type}.${hex}"`, signature };
+      }
+      const box = children.find((child) => child.type === "hvcC");
+      if (!box || box.end - box.start < box.headerSize + 13) continue;
+      const offset = box.start + box.headerSize;
+      if (initialization[offset] !== 1) continue;
+      const profileByte = initialization[offset + 1]!;
+      const profileIdc = profileByte & 31;
+      const level = initialization[offset + 12]!;
+      if (profileIdc === 0 || level === 0) continue;
+      let compatibility = data.getUint32(offset + 2, false);
+      let reversed = 0;
+      for (let bit = 0; bit < 32; bit += 1) {
+        reversed = (reversed << 1) | (compatibility & 1);
+        compatibility >>>= 1;
+      }
+      const space = ["", "A", "B", "C"][profileByte >> 6]!;
+      const tier = (profileByte & 0x20) !== 0 ? "H" : "L";
+      const constraints = Array.from(initialization.subarray(offset + 6, offset + 12));
+      while (constraints.length > 0 && constraints[constraints.length - 1] === 0) constraints.pop();
+      const constraintSuffix = constraints.length
+        ? `.${constraints.map((value) => value.toString(16).padStart(2, "0").toUpperCase()).join(".")}`
+        : "";
+      return { mime: `video/mp4; codecs="${entry.type}.${space}${profileIdc}.${(reversed >>> 0).toString(16).toUpperCase()}.${tier}${level}${constraintSuffix}"`, signature };
+    }
+  }
+  return null;
+}
+
+export function detectLiveVideoMime(initialization: Uint8Array): string | null {
+  return detectLiveVideoConfiguration(initialization)?.mime ?? null;
+}
+
 /**
  * Converts one independently muxed live MP4 file into the ISO-BMFF pieces
  * expected by a long-lived Media Source Extensions buffer.
+ * Contiguous box ranges are returned as views over the response buffer and
+ * movie-fragment sequence numbers are rewritten in place so the realtime path
+ * does not allocate a second full media fragment just before MSE appends it.
  *
  * FFmpeg emits a complete file for every worker chunk, so every file repeats
  * `ftyp`/`moov`, indexing/footer boxes, and starts its `mfhd.sequence_number`

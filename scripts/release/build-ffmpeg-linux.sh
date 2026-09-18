@@ -48,8 +48,8 @@ configure_flags=(
   --enable-protocol=file,tcp,rtp,udp
   --enable-demuxer=matroska,mov,rtsp
   --enable-muxer=matroska,mov,mp4
-  --enable-parser=h264,mpeg4video,mpegaudio,aac
-  --enable-decoder=mpeg4,aac
+  --enable-parser=h264,hevc,mpeg4video,mpegaudio,aac
+  --enable-decoder=h264,hevc,mpeg4,aac,pcm_alaw,pcm_mulaw
 )
 
 printf '%s\n' "${configure_flags[@]}" > "$output_dir/FFMPEG_BUILD_FLAGS.txt"

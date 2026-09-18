@@ -9,8 +9,10 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, NaiveDateTime, TimeDelta, Utc};
 use nian_application::{
-    PersistedEventSignal, PersistedEventSink, RecordingController, RecordingControllerError,
-    RecordingState, SupervisorRecordingRunnerFactory, WorkerEventClipComposer,
+    BrokerEventBufferRunnerFactory, CameraMotionLease, CameraMotionStatus, CameraPreRollLease,
+    CameraWorkerBroker, CameraWorkerError, EventRuntimeState, PersistedEventSignal,
+    PersistedEventSink, RecordingController, RecordingControllerError, RecordingState,
+    WorkerEventClipComposer,
 };
 use nian_domain::CameraId;
 use nian_index::DEFAULT_EVENT_RETENTION_DAYS;
@@ -25,6 +27,8 @@ const EVENT_BUFFER_SEGMENT_SECS: u64 = 2;
 const EVENT_CAPTURE_POLL: Duration = Duration::from_millis(250);
 const EVENT_PRE_ROLL: Duration = Duration::from_secs(5);
 const EVENT_POST_ROLL: Duration = Duration::from_secs(5);
+const PRE_ROLL_RETRY_DELAY: Duration = Duration::from_secs(2);
+const PRE_ROLL_HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 const EVENT_BUFFER_IDLE_RETENTION: Duration = Duration::from_secs(30);
 const EVENT_CLIP_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
 const EVENT_CLIP_HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(60);
@@ -53,40 +57,40 @@ pub(crate) struct EventCaptureDispatcher {
 }
 
 impl EventCaptureDispatcher {
-    pub(crate) fn new(state: Weak<DesktopState>, worker_program: String) -> io::Result<Self> {
+    pub(crate) fn new(
+        state: Weak<DesktopState>,
+        worker_program: String,
+        camera_workers: CameraWorkerBroker,
+    ) -> io::Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let running = Arc::new(AtomicBool::new(true));
         let worker_running = running.clone();
-        let controller_program = worker_program.clone();
         let thread = std::thread::Builder::new()
             .name("event-capture-dispatcher".to_owned())
             .spawn(move || {
                 let mut controller =
-                    RecordingController::with_factory(Arc::new(SupervisorRecordingRunnerFactory {
-                        worker_program: controller_program,
+                    RecordingController::with_factory(Arc::new(BrokerEventBufferRunnerFactory {
+                        broker: camera_workers.clone(),
                     }));
                 let composer = WorkerEventClipComposer::new(worker_program);
-                let mut buffers = HashMap::<CameraId, BufferRuntime>::new();
-                let mut active_episodes = HashMap::<CameraId, ActiveEpisode>::new();
-                let mut pending_episodes = Vec::<(CameraId, ActiveEpisode)>::new();
-                let mut aggregate_motion = HashMap::<CameraId, bool>::new();
+                let mut runtime = EventCaptureRuntime::default();
                 let mut next_clip_housekeeping = Instant::now();
 
                 while worker_running.load(Ordering::Acquire) {
                     match receiver.recv_timeout(EVENT_CAPTURE_POLL) {
                         Ok(signal) => {
                             apply_signal(
-                                &mut active_episodes,
-                                &mut pending_episodes,
-                                &mut aggregate_motion,
+                                &mut runtime.active_episodes,
+                                &mut runtime.pending_episodes,
+                                &mut runtime.aggregate_motion,
                                 signal,
                                 Instant::now(),
                             );
                             while let Ok(signal) = receiver.try_recv() {
                                 apply_signal(
-                                    &mut active_episodes,
-                                    &mut pending_episodes,
-                                    &mut aggregate_motion,
+                                    &mut runtime.active_episodes,
+                                    &mut runtime.pending_episodes,
+                                    &mut runtime.aggregate_motion,
                                     signal,
                                     Instant::now(),
                                 );
@@ -101,12 +105,10 @@ impl EventCaptureDispatcher {
                     };
                     reconcile(
                         &state,
+                        &camera_workers,
                         &mut controller,
                         &composer,
-                        &mut buffers,
-                        &mut active_episodes,
-                        &mut pending_episodes,
-                        &aggregate_motion,
+                        &mut runtime,
                     );
                     if Instant::now() >= next_clip_housekeeping {
                         if let Err(error) = prune_event_clip_retention(&state) {
@@ -116,7 +118,17 @@ impl EventCaptureDispatcher {
                     }
                 }
 
-                let _ = controller.shutdown_all();
+                match controller.shutdown_all() {
+                    Ok(_) => cleanup_event_buffers(&runtime.buffers),
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            "event capture buffers could not stop during dispatcher shutdown"
+                        );
+                    }
+                }
+                runtime.local_motion.clear();
+                runtime.pre_rolls.clear();
             })?;
         Ok(Self {
             running,
@@ -144,6 +156,34 @@ impl Drop for EventCaptureDispatcher {
             let _ = thread.join();
         }
     }
+}
+
+struct PreRollRuntime {
+    lease: CameraPreRollLease,
+    next_health_check: Instant,
+}
+
+struct LocalMotionRuntime {
+    lease: CameraMotionLease,
+    /// Highest contiguous transition durably committed to EventIndex. An ACK
+    /// response can be lost after the worker already removed the queue prefix.
+    last_persisted: u64,
+    /// Highest sequence for which the worker confirmed the removal.
+    last_acknowledged: u64,
+}
+
+const LOCAL_MOTION_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct EventCaptureRuntime {
+    pre_rolls: HashMap<CameraId, PreRollRuntime>,
+    pre_roll_retry: HashMap<CameraId, Instant>,
+    local_motion: HashMap<CameraId, LocalMotionRuntime>,
+    local_motion_retry: HashMap<CameraId, Instant>,
+    buffers: HashMap<CameraId, BufferRuntime>,
+    active_episodes: HashMap<CameraId, ActiveEpisode>,
+    pending_episodes: Vec<(CameraId, ActiveEpisode)>,
+    aggregate_motion: HashMap<CameraId, bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -204,11 +244,37 @@ fn apply_signal(
     signal: PersistedEventSignal,
     now: Instant,
 ) {
-    let Some(motion_active) = signal.motion_active else {
-        return;
-    };
     let Ok(camera_id) = CameraId::parse(&signal.camera_id) else {
         tracing::warn!("persisted motion signal carried an invalid camera id");
+        return;
+    };
+    // Person classification comes from a trusted camera ONVIF topic, not a
+    // second recording trigger. Link its separately persisted Event Review row
+    // to the already-owned aggregate motion episode when time windows overlap.
+    if matches!(
+        signal.kind,
+        nian_application::EventHistoryKind::PersonStarted
+            | nian_application::EventHistoryKind::PersonEnded
+    ) && signal.motion_active.is_none()
+    {
+        if let Some(episode) = active_episodes.get_mut(&camera_id)
+            && signal.received_time_utc >= episode.trigger_utc
+        {
+            episode.add_event(signal.event_id);
+            return;
+        }
+        if let Some((_, episode)) = pending_episodes.iter_mut().rev().find(|(id, episode)| {
+            id == &camera_id
+                && signal.received_time_utc >= episode.trigger_utc
+                && episode
+                    .ended_utc
+                    .is_some_and(|end| signal.received_time_utc <= end + TimeDelta::seconds(5))
+        }) {
+            episode.add_event(signal.event_id);
+        }
+        return;
+    }
+    let Some(motion_active) = signal.motion_active else {
         return;
     };
     aggregate_motion.insert(camera_id.clone(), motion_active);
@@ -228,44 +294,450 @@ fn apply_signal(
 
 fn reconcile(
     state: &DesktopState,
+    camera_workers: &CameraWorkerBroker,
     controller: &mut RecordingController,
     composer: &WorkerEventClipComposer,
-    buffers: &mut HashMap<CameraId, BufferRuntime>,
-    active_episodes: &mut HashMap<CameraId, ActiveEpisode>,
-    pending_episodes: &mut Vec<(CameraId, ActiveEpisode)>,
-    aggregate_motion: &HashMap<CameraId, bool>,
+    runtime: &mut EventCaptureRuntime,
 ) {
     let running = state
         .lifecycle
         .state()
         .is_ok_and(|lifecycle| lifecycle == nian_application::DesktopLifecycleState::Running);
     if !running {
-        if let Err(error) = controller.shutdown_all() {
-            tracing::warn!(
-                ?error,
-                "event capture buffers could not stop for lifecycle transition"
-            );
+        runtime.local_motion.clear();
+        runtime.local_motion_retry.clear();
+        runtime.pre_rolls.clear();
+        runtime.pre_roll_retry.clear();
+        match controller.shutdown_all() {
+            Ok(_) => {
+                cleanup_event_buffers(&runtime.buffers);
+                runtime.buffers.clear();
+                runtime.active_episodes.clear();
+                runtime.pending_episodes.clear();
+                runtime.aggregate_motion.clear();
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "event capture buffers could not stop for lifecycle transition"
+                );
+            }
         }
-        buffers.clear();
         return;
     }
 
-    let desired = match state.event_controller.statuses() {
-        Ok(statuses) => statuses
-            .into_iter()
-            .filter(|status| status.desired)
-            .filter_map(|status| CameraId::parse(&status.camera_id).ok())
-            .collect::<HashSet<_>>(),
+    let statuses = match state.event_controller.statuses() {
+        Ok(statuses) => statuses,
         Err(error) => {
-            tracing::warn!(?error, "event capture desired state is unavailable");
-            return;
+            tracing::warn!(
+                ?error,
+                "event capture desired state is unavailable; settling active capture fail-closed"
+            );
+            Vec::new()
         }
     };
+    let local_desired = match state.local_motion_settings.lock() {
+        Ok(settings) => settings
+            .local_motion_enabled_cameras()
+            .map(|cameras| cameras.into_iter().collect::<HashSet<_>>()),
+        Err(_) => Err(nian_settings::SettingsError::InvalidData(
+            "local motion settings lock unavailable".to_owned(),
+        )),
+    }
+    .unwrap_or_else(|error| {
+        tracing::warn!(
+            ?error,
+            "local motion desired state unavailable; settling capture fail-closed"
+        );
+        HashSet::new()
+    });
+    let onvif_desired = statuses
+        .iter()
+        .filter(|status| status.desired)
+        .filter_map(|status| CameraId::parse(&status.camera_id).ok())
+        .collect::<HashSet<_>>();
+    // An invalid persisted dual-mode configuration never spawns two motion
+    // consumers. ONVIF remains authoritative until the operator resolves it.
+    let local_desired = local_desired
+        .difference(&onvif_desired)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let desired = onvif_desired
+        .union(&local_desired)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut monitoring_unavailable = statuses
+        .iter()
+        .filter(|status| {
+            status.desired
+                && status.motion_active.is_none()
+                && !matches!(status.state, EventRuntimeState::Polling)
+        })
+        .filter_map(|status| CameraId::parse(&status.camera_id).ok())
+        .collect::<HashSet<_>>();
 
-    reconcile_buffers(state, controller, buffers, &desired);
-    reconcile_episode_deadlines(active_episodes, pending_episodes, aggregate_motion);
-    finalize_ready_episodes(controller, composer, buffers, pending_episodes);
-    prune_buffers(buffers, active_episodes, pending_episodes);
+    // Retain the archival main ring *before* starting any substream decoder,
+    // so local detection cannot race pre-roll initialization.
+    reconcile_pre_roll(
+        state,
+        camera_workers,
+        &mut runtime.pre_rolls,
+        &mut runtime.pre_roll_retry,
+        &desired,
+    );
+    // A healthy substream cannot trigger archival events when its main
+    // pre-roll source is unavailable (for example, missing storage).
+    let ready_main = runtime.pre_rolls.keys().cloned().collect::<HashSet<_>>();
+    let (local_admitted, local_blocked) = local_motion_admission(&local_desired, &ready_main);
+    monitoring_unavailable.extend(local_blocked);
+    reconcile_local_motion(
+        state,
+        camera_workers,
+        &local_admitted,
+        &mut runtime.local_motion,
+        &mut runtime.local_motion_retry,
+        &mut monitoring_unavailable,
+    );
+    settle_unmonitorable_episodes(
+        &mut runtime.active_episodes,
+        &mut runtime.pending_episodes,
+        &mut runtime.aggregate_motion,
+        &desired,
+        &monitoring_unavailable,
+        Utc::now(),
+        Instant::now(),
+    );
+    reconcile_episode_deadlines(
+        &mut runtime.active_episodes,
+        &mut runtime.pending_episodes,
+        &runtime.aggregate_motion,
+    );
+    let capture_cameras = runtime
+        .active_episodes
+        .keys()
+        .cloned()
+        .chain(
+            runtime
+                .pending_episodes
+                .iter()
+                .map(|(camera_id, _)| camera_id.clone()),
+        )
+        .collect::<HashSet<_>>();
+    reconcile_buffers(state, controller, &mut runtime.buffers, &capture_cameras);
+    finalize_ready_episodes(
+        controller,
+        composer,
+        &runtime.buffers,
+        &mut runtime.pending_episodes,
+    );
+    prune_buffers(
+        &runtime.buffers,
+        &runtime.active_episodes,
+        &runtime.pending_episodes,
+    );
+}
+
+fn settle_unmonitorable_episodes(
+    active_episodes: &mut HashMap<CameraId, ActiveEpisode>,
+    pending_episodes: &mut Vec<(CameraId, ActiveEpisode)>,
+    aggregate_motion: &mut HashMap<CameraId, bool>,
+    desired_cameras: &HashSet<CameraId>,
+    monitoring_unavailable: &HashSet<CameraId>,
+    now_utc: DateTime<Utc>,
+    now: Instant,
+) {
+    let cameras = active_episodes.keys().cloned().collect::<Vec<_>>();
+    for camera_id in cameras {
+        let desired = desired_cameras.contains(&camera_id);
+        if desired && !monitoring_unavailable.contains(&camera_id) {
+            continue;
+        }
+        let Some(mut episode) = active_episodes.remove(&camera_id) else {
+            continue;
+        };
+        episode.ended_utc = Some(now_utc);
+        episode.finalize_after = Some(now + EVENT_POST_ROLL);
+        pending_episodes.push((camera_id.clone(), episode));
+        aggregate_motion.remove(&camera_id);
+    }
+
+    aggregate_motion.retain(|camera_id, _| {
+        desired_cameras.contains(camera_id) && !monitoring_unavailable.contains(camera_id)
+    });
+}
+
+/// Only camera IDs with an owned main pre-roll lease may run the local
+/// detector. Unavailable main streams must fail closed even if Grid is healthy.
+fn local_motion_admission(
+    desired: &HashSet<CameraId>,
+    main_ready: &HashSet<CameraId>,
+) -> (HashSet<CameraId>, HashSet<CameraId>) {
+    (
+        desired.intersection(main_ready).cloned().collect(),
+        desired.difference(main_ready).cloned().collect(),
+    )
+}
+
+/// No local video decoding in the desktop process: every enabled camera
+/// acquires a worker-owned subscriber to the Grid/sub profile (main fallback).
+/// Transitions are acknowledged only after EventIndex persistence. Errors
+/// revoke authority so event clips settle rather than growing indefinitely.
+fn reconcile_local_motion(
+    state: &DesktopState,
+    broker: &CameraWorkerBroker,
+    desired: &HashSet<CameraId>,
+    runtimes: &mut HashMap<CameraId, LocalMotionRuntime>,
+    retries: &mut HashMap<CameraId, Instant>,
+    unavailable: &mut HashSet<CameraId>,
+) {
+    let now = Instant::now();
+    let stopped = runtimes
+        .keys()
+        .filter(|id| !desired.contains(*id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for camera_id in stopped {
+        runtimes.remove(&camera_id);
+        retries.remove(&camera_id);
+    }
+    for camera_id in desired {
+        if runtimes.contains_key(camera_id)
+            || retries.get(camera_id).is_some_and(|until| now < *until)
+        {
+            continue;
+        }
+        let prepared = state.camera_service.lock().ok().and_then(|service| {
+            service
+                .prepare_live_profile(
+                    camera_id.as_str(),
+                    nian_application::LiveStreamProfile::Grid,
+                )
+                .ok()
+        });
+        let Some(prepared) = prepared else {
+            unavailable.insert(camera_id.clone());
+            retries.insert(camera_id.clone(), now + LOCAL_MOTION_RETRY_DELAY);
+            continue;
+        };
+        match broker.retain_local_motion(camera_id, prepared.source_json) {
+            Ok(lease) => {
+                runtimes.insert(
+                    camera_id.clone(),
+                    LocalMotionRuntime {
+                        lease,
+                        last_persisted: 0,
+                        last_acknowledged: 0,
+                    },
+                );
+                retries.remove(camera_id);
+            }
+            Err(error) => {
+                tracing::warn!(camera_id=%camera_id.as_str(), ?error, "local motion monitor unavailable");
+                unavailable.insert(camera_id.clone());
+                retries.insert(camera_id.clone(), now + LOCAL_MOTION_RETRY_DELAY);
+            }
+        }
+    }
+
+    let mut restart = Vec::new();
+    for (camera_id, runtime) in runtimes.iter_mut() {
+        let status = match runtime.lease.status() {
+            Ok(status) => status,
+            Err(error) => {
+                unavailable.insert(camera_id.clone());
+                // A dead or protocol-broken worker cannot recover through a
+                // stale lease. Reacquire through the broker's single-flight
+                // slot. A transient timeout does not justify killing a
+                // healthy shared Recorder/Live worker.
+                if local_motion_requires_new_lease(&error) {
+                    tracing::warn!(camera_id=%camera_id.as_str(), ?error, "reacquiring failed local motion worker lease");
+                    restart.push(camera_id.clone());
+                }
+                continue;
+            }
+        };
+        if local_motion_cursor_regressed(
+            runtime.last_acknowledged,
+            status
+                .transitions
+                .first()
+                .map(|transition| transition.sequence),
+        ) {
+            unavailable.insert(camera_id.clone());
+            tracing::warn!(camera_id=%camera_id.as_str(), "local motion worker sequence reset while lease was held");
+            restart.push(camera_id.clone());
+            continue;
+        }
+        // A new desktop lease can inherit the worker's *remaining* queue
+        // after a previous lease durably ACKed its prefix. Starting at zero
+        // would mistake that legitimate prefix for a gap and deadlock replay.
+        // Only the first pending sequence may establish this initial cursor;
+        // subsequent gaps still fail closed inside the loop below.
+        let Some(mut persisted_cursor) = local_motion_resume_cursor(
+            runtime.last_persisted,
+            status
+                .transitions
+                .first()
+                .map(|transition| transition.sequence),
+        ) else {
+            unavailable.insert(camera_id.clone());
+            tracing::warn!(camera_id=%camera_id.as_str(), "local motion transition has invalid zero sequence");
+            continue;
+        };
+        // Only the first lease poll can adopt a worker's already-ACKed
+        // prefix. Later polls never relabel missing transitions as history.
+        if runtime.last_persisted == 0 && runtime.last_acknowledged == 0 {
+            runtime.last_acknowledged = persisted_cursor;
+        }
+        let mut persisted = true;
+        for transition in &status.transitions {
+            if transition.sequence <= persisted_cursor {
+                continue;
+            }
+            if transition.sequence != persisted_cursor.saturating_add(1) {
+                persisted = false;
+                tracing::warn!(camera_id=%camera_id.as_str(), "local motion transition sequence gap");
+                break;
+            }
+            let observed = match DateTime::parse_from_rfc3339(&transition.observed_at_utc) {
+                Ok(observed) => observed.with_timezone(&Utc),
+                Err(_) => {
+                    persisted = false;
+                    break;
+                }
+            };
+            if let Err(error) = state.event_controller.persist_local_motion(
+                camera_id,
+                transition.sequence,
+                transition.motion_active,
+                observed,
+            ) {
+                tracing::warn!(camera_id=%camera_id.as_str(), ?error, "local motion event could not persist");
+                persisted = false;
+                break;
+            }
+            persisted_cursor = transition.sequence;
+        }
+        // Persisted and acknowledged are deliberately separate. If an ACK
+        // reached the worker but its response was lost, the next status may
+        // begin after last_acknowledged; replay still advances from the
+        // durable cursor and retries an idempotent ACK without duplicate rows.
+        runtime.last_persisted = persisted_cursor;
+        if persisted_cursor > runtime.last_acknowledged {
+            match runtime.lease.acknowledge(persisted_cursor) {
+                Ok(()) => runtime.last_acknowledged = persisted_cursor,
+                Err(_) => persisted = false,
+            }
+        }
+        if !persisted || !local_motion_authoritative(&status) {
+            unavailable.insert(camera_id.clone());
+        }
+        if matches!(status.state.as_str(), "failed" | "disabled") && status.transitions.is_empty() {
+            restart.push(camera_id.clone());
+        }
+    }
+    for camera_id in restart {
+        runtimes.remove(&camera_id);
+        retries.insert(camera_id, now + LOCAL_MOTION_RETRY_DELAY);
+    }
+}
+
+fn local_motion_requires_new_lease(error: &CameraWorkerError) -> bool {
+    matches!(
+        error,
+        CameraWorkerError::Unavailable | CameraWorkerError::Protocol
+    )
+}
+
+/// An acknowledged transition cannot reappear at the front of this worker's
+/// unacknowledged queue. Detect a reset sequence epoch rather than silently
+/// dropping fresh events as if they belonged to the previous job.
+fn local_motion_cursor_regressed(last_acknowledged: u64, first_pending: Option<u64>) -> bool {
+    last_acknowledged != 0 && first_pending.is_some_and(|first| first <= last_acknowledged)
+}
+
+/// The worker retains only unacknowledged transitions. A replacement lease
+/// has no knowledge of the previous lease's committed/ACKed prefix, so its
+/// first pending sequence establishes the cursor once. Subsequent calls must
+/// use the durable cursor, not the last confirmed ACK: the ACK response may
+/// have been lost after the worker already dequeued its persisted prefix.
+fn local_motion_resume_cursor(last_persisted: u64, first_pending: Option<u64>) -> Option<u64> {
+    if last_persisted != 0 {
+        Some(last_persisted)
+    } else {
+        first_pending.map_or(Some(0), |sequence| sequence.checked_sub(1))
+    }
+}
+
+fn local_motion_authoritative(status: &CameraMotionStatus) -> bool {
+    status.state == "monitoring"
+        && status.motion_active.is_some()
+        && status.last_error_code.is_none()
+}
+
+fn reconcile_pre_roll(
+    state: &DesktopState,
+    camera_workers: &CameraWorkerBroker,
+    pre_rolls: &mut HashMap<CameraId, PreRollRuntime>,
+    retry_after: &mut HashMap<CameraId, Instant>,
+    desired_cameras: &HashSet<CameraId>,
+) {
+    let now = Instant::now();
+    let known = pre_rolls.keys().cloned().collect::<Vec<_>>();
+    for camera_id in known {
+        if !desired_cameras.contains(&camera_id) {
+            pre_rolls.remove(&camera_id);
+            retry_after.remove(&camera_id);
+            continue;
+        }
+        let unhealthy = pre_rolls.get_mut(&camera_id).is_some_and(|runtime| {
+            if now < runtime.next_health_check {
+                return false;
+            }
+            runtime.next_health_check = now + PRE_ROLL_HEALTH_INTERVAL;
+            !runtime.lease.is_healthy()
+        });
+        if unhealthy {
+            pre_rolls.remove(&camera_id);
+            retry_after.insert(camera_id, now + PRE_ROLL_RETRY_DELAY);
+        }
+    }
+
+    for camera_id in desired_cameras {
+        if pre_rolls.contains_key(camera_id)
+            || retry_after
+                .get(camera_id)
+                .is_some_and(|deadline| now < *deadline)
+        {
+            continue;
+        }
+        let prepared = state
+            .camera_service
+            .lock()
+            .ok()
+            .and_then(|service| service.prepare_recording(camera_id.as_str()).ok());
+        let Some(prepared) = prepared else {
+            retry_after.insert(camera_id.clone(), now + PRE_ROLL_RETRY_DELAY);
+            continue;
+        };
+        match camera_workers.retain_pre_roll(camera_id, prepared.source_json) {
+            Ok(lease) => {
+                pre_rolls.insert(
+                    camera_id.clone(),
+                    PreRollRuntime {
+                        lease,
+                        next_health_check: now + PRE_ROLL_HEALTH_INTERVAL,
+                    },
+                );
+                retry_after.remove(camera_id);
+                tracing::info!(camera_id = %camera_id.as_str(), "compressed event pre-roll retained");
+            }
+            Err(error) => {
+                retry_after.insert(camera_id.clone(), now + PRE_ROLL_RETRY_DELAY);
+                tracing::warn!(camera_id = %camera_id.as_str(), ?error, "compressed event pre-roll unavailable");
+            }
+        }
+    }
 }
 
 fn reconcile_buffers(
@@ -276,7 +748,13 @@ fn reconcile_buffers(
 ) {
     let known = buffers.keys().cloned().collect::<Vec<_>>();
     for camera_id in known {
-        let status = controller.status(&camera_id).unwrap_or_default();
+        let status = match controller.status(&camera_id) {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::warn!(camera_id = %camera_id.as_str(), ?error, "event buffer status unavailable");
+                continue;
+            }
+        };
         if !desired_cameras.contains(&camera_id) {
             if status.state.is_active() && status.state != RecordingState::Stopping {
                 if let Err(error) = controller.stop(&camera_id)
@@ -284,8 +762,11 @@ fn reconcile_buffers(
                 {
                     tracing::warn!(camera_id = %camera_id.as_str(), ?error, "event buffer stop failed");
                 }
-            } else if !status.state.is_active() {
-                buffers.remove(&camera_id);
+            } else if !status.state.is_active()
+                && let Some(runtime) = buffers.remove(&camera_id)
+                && let Err(error) = cleanup_event_buffer_camera(&runtime, &camera_id)
+            {
+                tracing::warn!(camera_id = %camera_id.as_str(), ?error, "event buffer cleanup failed");
             }
         }
     }
@@ -293,7 +774,13 @@ fn reconcile_buffers(
     for camera_id in desired_cameras {
         let now = Instant::now();
         if let Some(runtime) = buffers.get(camera_id) {
-            let status = controller.status(camera_id).unwrap_or_default();
+            let status = match controller.status(camera_id) {
+                Ok(status) => status,
+                Err(error) => {
+                    tracing::warn!(camera_id = %camera_id.as_str(), ?error, "event buffer status unavailable");
+                    continue;
+                }
+            };
             if status.state.is_active() || now < runtime.next_start_attempt {
                 continue;
             }
@@ -321,14 +808,24 @@ fn reconcile_buffers(
             .get(camera_id)
             .is_some_and(|runtime| runtime.buffer_root != buffer_root);
         if root_changed {
-            let status = controller.status(camera_id).unwrap_or_default();
+            let status = match controller.status(camera_id) {
+                Ok(status) => status,
+                Err(error) => {
+                    tracing::warn!(camera_id = %camera_id.as_str(), ?error, "event buffer status unavailable during storage switch");
+                    continue;
+                }
+            };
             if status.state.is_active() {
                 if status.state != RecordingState::Stopping {
                     let _ = controller.stop(camera_id);
                 }
                 continue;
             }
-            buffers.remove(camera_id);
+            if let Some(runtime) = buffers.remove(camera_id)
+                && let Err(error) = cleanup_event_buffer_camera(&runtime, camera_id)
+            {
+                tracing::warn!(camera_id = %camera_id.as_str(), ?error, "old event buffer cleanup failed during storage switch");
+            }
         }
 
         prepared.storage_root = buffer_root.to_string_lossy().into_owned();
@@ -976,6 +1473,46 @@ fn delete_event_clip_candidate(
     Ok(())
 }
 
+fn cleanup_event_buffer_camera(runtime: &BufferRuntime, camera_id: &CameraId) -> io::Result<usize> {
+    let layout = RecordingsLayout::new(runtime.buffer_root.clone()).map_err(io::Error::other)?;
+    let inventory = inventory_recordings(&layout).map_err(io::Error::other)?;
+    let mut removed = 0_usize;
+    for path in inventory
+        .recordings
+        .into_iter()
+        .filter(|recording| &recording.camera_id == camera_id)
+        .map(|recording| recording.path)
+        .chain(
+            inventory
+                .partials
+                .into_iter()
+                .filter(|partial| &partial.camera_id == camera_id)
+                .map(|partial| partial.path),
+        )
+    {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed = removed.saturating_add(1),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removed)
+}
+
+fn cleanup_event_buffers(buffers: &HashMap<CameraId, BufferRuntime>) {
+    for (camera_id, runtime) in buffers {
+        match cleanup_event_buffer_camera(runtime, camera_id) {
+            Ok(removed) if removed > 0 => {
+                tracing::debug!(camera_id = %camera_id.as_str(), removed, "event buffer temporary media cleaned");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(camera_id = %camera_id.as_str(), ?error, "event buffer cleanup failed");
+            }
+        }
+    }
+}
+
 fn prune_buffers(
     buffers: &HashMap<CameraId, BufferRuntime>,
     active_episodes: &HashMap<CameraId, ActiveEpisode>,
@@ -1311,6 +1848,145 @@ mod tests {
     }
 
     #[test]
+    fn local_motion_requires_archival_main_preroll_even_with_a_healthy_substream() {
+        let front = CameraId::parse("cam-front").unwrap();
+        let side = CameraId::parse("cam-side").unwrap();
+        let desired = HashSet::from([front.clone(), side.clone()]);
+
+        let (admitted, unavailable) = local_motion_admission(&desired, &HashSet::new());
+        assert!(
+            admitted.is_empty(),
+            "substream alone must not authorize detection"
+        );
+        assert_eq!(unavailable, desired);
+
+        let (admitted, unavailable) =
+            local_motion_admission(&desired, &HashSet::from([front.clone()]));
+        assert_eq!(admitted, HashSet::from([front.clone()]));
+        assert_eq!(unavailable, HashSet::from([side.clone()]));
+
+        let (admitted, unavailable) =
+            local_motion_admission(&desired, &HashSet::from([front, side]));
+        assert_eq!(admitted, desired);
+        assert!(unavailable.is_empty());
+    }
+
+    #[test]
+    fn replacement_local_motion_lease_resumes_at_first_unacked_transition() {
+        // The previous lease persisted/ACKed sequences 1..=40. A subsequent
+        // status reports the outstanding 41/42 pair, not the already ACKed
+        // history. Never treat that legitimate prefix as an unrecoverable gap.
+        assert_eq!(local_motion_resume_cursor(0, Some(41)), Some(40));
+        assert_eq!(local_motion_resume_cursor(40, Some(41)), Some(40));
+        assert_eq!(local_motion_resume_cursor(0, None), Some(0));
+        assert_eq!(local_motion_resume_cursor(0, Some(0)), None);
+
+        // Once an owner has a cursor, a missing transition cannot silently
+        // become a new baseline. The reconciliation sequence check rejects it.
+        let cursor = local_motion_resume_cursor(40, Some(42)).unwrap();
+        assert_ne!(42, cursor.saturating_add(1));
+    }
+
+    #[test]
+    fn lost_motion_ack_reply_keeps_the_durable_cursor_and_retries_without_duplicate_events() {
+        // After persisting 11 and 12, an ACK for 12 may succeed at the worker
+        // but its response can be lost. The desktop has confirmed ACK 10 yet
+        // must remember that 11 and 12 are already durable.
+        let acknowledged = 10;
+        let persisted = 12;
+        // ACK was not applied: the worker still offers 11/12 for replay.
+        assert!(!local_motion_cursor_regressed(acknowledged, Some(11)));
+        let cursor = local_motion_resume_cursor(persisted, Some(11)).unwrap();
+        assert_eq!(cursor, 12);
+        assert!(12 <= cursor, "already-committed rows are skipped");
+        // ACK was applied but the response vanished: only sequence 13 remains.
+        assert!(!local_motion_cursor_regressed(acknowledged, Some(13)));
+        let cursor = local_motion_resume_cursor(persisted, Some(13)).unwrap();
+        assert_eq!(13, cursor + 1, "the next real event is never a false gap");
+        // A genuinely missing transition after the durable cursor is an error.
+        assert_ne!(14, cursor + 1);
+        // An empty queue still permits an idempotent retry of ACK 12.
+        assert_eq!(local_motion_resume_cursor(persisted, None), Some(12));
+    }
+
+    #[test]
+    fn dead_motion_worker_reacquires_but_a_transient_status_timeout_does_not_kill_shared_media() {
+        assert!(local_motion_requires_new_lease(
+            &CameraWorkerError::Unavailable
+        ));
+        assert!(local_motion_requires_new_lease(
+            &CameraWorkerError::Protocol
+        ));
+        assert!(!local_motion_requires_new_lease(
+            &CameraWorkerError::Timeout
+        ));
+        assert!(!local_motion_requires_new_lease(
+            &CameraWorkerError::Synchronization
+        ));
+        assert!(!local_motion_requires_new_lease(&CameraWorkerError::Rpc(
+            "motion_busy".to_owned(),
+        )));
+    }
+
+    #[test]
+    fn worker_sequence_epoch_regression_cannot_silently_discard_new_motion_events() {
+        assert!(!local_motion_cursor_regressed(0, Some(1)));
+        assert!(!local_motion_cursor_regressed(0, Some(42)));
+        assert!(!local_motion_cursor_regressed(42, None));
+        assert!(!local_motion_cursor_regressed(42, Some(43)));
+        assert!(local_motion_cursor_regressed(42, Some(1)));
+        assert!(local_motion_cursor_regressed(42, Some(42)));
+        assert!(local_motion_cursor_regressed(42, Some(0)));
+    }
+
+    #[test]
+    fn camera_person_events_link_to_one_motion_episode_without_creating_recorders() {
+        let at = Utc::now();
+        let camera = CameraId::parse("cam-front").unwrap();
+        let mut active = HashMap::new();
+        let mut pending = Vec::new();
+        let mut aggregate = HashMap::new();
+        let now = Instant::now();
+        apply_signal(
+            &mut active,
+            &mut pending,
+            &mut aggregate,
+            signal(1, true, at),
+            now,
+        );
+        let mut person_start = signal(2, true, at + TimeDelta::seconds(1));
+        person_start.kind = nian_application::EventHistoryKind::PersonStarted;
+        person_start.motion_active = None;
+        apply_signal(&mut active, &mut pending, &mut aggregate, person_start, now);
+        assert_eq!(
+            active.len(),
+            1,
+            "person detection cannot start another recorder"
+        );
+        assert_eq!(active[&camera].event_ids, vec![1, 2]);
+        assert_eq!(aggregate.get(&camera), Some(&true));
+        apply_signal(
+            &mut active,
+            &mut pending,
+            &mut aggregate,
+            signal(3, false, at + TimeDelta::seconds(2)),
+            now,
+        );
+        let mut person_end = signal(4, false, at + TimeDelta::seconds(2));
+        person_end.kind = nian_application::EventHistoryKind::PersonEnded;
+        person_end.motion_active = None;
+        apply_signal(&mut active, &mut pending, &mut aggregate, person_end, now);
+        assert!(active.is_empty());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1.event_ids, vec![1, 2, 3, 4]);
+        let mut stale = signal(5, true, at - TimeDelta::minutes(1));
+        stale.kind = nian_application::EventHistoryKind::PersonStarted;
+        stale.motion_active = None;
+        apply_signal(&mut active, &mut pending, &mut aggregate, stale, now);
+        assert_eq!(pending[0].1.event_ids, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
     fn a_new_motion_burst_does_not_merge_into_the_previous_post_roll() {
         let camera = CameraId::parse("cam-front").unwrap();
         let at = Utc::now();
@@ -1392,6 +2068,154 @@ mod tests {
         assert_eq!(start, at - TimeDelta::seconds(5));
         assert_eq!(end, at + TimeDelta::seconds(8));
         assert!(end.signed_duration_since(start) <= TimeDelta::minutes(5));
+    }
+
+    #[test]
+    fn disabling_events_during_motion_settles_once_with_bounded_post_roll() {
+        let camera = CameraId::parse("cam-front").unwrap();
+        let at = Utc::now();
+        let mut active = HashMap::new();
+        let mut pending = Vec::new();
+        let mut aggregate = HashMap::new();
+        apply_signal(
+            &mut active,
+            &mut pending,
+            &mut aggregate,
+            signal(1, true, at),
+            Instant::now(),
+        );
+        assert_eq!(aggregate.get(&camera), Some(&true));
+
+        let settle_at = Instant::now();
+        settle_unmonitorable_episodes(
+            &mut active,
+            &mut pending,
+            &mut aggregate,
+            &HashSet::new(),
+            &HashSet::new(),
+            at + TimeDelta::seconds(2),
+            settle_at,
+        );
+
+        assert!(active.is_empty());
+        assert!(!aggregate.contains_key(&camera));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, camera);
+        assert_eq!(pending[0].1.ended_utc, Some(at + TimeDelta::seconds(2)));
+        assert_eq!(
+            pending[0].1.finalize_after,
+            Some(settle_at + EVENT_POST_ROLL)
+        );
+
+        reconcile_episode_deadlines(&mut active, &mut pending, &aggregate);
+        assert!(
+            active.is_empty(),
+            "Desired Off must never create a continuation"
+        );
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn monitoring_loss_during_motion_settles_without_five_minute_continuations() {
+        let camera = CameraId::parse("cam-front").unwrap();
+        let at = Utc::now();
+        let mut active = HashMap::new();
+        let mut pending = Vec::new();
+        let mut aggregate = HashMap::new();
+        apply_signal(
+            &mut active,
+            &mut pending,
+            &mut aggregate,
+            signal(1, true, at),
+            Instant::now(),
+        );
+
+        settle_unmonitorable_episodes(
+            &mut active,
+            &mut pending,
+            &mut aggregate,
+            &HashSet::from([camera.clone()]),
+            &HashSet::from([camera.clone()]),
+            at + TimeDelta::seconds(3),
+            Instant::now(),
+        );
+
+        assert!(active.is_empty());
+        assert!(!aggregate.contains_key(&camera));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, camera);
+    }
+
+    #[test]
+    fn healthy_desired_monitoring_does_not_settle_an_active_episode() {
+        let camera = CameraId::parse("cam-front").unwrap();
+        let at = Utc::now();
+        let mut active = HashMap::new();
+        let mut pending = Vec::new();
+        let mut aggregate = HashMap::new();
+        apply_signal(
+            &mut active,
+            &mut pending,
+            &mut aggregate,
+            signal(1, true, at),
+            Instant::now(),
+        );
+
+        settle_unmonitorable_episodes(
+            &mut active,
+            &mut pending,
+            &mut aggregate,
+            &HashSet::from([camera.clone()]),
+            &HashSet::new(),
+            at + TimeDelta::seconds(1),
+            Instant::now(),
+        );
+
+        assert!(active.contains_key(&camera));
+        assert!(pending.is_empty());
+        assert_eq!(aggregate.get(&camera), Some(&true));
+    }
+
+    #[test]
+    fn idle_event_buffer_cleanup_removes_owned_temp_media_without_touching_foreign_or_other_camera_files()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        std::fs::create_dir_all(&root).unwrap();
+        let buffer_root = ensure_event_subdir(&root, "event-buffer").unwrap();
+        let camera = CameraId::parse("cam-front").unwrap();
+        let other_camera = CameraId::parse("cam-side").unwrap();
+        let camera_day = buffer_root
+            .join(camera.as_str())
+            .join("2026")
+            .join("09")
+            .join("16");
+        let other_day = buffer_root
+            .join(other_camera.as_str())
+            .join("2026")
+            .join("09")
+            .join("16");
+        std::fs::create_dir_all(&camera_day).unwrap();
+        std::fs::create_dir_all(&other_day).unwrap();
+        let finalized = camera_day.join("09-00-00.mkv");
+        let partial = camera_day.join("09-00-02.partial.mkv");
+        let foreign = camera_day.join("notes.txt");
+        let other = other_day.join("09-00-00.mkv");
+        std::fs::write(&finalized, b"temporary-event-media").unwrap();
+        std::fs::write(&partial, b"partial-event-media").unwrap();
+        std::fs::write(&foreign, b"foreign-evidence").unwrap();
+        std::fs::write(&other, b"other-camera-media").unwrap();
+
+        let runtime = BufferRuntime {
+            manual_storage_root: root,
+            buffer_root,
+            next_start_attempt: Instant::now(),
+        };
+        assert_eq!(cleanup_event_buffer_camera(&runtime, &camera).unwrap(), 2);
+        assert!(!finalized.exists());
+        assert!(!partial.exists());
+        assert!(foreign.exists());
+        assert!(other.exists());
     }
 
     #[test]

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 const HEADER_FILES: &[&str] = &[
     "libavutil/avutil.h",
+    "libavutil/frame.h",
     "libavutil/dict.h",
     "libavutil/error.h",
     "libavutil/rational.h",
@@ -55,8 +56,20 @@ const ALLOWLISTED_FUNCTIONS: &[&str] = &[
     "av_packet_rescale_ts",
     "av_packet_new_side_data",
     "av_packet_get_side_data",
+    "avcodec_parameters_alloc",
+    "avcodec_parameters_free",
     "avcodec_parameters_copy",
     "avcodec_get_name",
+    "avcodec_find_decoder",
+    "avcodec_alloc_context3",
+    "avcodec_parameters_to_context",
+    "avcodec_open2",
+    "avcodec_send_packet",
+    "avcodec_receive_frame",
+    "avcodec_free_context",
+    "av_frame_alloc",
+    "av_frame_unref",
+    "av_frame_free",
     "avcodec_version",
     "avutil_version",
     "av_strerror",
@@ -75,6 +88,8 @@ const ALLOWLISTED_TYPES: &[&str] = &[
     "AVStream",
     "AVInputFormat",
     "AVCodecParameters",
+    "AVCodecContext",
+    "AVFrame",
     "AVPacket",
     "AVPacketSideData",
     "AVDictionary",
@@ -85,6 +100,7 @@ const ALLOWLISTED_TYPES: &[&str] = &[
     "AVClass",
     "AVMediaType",
     "AVCodecID",
+    "AVPixelFormat",
     "AVColorRange",
     "AVRounding",
     "AVPacketSideDataType",
@@ -93,6 +109,7 @@ const ALLOWLISTED_TYPES: &[&str] = &[
 const ALLOWLISTED_VARS: &[&str] = &[
     "NIAN_AV_NOPTS_VALUE",
     "NIAN_AVERROR_EOF",
+    "NIAN_AVERROR_EAGAIN",
     "LIBAVFORMAT_VERSION_MAJOR",
     "LIBAVCODEC_VERSION_MAJOR",
     "LIBAVUTIL_VERSION_MAJOR",
@@ -101,6 +118,10 @@ const ALLOWLISTED_VARS: &[&str] = &[
     "AV_PKT_FLAG_KEY",
     "AV_PKT_FLAG_CORRUPT",
     "AV_PKT_FLAG_DISCARD",
+    "AV_PIX_FMT_YUV420P",
+    "AV_PIX_FMT_YUVJ420P",
+    "AV_PIX_FMT_NV12",
+    "AV_PIX_FMT_GRAY8",
     "AVFMT_NOFILE",
     "AVFMT_FLAG_NONBLOCK",
     "AVFMT_GLOBALHEADER",
@@ -160,12 +181,14 @@ fn main() -> Result<(), String> {
         .opaque_type("AVIOContext")
         .opaque_type("AVOutputFormat")
         .opaque_type("AVCodec")
+        .opaque_type("AVCodecContext")
         .opaque_type("AVClass")
         .opaque_type("AVPacketSideData")
         .constified_enum("AVMediaType")
         .constified_enum("AVCodecID")
         .constified_enum("AVRounding")
         .constified_enum("AVColorRange")
+        .constified_enum("AVPixelFormat")
         .constified_enum("AVPacketSideDataType")
         .layout_tests(false)
         .default_enum_style(bindgen::EnumVariation::Consts)

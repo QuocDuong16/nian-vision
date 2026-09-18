@@ -8,6 +8,23 @@ afterEach(() => {
 });
 
 describe("VideoPlayer", () => {
+  it("releases the media resource explicitly when unmounted", async () => {
+    const pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    const load = vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
+    const view = render(<VideoPlayer src="http://127.0.0.1:43100/playback/release" />);
+
+    const video = await waitFor(() => {
+      const current = view.container.querySelector("video");
+      expect(current?.getAttribute("src")).toBe("http://127.0.0.1:43100/playback/release");
+      return current as HTMLVideoElement;
+    });
+    view.unmount();
+
+    expect(pause).toHaveBeenCalled();
+    expect(load).toHaveBeenCalled();
+    expect(video?.hasAttribute("src")).toBe(false);
+  });
+
   it("mounts the Sutro Media Chrome theme instead of native browser controls and exposes NVR metadata", async () => {
     render(
       <VideoPlayer
@@ -63,6 +80,68 @@ describe("VideoPlayer", () => {
     fireEvent.error(video);
     expect(onEnded).toHaveBeenCalledTimes(1);
     expect(onError).toHaveBeenCalledTimes(1);
+  });
+
+  it("synchronizes G.711 PCM sidecar playback, seeking, volume and teardown without restarting on metadata updates", async () => {
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    const pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    const load = vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
+    const audioSrc = "http://127.0.0.1:43100/playback/test/audio";
+    const view = render(<VideoPlayer src="http://127.0.0.1:43100/playback/test" audioSrc={audioSrc} />);
+    await waitFor(() => expect(view.container.querySelector("audio")?.getAttribute("src")).toBe(audioSrc));
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    const audio = view.container.querySelector("audio") as HTMLAudioElement;
+    video.currentTime = 4;
+    video.volume = 0.4;
+    video.muted = true;
+    video.playbackRate = 1.5;
+    fireEvent.play(video);
+    expect(play).not.toHaveBeenCalled(); // video is not actually rendering yet
+    fireEvent.playing(video);
+    expect(play).toHaveBeenCalledTimes(1);
+    expect(audio.currentTime).toBe(4);
+    expect(audio.volume).toBe(0.4);
+    expect(audio.muted).toBe(true);
+    expect(audio.playbackRate).toBe(1.5);
+
+    Object.defineProperty(video, "duration", { configurable: true, value: 30 });
+    fireEvent.durationChange(video); // React re-render must not detach audio.
+    expect(audio.getAttribute("src")).toBe(audioSrc);
+    video.currentTime = 10;
+    fireEvent.seeked(video);
+    expect(audio.currentTime).toBe(10);
+    video.volume = 0.7;
+    video.muted = false;
+    fireEvent.volumeChange(video);
+    expect(audio.volume).toBe(0.7);
+    expect(audio.muted).toBe(false);
+    fireEvent.waiting(video);
+    expect(pause).toHaveBeenCalledTimes(1);
+    fireEvent.playing(video);
+    expect(play).toHaveBeenCalledTimes(2);
+    fireEvent.seeking(video);
+    expect(pause).toHaveBeenCalledTimes(2);
+    fireEvent.playing(video);
+    expect(play).toHaveBeenCalledTimes(3);
+    fireEvent.stalled(video);
+    expect(pause).toHaveBeenCalledTimes(3);
+    fireEvent.pause(video);
+    expect(pause).toHaveBeenCalledTimes(4);
+    view.unmount();
+    expect(audio.hasAttribute("src")).toBe(false);
+    expect(load).toHaveBeenCalled();
+  });
+
+  it("reports G.711 sidecar decode failures without closing the video", async () => {
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
+    const onVideoError = vi.fn();
+    const view = render(<VideoPlayer src="http://127.0.0.1:43100/playback/test" audioSrc="http://127.0.0.1:43100/playback/test/audio" onError={onVideoError} />);
+    await waitFor(() => expect(view.container.querySelector("audio")).toBeTruthy());
+    fireEvent.error(view.container.querySelector("audio") as HTMLAudioElement);
+    expect(screen.getByRole("status").textContent).toContain("G.711 audio could not be played");
+    expect(view.container.querySelector("video")?.getAttribute("src")).toContain("/playback/test");
+    expect(onVideoError).not.toHaveBeenCalled();
   });
 
   it("resets clip-specific metadata UI when the source changes", async () => {

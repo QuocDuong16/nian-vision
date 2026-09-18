@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use nian_domain::{MediaStreamInfo, MediaType};
+use nian_domain::{MediaRational, MediaStreamInfo, MediaType};
 use nian_media::{MediaError, MediaSource, Probe};
 use nian_media_ffmpeg::{FfmpegBackend, InterruptHandle, MatroskaMuxer, MediaInput};
 
@@ -90,6 +90,7 @@ fn probe_reports_fixture_streams() {
     assert_eq!(video.codec_name, "mpeg4");
     assert_eq!(video.width, Some(160));
     assert_eq!(video.height, Some(120));
+    assert_eq!(video.frame_rate, MediaRational::new(10, 1).ok());
     assert!(video.time_base.is_some());
 
     let duration = report.duration.expect("fixture duration is known");
@@ -587,4 +588,72 @@ fn live_fragmented_mp4_packet_copy_is_probeable() {
         .unwrap();
     assert!(report.format_name.contains("mp4"));
     assert_eq!(report.video_stream().unwrap().codec_name, "h264");
+}
+
+#[test]
+fn hevc_and_g711_law_variants_survive_native_matroska_recording() {
+    for (fixture, codec) in [
+        ("hevc_g711_alaw.mkv", "pcm_alaw"),
+        ("hevc_g711_mulaw.mkv", "pcm_mulaw"),
+    ] {
+        let interrupt = InterruptHandle::new();
+        let mut input =
+            MediaInput::open(&MediaSource::file(fixture_path(fixture)), &interrupt).unwrap();
+        let streams = input.streams();
+        assert_eq!(streams[0].codec_name, "hevc");
+        assert_eq!(streams[1].codec_name, codec);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.mkv");
+        let mut muxer = MatroskaMuxer::create_recording_segment_with_selection(
+            &mut input,
+            &path,
+            &interrupt,
+            |stream| matches!(stream.media_type, MediaType::Video | MediaType::Audio),
+        )
+        .unwrap();
+        assert!(copy_all_packets(&mut input, &mut muxer).unwrap() > 5);
+        muxer.finalize().unwrap();
+        let report = FfmpegBackend::new()
+            .unwrap()
+            .probe(&MediaSource::file(&path))
+            .unwrap();
+        assert_eq!(report.video_stream().unwrap().codec_name, "hevc");
+        assert!(
+            report.streams.iter().any(|stream| {
+                stream.media_type == MediaType::Audio && stream.codec_name == codec
+            }),
+            "recording must preserve original {codec} instead of silently dropping it"
+        );
+    }
+}
+
+#[test]
+fn hevc_packet_copy_to_browser_fragment_uses_hvc1_without_transcoding() {
+    let interrupt = InterruptHandle::new();
+    let mut input = MediaInput::open(
+        &MediaSource::file(fixture_path("hevc_g711_alaw.mkv")),
+        &interrupt,
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.mp4");
+    let mut muxer = MatroskaMuxer::create_live_fragmented_mp4_with_selection(
+        &mut input,
+        &path,
+        &interrupt,
+        |stream| stream.media_type == MediaType::Video,
+    )
+    .unwrap();
+    assert!(copy_all_packets(&mut input, &mut muxer).unwrap() > 5);
+    muxer.finalize().unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        bytes.windows(4).any(|value| value == b"hvc1"),
+        "HEVC browser entry must be hvc1"
+    );
+    let report = FfmpegBackend::new()
+        .unwrap()
+        .probe(&MediaSource::file(&path))
+        .unwrap();
+    assert_eq!(report.video_stream().unwrap().codec_name, "hevc");
 }

@@ -617,10 +617,10 @@ path. Only the selected authentication mode is cached per authority, never crede
 or reusable challenges. The protocol crate itself owns no secret persistence.
 
 Device interrogation retrieves Device Management information and service endpoints,
-prefers Media2 and falls back to legacy Media for profile enumeration. H.264 is the
-only M10 recording-compatible video codec. Multiple H.264 profiles remain visible
-for explicit user choice; H.265/other profiles may be displayed as unsupported but
-are never silently selected or transcoded. `GetStreamUri` is resolved only after a
+prefers Media2 and falls back to legacy Media for profile enumeration. H.264 and
+H.265/HEVC video profiles are recordable; other video codecs remain unsupported.
+Multiple profiles remain visible for explicit user choice; no profile is silently
+selected or transcoded. HEVC Live/playback requires OS/WebView decoding support. `GetStreamUri` is resolved only after a
 profile choice, then normalized into safe RTSP host/port/path fields.
 
 Provisioning is deliberately two-phase. The desktop resolves an opaque ONVIF
@@ -670,17 +670,17 @@ The capture moves only the currently active/opening owners to draining and remov
 identity-matched HTTP capabilities; it never clears capabilities belonging to sessions
 created later. Close-to-tray performs this capture before hiding, then runs only the frozen
 batch's signal/join/cleanup on the blocking runtime. Reactivation can therefore admit a
-fresh same-camera session while the old one drains, subject to the same four-worker total
+fresh same-camera session while the old one drains, subject to the same 16-worker total
 capacity. Session teardown has one leader and a completion Condvar, so a later
 Quit/Update/Suspend waits on the same owner instead of double-joining it. Stale draining
 retirement is session/owner-identity checked so an old completion cannot erase a newer
 session.
 
-The worker accepts `live.start`, `live.status` and `live.stop`, requires H.264 and
-packet-copies video only. Instead of one growing MP4, it writes independently finalized
+The worker accepts `live.start`, `live.status` and `live.stop`, requires H.264 or
+HEVC and packet-copies video only. Instead of one growing MP4, it writes independently finalized
 fragmented-MP4 files. Only the initial fragment waits for a keyframe; later fragments rotate
 at a 500 ms media-time target without waiting for another keyframe. Production limits are:
-four live sessions, a 24-fragment retained target per session (nominally about a 12-second
+16 live sessions, a 24-fragment retained target per session (nominally about a 12-second
 post-initial live window), a 26-finalized-fragment hard count ceiling that accounts for two
 possible reader pins, the previous 96 MiB retained-byte ceiling, 16 MiB maximum per fragment,
 two HTTP readers per session and eight concurrent live HTTP requests globally. The worker backpressures when the hard fragment-count
@@ -898,7 +898,7 @@ M14 is a projection over M13 persistence, not a new camera authority. Event Revi
 
 RC49 supersedes the RC47 recording-correlation and shared-recorder model; RC50 refines the Event-review projection and burst boundaries. Event Review never searches the manual Recording index by Event timestamp and never treats Timeline footage as the Event clip. Instead, each persisted Event ID may resolve through immutable filesystem aliases under `<storage_root>/.nian/event-clips/<camera>/by-event/<event-id>/` to one or more dedicated clip episodes. Playback validates the real directory chain, immutable clip identity and active-session source identity before exposing loopback media; event-clip playback has no Timeline adjacency. The root Event page refreshes every ten seconds and selected context rechecks when clip aliases appear after finalization. Missing, retained-away or not-yet-finalized Event clips yield `available=false` while Event metadata remains valid.
 
-RC49 adds an independent Event capture data plane. While Event monitoring Desired is On, a dedicated recording controller packet-copies H.264 into short finalized segments under `<storage_root>/.nian/event-buffer`; this controller, its slots and its files are distinct from persistent/manual Recording Desired, manual Start/Stop, the normal recording controller and Timeline index. Persisted aggregate MotionStarted opens an Event episode over the already-running buffer, giving about five seconds of real pre-trigger footage when the buffer is warm. The matching aggregate MotionEnded closes that product event and adds five seconds of post-roll. RC50 does not use post-roll as a merge window: a new MotionStarted creates a second episode even while the previous episode is pending finalization, and both clips may overlap in source time. The media worker concatenates the selected finalized buffer segments into an immutable event-only Matroska clip without transcoding, rebasing every source segment to a cumulative output timeline rather than overlapping timestamps. Each clip part has a mux-level hard duration bound below five minutes. Continuous motion creates continuation episodes that inherit the root Event IDs and overlap their selection window at the boundary, so Event Review exposes every part through Clip N/M Previous/Next navigation instead of hiding continuation footage. Short buffer files are continuously pruned. Final Event clips follow configured Event/history age (or the 30-day default), contribute to shared storage-quota pressure, are preferentially removed before manual Timeline footage when quota cleanup is required, and are skipped while an Event playback session owns that episode. See ADR-0019.
+RC49 introduced an independent Event capture product plane; the 2026-09-16 media refinement keeps that logical ownership while moving transport onto the per-camera shared ingest. Event Desired retains the main ingest and a keyframe-aware compressed-packet ring (about ten seconds, hard-capped at 32 MiB/source) instead of continuously writing `.nian/event-buffer` segments. Persisted aggregate MotionStarted atomically creates an event subscriber prefilled from roughly five seconds of ring history and then continues on live packets from the same ingest generation; MotionEnded adds five seconds of post-roll. RC50's burst rule remains: a new MotionStarted creates a second episode even while the previous episode is pending finalization, so clips may overlap in source time without being merged. The event-only recorder packet-copies bounded temporary segments under `.nian/event-buffer` only while an episode is active/pending, using a media-time→wall-clock anchor for truthful pre-roll timestamps; finalization composes those segments into the dedicated `.nian/event-clips` tree and enforces a mux-level hard duration bound below five minutes. Continuous motion creates continuation episodes that inherit the root Event IDs, so Event Review exposes every part through Clip N/M Previous/Next navigation. Final Event clips follow configured Event/history age (or the 30-day default), contribute to shared storage-quota pressure, are preferentially removed before manual Timeline footage when quota cleanup is required, and are skipped while an Event playback session owns that episode. See ADR-0019.
 
 Settings schema v6 adds only the independent `motion_notifications_enabled` preference, default Off. Newly committed normalized Events may publish a non-blocking application signal after `EventIndex::insert_and_cleanup` returns a new event ID. Duplicate fingerprints, persistence failures and historical queries cannot publish. The application dispatcher owns a 32-item `sync_channel`, admits only `MotionStarted`, uses `try_send` so a full queue drops UX work instead of blocking Event ingestion, rate-limits each camera to one notification per 15 seconds, and bounds rate-limiter state to 128 camera entries. Native delivery failures are counted/ignored by the projection and do not change Event monitoring state. Notification text is limited to `Motion detected` and the current camera display name.
 
@@ -907,18 +907,24 @@ Notification lifecycle follows background Event ownership: Hide leaves the dispa
 
 ## v1 final architecture (M15)
 
-M15 freezes the accepted product architecture rather than introducing a new data plane:
+M15 freezes the accepted product architecture; the media hardening tranche adds shared transport ownership without merging the independent product/lifecycle authorities:
 
 ```text
 Camera
-├── RTSP Recording ───────────────→ nian-media-worker ─→ local recordings
-├── RTSP Live ────────────────────→ nian-media-worker ─→ bounded loopback live cache
+├── Main RTSP ingest ─────────────→ per-camera nian-media-worker
+│     ├── Recording subscriber ───→ local recordings
+│     ├── Focus Live subscriber ──→ bounded loopback live cache
+│     └── compressed pre-roll ring (≈10s, ≤32 MiB)
+│             └── Event episode recorder (≈5s pre + motion + 5s post)
+│                     ├── temporary `.nian/event-buffer` segments while active
+│                     └── compose → `.nian/event-clips`
+├── Sub RTSP ingest (lazy) ───────→ same per-camera worker
+│     ├── Grid Live subscriber ───→ bounded loopback live cache
+│     └── Local Motion subscriber → sampled luma thumbnails (main fallback)
+│
 ├── Playback of finalized media ─→ nian-media-worker ─→ bounded loopback playback cache
 ├── ONVIF Provisioning
 ├── ONVIF PTZ
-├── RTSP Event buffer ────────────→ nian-media-worker ─→ `.nian/event-buffer`
-│                                      ↓ motion episode compose
-│                                  `.nian/event-clips`
 └── ONVIF Event PullPoint
       ↓
    EventIndex (local derived SQLite)
@@ -928,4 +934,6 @@ Camera
         short-lived native notification helper
 ```
 
-The four per-camera ownership planes remain independent: Recording, Live, PTZ and Events. Authoritative non-secret configuration remains in platform app-data `settings.sqlite3`; passwords remain in the native CredentialStore. There is no cloud/server/WebRTC/mobile component in v1. Release/process/corruption guarantees are fixed by ADR-0018.
+ONVIF motion monitoring remains on the Event/control plane and does not consume an RTSP substream. Optional Local Motion subscribes to the shared sub ingest (main fallback) and performs its own bounded thumbnail decode. Grid and Focus reuse one mounted video element per camera and switch the live profile rather than keeping both full video decoders mounted; a WebView renderer cannot share its decoded frames directly with the FFmpeg Local Motion detector. This is one RTSP ingest per endpoint, not a claim of one hardware/software decoder across all consumers.
+
+The four per-camera product ownership planes remain independent: Recording, Live, PTZ and Events. Media transport is not independent per feature: consumers share one main ingest and, when configured, one lazy sub ingest; identical endpoints dedupe to one generation. Queues are bounded by packet/byte/time limits, realtime consumers may drop and resync at a keyframe, reliable recording consumers fail closed, and ingest open/read operations have deadlines. Per-source and per-camera diagnostics count active Recording, Live, Local Motion and Event packet subscriptions separately from their reliable/realtime policy and from Event pre-roll ingest retainers. The counts expose no RTSP URLs or credentials and return to zero when subscriptions are dropped. Authoritative non-secret configuration remains in platform app-data `settings.sqlite3`; passwords remain in the native CredentialStore. There is no cloud/server/WebRTC/mobile component in v1. Release/process/corruption guarantees are fixed by ADR-0018.

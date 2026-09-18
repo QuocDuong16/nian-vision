@@ -20,14 +20,17 @@ use std::ffi::c_int;
 
 use nian_domain::MediaPacketMetadata;
 use nian_ffmpeg_sys as sys;
+use nian_media::MediaError;
+
+use crate::error_util::{ErrorKind, error_for};
 
 /// An owned, reference-counted FFmpeg packet.
 ///
-/// Not `Send`/`Sync` (raw FFI pointer), matching the worker's
-/// single-threaded media loop. Payload bytes are shared with the demuxing
-/// context's buffer through libavutil refcounting; no copy is made when the
-/// source packet is reference-counted (demuxers emit refcounted packets by
-/// default; non-refcounted sources are deep-copied once by `av_packet_ref`).
+/// The wrapper is `Send` but deliberately not `Sync`: one owned `AVPacket`
+/// may move to another worker thread, but it is never accessed concurrently.
+/// Fan-out uses [`FfmpegPacket::try_clone_ref`] so every subscriber owns its
+/// own packet header/side data while the compressed payload buffer stays
+/// shared through FFmpeg's reference-counted `AVBufferRef`.
 pub struct FfmpegPacket {
     /// Owning AVPacket with at least one live reference to the payload.
     /// Freed with `av_packet_free` in `Drop`.
@@ -39,6 +42,38 @@ impl FfmpegPacket {
     /// reference (used by `MediaInput` after a successful `av_packet_ref`).
     pub(crate) fn from_owned(packet: *mut sys::AVPacket) -> Self {
         Self { packet }
+    }
+
+    /// Clones the FFmpeg packet reference for an independent subscriber.
+    ///
+    /// `av_packet_ref` preserves flags, timestamps and side data. For normal
+    /// demuxer packets it shares the compressed payload through FFmpeg's
+    /// reference-counted buffer instead of copying payload bytes.
+    pub fn try_clone_ref(&self) -> Result<Self, MediaError> {
+        // SAFETY: av_packet_alloc has no preconditions; NULL is checked.
+        let owned = unsafe { sys::av_packet_alloc() };
+        if owned.is_null() {
+            return Err(MediaError::ReadFailed {
+                message: "out of memory cloning media packet".to_owned(),
+            });
+        }
+
+        // SAFETY: `owned` is a fresh packet and `self.packet` remains valid
+        // for the immutable borrow. The destination owns its reference on
+        // success and remains ours to free on failure.
+        let code = unsafe { sys::av_packet_ref(owned, self.packet) };
+        if code < 0 {
+            let mut failed = owned;
+            // SAFETY: failed is the allocation created immediately above.
+            unsafe { sys::av_packet_free(&mut failed) };
+            return Err(error_for(
+                code,
+                "clone media packet reference",
+                ErrorKind::Read,
+                None,
+            ));
+        }
+        Ok(Self::from_owned(owned))
     }
 
     /// Generic metadata view used by recorder logic: stream index,
@@ -111,6 +146,14 @@ impl FfmpegPacket {
         }
     }
 }
+
+// SAFETY: ownership of the AVPacket allocation moves with this Rust value and
+// the wrapper exposes no mutation through shared references. `av_packet_ref`
+// gives fan-out subscribers independent packet headers/side-data ownership;
+// only the AVBufferRef payload can be shared, whose reference counting is
+// designed for cross-thread packet ownership. We intentionally do not
+// implement Sync, so one wrapper cannot be accessed concurrently.
+unsafe impl Send for FfmpegPacket {}
 
 impl Drop for FfmpegPacket {
     fn drop(&mut self) {
@@ -221,6 +264,43 @@ mod tests {
         assert_eq!(
             packet.side_data(sys::AV_PKT_DATA_NEW_EXTRADATA).as_deref(),
             Some(SENTINEL)
+        );
+    }
+
+    #[test]
+    fn cloned_packet_reference_is_zero_copy_and_can_move_to_a_subscriber_thread() {
+        fn assert_send<T: Send>() {}
+        assert_send::<FfmpegPacket>();
+
+        let mut input = open_fixture();
+        let packet = input
+            .next_packet()
+            .unwrap()
+            .expect("fixture yields a packet");
+        inject_new_extradata(&packet, SENTINEL);
+        let payload_pointer = packet.data().as_ptr() as usize;
+        let metadata = packet.metadata();
+        let cloned = packet.try_clone_ref().expect("packet reference clones");
+
+        let observed = std::thread::spawn(move || {
+            (
+                cloned.data().as_ptr() as usize,
+                cloned.metadata(),
+                cloned
+                    .side_data(sys::AV_PKT_DATA_NEW_EXTRADATA)
+                    .expect("cloned side data"),
+            )
+        })
+        .join()
+        .expect("subscriber thread exits");
+
+        assert_eq!(observed.0, payload_pointer, "payload stays refcount-shared");
+        assert_eq!(observed.1, metadata);
+        assert_eq!(observed.2, SENTINEL);
+        assert_eq!(
+            packet.side_data(sys::AV_PKT_DATA_NEW_EXTRADATA).as_deref(),
+            Some(SENTINEL),
+            "source packet remains independently owned",
         );
     }
 

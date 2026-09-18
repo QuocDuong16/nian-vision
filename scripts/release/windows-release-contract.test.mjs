@@ -104,7 +104,7 @@ test("Windows FFmpeg build is source-pinned MSVC shared LGPL with bounded resour
   assert.equal(releaseConfig.ffmpegVersion, "8.0.3");
   assert.equal(releaseConfig.ffmpegSourceUrl, "https://ffmpeg.org/releases/ffmpeg-8.0.3.tar.xz");
   assert.equal(releaseConfig.ffmpegSourceSha256, "6136812ea6d4e68bdba27e33c2a94382711cdf4f8602ffef056ff792bd6f9818");
-  assert.equal(windowsFfmpegContract.buildContractVersion, 4);
+  assert.equal(windowsFfmpegContract.buildContractVersion, 5);
   assert.equal(windowsFfmpegContract.toolchain, "msvc");
   assert.equal(windowsFfmpegContract.architecture, "x86_64");
   for (const flag of ["--toolchain=msvc", "--enable-shared", "--disable-static", "--disable-gpl", "--disable-nonfree", "--disable-autodetect", "--disable-everything"]) {

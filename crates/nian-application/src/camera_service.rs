@@ -229,18 +229,38 @@ pub struct CameraSummary {
     pub host: String,
     pub port: u16,
     pub path: String,
+    pub sub_host: Option<String>,
+    pub sub_port: Option<u16>,
+    pub sub_path: Option<String>,
     pub audio_policy: AudioPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveStreamProfile {
+    Grid,
+    Focus,
 }
 
 impl From<&CameraConfig> for CameraSummary {
     fn from(camera: &CameraConfig) -> Self {
         let CameraSource::Rtsp(endpoint) = camera.source();
+        let (sub_host, sub_port, sub_path) = match camera.sub_source() {
+            Some(CameraSource::Rtsp(sub)) => (
+                Some(sub.host().as_str().to_owned()),
+                Some(sub.port()),
+                Some(sub.path().to_owned()),
+            ),
+            None => (None, None, None),
+        };
         Self {
             camera_id: camera.camera_id().as_str().to_owned(),
             display_name: camera.display_name().to_owned(),
             host: endpoint.host().as_str().to_owned(),
             port: endpoint.port(),
             path: endpoint.path().to_owned(),
+            sub_host,
+            sub_port,
+            sub_path,
             audio_policy: camera.audio_policy(),
         }
     }
@@ -272,6 +292,9 @@ pub struct CameraDraft {
     pub host: String,
     pub port: u16,
     pub path: String,
+    pub sub_host: Option<String>,
+    pub sub_port: Option<u16>,
+    pub sub_path: Option<String>,
     pub audio_policy: AudioPolicy,
     pub replacement_credentials: Option<Credentials>,
 }
@@ -435,6 +458,7 @@ impl CameraService {
 
         let camera_id = parse_camera_id(&draft.camera_id)?;
         let endpoint = endpoint_from_draft(&draft)?;
+        let sub_endpoint = sub_endpoint_from_draft(&draft)?;
         validate_display_name(&draft.display_name)?;
 
         // Safety optimization only. The settings DB UNIQUE constraint remains
@@ -457,7 +481,8 @@ impl CameraService {
             draft.audio_policy,
             credential_ref.clone(),
         )
-        .map_err(|error| CameraServiceError::Validation(error.to_string()))?;
+        .map_err(|error| CameraServiceError::Validation(error.to_string()))?
+        .with_sub_source(sub_endpoint.map(CameraSource::Rtsp));
 
         self.credentials.put(&credential_ref, &credentials)?;
         if let Err(error) = self.repository.insert_camera(&config) {
@@ -489,12 +514,14 @@ impl CameraService {
             .ok_or(CameraServiceError::CameraNotFound)?;
 
         let endpoint = endpoint_from_draft(&draft)?;
+        let sub_endpoint = sub_endpoint_from_draft(&draft)?;
         validate_display_name(&draft.display_name)?;
         if let Some(credentials) = &draft.replacement_credentials {
             validate_credentials(credentials)?;
         }
 
         let critical_change = previous.source() != &CameraSource::Rtsp(endpoint.clone())
+            || previous.sub_source().cloned() != sub_endpoint.clone().map(CameraSource::Rtsp)
             || previous.audio_policy() != draft.audio_policy
             || draft.replacement_credentials.is_some();
         if active_camera == Some(&camera_id) && critical_change {
@@ -544,7 +571,8 @@ impl CameraService {
             draft.audio_policy,
             credential_ref.clone(),
         )
-        .map_err(|error| CameraServiceError::Validation(error.to_string()))?;
+        .map_err(|error| CameraServiceError::Validation(error.to_string()))?
+        .with_sub_source(sub_endpoint.map(CameraSource::Rtsp));
 
         let old_ref = replacing_credentials.then(|| previous.credential_ref().clone());
         if let Some(credentials) = &draft.replacement_credentials {
@@ -796,6 +824,7 @@ impl CameraService {
             storage_root: config.storage_root().to_string_lossy().into_owned(),
             source_json: serde_json::json!({
                 "kind": "rtsp",
+                "profile": "main",
                 "url": endpoint.url_with(Some(&credentials)),
             }),
             segment_target_secs: config.segment_target_duration().get().as_secs(),
@@ -804,6 +833,14 @@ impl CameraService {
     }
 
     pub fn prepare_live(&self, camera_id: &str) -> Result<PreparedLive, CameraServiceError> {
+        self.prepare_live_profile(camera_id, LiveStreamProfile::Grid)
+    }
+
+    pub fn prepare_live_profile(
+        &self,
+        camera_id: &str,
+        profile: LiveStreamProfile,
+    ) -> Result<PreparedLive, CameraServiceError> {
         let camera_id = parse_camera_id(camera_id)?;
         let camera = self
             .repository
@@ -812,11 +849,19 @@ impl CameraService {
             .ok_or(CameraServiceError::CameraNotFound)?;
         let credentials = self.credentials.get(camera.credential_ref())?;
         validate_credentials(&credentials)?;
-        let CameraSource::Rtsp(endpoint) = camera.source();
+        let (source, source_profile) = match profile {
+            LiveStreamProfile::Grid => match camera.sub_source() {
+                Some(sub_source) if sub_source != camera.source() => (sub_source, "sub"),
+                _ => (camera.source(), "main"),
+            },
+            LiveStreamProfile::Focus => (camera.source(), "main"),
+        };
+        let CameraSource::Rtsp(endpoint) = source;
         Ok(PreparedLive {
             camera_id,
             source_json: serde_json::json!({
                 "kind": "rtsp",
+                "profile": source_profile,
                 "url": endpoint.url_with(Some(&credentials)),
             }),
         })
@@ -979,6 +1024,24 @@ fn prepared_probe(
 
 fn parse_camera_id(value: &str) -> Result<CameraId, CameraServiceError> {
     CameraId::parse(value).map_err(|error| CameraServiceError::Validation(error.to_string()))
+}
+
+fn sub_endpoint_from_draft(
+    draft: &CameraDraft,
+) -> Result<Option<CameraEndpoint>, CameraServiceError> {
+    match (&draft.sub_host, draft.sub_port, &draft.sub_path) {
+        (None, None, None) => Ok(None),
+        (Some(host), Some(port), Some(path)) => {
+            let host = Host::parse(host)
+                .map_err(|error| CameraServiceError::Validation(error.to_string()))?;
+            CameraEndpoint::new(host, port, path)
+                .map(Some)
+                .map_err(|error| CameraServiceError::Validation(error.to_string()))
+        }
+        _ => Err(CameraServiceError::Validation(
+            "substream host, port and path must be supplied together".to_owned(),
+        )),
+    }
 }
 
 fn endpoint_from_draft(draft: &CameraDraft) -> Result<CameraEndpoint, CameraServiceError> {

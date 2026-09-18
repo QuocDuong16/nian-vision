@@ -99,6 +99,9 @@ pub struct MediaStreamInfo {
     pub height: Option<u32>,
     /// Sample rate in Hz (audio only).
     pub sample_rate: Option<u32>,
+    /// Average frame rate reported by the container/demuxer (video only).
+    #[serde(default)]
+    pub frame_rate: Option<MediaRational>,
     /// Time base that packet timestamps of this stream are expressed in.
     pub time_base: Option<MediaRational>,
 }

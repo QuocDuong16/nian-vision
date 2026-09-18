@@ -96,6 +96,18 @@ const onvifConnection = {
       height: 2160,
       framerate: 25,
       bitrate_kbps: 8192,
+      audio_codec: "G711",
+      supported: true,
+      recommended: false,
+    },
+    {
+      token: "mjpeg",
+      name: "Legacy MJPEG",
+      video_codec: "MJPEG",
+      width: 640,
+      height: 480,
+      framerate: 15,
+      bitrate_kbps: 1024,
       audio_codec: null,
       supported: false,
       recommended: false,
@@ -148,6 +160,160 @@ afterEach(() => {
 });
 
 describe("CamerasScreen", () => {
+  it("does not let a slow camera reload undo a newer Local Motion mutation", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    let resolvePtz!: (value: boolean) => void;
+    const pendingPtz = new Promise<boolean>((resolve) => { resolvePtz = resolve; });
+    let ptzReads = 0;
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "camera_list") return [camera];
+      if (command === "event_statuses") return [];
+      if (command === "local_motion_statuses") return [];
+      if (command === "ptz_configured") return ++ptzReads === 1 ? false : pendingPtz;
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "camera_update") return { value: camera, warning: null };
+      if (command === "local_motion_set") return { camera_id: camera.camera_id, enabled: true };
+      throw new Error(`unexpected command ${command}`);
+    });
+    render(<CamerasScreen />);
+    await screen.findByRole("button", { name: "Enable Local Motion" });
+    fireEvent.click(screen.getByRole("button", { name: "Edit settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(ptzReads).toBe(2));
+    const enable = screen.getByRole("button", { name: "Enable Local Motion" });
+    expect(enable.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(enable);
+    expect(await screen.findByRole("button", { name: "Disable Local Motion" })).toBeTruthy();
+    await act(async () => { resolvePtz(false); await pendingPtz; });
+    expect(screen.getByRole("button", { name: "Disable Local Motion" })).toBeTruthy();
+    expect(screen.getByText("Local scene motion: On")).toBeTruthy();
+  });
+
+  it("ignores an old diagnostics poll that resolves after Local Motion is enabled", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    let finishPoll!: (value: {camera_id: string; enabled: boolean}[]) => void;
+    const pendingPoll = new Promise<{camera_id: string; enabled: boolean}[]>((resolve) => { finishPoll = resolve; });
+    let statusReads = 0;
+    const intervals = vi.spyOn(window, "setInterval");
+    try {
+      vi.mocked(invoke).mockImplementation(async (command) => {
+        if (command === "camera_list") return [camera];
+        if (command === "event_statuses") return [];
+        if (command === "local_motion_statuses") return ++statusReads === 1 ? [] : pendingPoll;
+        if (command === "ptz_configured") return false;
+        if (command === "recording_statuses") return [];
+        if (command === "recording_intent") return { camera_ids: [] };
+        if (command === "local_motion_set") return { camera_id: camera.camera_id, enabled: true };
+        throw new Error(`unexpected command ${command}`);
+      });
+      render(<CamerasScreen />);
+      const enable = await screen.findByRole("button", { name: "Enable Local Motion" });
+      const poll = intervals.mock.calls.find((call) => call[1] === 5_000)?.[0] as (() => void) | undefined;
+      expect(poll).toBeDefined();
+      act(() => poll?.());
+      await waitFor(() => expect(statusReads).toBe(2));
+      fireEvent.click(enable);
+      expect(await screen.findByRole("button", { name: "Disable Local Motion" })).toBeTruthy();
+      await act(async () => { finishPoll([]); await pendingPoll; });
+      expect(screen.getByRole("button", { name: "Disable Local Motion" })).toBeTruthy();
+      expect(screen.getByText("Local scene motion: On")).toBeTruthy();
+    } finally {
+      intervals.mockRestore();
+    }
+  });
+  it("persists explicitly opted-in local scene motion without ONVIF pairing", async () => {
+    installDesktop([camera]);
+    let enabled = false;
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "camera_list") return [camera];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "ptz_configured") return false;
+      if (command === "event_statuses") return [{
+        camera_id: camera.camera_id, configured: false, desired: false,
+        state: "disabled", motion_active: null, last_event_at: null, last_error_code: null,
+      }];
+      if (command === "local_motion_statuses") return enabled ? [{ camera_id: camera.camera_id, enabled }] : [];
+      if (command === "local_motion_set") {
+        expect(args).toEqual({ cameraId: camera.camera_id, enabled: !enabled });
+        enabled = !enabled;
+        return { camera_id: camera.camera_id, enabled };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+    render(<CamerasScreen />);
+    const enable = await screen.findByRole("button", { name: "Enable Local Motion" });
+    expect(enable.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(enable);
+    expect(await screen.findByRole("button", { name: "Disable Local Motion" })).toBeTruthy();
+    expect(screen.getByText("Local scene motion: On")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Disable Local Motion" }));
+    expect(await screen.findByRole("button", { name: "Enable Local Motion" })).toBeTruthy();
+    expect(screen.getByText("Local scene motion: Off")).toBeTruthy();
+  });
+
+  it("distinguishes Local Motion Desired On from a detector that has not started", async () => {
+    installDesktop([camera]);
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "camera_list") return [camera];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "ptz_configured") return false;
+      if (command === "event_statuses") return [];
+      if (command === "local_motion_statuses") return [{
+        camera_id: camera.camera_id, enabled: true, runtime_state: null,
+        motion_active: null, sampled_frames: null, last_error_code: null,
+      }];
+      throw new Error(`unexpected command ${command}`);
+    });
+    render(<CamerasScreen />);
+    expect(await screen.findByText("Desired on · substream preferred")).toBeTruthy();
+    expect(screen.getByText("Waiting for main pre-roll / worker")).toBeTruthy();
+    expect(screen.queryByText(/Monitoring · Motion detected/)).toBeNull();
+  });
+
+  it("renders actual local detector activity without exposing camera credentials", async () => {
+    installDesktop([camera]);
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "camera_list") return [camera];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "ptz_configured") return false;
+      if (command === "event_statuses") return [];
+      if (command === "local_motion_statuses") return [{
+        camera_id: camera.camera_id, enabled: true, runtime_state: "monitoring",
+        motion_active: true, sampled_frames: 14, last_error_code: null,
+      }];
+      throw new Error(`unexpected command ${command}`);
+    });
+    render(<CamerasScreen />);
+    expect(await screen.findByText("Monitoring · Motion detected · 14 sampled frames")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("rtsp://");
+    expect(document.body.textContent).not.toContain("password");
+  });
+
+  it("never allows local scene motion to be enabled over active ONVIF Events", async () => {
+    installDesktop([camera]);
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "camera_list") return [camera];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "ptz_configured") return false;
+      if (command === "event_statuses") return [{
+        camera_id: camera.camera_id, configured: true, desired: true,
+        state: "polling", motion_active: false, last_event_at: null, last_error_code: null,
+      }];
+      if (command === "local_motion_statuses") return [];
+      throw new Error(`unexpected command ${command}`);
+    });
+    render(<CamerasScreen />);
+    const button = await screen.findByRole("button", { name: "Enable Local Motion" });
+    expect(button.hasAttribute("disabled")).toBe(true);
+    expect(button.getAttribute("title")).toContain("Disable ONVIF Events");
+    expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "local_motion_set")).toBe(false);
+  });
+
   it("renders the camera empty state", async () => {
     installDesktop();
     render(<CamerasScreen />);
@@ -571,7 +737,11 @@ describe("CamerasScreen", () => {
     const h264 = await screen.findByText("Main H264");
     const h264Card = h264.closest("article") as HTMLElement;
     const h265Card = screen.getByText("Main H265").closest("article") as HTMLElement;
-    expect((within(h265Card).getByRole("button", { name: "Unavailable" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((within(h265Card).getByRole("button", { name: "Use stream" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(within(h265Card).getByText(/Live View and playback require HEVC decoding/)).toBeTruthy();
+    const mjpegCard = screen.getByText("Legacy MJPEG").closest("article") as HTMLElement;
+    expect((within(mjpegCard).getByRole("button", { name: "Unavailable" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(within(mjpegCard).getByText(/records H\.264 and H\.265/)).toBeTruthy();
     expect(document.body.textContent).not.toContain("SENTINEL-onvif-password");
     fireEvent.click(within(h264Card).getByRole("button", { name: "Use stream" }));
 
@@ -587,6 +757,61 @@ describe("CamerasScreen", () => {
     expect(serialized).not.toContain("rtsp://");
     expect(serialized).toContain("profile_token");
     expect((screen.getAllByRole("button", { name: "Start" })[0] as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("provisions an H265/G711 ONVIF stream with original audio and no credentials in UI payload", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    let saved = false;
+    let preparedToken: string | undefined;
+    let addedInput: Record<string, unknown> | undefined;
+    const hevcCamera: CameraSummary = {
+      camera_id: "onvif-front", display_name: "Front provisioned",
+      host: "192.168.1.80", port: 8554, path: "/live/hevc", audio_policy: "copy_all",
+    };
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "camera_list") return saved ? [camera, hevcCamera] : [camera];
+      if (command === "recording_statuses") return [];
+      if (command === "recording_intent") return { camera_ids: [] };
+      if (command === "ptz_configured") return false;
+      if (command === "event_statuses") return [];
+      if (command === "local_motion_statuses") return [];
+      if (command === "onvif_discover") return onvifDiscovery;
+      if (command === "onvif_connect") return onvifConnection;
+      if (command === "onvif_prepare_profile") {
+        preparedToken = (args as { input: { profile_token: string } }).input.profile_token;
+        return { ...onvifPrepared, profile_token: "hevc", path: "/live/hevc" };
+      }
+      if (command === "onvif_add_camera") {
+        addedInput = (args as { input: Record<string, unknown> }).input;
+        saved = true;
+        return { value: hevcCamera, warning: null };
+      }
+      if (command === "onvif_cancel") return undefined;
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<CamerasScreen />);
+    await screen.findByText("Front door");
+    fireEvent.click(screen.getByRole("button", { name: "Add camera" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discover ONVIF cameras" }));
+    await screen.findByText("Front ONVIF");
+    fireEvent.click(screen.getByRole("button", { name: "Use device" }));
+    fireEvent.change(screen.getByLabelText("ONVIF username"), { target: { value: "admin" } });
+    fireEvent.change(screen.getByLabelText("ONVIF password"), { target: { value: "SENTINEL-hevc-password" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    const hevcCard = (await screen.findByText("Main H265")).closest("article") as HTMLElement;
+    fireEvent.click(within(hevcCard).getByRole("button", { name: "Use stream" }));
+
+    expect(await screen.findByText("192.168.1.80:8554/live/hevc")).toBeTruthy();
+    expect(preparedToken).toBe("hevc");
+    expect(screen.getByRole("combobox", { name: "ONVIF audio policy" }).textContent).toContain("Record camera audio");
+    expect(document.body.textContent).not.toContain("SENTINEL-hevc-password");
+    fireEvent.click(screen.getByRole("combobox", { name: "ONVIF audio policy" }));
+    expect((screen.getByRole("option", { name: /Record camera audio/ }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Test & add camera" }));
+    await screen.findByText("Front provisioned");
+    expect(addedInput).toMatchObject({ profile_token: "hevc", audio_policy: "copy_all" });
+    expect(JSON.stringify(addedInput)).not.toMatch(/SENTINEL|password|username|rtsp:\/\//);
   });
 
   it("keeps the ONVIF review open when final provisioning fails", async () => {

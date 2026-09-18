@@ -65,6 +65,20 @@ impl MediaProfile {
             codec.eq_ignore_ascii_case("H264") || codec.eq_ignore_ascii_case("H.264")
         })
     }
+
+    pub fn is_h265_compatible(&self) -> bool {
+        self.video_codec.as_deref().is_some_and(|codec| {
+            codec.eq_ignore_ascii_case("H265")
+                || codec.eq_ignore_ascii_case("H.265")
+                || codec.eq_ignore_ascii_case("HEVC")
+        })
+    }
+
+    /// Archive-compatible profiles. WebView HEVC playback is separately gated
+    /// by the actual platform decoder; ONVIF must not hide recordable streams.
+    pub fn is_recordable_video(&self) -> bool {
+        self.is_h264_compatible() || self.is_h265_compatible()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +283,8 @@ impl PullPointSubscription {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MotionNotification {
     pub active: bool,
+    /// True only for a camera-reported PeopleDetector/IsPeople state. Not Nian AI.
+    pub is_person: bool,
     pub device_time_utc: Option<DateTime<Utc>>,
     /// SHA-256 of bounded canonical Source SimpleItems. Raw source tokens never
     /// escape the protocol crate.

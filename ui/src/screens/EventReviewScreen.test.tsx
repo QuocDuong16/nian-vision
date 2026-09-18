@@ -63,7 +63,7 @@ describe("EventReviewScreen", () => {
     });
 
     render(<EventReviewScreen />);
-    expect(await screen.findByText("Motion event")).toBeTruthy();
+    expect(await screen.findByText("Motion started")).toBeTruthy();
 
     const firstQuery = vi.mocked(invoke).mock.calls.find(([command]) => command === "event_query");
     expect(firstQuery).toBeTruthy();
@@ -82,7 +82,30 @@ describe("EventReviewScreen", () => {
       )).toBe(true);
     });
 
-    expect(screen.queryByLabelText("Event type")).toBeNull();
+    const kindSelect = screen.getByLabelText("Event type native value");
+    fireEvent.change(kindSelect, { target: { value: "person_started" } });
+    await waitFor(() => expect(vi.mocked(invoke).mock.calls.some(([command, args]) =>
+      command === "event_query"
+      && (args as { input?: { kind?: string } }).input?.kind === "person_started",
+    )).toBe(true));
+  });
+
+  it("labels camera ONVIF person events distinctly without claiming Nian AI", async () => {
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "camera_list") return [];
+      if (command === "event_query") return {
+        rows: [{ ...eventA, event_id: 33, kind: "person_started", recording_available: false }],
+        next_cursor: null,
+      } satisfies EventReviewPage;
+      if (command === "event_recording_context") return { available: false, camera_id: "cam-a", seek_offset_ms: null, clip_count: 0 };
+      throw new Error(`unexpected command ${command}`);
+    });
+    render(<EventReviewScreen />);
+    const person = await screen.findByRole("button", { name: /Person detected \(camera ONVIF\)/ });
+    expect(person.textContent).toContain("Recording pending or unavailable");
+    fireEvent.click(person);
+    expect(await screen.findByText("Person detected (camera ONVIF)", { selector: "dd" })).toBeTruthy();
+    expect(screen.getByText(/Nian does not infer people/)).toBeTruthy();
   });
 
   it("periodic root refresh invalidates an older in-flight pagination response", async () => {
@@ -106,12 +129,12 @@ describe("EventReviewScreen", () => {
 
     render(<EventReviewScreen />);
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
-    expect(screen.getByRole("button", { name: /Front Door.*Motion event/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Front Door.*Motion started/ })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Load more" }));
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
 
     await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
-    expect(screen.getByRole("button", { name: /Back Door.*Motion event/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Back Door.*Motion started/ })).toBeTruthy();
 
     const staleRow = { ...eventA, event_id: 30, camera_display_name: "Stale Poll Page" };
     oldPage.resolve({ rows: [staleRow], next_cursor: "cursor-stale" });
@@ -144,10 +167,10 @@ describe("EventReviewScreen", () => {
     });
 
     render(<EventReviewScreen />);
-    await screen.findByRole("button", { name: /Front Door.*Motion event/ });
+    await screen.findByRole("button", { name: /Front Door.*Motion started/ });
     fireEvent.click(screen.getByRole("button", { name: "Load more" }));
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
-    expect(await screen.findByRole("button", { name: /Back Door.*Motion event/ })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: /Back Door.*Motion started/ })).toBeTruthy();
 
     const staleRow = { ...eventA, event_id: 31, camera_display_name: "Stale Manual Page" };
     oldPage.resolve({ rows: [staleRow], next_cursor: "cursor-stale" });
@@ -220,7 +243,7 @@ describe("EventReviewScreen", () => {
 
     expect(roots).toHaveLength(2);
     expect(roots[1]!.to_utc).toBe("2026-09-05T12:00:20.000Z");
-    expect(screen.getByRole("button", { name: /Back Door.*Motion event/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Back Door.*Motion started/ })).toBeTruthy();
   });
 
   it("ignores stale selected-event recording lookup completion", async () => {
@@ -239,7 +262,7 @@ describe("EventReviewScreen", () => {
 
     render(<EventReviewScreen />);
     await screen.findByText("Back Door");
-    const rows = screen.getAllByRole("button", { name: /Motion event/ });
+    const rows = screen.getAllByRole("button", { name: /Motion started/ });
     fireEvent.click(rows[0]!);
     fireEvent.click(rows[1]!);
 
@@ -279,7 +302,7 @@ describe("EventReviewScreen", () => {
 
     render(<EventReviewScreen />);
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
-    fireEvent.click(screen.getByRole("button", { name: /Front Door.*Motion event/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Front Door.*Motion started/ }));
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     expect(screen.getByText(/No recording available yet/)).toBeTruthy();
 
@@ -333,7 +356,7 @@ describe("EventReviewScreen", () => {
     });
 
     render(<EventReviewScreen />);
-    fireEvent.click(await screen.findByRole("button", { name: /Front Door.*Motion event/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Front Door.*Motion started/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Open recording" }));
     expect(await screen.findByText("Clip 1 of 2")).toBeTruthy();
 
@@ -365,10 +388,10 @@ describe("EventReviewScreen", () => {
     });
 
     render(<EventReviewScreen />);
-    await screen.findByRole("button", { name: /Front Door.*Motion event/ });
+    await screen.findByRole("button", { name: /Front Door.*Motion started/ });
     fireEvent.click(screen.getByRole("button", { name: "Load more" }));
     fireEvent.change(screen.getByLabelText("Camera"), { target: { value: "cam-b" } });
-    expect(await screen.findByRole("button", { name: /Back Door.*Motion event/ })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: /Back Door.*Motion started/ })).toBeTruthy();
 
     const staleRow = { ...eventA, event_id: 3, camera_display_name: "Old Page Camera" };
     oldPage.resolve({ rows: [staleRow], next_cursor: null });

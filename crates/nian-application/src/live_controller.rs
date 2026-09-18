@@ -21,11 +21,15 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const MAX_SIMULTANEOUS_LIVE_VIEWS: usize = 16;
+use crate::camera_worker::{CameraWorkerBroker, CameraWorkerError, CameraWorkerProcess};
+
 const LIVE_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const WORKER_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const LIVE_FRAGMENT_TARGET_MS: u64 = 500;
-const LIVE_FRAGMENT_RETENTION_MS: u64 = 12_000;
+// Live fragments are compressed transport cache, not playback history. Four
+// seconds covers manifest polling jitter without retaining twelve seconds per session.
+const LIVE_FRAGMENT_RETENTION_MS: u64 = 4_000;
 pub const LIVE_FRAGMENT_TARGET: Duration = Duration::from_millis(LIVE_FRAGMENT_TARGET_MS);
 pub const MAX_RETAINED_LIVE_FRAGMENTS: usize =
     (LIVE_FRAGMENT_RETENTION_MS / LIVE_FRAGMENT_TARGET_MS) as usize;
@@ -238,7 +242,7 @@ impl LiveOpenAdmission {
         if self.opening.is_cancelled() {
             return Err(self.start_error(LiveError::LifecycleBlocked));
         }
-        let runner = match self.factory.spawn() {
+        let runner = match self.factory.spawn_for_camera(&self.opening.camera_id) {
             Ok(runner) => runner,
             Err(error) => return Err(self.start_error(error)),
         };
@@ -336,6 +340,10 @@ pub trait LiveRunner: Send {
 
 pub trait LiveRunnerFactory: Send + Sync {
     fn spawn(&self) -> Result<Box<dyn LiveRunner>, LiveError>;
+
+    fn spawn_for_camera(&self, _camera_id: &CameraId) -> Result<Box<dyn LiveRunner>, LiveError> {
+        self.spawn()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -346,6 +354,22 @@ pub struct WorkerLiveRunnerFactory {
 impl LiveRunnerFactory for WorkerLiveRunnerFactory {
     fn spawn(&self) -> Result<Box<dyn LiveRunner>, LiveError> {
         WorkerLiveRunner::spawn(&self.worker_program)
+            .map(|runner| Box::new(runner) as Box<dyn LiveRunner>)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BrokerLiveRunnerFactory {
+    pub broker: CameraWorkerBroker,
+}
+
+impl LiveRunnerFactory for BrokerLiveRunnerFactory {
+    fn spawn(&self) -> Result<Box<dyn LiveRunner>, LiveError> {
+        Err(LiveError::Internal)
+    }
+
+    fn spawn_for_camera(&self, camera_id: &CameraId) -> Result<Box<dyn LiveRunner>, LiveError> {
+        BrokerLiveRunner::spawn(self.broker.clone(), camera_id.clone())
             .map(|runner| Box::new(runner) as Box<dyn LiveRunner>)
     }
 }
@@ -1586,6 +1610,98 @@ enum WorkerMessage {
     Frame(Envelope),
     Eof,
     Error,
+}
+
+struct BrokerLiveRunner {
+    broker: CameraWorkerBroker,
+    camera_id: CameraId,
+    worker: Arc<CameraWorkerProcess>,
+    stopped: bool,
+}
+
+impl BrokerLiveRunner {
+    fn spawn(broker: CameraWorkerBroker, camera_id: CameraId) -> Result<Self, LiveError> {
+        let worker = broker.acquire(&camera_id).map_err(map_broker_live_error)?;
+        Ok(Self {
+            broker,
+            camera_id,
+            worker,
+            stopped: false,
+        })
+    }
+}
+
+impl LiveRunner for BrokerLiveRunner {
+    fn start(
+        &mut self,
+        source_json: serde_json::Value,
+        output_dir: &Path,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<(), LiveError> {
+        let result = self
+            .worker
+            .request(
+                "live.start",
+                serde_json::json!({
+                    "source": source_json,
+                    "output_dir": output_dir.to_string_lossy(),
+                    "fragment_target_ms": LIVE_FRAGMENT_TARGET.as_millis() as u64,
+                    "max_fragment_bytes": MAX_LIVE_FRAGMENT_BYTES,
+                    "max_fragment_count": MAX_LIVE_CACHE_FRAGMENTS,
+                }),
+                WORKER_REQUEST_TIMEOUT,
+                Some(&cancel),
+            )
+            .map_err(map_broker_live_error)?;
+        if result.get("started").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(LiveError::WorkerUnavailable);
+        }
+        self.stopped = false;
+        Ok(())
+    }
+
+    fn status(&mut self) -> Result<LiveWorkerStatus, LiveError> {
+        let value = self
+            .worker
+            .request_default("live.status", serde_json::json!({}))
+            .map_err(map_broker_live_error)?;
+        serde_json::from_value(value).map_err(|_| LiveError::WorkerUnavailable)
+    }
+
+    fn request_stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        let result = self.worker.request(
+            "live.stop",
+            serde_json::json!({}),
+            Duration::from_secs(3),
+            None,
+        );
+        if matches!(
+            result,
+            Err(CameraWorkerError::Unavailable | CameraWorkerError::Protocol)
+        ) {
+            self.broker.invalidate(&self.camera_id, &self.worker);
+        }
+        self.stopped = true;
+    }
+
+    fn join_or_reap(&mut self) {
+        self.request_stop();
+    }
+}
+
+fn map_broker_live_error(error: CameraWorkerError) -> LiveError {
+    match error {
+        CameraWorkerError::Cancelled => LiveError::LifecycleBlocked,
+        CameraWorkerError::Rpc(code) => map_worker_error(&code),
+        CameraWorkerError::Spawn
+        | CameraWorkerError::Protocol
+        | CameraWorkerError::Unavailable
+        | CameraWorkerError::Timeout
+        | CameraWorkerError::Synchronization => LiveError::WorkerUnavailable,
+    }
 }
 
 struct WorkerLiveRunner {

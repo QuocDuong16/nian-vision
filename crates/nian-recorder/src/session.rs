@@ -26,10 +26,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use chrono::{Local, NaiveDateTime};
+use chrono::{Local, NaiveDateTime, TimeDelta};
 use nian_domain::{MediaPacketMetadata, MediaRational, MediaStreamInfo, MediaType};
 use nian_media::MediaSource;
-use nian_media_ffmpeg::{InterruptHandle, MatroskaMuxer, MediaInput};
+use nian_media_ffmpeg::{
+    InterruptHandle, MatroskaMuxer, MediaInput, MediaStreamTemplate, PacketSubscription,
+};
 use nian_storage::paths::{ClaimedSegment, publish_no_replace};
 use nian_storage::{RecordingsLayout, StorageError};
 
@@ -297,6 +299,34 @@ pub struct RecordingSummary {
     pub discarded_startup_packets: u64,
 }
 
+enum RecordingPacketSource {
+    Direct(MediaInput),
+    Shared(PacketSubscription),
+}
+
+impl RecordingPacketSource {
+    fn initial_history_age(&self) -> Duration {
+        match self {
+            Self::Direct(_) => Duration::ZERO,
+            Self::Shared(subscription) => subscription.initial_history_age(),
+        }
+    }
+
+    fn next_packet(
+        &mut self,
+        timeout: Duration,
+        interrupt: &InterruptHandle,
+    ) -> Result<Option<nian_media_ffmpeg::FfmpegPacket>, nian_media::MediaError> {
+        match self {
+            Self::Direct(input) => {
+                let _read_deadline = interrupt.scoped_deadline(timeout);
+                input.next_packet()
+            }
+            Self::Shared(subscription) => subscription.receive_interruptible(timeout, interrupt),
+        }
+    }
+}
+
 /// A running recorder bound to one source and one recordings layout.
 ///
 /// Ownership boundary: no production `RecordingSession` may write a canonical
@@ -304,14 +334,18 @@ pub struct RecordingSummary {
 /// [`nian_storage::CameraLease`] for the entire session lifetime. This type is
 /// intentionally low-level so crate tests can exercise session mechanics.
 pub struct RecordingSession {
-    input: MediaInput,
-    /// Derived from `input.interrupt_handle()` by construction: one shared
-    /// interrupt state for reads, muxer writes and forced cancellation.
+    source: RecordingPacketSource,
+    stream_template: MediaStreamTemplate,
+    /// Consumer-local interrupt state for direct input reads, shared-ingest
+    /// subscription waits, muxer writes and forced cancellation. Cancelling a
+    /// shared recording session never cancels the camera ingest itself.
     interrupt: InterruptHandle,
     layout: RecordingsLayout,
     config: RecorderConfig,
     plan: StreamPlan,
     stop: StopFlag,
+    initial_history_age: Duration,
+    history_wall_anchor: Option<(i64, NaiveDateTime)>,
 
     /// Deterministic fault injection at the I/O boundaries, used only by
     /// in-crate tests; compiled out of production builds entirely. No fake
@@ -325,12 +359,14 @@ pub struct RecordingSession {
 impl std::fmt::Debug for RecordingSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RecordingSession")
-            .field("input", &self.input)
+            .field("source", &"packet-source")
+            .field("stream_template", &self.stream_template)
             .field("interrupt", &self.interrupt)
             .field("layout", &self.layout)
             .field("config", &self.config)
             .field("plan", &self.plan)
             .field("stop", &self.stop)
+            .field("initial_history_age", &self.initial_history_age)
             .finish_non_exhaustive()
     }
 }
@@ -389,32 +425,86 @@ impl RecordingSession {
         config: RecorderConfig,
         run_stop: StopFlag,
     ) -> Result<Self, RecordingError> {
-        let mut session = Self::from_input_internal(input, layout, config)?;
-        session.stop = run_stop;
-        Ok(session)
+        let interrupt = input.interrupt_handle().clone();
+        let stream_template = MediaStreamTemplate::capture(&input)?;
+        Self::from_packet_source(
+            RecordingPacketSource::Direct(input),
+            stream_template,
+            interrupt,
+            layout,
+            config,
+            run_stop,
+        )
     }
 
-    fn from_input_internal(
-        input: MediaInput,
+    /// Builds a recording session on a bounded shared-ingest subscription.
+    ///
+    /// The subscription owns packet delivery only; the camera RTSP connection
+    /// remains owned by the ingest hub. Forced cancellation therefore stops
+    /// this recorder without disconnecting live view or other subscribers.
+    pub fn from_subscription_with_stop(
+        subscription: PacketSubscription,
         layout: RecordingsLayout,
         config: RecorderConfig,
+        run_stop: StopFlag,
+    ) -> Result<Self, RecordingError> {
+        Self::from_subscription_with_stop_and_interrupt(
+            subscription,
+            layout,
+            config,
+            run_stop,
+            InterruptHandle::new(),
+        )
+    }
+
+    /// Shared-ingest constructor with an externally observable consumer-local
+    /// interrupt. Worker supervision uses this to force-cancel only the
+    /// recorder subscriber/muxer while leaving the camera ingest alive.
+    pub fn from_subscription_with_stop_and_interrupt(
+        subscription: PacketSubscription,
+        layout: RecordingsLayout,
+        config: RecorderConfig,
+        run_stop: StopFlag,
+        interrupt: InterruptHandle,
+    ) -> Result<Self, RecordingError> {
+        let stream_template = subscription.stream_template().try_clone()?;
+        Self::from_packet_source(
+            RecordingPacketSource::Shared(subscription),
+            stream_template,
+            interrupt,
+            layout,
+            config,
+            run_stop,
+        )
+    }
+
+    fn from_packet_source(
+        source: RecordingPacketSource,
+        stream_template: MediaStreamTemplate,
+        interrupt: InterruptHandle,
+        layout: RecordingsLayout,
+        config: RecorderConfig,
+        stop: StopFlag,
     ) -> Result<Self, RecordingError> {
         if config.segment_target.is_zero() {
             return Err(RecordingError::InvalidConfig {
                 reason: "segment_target must be greater than zero".to_owned(),
             });
         }
-        let streams = input.streams();
+        let streams = stream_template.streams();
         let plan = plan_selection(&streams, config.audio)?;
-        let interrupt = input.interrupt_handle().clone();
+        let initial_history_age = source.initial_history_age();
 
         Ok(Self {
-            input,
+            source,
+            stream_template,
             interrupt,
             layout,
             config,
             plan,
-            stop: StopFlag::new(),
+            stop,
+            initial_history_age,
+            history_wall_anchor: None,
             #[cfg(test)]
             write_fault: None,
             #[cfg(test)]
@@ -483,14 +573,12 @@ impl RecordingSession {
                 break 'run;
             }
 
-            // Per-read stall deadline (M3 §5): armed for exactly this read,
-            // cleared on drop before any mux write/finalization runs. If the
-            // read blocks longer than `timeouts.read`, FFmpeg aborts with a
-            // deadline cause, which surfaces below as the retryable
-            // TimedOut error — never as cancellation.
-            let _read_deadline = self.interrupt.scoped_deadline(self.config.timeouts.read);
-            let read_result = self.input.next_packet();
-            drop(_read_deadline);
+            // Direct FFmpeg reads and shared-ingest subscription waits use the
+            // same bounded read budget. The session-local interrupt cancels
+            // either path without cancelling a shared camera ingest.
+            let read_result = self
+                .source
+                .next_packet(self.config.timeouts.read, &self.interrupt);
 
             match read_result {
                 Ok(Some(packet)) => {
@@ -513,7 +601,7 @@ impl RecordingSession {
                         // is dropped rather than synchronized; inter-frame
                         // video cannot start a decodable segment.
                         if is_primary_video && metadata.keyframe {
-                            let mut segment = match self.begin_segment(events) {
+                            let mut segment = match self.begin_segment(events, &metadata) {
                                 Ok(segment) => segment,
                                 Err(error) => {
                                     end_reason = RecordingEndReason::SourceError;
@@ -570,7 +658,7 @@ impl RecordingSession {
                             }
                         }
                         // …open the NEW segment…
-                        let mut segment = match self.begin_segment(events) {
+                        let mut segment = match self.begin_segment(events, &metadata) {
                             Ok(segment) => segment,
                             Err(error) => {
                                 end_reason = RecordingEndReason::SourceError;
@@ -713,6 +801,16 @@ impl RecordingSession {
         }
     }
 
+    fn segment_started_wall(&mut self, metadata: &MediaPacketMetadata) -> NaiveDateTime {
+        estimate_backfill_wall_time(
+            self.initial_history_age,
+            &mut self.history_wall_anchor,
+            self.plan.video_time_base,
+            metadata,
+            local_now(),
+        )
+    }
+
     /// Claims a slot and opens the muxer on the claimed partial, emitting
     /// `SegmentStarted`. Does NOT write anything yet: the caller writes the
     /// opening keyframe and commits it to the clock only on success, so a
@@ -726,15 +824,16 @@ impl RecordingSession {
     fn begin_segment(
         &mut self,
         events: &mut dyn FnMut(RecordingEvent),
+        opening_metadata: &MediaPacketMetadata,
     ) -> Result<Segment, RecordingError> {
-        let started_wall = local_now();
+        let started_wall = self.segment_started_wall(opening_metadata);
         let claim = self
             .layout
             .claim_segment(&self.config.camera, started_wall)?;
 
         let selection = self.plan.selection.clone();
-        let opened = MatroskaMuxer::create_recording_segment_with_selection(
-            &mut self.input,
+        let opened = MatroskaMuxer::create_recording_segment_from_template_with_selection(
+            &self.stream_template,
             claim.partial_path(),
             &self.interrupt,
             |info| {
@@ -833,6 +932,44 @@ fn target_ticks_in(target: Duration, time_base: MediaRational) -> i64 {
     i64::try_from(ticks).unwrap_or(i64::MAX)
 }
 
+fn estimate_backfill_wall_time(
+    initial_history_age: Duration,
+    anchor: &mut Option<(i64, NaiveDateTime)>,
+    video_time_base: MediaRational,
+    metadata: &MediaPacketMetadata,
+    now: NaiveDateTime,
+) -> NaiveDateTime {
+    if initial_history_age.is_zero() {
+        return now;
+    }
+    let Some(timestamp) = metadata.dts.or(metadata.pts) else {
+        return now;
+    };
+    let (origin_media, origin_wall) = match *anchor {
+        Some(anchor) => anchor,
+        None => {
+            let backdate = TimeDelta::from_std(initial_history_age).ok();
+            let origin_wall = backdate
+                .and_then(|delta| now.checked_sub_signed(delta))
+                .unwrap_or(now);
+            let anchor_value = (timestamp, origin_wall);
+            *anchor = Some(anchor_value);
+            anchor_value
+        }
+    };
+    let elapsed_ticks = timestamp.saturating_sub(origin_media).max(0);
+    let Some(elapsed) = video_time_base.duration_of(elapsed_ticks) else {
+        return origin_wall;
+    };
+    let Some(estimated) = TimeDelta::from_std(elapsed)
+        .ok()
+        .and_then(|delta| origin_wall.checked_add_signed(delta))
+    else {
+        return origin_wall;
+    };
+    estimated.min(now)
+}
+
 fn local_now() -> NaiveDateTime {
     Local::now().naive_local()
 }
@@ -859,6 +996,7 @@ mod tests {
             width: None,
             height: None,
             sample_rate: None,
+            frame_rate: None,
             time_base,
         }
     }
@@ -971,6 +1109,44 @@ mod tests {
             duration: None,
             keyframe,
         }
+    }
+
+    #[test]
+    fn prefilled_media_time_backdates_each_segment_consistently_and_never_future_dates() {
+        let now = NaiveDateTime::parse_from_str("2026-09-16T08:00:00.000", "%Y-%m-%dT%H:%M:%S%.3f")
+            .unwrap();
+        let time_base = MediaRational::new(1, 1000).unwrap();
+        let mut anchor = None;
+
+        let first = estimate_backfill_wall_time(
+            Duration::from_secs(5),
+            &mut anchor,
+            time_base,
+            &metadata(Some(1_000), Some(1_000), true),
+            now,
+        );
+        assert_eq!(first, now - TimeDelta::seconds(5));
+
+        let second = estimate_backfill_wall_time(
+            Duration::from_secs(5),
+            &mut anchor,
+            time_base,
+            &metadata(Some(3_000), Some(3_000), true),
+            now,
+        );
+        assert_eq!(second, now - TimeDelta::seconds(3));
+
+        let caught_up = estimate_backfill_wall_time(
+            Duration::from_secs(5),
+            &mut anchor,
+            time_base,
+            &metadata(Some(7_000), Some(7_000), true),
+            now,
+        );
+        assert_eq!(
+            caught_up, now,
+            "media-derived wall time must never enter the future"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::V
 
 use crate::{BUSY_TIMEOUT, IndexError, enable_and_verify_wal, verify_foreign_keys};
 
-const EVENT_SCHEMA_VERSION: i32 = 2;
+const EVENT_SCHEMA_VERSION: i32 = 3;
 pub const DEFAULT_EVENT_RETENTION_DAYS: u32 = 30;
 pub const MAX_EVENT_ROWS: u64 = 250_000;
 pub const EVENT_CLEANUP_BATCH: u32 = 500;
@@ -21,6 +21,8 @@ const MAX_EVENT_INDEX_CORRUPT_BACKUPS: usize = 4;
 pub enum EventKind {
     MotionStarted,
     MotionEnded,
+    PersonStarted,
+    PersonEnded,
 }
 
 impl EventKind {
@@ -28,6 +30,8 @@ impl EventKind {
         match self {
             Self::MotionStarted => "motion_started",
             Self::MotionEnded => "motion_ended",
+            Self::PersonStarted => "person_started",
+            Self::PersonEnded => "person_ended",
         }
     }
 
@@ -35,6 +39,8 @@ impl EventKind {
         match value {
             "motion_started" => Ok(Self::MotionStarted),
             "motion_ended" => Ok(Self::MotionEnded),
+            "person_started" => Ok(Self::PersonStarted),
+            "person_ended" => Ok(Self::PersonEnded),
             _ => Err(IndexError::InvalidData("unknown event kind".to_owned())),
         }
     }
@@ -156,7 +162,7 @@ impl EventIndex {
                  CREATE TABLE events (\
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,\
                     camera_id TEXT NOT NULL,\
-                    kind TEXT NOT NULL CHECK(kind IN ('motion_started','motion_ended')),\
+                    kind TEXT NOT NULL CHECK(kind IN ('motion_started','motion_ended','person_started','person_ended')),\
                     source_key TEXT NULL,\
                     device_time_utc_ms INTEGER NULL,\
                     received_time_utc_ms INTEGER NOT NULL,\
@@ -167,7 +173,7 @@ impl EventIndex {
                     ON events(camera_id, received_time_utc_ms DESC, event_id DESC);\
                  CREATE INDEX events_received \
                     ON events(received_time_utc_ms, event_id);\
-                 PRAGMA user_version=2;\
+                 PRAGMA user_version=3;\
                  COMMIT;",
             )?;
         } else if version == 1 {
@@ -178,6 +184,36 @@ impl EventIndex {
                  ALTER TABLE events ADD COLUMN user_visible INTEGER NOT NULL DEFAULT 1 \
                     CHECK(user_visible IN (0,1));\
                  PRAGMA user_version=2;\
+                 COMMIT;",
+            )?;
+        }
+        if version == 1 || version == 2 {
+            // SQLite cannot widen a CHECK constraint in place. Rebuild in one
+            // transaction, retaining event IDs/fingerprints/visibility exactly.
+            // The v1 branch above supplies user_visible before this copy.
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;\
+                 ALTER TABLE events RENAME TO events_v2;\
+                 CREATE TABLE events (\
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                    camera_id TEXT NOT NULL,\
+                    kind TEXT NOT NULL CHECK(kind IN ('motion_started','motion_ended','person_started','person_ended')),\
+                    source_key TEXT NULL,\
+                    device_time_utc_ms INTEGER NULL,\
+                    received_time_utc_ms INTEGER NOT NULL,\
+                    fingerprint BLOB NULL UNIQUE,\
+                    user_visible INTEGER NOT NULL CHECK(user_visible IN (0,1))\
+                 );\
+                 INSERT INTO events (event_id, camera_id, kind, source_key, device_time_utc_ms,\
+                   received_time_utc_ms, fingerprint, user_visible)\
+                   SELECT event_id, camera_id, kind, source_key, device_time_utc_ms,\
+                     received_time_utc_ms, fingerprint, user_visible FROM events_v2;\
+                 DROP TABLE events_v2;\
+                 CREATE INDEX events_camera_received \
+                   ON events(camera_id, received_time_utc_ms DESC, event_id DESC);\
+                 CREATE INDEX events_received \
+                   ON events(received_time_utc_ms, event_id);\
+                 PRAGMA user_version=3;\
                  COMMIT;",
             )?;
         }
@@ -257,14 +293,34 @@ impl EventIndex {
         now: DateTime<Utc>,
         retention_days: Option<u32>,
     ) -> Result<Option<u64>, IndexError> {
-        if event
-            .source_key
-            .as_ref()
-            .is_some_and(|key| key.len() > MAX_SOURCE_KEY_BYTES || !key.is_ascii())
-        {
+        let ids = self.insert_batch_and_cleanup(&[event], now, retention_days)?;
+        Ok(ids[0])
+    }
+
+    /// Atomically commits a bounded pair of related source/aggregate events.
+    /// A failure after the first insert must not strand an unprojectable Person
+    /// event or a motion clip whose index transaction was only half committed.
+    pub fn insert_batch_and_cleanup(
+        &mut self,
+        events: &[&EventInsert],
+        now: DateTime<Utc>,
+        retention_days: Option<u32>,
+    ) -> Result<Vec<Option<u64>>, IndexError> {
+        if events.is_empty() || events.len() > 2 {
             return Err(IndexError::InvalidData(
-                "invalid event source key".to_owned(),
+                "invalid event batch size".to_owned(),
             ));
+        }
+        for event in events {
+            if event
+                .source_key
+                .as_ref()
+                .is_some_and(|key| key.len() > MAX_SOURCE_KEY_BYTES || !key.is_ascii())
+            {
+                return Err(IndexError::InvalidData(
+                    "invalid event source key".to_owned(),
+                ));
+            }
         }
         let days = retention_days
             .unwrap_or(DEFAULT_EVENT_RETENTION_DAYS)
@@ -273,33 +329,33 @@ impl EventIndex {
             .checked_sub_signed(Duration::days(i64::from(days)))
             .ok_or_else(|| IndexError::InvalidData("invalid event retention cutoff".to_owned()))?
             .timestamp_millis();
-        let device_ms = event.device_time_utc.map(|value| value.timestamp_millis());
-        let received_ms = event.received_time_utc.timestamp_millis();
-        let fingerprint = event.fingerprint.map(|value| value.to_vec());
 
         let transaction = self.connection.transaction()?;
-        let changed = transaction.execute(
-            "INSERT OR IGNORE INTO events \
-             (camera_id, kind, source_key, device_time_utc_ms, received_time_utc_ms, fingerprint, user_visible) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                event.camera_id.as_str(),
-                event.kind.as_str(),
-                event.source_key,
-                device_ms,
-                received_ms,
-                fingerprint,
-                i64::from(event.user_visible),
-            ],
-        )?;
-        let inserted_id = if changed == 0 {
-            None
-        } else {
-            Some(
-                u64::try_from(transaction.last_insert_rowid())
-                    .map_err(|_| IndexError::InvalidData("invalid event id".to_owned()))?,
-            )
-        };
+        let mut ids = Vec::with_capacity(events.len());
+        for event in events {
+            let changed = transaction.execute(
+                "INSERT OR IGNORE INTO events \
+                 (camera_id, kind, source_key, device_time_utc_ms, received_time_utc_ms, fingerprint, user_visible) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    event.camera_id.as_str(),
+                    event.kind.as_str(),
+                    event.source_key,
+                    event.device_time_utc.map(|value| value.timestamp_millis()),
+                    event.received_time_utc.timestamp_millis(),
+                    event.fingerprint.map(|value| value.to_vec()),
+                    i64::from(event.user_visible),
+                ],
+            )?;
+            ids.push(if changed == 0 {
+                None
+            } else {
+                Some(
+                    u64::try_from(transaction.last_insert_rowid())
+                        .map_err(|_| IndexError::InvalidData("invalid event id".to_owned()))?,
+                )
+            });
+        }
         transaction.execute(
             "DELETE FROM events WHERE event_id IN (\
                  SELECT event_id FROM events WHERE received_time_utc_ms < ?1 \
@@ -323,7 +379,7 @@ impl EventIndex {
             )?;
         }
         transaction.commit()?;
-        Ok(inserted_id)
+        Ok(ids)
     }
 
     pub fn recent(&self, camera_id: &CameraId, limit: u32) -> Result<Vec<EventRecord>, IndexError> {
@@ -742,6 +798,133 @@ mod tests {
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].kind, EventKind::MotionStarted);
         assert_eq!(page.rows[0].source_key.as_deref(), Some("legacy-source"));
+    }
+
+    #[test]
+    fn source_and_aggregate_insert_failure_rolls_back_both_before_any_projection() {
+        let temp = tempdir().unwrap();
+        let mut index = EventIndex::open(temp.path().join("events.sqlite3")).unwrap();
+        let mut person = event("front-door", true, 100);
+        person.kind = EventKind::PersonStarted;
+        person.source_key = Some("person-topic".to_owned());
+        let mut aggregate = event("front-door", true, 100);
+        aggregate.source_key = Some("__aggregate_motion__".to_owned());
+        aggregate.fingerprint = Some([9; 32]);
+        index
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER injected_failure BEFORE INSERT ON events
+             WHEN NEW.kind='motion_started' BEGIN SELECT RAISE(FAIL, 'aggregate injection'); END;",
+            )
+            .unwrap();
+        let now = DateTime::from_timestamp(150, 0).unwrap();
+        assert!(
+            index
+                .insert_batch_and_cleanup(&[&person, &aggregate], now, Some(30))
+                .is_err()
+        );
+        assert!(
+            index.recent(&person.camera_id, 10).unwrap().is_empty(),
+            "a committed Person row without its aggregate would become a clip orphan"
+        );
+        index
+            .connection
+            .execute_batch("DROP TRIGGER injected_failure;")
+            .unwrap();
+        let ids = index
+            .insert_batch_and_cleanup(&[&person, &aggregate], now, Some(30))
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(
+            index.get(ids[0].unwrap()).unwrap().unwrap().kind,
+            EventKind::PersonStarted
+        );
+        assert_eq!(
+            index.get(ids[1].unwrap()).unwrap().unwrap().kind,
+            EventKind::MotionStarted
+        );
+        assert_eq!(
+            index
+                .insert_batch_and_cleanup(&[&person, &aggregate], now, Some(30))
+                .unwrap(),
+            vec![None, None],
+            "replay must not duplicate either transition"
+        );
+    }
+
+    #[test]
+    fn v2_migration_preserves_ids_visibility_and_fingerprints_then_admits_person_events() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("event-index.sqlite3");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(
+                "CREATE TABLE events (event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  camera_id TEXT NOT NULL,
+                  kind TEXT NOT NULL CHECK(kind IN ('motion_started','motion_ended')),
+                  source_key TEXT NULL, device_time_utc_ms INTEGER NULL,
+                  received_time_utc_ms INTEGER NOT NULL,
+                  fingerprint BLOB NULL UNIQUE,
+                  user_visible INTEGER NOT NULL CHECK(user_visible IN (0,1)));
+                 CREATE INDEX events_camera_received ON events(camera_id, received_time_utc_ms DESC, event_id DESC);
+                 CREATE INDEX events_received ON events(received_time_utc_ms, event_id);
+                 INSERT INTO events (event_id,camera_id,kind,source_key,received_time_utc_ms,fingerprint,user_visible)
+                 VALUES (41,'front-door','motion_started','legacy',101000,X'0102',0);
+                 INSERT INTO events (event_id,camera_id,kind,source_key,received_time_utc_ms,fingerprint,user_visible)
+                 VALUES (42,'front-door','motion_ended','legacy',102000,X'0304',1);
+                 PRAGMA user_version=2;",
+            ).unwrap();
+        }
+        let mut index = EventIndex::open(&path).unwrap();
+        assert_eq!(index.schema_version().unwrap(), 3);
+        assert_eq!(
+            index
+                .recent(&CameraId::parse("front-door").unwrap(), 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        let page = index
+            .query(&EventQuery {
+                camera_ids: vec![],
+                kind: None,
+                from_utc: DateTime::from_timestamp(90, 0).unwrap(),
+                to_utc: DateTime::from_timestamp(110, 0).unwrap(),
+                limit: 10,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].event_id, 42);
+        let connection = Connection::open(&path).unwrap();
+        let original_fingerprint: Vec<u8> = connection
+            .query_row(
+                "SELECT fingerprint FROM events WHERE event_id=41",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(original_fingerprint, vec![1, 2]);
+        drop(connection);
+        let mut person = event("front-door", true, 103);
+        person.kind = EventKind::PersonStarted;
+        person.fingerprint = Some([9; 32]);
+        let id = index.insert(&person).unwrap().unwrap();
+        assert!(id > 42, "migration must retain monotonic event identity");
+        assert_eq!(
+            index.get(id).unwrap().unwrap().kind,
+            EventKind::PersonStarted
+        );
+        person.kind = EventKind::PersonEnded;
+        person.fingerprint = Some([10; 32]);
+        assert!(index.insert(&person).unwrap().is_some());
+        assert_eq!(index.insert(&person).unwrap(), None);
+        // Repeat open cannot remigrate or retarget existing event IDs.
+        drop(index);
+        assert_eq!(
+            EventIndex::open(&path).unwrap().schema_version().unwrap(),
+            3
+        );
     }
 
     #[test]

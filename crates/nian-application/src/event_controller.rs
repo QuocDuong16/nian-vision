@@ -50,6 +50,10 @@ pub trait EventSettingsRepository: Send {
         &self,
         camera_id: &CameraId,
     ) -> Result<bool, SettingsRepositoryError>;
+    fn local_motion_enabled(&self, _camera_id: &CameraId) -> Result<bool, SettingsRepositoryError> {
+        // Existing test repositories remain ONVIF-only unless they opt in.
+        Ok(false)
+    }
     fn event_monitoring_enabled_cameras(&self) -> Result<Vec<CameraId>, SettingsRepositoryError>;
     fn event_status_camera_ids(&self) -> Result<Vec<CameraId>, SettingsRepositoryError>;
     fn set_event_monitoring_enabled(
@@ -92,6 +96,11 @@ impl EventSettingsRepository for SettingsStore {
         camera_id: &CameraId,
     ) -> Result<bool, SettingsRepositoryError> {
         SettingsStore::event_monitoring_enabled(self, camera_id)
+            .map_err(|_| SettingsRepositoryError::Persistence)
+    }
+
+    fn local_motion_enabled(&self, camera_id: &CameraId) -> Result<bool, SettingsRepositoryError> {
+        SettingsStore::local_motion_enabled(self, camera_id)
             .map_err(|_| SettingsRepositoryError::Persistence)
     }
 
@@ -244,6 +253,8 @@ pub struct EventStatusDto {
 pub enum EventHistoryKind {
     MotionStarted,
     MotionEnded,
+    PersonStarted,
+    PersonEnded,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -575,6 +586,95 @@ impl EventController {
         Ok(())
     }
 
+    /// Persist a local video-detector transition before publishing it to
+    /// Event Review, notification dispatch and the clip-capture dispatcher.
+    /// ONVIF does not participate: a camera can enable local detection without
+    /// an ONVIF binding. The stored fingerprint makes a status retry after a
+    /// lost ACK idempotent; duplicates never trigger a second clip.
+    pub fn persist_local_motion(
+        &self,
+        camera_id: &CameraId,
+        sequence: u64,
+        active: bool,
+        observed_at_utc: DateTime<Utc>,
+    ) -> Result<Option<u64>, EventError> {
+        self.require_accepting()?;
+        if sequence == 0 {
+            return Err(EventError::InvalidQuery(
+                "invalid local motion sequence".to_owned(),
+            ));
+        }
+        let display_name = {
+            let repository = self.repository.lock().map_err(|_| EventError::Internal)?;
+            if !repository
+                .local_motion_enabled(camera_id)
+                .map_err(|_| EventError::Settings)?
+            {
+                return Err(EventError::LifecycleCancelled);
+            }
+            repository
+                .get_camera(camera_id)
+                .map_err(|_| EventError::Settings)?
+                .ok_or(EventError::CameraNotFound)?
+                .display_name()
+                .to_owned()
+        };
+        let kind = if active {
+            EventKind::MotionStarted
+        } else {
+            EventKind::MotionEnded
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"nian-local-scene-motion-v1\0");
+        hasher.update(camera_id.as_str().as_bytes());
+        hasher.update(sequence.to_be_bytes());
+        hasher.update(observed_at_utc.timestamp_millis().to_be_bytes());
+        hasher.update(observed_at_utc.timestamp_subsec_nanos().to_be_bytes());
+        hasher.update([u8::from(active)]);
+        let insert = EventInsert {
+            camera_id: camera_id.clone(),
+            kind,
+            source_key: Some("local_scene_motion".to_owned()),
+            device_time_utc: None,
+            received_time_utc: observed_at_utc,
+            fingerprint: Some(hasher.finalize().into()),
+            user_visible: true,
+        };
+        // Resolve the projection before committing the event. If sink
+        // admission fails after SQLite commit, an idempotent retry would see
+        // an existing fingerprint and could never publish the original clip
+        // trigger. There must be no fallible local step between commit and
+        // notification/capture projection.
+        let sink = self
+            .persisted_event_sink
+            .lock()
+            .map_err(|_| EventError::Internal)?
+            .clone();
+        let retention_days = *self
+            .retention_days
+            .lock()
+            .map_err(|_| EventError::Internal)?;
+        let inserted = self
+            .event_index
+            .lock()
+            .map_err(|_| EventError::Internal)?
+            .as_mut()
+            .ok_or(EventError::PersistenceFailed)?
+            .insert_and_cleanup(&insert, Utc::now(), retention_days)
+            .map_err(|_| EventError::PersistenceFailed)?;
+        if let Some(event_id) = inserted {
+            sink.try_publish(PersistedEventSignal {
+                event_id,
+                camera_id: camera_id.as_str().to_owned(),
+                camera_display_name: display_name,
+                kind: history_kind(kind),
+                motion_active: Some(active),
+                received_time_utc: observed_at_utc,
+            });
+        }
+        Ok(inserted)
+    }
+
     pub fn configured(&self, camera_id: &str) -> Result<bool, EventError> {
         let camera_id = parse_camera_id(camera_id)?;
         Ok(self
@@ -696,6 +796,12 @@ impl EventController {
             .is_none()
         {
             return Err(EventError::NotConfigured);
+        }
+        if repository
+            .local_motion_enabled(&camera_id)
+            .map_err(|_| EventError::Settings)?
+        {
+            return Err(EventError::Busy);
         }
         if !repository
             .set_event_monitoring_enabled(&camera_id, true)
@@ -836,6 +942,8 @@ impl EventController {
                 kind: match row.kind {
                     EventKind::MotionStarted => EventHistoryKind::MotionStarted,
                     EventKind::MotionEnded => EventHistoryKind::MotionEnded,
+                    EventKind::PersonStarted => EventHistoryKind::PersonStarted,
+                    EventKind::PersonEnded => EventHistoryKind::PersonEnded,
                 },
                 source_key: row.source_key,
                 device_time_utc: row.device_time_utc.map(|value| value.to_rfc3339()),
@@ -1608,6 +1716,11 @@ impl MotionNormalizer {
                 | (MotionState::Idle, MotionState::Unknown)
                 | (MotionState::Active, MotionState::Unknown) => None,
             };
+            let kind = match (kind, notification.is_person) {
+                (Some(EventKind::MotionStarted), true) => Some(EventKind::PersonStarted),
+                (Some(EventKind::MotionEnded), true) => Some(EventKind::PersonEnded),
+                (kind, _) => kind,
+            };
             kind.map(|kind| EventInsert {
                 camera_id: camera_id.clone(),
                 kind,
@@ -1617,7 +1730,7 @@ impl MotionNormalizer {
                 fingerprint: notification.device_time_utc.map(|device_time| {
                     event_fingerprint(camera_id, kind, key.as_deref(), device_time)
                 }),
-                user_visible: false,
+                user_visible: notification.is_person,
             })
         };
 
@@ -1661,16 +1774,25 @@ impl MotionNormalizer {
     }
 }
 
-fn persist_motion_transition(
+fn persist_motion_transitions(
     event_index: &Mutex<Option<EventIndex>>,
-    insert: &EventInsert,
+    raw: Option<&EventInsert>,
+    aggregate: Option<&EventInsert>,
     retention_days: Option<u32>,
-) -> Result<Option<u64>, ()> {
+) -> Result<(Option<u64>, Option<u64>), ()> {
+    let inserts = raw.into_iter().chain(aggregate).collect::<Vec<_>>();
+    if inserts.is_empty() {
+        return Ok((None, None));
+    }
     let mut index = event_index.lock().map_err(|_| ())?;
     let index = index.as_mut().ok_or(())?;
-    index
-        .insert_and_cleanup(insert, Utc::now(), retention_days)
-        .map_err(|_| ())
+    let ids = index
+        .insert_batch_and_cleanup(&inserts, Utc::now(), retention_days)
+        .map_err(|_| ())?;
+    let mut ids = ids.into_iter();
+    let raw_id = raw.and_then(|_| ids.next().flatten());
+    let aggregate_id = aggregate.and_then(|_| ids.next().flatten());
+    Ok((raw_id, aggregate_id))
 }
 
 #[derive(Clone, Copy)]
@@ -1705,12 +1827,6 @@ fn apply_motion_notification_with_sink(
     candidate.commit(decision);
     let after = candidate.aggregate_motion();
 
-    // Keep exact per-source transitions durable for audit/debug, but do not let
-    // vendor topic fan-out create duplicate user-facing episodes or clips.
-    if let Some(insert) = raw_transition.as_ref() {
-        persist_motion_transition(event_index, insert, retention_days)?;
-    }
-
     let aggregate_insert = (!notification.synchronization_baseline)
         .then(|| aggregate_transition(before, after))
         .flatten()
@@ -1730,11 +1846,15 @@ fn apply_motion_notification_with_sink(
             }),
             user_visible: true,
         });
-    let persisted_event_id = aggregate_insert
-        .as_ref()
-        .map(|insert| persist_motion_transition(event_index, insert, retention_days))
-        .transpose()?
-        .flatten();
+    // Raw source state and the camera-level aggregate must commit together.
+    // Otherwise a partial SQLite failure can leave a visible Person event with
+    // no durable motion trigger or clip alias on retry.
+    let (raw_person_event_id, persisted_event_id) = persist_motion_transitions(
+        event_index,
+        raw_transition.as_ref(),
+        aggregate_insert.as_ref(),
+        retention_days,
+    )?;
 
     *normalizer = candidate;
     if let (Some(insert), Some(event_id)) = (aggregate_insert.as_ref(), persisted_event_id) {
@@ -1746,6 +1866,23 @@ fn apply_motion_notification_with_sink(
                 camera_display_name: projection.camera_display_name.to_owned(),
                 kind: history_kind(insert.kind),
                 motion_active: after,
+                received_time_utc: insert.received_time_utc,
+            });
+    }
+    // A camera-reported PeopleDetector transition is its own review event.
+    // Publish *after* the aggregate start/end so capture can link it to the
+    // same clip; never manufacture a second motion-triggered recording.
+    if let (Some(insert), Some(event_id)) = (raw_transition.as_ref(), raw_person_event_id)
+        && insert.user_visible
+    {
+        projection
+            .persisted_event_sink
+            .try_publish(PersistedEventSignal {
+                event_id,
+                camera_id: camera_id.as_str().to_owned(),
+                camera_display_name: projection.camera_display_name.to_owned(),
+                kind: history_kind(insert.kind),
+                motion_active: None,
                 received_time_utc: insert.received_time_utc,
             });
     }
@@ -1968,6 +2105,8 @@ fn event_fingerprint(
     hasher.update(match kind {
         EventKind::MotionStarted => b"motion_started".as_slice(),
         EventKind::MotionEnded => b"motion_ended".as_slice(),
+        EventKind::PersonStarted => b"person_started".as_slice(),
+        EventKind::PersonEnded => b"person_ended".as_slice(),
     });
     hasher.update([0]);
     if let Some(source_key) = source_key {
@@ -2061,6 +2200,8 @@ fn history_kind(kind: EventKind) -> EventHistoryKind {
     match kind {
         EventKind::MotionStarted => EventHistoryKind::MotionStarted,
         EventKind::MotionEnded => EventHistoryKind::MotionEnded,
+        EventKind::PersonStarted => EventHistoryKind::PersonStarted,
+        EventKind::PersonEnded => EventHistoryKind::PersonEnded,
     }
 }
 
@@ -2068,6 +2209,8 @@ fn index_kind(kind: EventHistoryKind) -> EventKind {
     match kind {
         EventHistoryKind::MotionStarted => EventKind::MotionStarted,
         EventHistoryKind::MotionEnded => EventKind::MotionEnded,
+        EventHistoryKind::PersonStarted => EventKind::PersonStarted,
+        EventHistoryKind::PersonEnded => EventKind::PersonEnded,
     }
 }
 
@@ -2479,11 +2622,82 @@ mod tests {
     }
 
     #[test]
+    fn local_motion_requires_opt_in_persists_before_publish_and_deduplicates_replay() {
+        let (controller, _, temp) =
+            controller_fixture(FakeBackend::new(), "192.168.1.50", "192.168.1.50", false);
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let started = Utc::now();
+        assert!(matches!(
+            controller.persist_local_motion(&camera_id, 1, true, started),
+            Err(EventError::LifecycleCancelled)
+        ));
+        let mut settings = SettingsStore::open(temp.path().join("settings.sqlite3")).unwrap();
+        assert!(settings.set_local_motion_enabled(&camera_id, true).unwrap());
+        let sink = Arc::new(RecordingEventSink::default());
+        controller.set_persisted_event_sink(sink.clone()).unwrap();
+        let event_id = controller
+            .persist_local_motion(&camera_id, 1, true, started)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            controller
+                .persist_local_motion(&camera_id, 1, true, started)
+                .unwrap(),
+            None
+        );
+        assert_eq!(sink.signals.lock().unwrap().len(), 1);
+        assert_eq!(sink.signals.lock().unwrap()[0].event_id, event_id);
+        assert_eq!(sink.signals.lock().unwrap()[0].motion_active, Some(true));
+        let ended = started + chrono::TimeDelta::seconds(3);
+        assert!(
+            controller
+                .persist_local_motion(&camera_id, 2, false, ended)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(controller.recent("front-door", 10).unwrap().len(), 2);
+        assert_eq!(sink.signals.lock().unwrap().len(), 2);
+        assert!(
+            !settings
+                .set_event_monitoring_enabled(&camera_id, true)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn local_motion_sink_failure_cannot_commit_unprojectable_clip_trigger() {
+        let (controller, _, temp) =
+            controller_fixture(FakeBackend::new(), "192.168.1.50", "192.168.1.50", false);
+        let camera_id = CameraId::parse("front-door").unwrap();
+        let mut settings = SettingsStore::open(temp.path().join("settings.sqlite3")).unwrap();
+        assert!(settings.set_local_motion_enabled(&camera_id, true).unwrap());
+
+        // Simulate a poisoned projection lock. The failure must happen before
+        // SQLite insertion, otherwise replay dedupe would suppress the only
+        // clip/notification trigger forever.
+        let poisoned = controller.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned.persisted_event_sink.lock().unwrap();
+                panic!("simulate an unavailable event projection");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(matches!(
+            controller.persist_local_motion(&camera_id, 1, true, Utc::now()),
+            Err(EventError::Internal)
+        ));
+        assert!(controller.recent("front-door", 10).unwrap().is_empty());
+    }
+
+    #[test]
     fn synchronization_baseline_and_repeated_states_do_not_create_fake_transitions() {
         let camera_id = CameraId::parse("front-door").unwrap();
         let now = Utc::now();
         let mut normalizer = MotionNormalizer::default();
         let baseline = MotionNotification {
+            is_person: false,
             active: true,
             device_time_utc: Some(now),
             source_key: Some("source-a".to_owned()),
@@ -2515,6 +2729,7 @@ mod tests {
         let now = Utc::now();
         let mut normalizer = MotionNormalizer::default();
         let idle = MotionNotification {
+            is_person: false,
             active: false,
             device_time_utc: Some(now),
             source_key: None,
@@ -2538,6 +2753,7 @@ mod tests {
         let mut normalizer = MotionNormalizer::default();
         let event_index = Mutex::new(None);
         let idle = MotionNotification {
+            is_person: false,
             active: false,
             device_time_utc: None,
             source_key: Some("source-a".to_owned()),
@@ -2620,6 +2836,7 @@ mod tests {
         let mut normalizer = MotionNormalizer::default();
         let event_index = Mutex::new(None);
         let baseline = MotionNotification {
+            is_person: false,
             active: true,
             device_time_utc: None,
             source_key: Some("source-a".to_owned()),
@@ -2687,6 +2904,7 @@ mod tests {
             EventIndex::open(temp.path().join("events.sqlite3")).unwrap(),
         ));
         let idle = MotionNotification {
+            is_person: false,
             active: false,
             device_time_utc: Some(now),
             source_key: Some("source-a".to_owned()),
@@ -2750,6 +2968,7 @@ mod tests {
         ));
         let mut normalizer = MotionNormalizer::default();
         let idle = MotionNotification {
+            is_person: false,
             active: false,
             device_time_utc: None,
             source_key: Some("source-a".to_owned()),
@@ -2801,6 +3020,7 @@ mod tests {
         ));
         let sink = RecordingEventSink::default();
         let idle = MotionNotification {
+            is_person: false,
             active: false,
             device_time_utc: Some(now),
             source_key: Some("source-a".to_owned()),
@@ -2889,6 +3109,7 @@ mod tests {
                 &mut normalizer,
                 &camera_id,
                 &MotionNotification {
+                    is_person: false,
                     active: false,
                     device_time_utc: None,
                     source_key: Some(source.to_owned()),
@@ -2915,6 +3136,7 @@ mod tests {
                 &mut normalizer,
                 &camera_id,
                 &MotionNotification {
+                    is_person: false,
                     active,
                     device_time_utc: None,
                     source_key: Some(source.to_owned()),
@@ -2940,12 +3162,102 @@ mod tests {
     }
 
     #[test]
+    fn camera_person_transitions_are_distinct_review_rows_but_share_one_motion_episode() {
+        let camera = CameraId::parse("front-door").unwrap();
+        let temp = tempdir().unwrap();
+        let index = Mutex::new(Some(
+            EventIndex::open(temp.path().join("events.sqlite3")).unwrap(),
+        ));
+        let sink = RecordingEventSink::default();
+        let mut normalizer = MotionNormalizer::default();
+        let at = Utc::now();
+        let baseline = MotionNotification {
+            active: false,
+            is_person: true,
+            source_key: Some("person-topic-hash".to_owned()),
+            device_time_utc: Some(at - chrono::TimeDelta::seconds(1)),
+            synchronization_baseline: false,
+        };
+        for (notification, received) in [
+            (baseline.clone(), at - chrono::TimeDelta::seconds(1)),
+            (
+                MotionNotification {
+                    active: true,
+                    device_time_utc: Some(at),
+                    ..baseline.clone()
+                },
+                at,
+            ),
+            (
+                MotionNotification {
+                    active: false,
+                    device_time_utc: Some(at + chrono::TimeDelta::seconds(2)),
+                    ..baseline.clone()
+                },
+                at + chrono::TimeDelta::seconds(2),
+            ),
+        ] {
+            apply_motion_notification_with_sink(
+                &mut normalizer,
+                &camera,
+                &notification,
+                received,
+                &index,
+                MotionNotificationProjection {
+                    camera_display_name: "Front Door",
+                    persisted_event_sink: &sink,
+                },
+                Some(30),
+            )
+            .unwrap();
+        }
+        let signals = sink.signals.lock().unwrap();
+        assert_eq!(signals.len(), 4);
+        assert_eq!(
+            signals.iter().map(|signal| signal.kind).collect::<Vec<_>>(),
+            vec![
+                EventHistoryKind::MotionStarted,
+                EventHistoryKind::PersonStarted,
+                EventHistoryKind::MotionEnded,
+                EventHistoryKind::PersonEnded,
+            ]
+        );
+        assert_eq!(
+            signals
+                .iter()
+                .map(|signal| signal.motion_active)
+                .collect::<Vec<_>>(),
+            vec![Some(true), None, Some(false), None]
+        );
+        drop(signals);
+        let rows = index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query(&EventQuery {
+                camera_ids: vec![camera],
+                kind: Some(EventKind::PersonStarted),
+                from_utc: at - chrono::TimeDelta::minutes(1),
+                to_utc: at + chrono::TimeDelta::minutes(1),
+                limit: 10,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].kind, EventKind::PersonStarted);
+        // The per-source person signal never asks the clip recorder to start
+        // again: it carries no aggregate motion authority.
+    }
+
+    #[test]
     fn persistence_failure_never_publishes_notification_signal() {
         let camera_id = CameraId::parse("front-door").unwrap();
         let now = Utc::now();
         let event_index = Mutex::new(None);
         let sink = RecordingEventSink::default();
         let idle = MotionNotification {
+            is_person: false,
             active: false,
             device_time_utc: Some(now),
             source_key: Some("source-a".to_owned()),
@@ -3052,6 +3364,7 @@ mod tests {
         let mut normalizer = MotionNormalizer::default();
         for index in 0..(MAX_EVENT_SOURCES_PER_SESSION + 16) {
             let notification = MotionNotification {
+                is_person: false,
                 active: true,
                 device_time_utc: None,
                 source_key: Some(format!("source-{index}")),
@@ -3064,6 +3377,7 @@ mod tests {
         assert_eq!(normalizer.aggregate_motion(), None);
 
         let known_end = MotionNotification {
+            is_person: false,
             active: false,
             device_time_utc: None,
             source_key: Some("source-0".to_owned()),
@@ -3080,6 +3394,7 @@ mod tests {
         let now = Utc::now();
         let mut normalizer = MotionNormalizer::default();
         let started = MotionNotification {
+            is_person: false,
             active: true,
             device_time_utc: None,
             source_key: Some("source-a".to_owned()),
@@ -3218,6 +3533,31 @@ mod tests {
         b.join().unwrap();
         assert_eq!(controller.ownership_counts(), (0, 0, 0, 0));
         assert_eq!(backend.unsubscribe_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn entering_backoff_revokes_stale_motion_authority() {
+        let status = Mutex::new(RuntimeStatus {
+            state: EventRuntimeState::Polling,
+            motion_active: Some(true),
+            last_event_at: Some(Utc::now()),
+            last_error_code: None,
+        });
+
+        update_status(
+            &status,
+            EventRuntimeState::Backoff,
+            Some("event_pull_protocol"),
+            true,
+        );
+
+        let status = status.lock().unwrap();
+        assert_eq!(status.state, EventRuntimeState::Backoff);
+        assert_eq!(status.motion_active, None);
+        assert_eq!(
+            status.last_error_code.as_deref(),
+            Some("event_pull_protocol")
+        );
     }
 
     #[test]

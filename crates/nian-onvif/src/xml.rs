@@ -1186,6 +1186,7 @@ fn normalize_motion_notifications(
     for (data_name, active) in states {
         notifications.push(MotionNotification {
             active,
+            is_person: topic_kind == MotionTopicKind::TapoPeople && data_name == "IsPeople",
             device_time_utc,
             source_key: motion_source_key(
                 &raw.source_items,
@@ -1550,6 +1551,14 @@ mod tests {
         assert_eq!(
             notifications
                 .iter()
+                .map(|event| event.is_person)
+                .collect::<Vec<_>>(),
+            vec![true, false, false, false],
+            "only IsPeople on the fingerprint-gated PeopleDetector is person classification",
+        );
+        assert_eq!(
+            notifications
+                .iter()
                 .map(|notification| notification.active)
                 .collect::<Vec<_>>(),
             vec![true, true, false, true]
@@ -1562,6 +1571,19 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), original_len);
+    }
+
+    #[test]
+    fn tapo_people_topic_fallback_is_motion_not_a_person_claim() {
+        let xml = br#"<wsnt:NotificationMessage xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:tns1="http://www.onvif.org/ver10/topics"><wsnt:Topic>tns1:RuleEngine/PeopleDetector/People</wsnt:Topic><wsnt:Message><tt:Message><tt:Data><tt:SimpleItem Name="IsMotion" Value="true"/><tt:SimpleItem Name="IsPeople" Value="false"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>"#;
+        let parsed =
+            parse_motion_notifications_with_compatibility(xml, EventCompatibility::TapoC200)
+                .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.iter().filter(|row| row.is_person).count(), 1);
+        assert!(parsed.iter().any(|row| row.is_person && !row.active));
+        assert!(parsed.iter().any(|row| !row.is_person && row.active));
+        assert!(parse_motion_notifications(xml).unwrap().is_empty());
     }
 
     #[test]

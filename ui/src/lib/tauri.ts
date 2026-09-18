@@ -26,6 +26,9 @@ export interface CameraSummary {
   host: string;
   port: number;
   path: string;
+  sub_host?: string | null;
+  sub_port?: number | null;
+  sub_path?: string | null;
   audio_policy: AudioPolicy;
 }
 
@@ -130,6 +133,16 @@ export type EventRuntimeState =
   | "stopping"
   | "failed";
 
+export interface LocalMotionPreference {
+  camera_id: string;
+  enabled: boolean;
+  // Optional during desktop/worker upgrades. Desired state is not runtime state.
+  runtime_state?: string | null;
+  motion_active?: boolean | null;
+  sampled_frames?: number | null;
+  last_error_code?: string | null;
+}
+
 export interface EventStatus {
   camera_id: string;
   configured: boolean;
@@ -140,7 +153,7 @@ export interface EventStatus {
   last_error_code: string | null;
 }
 
-export type EventHistoryKind = "motion_started" | "motion_ended";
+export type EventHistoryKind = "motion_started" | "motion_ended" | "person_started" | "person_ended";
 
 export interface EventHistory {
   event_id: number;
@@ -232,6 +245,10 @@ export interface OnvifPreparedProfile {
   port: number;
   path: string;
   host_mismatch: boolean;
+  sub_profile_token: string | null;
+  sub_host: string | null;
+  sub_port: number | null;
+  sub_path: string | null;
 }
 
 export interface ApplicationSettings {
@@ -286,6 +303,57 @@ export interface PerformanceProcess {
   is_root: boolean;
 }
 
+export interface CameraMediaConsumerCounts {
+  recording: number;
+  live: number;
+  motion: number;
+  event: number;
+  other: number;
+}
+
+export interface CameraMediaSourceDiagnostics {
+  profile: string;
+  lifecycle: string;
+  retainers: number;
+  subscribers: number;
+  reliable_subscribers: number;
+  realtime_subscribers: number;
+  consumers: CameraMediaConsumerCounts;
+  queued_packets: number;
+  queued_bytes: number;
+  dropped_packets: number;
+  pre_roll_packets: number;
+  pre_roll_bytes: number;
+  pre_roll_dropped_packets: number;
+  video_frame_rate: { num: number; den: number } | null;
+  video_codec: string | null;
+  video_width: number | null;
+  video_height: number | null;
+}
+
+export interface CameraMediaDiagnostics {
+  camera_id: string;
+  worker_available: boolean;
+  generation_starts: number;
+  source_count: number;
+  main_sources: number;
+  sub_sources: number;
+  connecting_sources: number;
+  ready_sources: number;
+  failed_sources: number;
+  subscribers: number;
+  reliable_subscribers: number;
+  realtime_subscribers: number;
+  consumers: CameraMediaConsumerCounts;
+  queued_packets: number;
+  queued_bytes: number;
+  dropped_packets: number;
+  pre_roll_packets: number;
+  pre_roll_bytes: number;
+  pre_roll_dropped_packets: number;
+  sources: CameraMediaSourceDiagnostics[];
+}
+
 export interface RecordingIntent {
   camera_ids: string[];
 }
@@ -326,6 +394,8 @@ export interface PlaybackInspectDto {
 export interface PlaybackOpenDto {
   session_id: string;
   url: string;
+  /** Opaque PCM WAV capability when G.711 audio is delivered outside MP4. */
+  audio_url?: string | null;
   recording: RecordingDto;
   inspect: PlaybackInspectDto;
   adjacent: AdjacentRecordingsDto;

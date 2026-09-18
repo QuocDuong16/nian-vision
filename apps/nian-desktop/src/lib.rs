@@ -20,19 +20,20 @@ use std::thread::JoinHandle;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use nian_application::{
-    ApplicationSettingsDto, CameraDraft, CameraService, CameraServiceError, CameraSummary,
+    ApplicationSettingsDto, BrokerLiveRunnerFactory, BrokerRecordingRunnerFactory, CameraDraft,
+    CameraMediaDiagnostics, CameraService, CameraServiceError, CameraSummary, CameraWorkerBroker,
     CredentialStore, CredentialStoreError, DesktopLifecycle, DesktopLifecycleError,
     DesktopLifecycleState, DesktopNotificationDelivery, DesktopNotifier, EventController,
     EventError, EventHistoryDto, EventHistoryKind, EventMutation, EventPlaybackOpenDto,
     EventRecordingContextDto, EventReviewRowDto, EventStatusDto, LiveError, LiveOpenDto,
-    LiveStatus, LiveTeardownBatch, LiveViewController, MotionNotificationRequest,
-    NotificationDeliveryPoll, NotificationDispatcher, NotificationError, NotificationSettingsDto,
-    OnvifConnectionDto, OnvifController, OnvifControllerError, OnvifDiscoveryDto,
-    OnvifPreparedProfileDto, PersistedEventSignal, PersistedEventSink, PlaybackController,
-    PlaybackError, PlaybackOpenDto, ProbeController, ProbeError, ProbeResult, PtzCapabilitiesDto,
-    PtzController, PtzDirection, PtzError, PtzMovementDto, PtzMutation, PtzTeardownBatch,
-    RecordingController, RecordingControllerError, RecordingDto, RecordingState, RecordingStatus,
-    SupervisorRecordingRunnerFactory, WorkerProbeRunner,
+    LiveStatus, LiveStreamProfile, LiveTeardownBatch, LiveViewController,
+    MotionNotificationRequest, NotificationDeliveryPoll, NotificationDispatcher, NotificationError,
+    NotificationSettingsDto, OnvifConnectionDto, OnvifController, OnvifControllerError,
+    OnvifDiscoveryDto, OnvifPreparedProfileDto, PersistedEventSignal, PersistedEventSink,
+    PlaybackController, PlaybackError, PlaybackOpenDto, ProbeController, ProbeError, ProbeResult,
+    PtzCapabilitiesDto, PtzController, PtzDirection, PtzError, PtzMovementDto, PtzMutation,
+    PtzTeardownBatch, RecordingController, RecordingControllerError, RecordingDto, RecordingState,
+    RecordingStatus, WorkerProbeRunner,
 };
 use nian_domain::{
     AudioPolicy, CameraId, CredentialRef, Credentials, RetentionPolicy, StorageQuota,
@@ -127,6 +128,12 @@ struct CameraCommandInput {
     host: String,
     port: u16,
     path: String,
+    #[serde(default)]
+    sub_host: Option<String>,
+    #[serde(default)]
+    sub_port: Option<u16>,
+    #[serde(default)]
+    sub_path: Option<String>,
     audio_policy: AudioPolicy,
     #[serde(default)]
     username: String,
@@ -152,6 +159,9 @@ impl CameraCommandInput {
             host: self.host,
             port: self.port,
             path: self.path,
+            sub_host: self.sub_host,
+            sub_port: self.sub_port,
+            sub_path: self.sub_path,
             audio_policy: self.audio_policy,
             replacement_credentials,
         })
@@ -491,6 +501,7 @@ impl CredentialStore for NativeCredentialStore {
 
 struct DesktopState {
     camera_service: Mutex<CameraService>,
+    camera_worker_broker: CameraWorkerBroker,
     recording_controller: Mutex<RecordingController>,
     live_controller: LiveViewController,
     playback_controller: Mutex<PlaybackController>,
@@ -501,6 +512,7 @@ struct DesktopState {
     notification_dispatcher: NotificationDispatcher,
     _event_capture_dispatcher: Mutex<Option<EventCaptureDispatcher>>,
     notification_settings: Mutex<SettingsStore>,
+    local_motion_settings: Mutex<SettingsStore>,
     lifecycle: DesktopLifecycle,
     power_subscription: Mutex<Option<Box<dyn PowerEventSubscription>>>,
     power_dispatch_tx: Mutex<Option<mpsc::Sender<PowerDispatchMessage>>>,
@@ -1256,14 +1268,12 @@ fn add_onvif_camera(
             "selected ONVIF stream could not be opened",
         ));
     }
-    if !result
-        .codec
-        .as_deref()
-        .is_some_and(|codec| codec.eq_ignore_ascii_case("h264"))
-    {
+    if !result.codec.as_deref().is_some_and(|codec| {
+        codec.eq_ignore_ascii_case("h264") || codec.eq_ignore_ascii_case("hevc")
+    }) {
         return Err(DesktopErrorDto::new(
             "onvif_no_compatible_profile",
-            "selected stream is not H.264 compatible",
+            "selected stream is not H.264/H.265 compatible",
         ));
     }
 
@@ -1586,6 +1596,138 @@ async fn event_configured(
     })
     .await
     .map_err(|_| DesktopErrorDto::new("event_internal", "event status task failed"))?
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LocalMotionPreferenceDto {
+    camera_id: String,
+    enabled: bool,
+    runtime_state: Option<String>,
+    motion_active: Option<bool>,
+    sampled_frames: Option<u64>,
+    last_error_code: Option<String>,
+}
+
+#[tauri::command]
+async fn local_motion_statuses(
+    state: tauri::State<'_, Arc<DesktopState>>,
+) -> Result<Vec<LocalMotionPreferenceDto>, DesktopErrorDto> {
+    admit_running(&state)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = lock(&state.local_motion_settings)?;
+        let cameras = settings.local_motion_enabled_cameras().map_err(|_| {
+            DesktopErrorDto::new(
+                "local_motion_settings",
+                "local motion preferences are unavailable",
+            )
+        })?;
+        drop(settings); // Do not hold a SQLite settings lock across worker IPC.
+        Ok(cameras
+            .into_iter()
+            .map(|camera_id| {
+                let status = state.camera_worker_broker.local_motion_status(&camera_id);
+                let (runtime_state, motion_active, sampled_frames, last_error_code) = match status {
+                    Ok(Some(status)) => (
+                        Some(status.state),
+                        status.motion_active,
+                        Some(status.sampled_frames),
+                        status.last_error_code,
+                    ),
+                    Ok(None) => (None, None, None, None),
+                    Err(_) => (
+                        None,
+                        None,
+                        None,
+                        Some("motion_status_unavailable".to_owned()),
+                    ),
+                };
+                LocalMotionPreferenceDto {
+                    camera_id: camera_id.as_str().to_owned(),
+                    enabled: true,
+                    runtime_state,
+                    motion_active,
+                    sampled_frames,
+                    last_error_code,
+                }
+            })
+            .collect::<Vec<_>>())
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("local_motion_internal", "local motion task failed"))?
+}
+
+#[tauri::command]
+async fn local_motion_set(
+    state: tauri::State<'_, Arc<DesktopState>>,
+    camera_id: String,
+    enabled: bool,
+) -> Result<LocalMotionPreferenceDto, DesktopErrorDto> {
+    {
+        let _gate = lock(&state.control_gate)?;
+        require_running(&state)?;
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let camera_id = CameraId::parse(&camera_id)
+            .map_err(|_| DesktopErrorDto::new("camera_not_found", "invalid camera identity"))?;
+        if enabled && !state.event_controller.event_index_configured() {
+            return Err(DesktopErrorDto::new(
+                "local_motion_storage",
+                "configure recording storage before enabling local motion",
+            ));
+        }
+        let mut settings = lock(&state.local_motion_settings)?;
+        if settings
+            .get_camera(&camera_id)
+            .map_err(|_| {
+                DesktopErrorDto::new("local_motion_settings", "camera settings are unavailable")
+            })?
+            .is_none()
+        {
+            return Err(DesktopErrorDto::new(
+                "camera_not_found",
+                "camera was not found",
+            ));
+        }
+        if enabled
+            && settings.event_monitoring_enabled(&camera_id).map_err(|_| {
+                DesktopErrorDto::new(
+                    "local_motion_settings",
+                    "ONVIF event preference unavailable",
+                )
+            })?
+        {
+            return Err(DesktopErrorDto::new(
+                "local_motion_conflict",
+                "turn off ONVIF Events before enabling local motion",
+            ));
+        }
+        if !settings
+            .set_local_motion_enabled(&camera_id, enabled)
+            .map_err(|_| {
+                DesktopErrorDto::new(
+                    "local_motion_settings",
+                    "could not save local motion preference",
+                )
+            })?
+        {
+            return Err(DesktopErrorDto::new(
+                "local_motion_conflict",
+                "motion mode changed concurrently or camera is missing",
+            ));
+        }
+        Ok(LocalMotionPreferenceDto {
+            camera_id: camera_id.as_str().to_owned(),
+            enabled,
+            runtime_state: None, // Desired mutation is not worker admission.
+            motion_active: None,
+            sampled_frames: None,
+            last_error_code: None,
+        })
+    })
+    .await
+    .map_err(|_| DesktopErrorDto::new("local_motion_internal", "local motion task failed"))?
 }
 
 #[tauri::command]
@@ -1996,7 +2138,16 @@ fn recording_intent(
     Ok(RecordingIntentDto { camera_ids })
 }
 
+#[cfg(test)]
 fn open_live(state: &DesktopState, camera_id: &str) -> Result<LiveOpenDto, DesktopErrorDto> {
+    open_live_profile(state, camera_id, LiveStreamProfile::Grid)
+}
+
+fn open_live_profile(
+    state: &DesktopState,
+    camera_id: &str,
+    profile: LiveStreamProfile,
+) -> Result<LiveOpenDto, DesktopErrorDto> {
     admit_running(state)?;
     let parsed_camera_id = CameraId::parse(camera_id)
         .map_err(|error| DesktopErrorDto::new("validation", error.to_string()))?;
@@ -2009,7 +2160,7 @@ fn open_live(state: &DesktopState, camera_id: &str) -> Result<LiveOpenDto, Deskt
     }
 
     let prepared = lock(&state.camera_service)?
-        .prepare_live(camera_id)
+        .prepare_live_profile(camera_id, profile)
         .map_err(map_camera_error)?;
     let admission = match state.live_controller.admit(prepared) {
         Ok(admission) => admission,
@@ -2039,9 +2190,20 @@ fn open_live(state: &DesktopState, camera_id: &str) -> Result<LiveOpenDto, Deskt
 async fn live_open(
     state: tauri::State<'_, Arc<DesktopState>>,
     camera_id: String,
+    profile: Option<String>,
 ) -> Result<LiveOpenDto, DesktopErrorDto> {
     let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || open_live(&state, &camera_id))
+    let profile = match profile.as_deref() {
+        None | Some("grid") => LiveStreamProfile::Grid,
+        Some("focus") => LiveStreamProfile::Focus,
+        Some(_) => {
+            return Err(DesktopErrorDto::new(
+                "validation",
+                "unsupported live stream profile",
+            ));
+        }
+    };
+    tauri::async_runtime::spawn_blocking(move || open_live_profile(&state, &camera_id, profile))
         .await
         .map_err(|_| DesktopErrorDto::new("worker_unavailable", "live-view task failed"))?
 }
@@ -2207,6 +2369,13 @@ fn performance_snapshot() -> Result<PerformanceSnapshotDto, DesktopErrorDto> {
             "performance telemetry is unavailable",
         )
     })
+}
+
+#[tauri::command]
+fn media_diagnostics(
+    state: tauri::State<'_, Arc<DesktopState>>,
+) -> Result<Vec<CameraMediaDiagnostics>, DesktopErrorDto> {
+    Ok(state.camera_worker_broker.media_diagnostics())
 }
 
 #[tauri::command]
@@ -3983,6 +4152,7 @@ pub fn run() {
             let settings = SettingsStore::open(settings_path.clone())?;
             let ptz_settings = SettingsStore::open(settings_path.clone())?;
             let event_settings = SettingsStore::open(settings_path.clone())?;
+            let local_motion_settings = SettingsStore::open(settings_path.clone())?;
             let notification_settings = SettingsStore::open(settings_path)?;
             let credentials: Arc<dyn CredentialStore> = Arc::new(NativeCredentialStore);
             let camera_service = CameraService::new(Box::new(settings), credentials.clone());
@@ -4021,9 +4191,10 @@ pub fn run() {
             let worker_path = std::env::current_exe()?.with_file_name(worker_name);
             let worker_program = worker_path.to_string_lossy().into_owned();
             let (tray_watch_tx, tray_watch_rx) = mpsc::channel();
+            let camera_workers = CameraWorkerBroker::new(worker_program.clone());
             let mut recording_controller =
-                RecordingController::with_factory(Arc::new(SupervisorRecordingRunnerFactory {
-                    worker_program: worker_program.clone(),
+                RecordingController::with_factory(Arc::new(BrokerRecordingRunnerFactory {
+                    broker: camera_workers.clone(),
                 }));
             let tray_status_tx = tray_watch_tx.clone();
             recording_controller
@@ -4038,9 +4209,13 @@ pub fn run() {
             }));
             let onvif_controller = OnvifController::production()
                 .map_err(|_| std::io::Error::other("ONVIF service could not start"))?;
-            let live_controller =
-                LiveViewController::new(worker_program.clone(), app_data.join("live-cache"))
-                    .map_err(|_| std::io::Error::other("live-view service could not start"))?;
+            let live_controller = LiveViewController::with_factory(
+                Arc::new(BrokerLiveRunnerFactory {
+                    broker: camera_workers.clone(),
+                }),
+                app_data.join("live-cache"),
+            )
+            .map_err(|_| std::io::Error::other("live-view service could not start"))?;
             let mut playback_controller =
                 PlaybackController::new(worker_program.clone(), app_data.join("playback-cache"))
                     .map_err(|_| std::io::Error::other("playback service could not start"))?;
@@ -4061,6 +4236,7 @@ pub fn run() {
 
             let state = Arc::new(DesktopState {
                 camera_service: Mutex::new(camera_service),
+                camera_worker_broker: camera_workers.clone(),
                 recording_controller: Mutex::new(recording_controller),
                 live_controller,
                 playback_controller: Mutex::new(playback_controller),
@@ -4071,6 +4247,7 @@ pub fn run() {
                 notification_dispatcher,
                 _event_capture_dispatcher: Mutex::new(None),
                 notification_settings: Mutex::new(notification_settings),
+                local_motion_settings: Mutex::new(local_motion_settings),
                 lifecycle: DesktopLifecycle::new(),
                 power_subscription: Mutex::new(None),
                 power_dispatch_tx: Mutex::new(None),
@@ -4084,9 +4261,10 @@ pub fn run() {
                 settings_update_gate: Mutex::new(()),
             });
             let event_capture_dispatcher =
-                EventCaptureDispatcher::new(Arc::downgrade(&state), worker_program).map_err(
-                    |_| std::io::Error::other("event capture dispatcher could not start"),
-                )?;
+                EventCaptureDispatcher::new(Arc::downgrade(&state), worker_program, camera_workers)
+                    .map_err(|_| {
+                        std::io::Error::other("event capture dispatcher could not start")
+                    })?;
             state
                 .event_controller
                 .set_persisted_event_sink(Arc::new(FanoutPersistedEventSink::new(vec![
@@ -4210,6 +4388,8 @@ pub fn run() {
             event_configured,
             event_status,
             event_statuses,
+            local_motion_statuses,
+            local_motion_set,
             event_recent,
             event_query,
             event_get,
@@ -4235,6 +4415,7 @@ pub fn run() {
             playback_status,
             settings_get,
             performance_snapshot,
+            media_diagnostics,
             storage_usage,
             settings_update,
             notification_settings_get,
@@ -5082,6 +5263,8 @@ mod tests {
         .unwrap();
         let notification_settings =
             SettingsStore::open(root.with_extension("notification-settings.sqlite3")).unwrap();
+        let local_motion_settings =
+            SettingsStore::open(root.with_extension("event-settings.sqlite3")).unwrap();
         let notification_dispatcher =
             NotificationDispatcher::new(Arc::new(TestDesktopNotifier), false).unwrap();
         event_controller
@@ -5100,6 +5283,7 @@ mod tests {
         (
             DesktopState {
                 camera_service: Mutex::new(service),
+                camera_worker_broker: CameraWorkerBroker::new("unused-test-worker".to_owned()),
                 recording_controller: Mutex::new(recording_controller),
                 live_controller,
                 playback_controller: Mutex::new(playback_controller),
@@ -5110,6 +5294,7 @@ mod tests {
                 notification_dispatcher,
                 _event_capture_dispatcher: Mutex::new(None),
                 notification_settings: Mutex::new(notification_settings),
+                local_motion_settings: Mutex::new(local_motion_settings),
                 lifecycle: DesktopLifecycle::new(),
                 power_subscription: Mutex::new(None),
                 power_dispatch_tx: Mutex::new(None),
@@ -5145,6 +5330,9 @@ mod tests {
             host: "192.168.1.50".to_owned(),
             port: 554,
             path: "/stream1".to_owned(),
+            sub_host: None,
+            sub_port: None,
+            sub_path: None,
             audio_policy: AudioPolicy::CopyAll,
             username: username.to_owned(),
             password: password.to_owned(),
@@ -7032,6 +7220,9 @@ mod tests {
             host: "192.168.1.50".to_owned(),
             port: 554,
             path: "/stream1".to_owned(),
+            sub_host: None,
+            sub_port: None,
+            sub_path: None,
             audio_policy: AudioPolicy::CopyAll,
             username: String::new(),
             password: String::new(),

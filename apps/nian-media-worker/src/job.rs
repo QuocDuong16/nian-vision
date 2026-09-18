@@ -46,13 +46,18 @@
 // recorder/ipc crates), hence the unconditional scoped allow.
 #![allow(clippy::unwrap_used)]
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nian_domain::CameraId;
-use nian_media_ffmpeg::InterruptHandle;
+use nian_media_ffmpeg::{
+    InterruptHandle, PacketConsumerKind, PacketDeliveryPolicy, PacketQueueLimits,
+};
+
+use crate::ingest::{IngestProfile, PacketSubscriptionOptions, SharedIngestManager};
 use nian_recorder::{
     CameraRecordingSupervisor, RecorderConfig, RecordingError, RecordingSession, SeededJitter,
     SleepWaiter, SourceKind, StopFlag, SupervisorConfig, SupervisorEnd, SupervisorEvent,
@@ -157,7 +162,10 @@ pub enum JobSource {
     /// Local file path (test/manual sources).
     File(PathBuf),
     /// Live network stream.
-    Rtsp(SecretUrl),
+    Rtsp {
+        url: SecretUrl,
+        profile: IngestProfile,
+    },
 }
 
 impl std::fmt::Debug for JobSource {
@@ -165,7 +173,11 @@ impl std::fmt::Debug for JobSource {
         match self {
             Self::File(path) => f.debug_tuple("File").field(path).finish(),
             // Deliberately opaque: paths are safe to print, URLs are not.
-            Self::Rtsp(url) => f.debug_tuple("Rtsp").field(&url.expose().len()).finish(),
+            Self::Rtsp { url, profile } => f
+                .debug_struct("Rtsp")
+                .field("url_len", &url.expose().len())
+                .field("profile", profile)
+                .finish(),
         }
     }
 }
@@ -181,6 +193,8 @@ pub struct JobSpec {
     pub source: JobSource,
     /// Segment target duration.
     pub segment_target: Duration,
+    /// Optional compressed packet history to seed before live packets.
+    pub pre_roll: Duration,
     /// Whether audio streams are copied alongside video.
     pub copy_audio: bool,
 }
@@ -227,7 +241,15 @@ impl JobSpec {
                     .get("url")
                     .and_then(serde_json::Value::as_str)
                     .ok_or("missing 'source.url'")?;
-                JobSource::Rtsp(SecretUrl::new(url.to_owned()))
+                let profile = IngestProfile::from_wire(
+                    source_value
+                        .get("profile")
+                        .and_then(serde_json::Value::as_str),
+                );
+                JobSource::Rtsp {
+                    url: SecretUrl::new(url.to_owned()),
+                    profile,
+                }
             }
             _other => return Err("unknown 'source.kind' (file|rtsp)"),
         };
@@ -240,6 +262,14 @@ impl JobSpec {
             return Err("'segment_target_secs' must be greater than zero");
         }
 
+        let pre_roll_ms = params
+            .get("pre_roll_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if pre_roll_ms > 10_000 {
+            return Err("'pre_roll_ms' must be at most 10000");
+        }
+
         let copy_audio = params
             .get("copy_audio")
             .and_then(serde_json::Value::as_bool)
@@ -250,6 +280,7 @@ impl JobSpec {
             storage_root: PathBuf::from(storage),
             source,
             segment_target: Duration::from_secs(segment_target_secs),
+            pre_roll: Duration::from_millis(pre_roll_ms),
             copy_audio,
         })
     }
@@ -372,9 +403,13 @@ impl nian_recorder::SessionFactory for FileFactory {
 /// inside the job thread after spawn.
 struct RtspFactory {
     url: String,
+    profile: IngestProfile,
+    pre_roll: Duration,
+    consumer: PacketConsumerKind,
     layout: nian_storage::RecordingsLayout,
     config: RecorderConfig,
     latest_interrupt: LatestInterruptSlot,
+    ingests: SharedIngestManager,
 }
 
 impl nian_recorder::SessionFactory for RtspFactory {
@@ -384,24 +419,49 @@ impl nian_recorder::SessionFactory for RtspFactory {
     ) -> Result<Box<dyn nian_recorder::supervisor::ActiveSession>, RecordingError> {
         let interrupt = InterruptHandle::new();
         *self.latest_interrupt.lock().unwrap() = Some(interrupt.clone());
-        // §15: same open/connect budget discipline as the file factory.
-        let _open_budget = interrupt.scoped_deadline(self.config.timeouts.open);
-        let input = nian_media_ffmpeg::MediaInput::open(
-            &nian_media::MediaSource::Rtsp {
-                url: nian_media::RtspUrl::new(self.url.clone()),
+        let queue_limits = if self.pre_roll.is_zero() {
+            recording_queue_limits()
+        } else {
+            event_capture_queue_limits()
+        };
+        let subscription = self.ingests.subscribe_rtsp_with_options(
+            &self.url,
+            PacketSubscriptionOptions {
+                profile: self.profile,
+                limits: queue_limits,
+                policy: PacketDeliveryPolicy::Reliable,
+                consumer: self.consumer,
+                pre_roll: self.pre_roll,
+                ready_timeout: self.config.timeouts.open,
             },
-            &interrupt,
+            Some(&interrupt),
         )?;
-        drop(_open_budget);
         Ok(Box::new(SessionShell(
-            RecordingSession::from_input_with_stop(
-                input,
+            RecordingSession::from_subscription_with_stop_and_interrupt(
+                subscription,
                 self.layout.clone(),
                 self.config.clone(),
                 run_stop.clone(),
+                interrupt,
             )?,
         )))
     }
+}
+
+fn recording_queue_limits() -> PacketQueueLimits {
+    PacketQueueLimits::new(
+        NonZeroUsize::new(256).unwrap_or(NonZeroUsize::MIN),
+        NonZeroUsize::new(8 * 1024 * 1024).unwrap_or(NonZeroUsize::MIN),
+        Duration::from_secs(5),
+    )
+}
+
+fn event_capture_queue_limits() -> PacketQueueLimits {
+    PacketQueueLimits::new(
+        NonZeroUsize::new(4096).unwrap_or(NonZeroUsize::MIN),
+        NonZeroUsize::new(40 * 1024 * 1024).unwrap_or(NonZeroUsize::MIN),
+        Duration::from_secs(15),
+    )
 }
 
 /// Bridges a concrete [`RecordingSession`] to the supervisor's object seam.
@@ -428,6 +488,7 @@ enum BoxedSupervisor {
 /// The single-job lifecycle container. Not `Clone`: one job per worker.
 pub struct RecordingJobManager {
     shared: Arc<SharedState>,
+    ingests: SharedIngestManager,
     /// Clone of the supervisor's run-level flag captured at `start()` time;
     /// stop requests go here and are honored by the supervised loop.
     run_stop: Option<StopFlag>,
@@ -453,13 +514,19 @@ impl Default for RecordingJobManager {
 }
 
 impl RecordingJobManager {
-    /// Creates an idle manager.
+    /// Creates an idle manager with its own ingest registry.
     pub fn new() -> Self {
+        Self::with_ingest_manager(SharedIngestManager::new())
+    }
+
+    /// Creates an idle manager sharing camera ingests with other worker jobs.
+    pub fn with_ingest_manager(ingests: SharedIngestManager) -> Self {
         Self {
             shared: Arc::new(SharedState {
                 status: Mutex::new(JobStatus::initial()),
                 done: AtomicBool::new(false),
             }),
+            ingests,
             run_stop: None,
             latest_interrupt: Arc::new(Mutex::new(None)),
             active: None,
@@ -488,9 +555,24 @@ impl RecordingJobManager {
     /// `recording.start` acks promptly even when large crash files need remuxing.
     ///
     /// Fails with `job_already_active` when this worker already has/had a
-    /// job (one job per worker lifetime keeps recovery boundaries clean),
+    /// job (only one recording job may be active at a time),
     /// or `start_failed` when the thread cannot spawn.
     pub fn start(&mut self, spec: JobSpec) -> Result<(), &'static str> {
+        self.start_with_consumer(spec, PacketConsumerKind::Recording)
+    }
+
+    /// Event clips have distinct ownership even if their pre-roll window is
+    /// temporarily zero. The IPC namespace, not duration, identifies the job.
+    pub fn start_event(&mut self, spec: JobSpec) -> Result<(), &'static str> {
+        self.start_with_consumer(spec, PacketConsumerKind::Event)
+    }
+
+    fn start_with_consumer(
+        &mut self,
+        spec: JobSpec,
+        consumer: PacketConsumerKind,
+    ) -> Result<(), &'static str> {
+        self.reset_finished_job();
         if self.started_once || self.active.is_some() {
             return Err(code::JOB_ALREADY_ACTIVE);
         }
@@ -516,11 +598,14 @@ impl RecordingJobManager {
 
         enum ThreadSource {
             File(PathBuf),
-            Rtsp(String),
+            Rtsp { url: String, profile: IngestProfile },
         }
         let thread_source = match &spec.source {
             JobSource::File(path) => ThreadSource::File(path.clone()),
-            JobSource::Rtsp(url) => ThreadSource::Rtsp(url.expose().to_owned()),
+            JobSource::Rtsp { url, profile } => ThreadSource::Rtsp {
+                url: url.expose().to_owned(),
+                profile: *profile,
+            },
         };
 
         // Only plain data crosses `.spawn`; MediaInput is !Send, which is why
@@ -542,19 +627,25 @@ impl RecordingJobManager {
                 SleepWaiter,
                 SeededJitter::new(job_seed()),
             )),
-            ThreadSource::Rtsp(url) => BoxedSupervisor::Rtsp(CameraRecordingSupervisor::new(
-                spec.camera.clone(),
-                SourceKind::Rtsp,
-                SupervisorConfig::default(),
-                RtspFactory {
-                    url,
-                    layout: layout.clone(),
-                    config,
-                    latest_interrupt: Arc::clone(&self.latest_interrupt),
-                },
-                SleepWaiter,
-                SeededJitter::new(job_seed()),
-            )),
+            ThreadSource::Rtsp { url, profile } => {
+                BoxedSupervisor::Rtsp(CameraRecordingSupervisor::new(
+                    spec.camera.clone(),
+                    SourceKind::Rtsp,
+                    SupervisorConfig::default(),
+                    RtspFactory {
+                        url,
+                        profile,
+                        pre_roll: spec.pre_roll,
+                        consumer,
+                        layout: layout.clone(),
+                        config,
+                        latest_interrupt: Arc::clone(&self.latest_interrupt),
+                        ingests: self.ingests.clone(),
+                    },
+                    SleepWaiter,
+                    SeededJitter::new(job_seed()),
+                ))
+            }
         };
 
         // Capture the run-level stop flag BEFORE the supervisor moves into
@@ -598,6 +689,21 @@ impl RecordingJobManager {
         self.active = Some(join);
         self.started_once = true;
         Ok(())
+    }
+
+    fn reset_finished_job(&mut self) {
+        if !self.is_finished() {
+            return;
+        }
+        let _ = self.join_until(std::time::Instant::now());
+        self.run_stop = None;
+        if let Ok(mut interrupt) = self.latest_interrupt.lock() {
+            *interrupt = None;
+        }
+        self.started_once = false;
+        self.stop_presses = 0;
+        self.graceful_stop_requested = false;
+        self.shared.done.store(false, Ordering::SeqCst);
     }
 
     /// Requests a stop of the running job. M3 remediation §2: press state
@@ -1027,6 +1133,7 @@ mod tests {
             storage_root: PathBuf::from(leaked),
             source,
             segment_target: Duration::from_secs(5),
+            pre_roll: Duration::ZERO,
             copy_audio: true,
         }
     }
@@ -1147,6 +1254,7 @@ mod tests {
             storage_root: temp.path().join("rec").to_path_buf(),
             source: JobSource::File(PathBuf::from(fixtures)),
             segment_target: Duration::from_secs(300),
+            pre_roll: Duration::ZERO,
             copy_audio: true,
         });
         assert!(result.is_ok(), "start must ack without doing media work");
@@ -1158,6 +1266,44 @@ mod tests {
 
         let _ = manager.stop();
         assert!(wait_finished(&manager, 30));
+    }
+
+    #[test]
+    fn finished_recording_can_start_again_in_the_same_worker_manager() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/nian-media-ffmpeg/tests/fixtures/sample_av.mkv"
+        );
+        let mut manager = RecordingJobManager::new();
+
+        manager
+            .start(spec_for(
+                JobSource::File(PathBuf::from(fixture)),
+                "cam-sequential-recording",
+            ))
+            .expect("first job starts");
+        assert!(wait_finished(&manager, 30), "first job must finish");
+        assert!(matches!(
+            manager.status().end_kind.as_str(),
+            "completed" | "stopped"
+        ));
+
+        manager
+            .start(spec_for(
+                JobSource::File(PathBuf::from(fixture)),
+                "cam-sequential-recording",
+            ))
+            .expect("finished job must release the persistent worker for another recording");
+        assert_eq!(
+            manager.stop_presses_field(),
+            0,
+            "new job resets operator stop state"
+        );
+        assert!(wait_finished(&manager, 30), "second job must finish");
+        assert!(matches!(
+            manager.status().end_kind.as_str(),
+            "completed" | "stopped"
+        ));
     }
 
     #[test]
@@ -1261,6 +1407,7 @@ mod tests {
                 storage_root: temp.path().join("rec").to_path_buf(),
                 source: JobSource::File(PathBuf::from(source_path)),
                 segment_target: Duration::from_secs(300),
+                pre_roll: Duration::ZERO,
                 copy_audio: true,
             })
             .expect("start ok");
@@ -1317,6 +1464,7 @@ mod tests {
                 // source category instead of `camera_in_use`.
                 source: JobSource::File(temp.path().join("must-not-open.mkv")),
                 segment_target: Duration::from_secs(300),
+                pre_roll: Duration::ZERO,
                 copy_audio: true,
             })
             .expect("recording.start still acks asynchronously");
@@ -1374,6 +1522,7 @@ mod tests {
                 storage_root: root,
                 source: JobSource::File(PathBuf::from(fixtures)),
                 segment_target: Duration::from_secs(300),
+                pre_roll: Duration::ZERO,
                 copy_audio: true,
             })
             .expect("fresh worker starts after old holder releases ownership");
@@ -1429,6 +1578,7 @@ mod tests {
                 storage_root: temp.path().join("rec").to_path_buf(),
                 source: JobSource::File(PathBuf::from(fixtures)),
                 segment_target: Duration::from_secs(300),
+                pre_roll: Duration::ZERO,
                 copy_audio: true,
             })
             .expect("start must NOT be refused by a corrupt leftover");
@@ -1481,6 +1631,7 @@ mod tests {
                 storage_root: temp.path().join("rec").to_path_buf(),
                 source: JobSource::File(PathBuf::from(fixtures)),
                 segment_target: Duration::from_secs(300),
+                pre_roll: Duration::ZERO,
                 copy_audio: true,
             })
             .expect("start must NOT be refused by a preserved conflict");
@@ -1541,6 +1692,7 @@ mod tests {
                 storage_root: temp.path().join("rec").to_path_buf(),
                 source: JobSource::File(PathBuf::from(fixtures)),
                 segment_target: Duration::from_secs(300),
+                pre_roll: Duration::ZERO,
                 copy_audio: true,
             })
             .expect("start itself must ack (pre-flight only proves the camera dir)");
@@ -1596,6 +1748,7 @@ mod tests {
                 storage_root: temp.path().join("rec").to_path_buf(),
                 source: JobSource::File(PathBuf::from(fixtures)),
                 segment_target: Duration::from_secs(300),
+                pre_roll: Duration::ZERO,
                 copy_audio: true,
             })
             .expect("start ok");
@@ -1669,6 +1822,7 @@ mod tests {
                 storage_root: temp.path().join("rec").to_path_buf(),
                 source: JobSource::File(PathBuf::from(fixtures)),
                 segment_target: Duration::from_secs(300),
+                pre_roll: Duration::ZERO,
                 copy_audio: true,
             })
             .expect("start ok");
@@ -1756,6 +1910,7 @@ mod tests {
                 storage_root: temp.path().join("rec").to_path_buf(),
                 source: JobSource::File(PathBuf::from(fixtures)),
                 segment_target: Duration::from_secs(300),
+                pre_roll: Duration::ZERO,
                 copy_audio: true,
             })
             .expect("start ok");
@@ -1842,6 +1997,7 @@ mod tests {
                 storage_root: temp.path().join("rec").to_path_buf(),
                 source: JobSource::File(PathBuf::from(fixtures)),
                 segment_target: Duration::from_secs(300),
+                pre_roll: Duration::ZERO,
                 copy_audio: true,
             })
             .expect("start must not be refused by an artifact failure");
@@ -1880,6 +2036,7 @@ mod tests {
                 // 300 s target => the single attempt never rotates; the run
                 // can only end via our stop/escalation.
                 segment_target: Duration::from_secs(300),
+                pre_roll: Duration::ZERO,
                 copy_audio: true,
             })
             .expect("job starts");

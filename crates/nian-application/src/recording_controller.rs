@@ -4,12 +4,17 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use nian_domain::CameraId;
+use nian_domain::{CameraId, ReconnectBackoff};
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::{ApplicationError, BinaryLauncher, DesiredRecording, WorkerEnd, WorkerSupervisor};
+use crate::camera_worker::{CameraWorkerError, CameraWorkerProcess};
+use crate::{
+    ApplicationError, BinaryLauncher, CameraWorkerBroker, DesiredRecording, JobTerminal, WorkerEnd,
+    WorkerSupervisor,
+};
 
 /// Conservative process cap for the current desktop architecture.
 pub const MAX_SIMULTANEOUS_RECORDINGS: usize = 8;
@@ -119,6 +124,41 @@ impl RecordingRunnerFactory for SupervisorRecordingRunnerFactory {
     }
 }
 
+/// Production factory for recordings that share one worker process per camera
+/// with live view. The media worker owns RTSP ingest/fan-out; this factory owns
+/// only the recording client lifecycle.
+#[derive(Debug, Clone)]
+pub struct BrokerRecordingRunnerFactory {
+    pub broker: CameraWorkerBroker,
+}
+
+impl RecordingRunnerFactory for BrokerRecordingRunnerFactory {
+    fn create(&self, camera_id: &CameraId) -> Arc<dyn RecordingRunner> {
+        Arc::new(BrokerRecordingRunner {
+            broker: self.broker.clone(),
+            camera_id: camera_id.clone(),
+            namespace: BrokerRecordingNamespace::Recording,
+        })
+    }
+}
+
+/// Production factory for motion-event archive buffers. It uses an independent
+/// worker namespace while sharing the same per-camera process and RTSP ingest.
+#[derive(Debug, Clone)]
+pub struct BrokerEventBufferRunnerFactory {
+    pub broker: CameraWorkerBroker,
+}
+
+impl RecordingRunnerFactory for BrokerEventBufferRunnerFactory {
+    fn create(&self, camera_id: &CameraId) -> Arc<dyn RecordingRunner> {
+        Arc::new(BrokerRecordingRunner {
+            broker: self.broker.clone(),
+            camera_id: camera_id.clone(),
+            namespace: BrokerRecordingNamespace::EventBuffer,
+        })
+    }
+}
+
 /// Compatibility factory useful for tests whose runner is explicitly designed
 /// for concurrent calls. Production should use SupervisorRecordingRunnerFactory.
 struct SharedRecordingRunnerFactory {
@@ -174,6 +214,257 @@ impl RecordingRunner for SupervisorRecordingRunner {
             .map_err(|error| RecordingRunFailure::Permanent {
                 failure_category: failure_category(&error),
             })
+    }
+}
+
+const BROKER_RECORDING_STATUS_POLL: Duration = Duration::from_millis(500);
+const BROKER_RECORDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const BROKER_RECORDING_START_TIMEOUT: Duration = Duration::from_secs(15);
+const BROKER_RECORDING_STOP_GRACE: Duration = Duration::from_secs(25);
+const BROKER_RECORDING_FORCE_GRACE: Duration = Duration::from_secs(10);
+const BROKER_MAX_CONSECUTIVE_WORKER_FAILURES: u32 = 5;
+
+#[derive(Debug, Clone)]
+struct BrokerRecordingRunner {
+    broker: CameraWorkerBroker,
+    camera_id: CameraId,
+    namespace: BrokerRecordingNamespace,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BrokerRecordingNamespace {
+    Recording,
+    EventBuffer,
+}
+
+impl BrokerRecordingNamespace {
+    const fn start_method(self) -> &'static str {
+        match self {
+            Self::Recording => "recording.start",
+            Self::EventBuffer => "event_buffer.start",
+        }
+    }
+
+    const fn stop_method(self) -> &'static str {
+        match self {
+            Self::Recording => "recording.stop",
+            Self::EventBuffer => "event_buffer.stop",
+        }
+    }
+
+    const fn status_method(self) -> &'static str {
+        match self {
+            Self::Recording => "recording.status",
+            Self::EventBuffer => "event_buffer.status",
+        }
+    }
+
+    const fn pre_roll_ms(self) -> u64 {
+        match self {
+            Self::Recording => 0,
+            Self::EventBuffer => 5_000,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum BrokerEpisodeFailure {
+    Retryable,
+    Permanent(Option<String>),
+}
+
+impl RecordingRunner for BrokerRecordingRunner {
+    fn run(
+        &self,
+        desired: DesiredRecording,
+        stop: Arc<AtomicBool>,
+        observer: Arc<dyn Fn(&serde_json::Value) + Send + Sync>,
+    ) -> Result<WorkerEnd, RecordingRunFailure> {
+        let mut backoff = ReconnectBackoff::default();
+        let mut consecutive_failures = 0_u32;
+
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return Ok(WorkerEnd::RequestedShutdown);
+            }
+
+            let worker = match self.broker.acquire(&self.camera_id) {
+                Ok(worker) => worker,
+                Err(_) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures >= BROKER_MAX_CONSECUTIVE_WORKER_FAILURES {
+                        return Err(RecordingRunFailure::Permanent {
+                            failure_category: Some("worker_unavailable".to_owned()),
+                        });
+                    }
+                    if wait_stop_aware(&stop, backoff.next_delay()) {
+                        return Ok(WorkerEnd::RequestedShutdown);
+                    }
+                    continue;
+                }
+            };
+
+            match run_broker_recording_episode(&worker, &desired, &stop, &observer, self.namespace)
+            {
+                Ok(end) => return Ok(end),
+                Err(BrokerEpisodeFailure::Permanent(failure_category)) => {
+                    return Err(RecordingRunFailure::Permanent { failure_category });
+                }
+                Err(BrokerEpisodeFailure::Retryable) => {
+                    self.broker.invalidate(&self.camera_id, &worker);
+                    if stop.load(Ordering::Acquire) {
+                        return Ok(WorkerEnd::RequestedShutdown);
+                    }
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures >= BROKER_MAX_CONSECUTIVE_WORKER_FAILURES {
+                        return Err(RecordingRunFailure::Permanent {
+                            failure_category: Some("worker_unavailable".to_owned()),
+                        });
+                    }
+                    if wait_stop_aware(&stop, backoff.next_delay()) {
+                        return Ok(WorkerEnd::RequestedShutdown);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn run_broker_recording_episode(
+    worker: &Arc<CameraWorkerProcess>,
+    desired: &DesiredRecording,
+    stop: &AtomicBool,
+    observer: &Arc<dyn Fn(&serde_json::Value) + Send + Sync>,
+    namespace: BrokerRecordingNamespace,
+) -> Result<WorkerEnd, BrokerEpisodeFailure> {
+    let start = worker.request(
+        namespace.start_method(),
+        serde_json::json!({
+            "camera": desired.camera,
+            "storage": desired.storage_root,
+            "source": desired.source_json,
+            "segment_target_secs": desired.segment_target_secs,
+            "pre_roll_ms": namespace.pre_roll_ms(),
+            "copy_audio": desired.copy_audio,
+        }),
+        BROKER_RECORDING_START_TIMEOUT,
+        Some(stop),
+    );
+    match start {
+        Ok(result) if result.get("started").and_then(serde_json::Value::as_bool) == Some(true) => {}
+        Ok(_) => {
+            return Err(BrokerEpisodeFailure::Permanent(Some(
+                "worker_unavailable".to_owned(),
+            )));
+        }
+        Err(CameraWorkerError::Cancelled) if stop.load(Ordering::Acquire) => {
+            return Ok(WorkerEnd::RequestedShutdown);
+        }
+        Err(CameraWorkerError::Rpc(code)) => return Err(classify_broker_start_refusal(&code)),
+        Err(_) => return Err(BrokerEpisodeFailure::Retryable),
+    }
+
+    let mut graceful_stop_at: Option<Instant> = None;
+    let mut force_stop_at: Option<Instant> = None;
+    loop {
+        if stop.load(Ordering::Acquire) && graceful_stop_at.is_none() {
+            match worker.request(
+                namespace.stop_method(),
+                serde_json::json!({}),
+                BROKER_RECORDING_REQUEST_TIMEOUT,
+                None,
+            ) {
+                Ok(_) | Err(CameraWorkerError::Rpc(_)) => {
+                    graceful_stop_at = Some(Instant::now());
+                }
+                Err(_) => return Ok(WorkerEnd::RequestedShutdown),
+            }
+        }
+
+        if let Some(started_at) = graceful_stop_at
+            && force_stop_at.is_none()
+            && started_at.elapsed() >= BROKER_RECORDING_STOP_GRACE
+        {
+            match worker.request(
+                namespace.stop_method(),
+                serde_json::json!({}),
+                BROKER_RECORDING_REQUEST_TIMEOUT,
+                None,
+            ) {
+                Ok(_) | Err(CameraWorkerError::Rpc(_)) => {
+                    force_stop_at = Some(Instant::now());
+                }
+                Err(_) => return Ok(WorkerEnd::RequestedShutdown),
+            }
+        }
+
+        if force_stop_at
+            .is_some_and(|started_at| started_at.elapsed() >= BROKER_RECORDING_FORCE_GRACE)
+        {
+            return Err(BrokerEpisodeFailure::Retryable);
+        }
+
+        let status = match worker.request(
+            namespace.status_method(),
+            serde_json::json!({}),
+            BROKER_RECORDING_REQUEST_TIMEOUT,
+            None,
+        ) {
+            Ok(status) => status,
+            Err(_) if stop.load(Ordering::Acquire) => return Ok(WorkerEnd::RequestedShutdown),
+            Err(_) => return Err(BrokerEpisodeFailure::Retryable),
+        };
+        observer(&status);
+
+        match JobTerminal::parse(&status) {
+            Ok(Some(JobTerminal::Stopped)) => return Ok(WorkerEnd::RequestedShutdown),
+            Ok(Some(JobTerminal::Completed)) => return Ok(WorkerEnd::JobCompletedCleanly),
+            Ok(Some(JobTerminal::Failed(category))) => {
+                return Err(BrokerEpisodeFailure::Permanent(Some(category)));
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return Err(BrokerEpisodeFailure::Permanent(Some(
+                    "permanent_configuration".to_owned(),
+                )));
+            }
+        }
+
+        wait_until_next_broker_poll(stop, graceful_stop_at.is_some());
+    }
+}
+
+fn classify_broker_start_refusal(code: &str) -> BrokerEpisodeFailure {
+    let prefix = code.split(':').next().unwrap_or(code);
+    match prefix {
+        "storage_unavailable" => BrokerEpisodeFailure::Permanent(Some("storage_failed".to_owned())),
+        "invalid_params" | "job_already_active" | "unsupported" => {
+            BrokerEpisodeFailure::Permanent(Some("permanent_configuration".to_owned()))
+        }
+        _ => BrokerEpisodeFailure::Retryable,
+    }
+}
+
+fn wait_stop_aware(stop: &AtomicBool, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Acquire) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(Duration::from_millis(100).min(remaining));
+    }
+    stop.load(Ordering::Acquire)
+}
+
+fn wait_until_next_broker_poll(stop: &AtomicBool, stop_already_sent: bool) {
+    let deadline = Instant::now() + BROKER_RECORDING_STATUS_POLL;
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Acquire) && !stop_already_sent {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(Duration::from_millis(50).min(remaining));
     }
 }
 

@@ -608,6 +608,7 @@ mod tests {
             motion_active: match kind {
                 EventHistoryKind::MotionStarted => Some(true),
                 EventHistoryKind::MotionEnded => Some(false),
+                EventHistoryKind::PersonStarted | EventHistoryKind::PersonEnded => None,
             },
             received_time_utc: DateTime::from_timestamp(second, 0).unwrap(),
         }

@@ -224,11 +224,15 @@ test("Windows FFmpeg component ownership excludes global network and preserves r
     "CONFIG_MOV_MUXER",
     "CONFIG_MP4_MUXER",
     "CONFIG_H264_PARSER",
+    "CONFIG_HEVC_PARSER",
     "CONFIG_MPEG4VIDEO_PARSER",
     "CONFIG_MPEGAUDIO_PARSER",
     "CONFIG_AAC_PARSER",
     "CONFIG_MPEG4_DECODER",
     "CONFIG_AAC_DECODER",
+    "CONFIG_HEVC_DECODER",
+    "CONFIG_PCM_ALAW_DECODER",
+    "CONFIG_PCM_MULAW_DECODER",
   ]) {
     assert.equal(macros.has(macro), true, `missing required component macro ${macro}`);
   }
@@ -301,7 +305,11 @@ test("Windows FFmpeg cached runtime still enforces every required component fami
     "CONFIG_MATROSKA_DEMUXER",
     "CONFIG_MP4_MUXER",
     "CONFIG_H264_PARSER",
+    "CONFIG_HEVC_PARSER",
     "CONFIG_AAC_DECODER",
+    "CONFIG_HEVC_DECODER",
+    "CONFIG_PCM_ALAW_DECODER",
+    "CONFIG_PCM_MULAW_DECODER",
   ]) {
     const root = createValidOutput(t);
     const configPath = join(root, "FFMPEG_CONFIG_COMPONENTS.h");
@@ -339,9 +347,12 @@ test("Windows FFmpeg cached runtime rejects duplicated required DLL", (t) => {
 test("RC12 pristine FFmpeg contract cannot share the current patched cache key", () => {
   const rc12 = cloneInputs();
   rc12.windowsContract.buildContractVersion = 3;
-  rc12.windowsContract.configureFlags = rc12.windowsContract.configureFlags.map((flag) =>
-    flag === "--enable-protocol=file,tcp,rtp,udp" ? "--enable-protocol=file,tcp,rtsp,rtp,udp" : flag,
-  );
+  rc12.windowsContract.configureFlags = rc12.windowsContract.configureFlags.map((flag) => {
+    if (flag === "--enable-protocol=file,tcp,rtp,udp") return "--enable-protocol=file,tcp,rtsp,rtp,udp";
+    if (flag.startsWith("--enable-parser=")) return "--enable-parser=h264,mpeg4video,mpegaudio,aac";
+    if (flag.startsWith("--enable-decoder=")) return "--enable-decoder=mpeg4,aac";
+    return flag;
+  });
   delete rc12.releaseConfig.ffmpegUpstreamPatch;
   const rc12Digest = buildContractDigest(rc12.releaseConfig, rc12.windowsContract);
   const currentDigest = buildContractDigest(inputs.releaseConfig, inputs.windowsContract);
@@ -354,8 +365,9 @@ test("RC15 corrected protocol text cannot share the RC14 Windows FFmpeg cache di
   rc14.windowsContract.configureFlags = rc14.windowsContract.configureFlags.map((flag) =>
     flag === "--enable-protocol=file,tcp,rtp,udp" ? "--enable-protocol=file,tcp,rtsp,rtp,udp" : flag,
   );
+  rc14.windowsContract.buildContractVersion = 4;
   assert.equal(rc14.windowsContract.buildContractVersion, 4);
-  assert.equal(inputs.windowsContract.buildContractVersion, 4);
+  assert.equal(inputs.windowsContract.buildContractVersion, 5);
   assert.notEqual(
     buildContractDigest(rc14.releaseConfig, rc14.windowsContract),
     buildContractDigest(inputs.releaseConfig, inputs.windowsContract),
@@ -382,7 +394,7 @@ test("RC13 Windows FFmpeg build contract fails closed without patch metadata", (
 
 test("RC13 Windows FFmpeg metadata records exact upstream patch identity", () => {
   const metadata = expectedWindowsFfmpegMetadata(inputs.releaseConfig, inputs.windowsContract);
-  assert.equal(metadata.build_contract_version, 4);
+  assert.equal(metadata.build_contract_version, 5);
   assert.equal(metadata.upstream_patch_contract_version, 1);
   assert.equal(metadata.upstream_patch_repository, "FFmpeg/FFmpeg");
   assert.equal(metadata.upstream_patch_commit, "6a59c847b50c6bc30630df7fca56ccd6cd8a5a8c");

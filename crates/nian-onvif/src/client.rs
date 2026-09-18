@@ -109,7 +109,7 @@ impl OnvifClient {
                 .then_with(|| profile_pixels(right).cmp(&profile_pixels(left)))
                 .then_with(|| left.token.cmp(&right.token))
         });
-        if !profiles.iter().any(MediaProfile::is_h264_compatible) {
+        if !profiles.iter().any(MediaProfile::is_recordable_video) {
             return Err(OnvifError::NoCompatibleProfile);
         }
 
@@ -154,7 +154,7 @@ impl OnvifClient {
         credentials: &OnvifCredentials,
         profile: &MediaProfile,
     ) -> Result<StreamEndpoint, OnvifError> {
-        if !profile.is_h264_compatible() {
+        if !profile.is_recordable_video() {
             return Err(OnvifError::NoCompatibleProfile);
         }
         let token = xml_escape(&profile.token);
@@ -675,7 +675,7 @@ impl OnvifClient {
                 match self.get_profiles(service, credentials, kind) {
                     Ok(profiles) => {
                         saw_profile_response = true;
-                        if profiles.iter().any(MediaProfile::is_h264_compatible) {
+                        if profiles.iter().any(MediaProfile::is_recordable_video) {
                             return Ok((service.clone(), kind, profiles));
                         }
                     }
@@ -1512,7 +1512,7 @@ mod tests {
             .unwrap();
         assert_eq!(selected, media2[1]);
         assert_eq!(kind, MediaServiceKind::Media2);
-        assert!(profiles.iter().any(MediaProfile::is_h264_compatible));
+        assert!(profiles.iter().any(MediaProfile::is_recordable_video));
         server.join().unwrap();
     }
 
@@ -1636,7 +1636,7 @@ mod tests {
     }
 
     #[test]
-    fn all_validated_candidates_without_h264_return_no_compatible_profile() {
+    fn all_validated_candidates_with_only_unsupported_video_return_no_compatible_profile() {
         let media2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let media2_address = media2.local_addr().unwrap();
         let media1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1648,7 +1648,7 @@ mod tests {
                 &mut stream,
                 "200 OK",
                 &[],
-                "<Envelope><Profiles token=\"hevc2\"><VideoEncoderConfiguration><Encoding>H265</Encoding></VideoEncoderConfiguration></Profiles></Envelope>",
+                "<Envelope><Profiles token=\"mjpeg2\"><VideoEncoderConfiguration><Encoding>MJPEG</Encoding></VideoEncoderConfiguration></Profiles></Envelope>",
             );
         });
         let server1 = std::thread::spawn(move || {
@@ -1658,7 +1658,7 @@ mod tests {
                 &mut stream,
                 "200 OK",
                 &[],
-                "<Envelope><Profiles token=\"hevc1\"><VideoEncoderConfiguration><Encoding>H265</Encoding></VideoEncoderConfiguration></Profiles></Envelope>",
+                "<Envelope><Profiles token=\"mjpeg1\"><VideoEncoderConfiguration><Encoding>MJPEG</Encoding></VideoEncoderConfiguration></Profiles></Envelope>",
             );
         });
         let client = OnvifClient::with_timeout(Duration::from_millis(100)).unwrap();
@@ -1676,6 +1676,36 @@ mod tests {
         );
         server2.join().unwrap();
         server1.join().unwrap();
+    }
+
+    #[test]
+    fn hevc_only_media2_is_compatible_without_contacting_a_fallback() {
+        let media2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = media2.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = media2.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                &[],
+                "<Envelope><Profiles token=\"hevc-only\"><VideoEncoderConfiguration><Encoding>H265</Encoding></VideoEncoderConfiguration></Profiles></Envelope>",
+            );
+        });
+        let client = OnvifClient::with_timeout(Duration::from_millis(100)).unwrap();
+        let credentials = OnvifCredentials {
+            username: "admin".into(),
+            password: "secret".into(),
+        };
+        let (service, kind, profiles) = client
+            .select_media_profiles(&[format!("http://{address}/media2")], &[], &credentials)
+            .unwrap();
+        assert_eq!(service, format!("http://{address}/media2"));
+        assert_eq!(kind, MediaServiceKind::Media2);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].token, "hevc-only");
+        assert!(profiles[0].is_recordable_video());
+        server.join().unwrap();
     }
 
     #[test]

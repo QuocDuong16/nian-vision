@@ -232,6 +232,15 @@ impl MediaInput {
         }
     }
 
+    /// Validated channel count for an audio stream, without exposing FFmpeg pointers.
+    pub fn audio_channels(&self, stream_index: u32) -> Option<u16> {
+        let parameters = self.codec_parameters(stream_index as usize)?;
+        // SAFETY: parameters remains owned by this open demuxer, and the
+        // channel count is an immutable scalar after stream discovery.
+        let channels = unsafe { (*parameters).ch_layout.nb_channels };
+        (1..=2).contains(&channels).then_some(channels as u16)
+    }
+
     /// Reads the next compressed packet.
     ///
     /// Returns an owned [`FfmpegPacket`] that shares the demuxer's
@@ -406,6 +415,11 @@ unsafe fn stream_info(stream: *mut sys::AVStream, index: u32) -> Option<MediaStr
         let stream_ref = &*stream;
         MediaRational::new(stream_ref.time_base.num, stream_ref.time_base.den).ok()
     };
+    let frame_rate = unsafe {
+        let stream_ref = &*stream;
+        MediaRational::new(stream_ref.avg_frame_rate.num, stream_ref.avg_frame_rate.den).ok()
+    }
+    .filter(|value| value.num > 0 && value.den > 0);
 
     let is_video = media_type == MediaType::Video;
     let is_audio = media_type == MediaType::Audio;
@@ -418,6 +432,7 @@ unsafe fn stream_info(stream: *mut sys::AVStream, index: u32) -> Option<MediaStr
         height: (is_video && parameters.height > 0).then_some(parameters.height as u32),
         sample_rate: (is_audio && parameters.sample_rate > 0)
             .then_some(parameters.sample_rate as u32),
+        frame_rate: is_video.then_some(frame_rate).flatten(),
         time_base,
     })
 }

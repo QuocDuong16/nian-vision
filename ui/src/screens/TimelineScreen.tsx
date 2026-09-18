@@ -464,6 +464,7 @@ export function TimelineScreen() {
             <VideoPlayer
               key={playback.session_id}
               src={playback.url}
+              audioSrc={playback.audio_url ?? null}
               ariaLabel={`Playback ${playback.recording.recording_id}`}
               onEnded={() => setEnded(true)}
               onError={handlePlaybackMediaError}
@@ -475,7 +476,7 @@ export function TimelineScreen() {
                 { label: "File size", value: sizeLabel(playback.recording.size_bytes) },
                 { label: "Video", value: playback.inspect.video_codec.toUpperCase() },
                 { label: "Resolution", value: playback.inspect.width && playback.inspect.height ? `${playback.inspect.width}×${playback.inspect.height}` : "Unknown" },
-                { label: "Audio", value: playback.inspect.audio_available ? "Available" : "Video only" },
+                { label: "Audio", value: playback.audio_url ? "G.711 → PCM WAV" : playback.inspect.audio_available ? "AAC in MP4" : "Video only" },
                 { label: "Container", value: playback.inspect.container_compatibility },
                 { label: "Seek", value: playback.inspect.seekable ? "Seekable" : "Sequential only" },
                 { label: "Recording kind", value: playback.recording.kind === "recovered" ? "Recovered" : "Normal" },

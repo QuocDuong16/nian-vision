@@ -17,7 +17,7 @@ use nian_domain::{
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
@@ -98,7 +98,8 @@ impl SettingsStore {
 
     pub fn list_cameras(&self) -> Result<Vec<CameraConfig>, SettingsError> {
         let mut statement = self.connection.prepare(
-            "SELECT camera_id, display_name, host, port, rtsp_path, audio_policy, credential_ref \
+            "SELECT camera_id, display_name, host, port, rtsp_path, audio_policy, credential_ref, \
+                    sub_host, sub_port, sub_rtsp_path \
              FROM cameras ORDER BY display_name COLLATE NOCASE, camera_id",
         )?;
         let raws = statement
@@ -111,6 +112,9 @@ impl SettingsStore {
                     rtsp_path: row.get(4)?,
                     audio_policy: row.get(5)?,
                     credential_ref: row.get(6)?,
+                    sub_host: row.get(7)?,
+                    sub_port: row.get(8)?,
+                    sub_rtsp_path: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -119,7 +123,8 @@ impl SettingsStore {
 
     pub fn get_camera(&self, camera_id: &CameraId) -> Result<Option<CameraConfig>, SettingsError> {
         let raw = self.connection.query_row(
-            "SELECT camera_id, display_name, host, port, rtsp_path, audio_policy, credential_ref \
+            "SELECT camera_id, display_name, host, port, rtsp_path, audio_policy, credential_ref, \
+                    sub_host, sub_port, sub_rtsp_path \
              FROM cameras WHERE camera_id=?1",
             [camera_id.as_str()],
             |row| {
@@ -131,6 +136,9 @@ impl SettingsStore {
                     rtsp_path: row.get(4)?,
                     audio_policy: row.get(5)?,
                     credential_ref: row.get(6)?,
+                    sub_host: row.get(7)?,
+                    sub_port: row.get(8)?,
+                    sub_rtsp_path: row.get(9)?,
                 })
             },
         ).optional()?;
@@ -141,8 +149,8 @@ impl SettingsStore {
         let row = camera_row(camera)?;
         let result = self.connection.execute(
             "INSERT INTO cameras \
-             (camera_id, display_name, host, port, rtsp_path, audio_policy, credential_ref) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (camera_id, display_name, host, port, rtsp_path, audio_policy, credential_ref, sub_host, sub_port, sub_rtsp_path) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 row.camera_id,
                 row.display_name,
@@ -150,7 +158,10 @@ impl SettingsStore {
                 row.port,
                 row.rtsp_path,
                 row.audio_policy,
-                row.credential_ref
+                row.credential_ref,
+                row.sub_host,
+                row.sub_port,
+                row.sub_rtsp_path
             ],
         );
         match result {
@@ -166,7 +177,7 @@ impl SettingsStore {
         let row = camera_row(camera)?;
         Ok(self.connection.execute(
             "UPDATE cameras SET display_name=?2, host=?3, port=?4, rtsp_path=?5, \
-             audio_policy=?6, credential_ref=?7 WHERE camera_id=?1",
+             audio_policy=?6, credential_ref=?7, sub_host=?8, sub_port=?9, sub_rtsp_path=?10 WHERE camera_id=?1",
             params![
                 row.camera_id,
                 row.display_name,
@@ -174,7 +185,10 @@ impl SettingsStore {
                 row.port,
                 row.rtsp_path,
                 row.audio_policy,
-                row.credential_ref
+                row.credential_ref,
+                row.sub_host,
+                row.sub_port,
+                row.sub_rtsp_path
             ],
         )? > 0)
     }
@@ -328,8 +342,51 @@ impl SettingsStore {
         enabled: bool,
     ) -> Result<bool, SettingsError> {
         Ok(self.connection.execute(
-            "UPDATE cameras SET event_monitoring_enabled=?2 WHERE camera_id=?1",
+            "UPDATE cameras SET event_monitoring_enabled=?2 WHERE camera_id=?1 AND (?2=0 OR local_motion_enabled=0)",
             params![camera_id.as_str(), if enabled { 1_i64 } else { 0_i64 }],
+        )? == 1)
+    }
+
+    /// Local scene-motion detection is an independent, opt-in per-camera
+    /// preference. It is exclusive with ONVIF motion monitoring to prevent
+    /// duplicate user-visible episodes and notifications.
+    pub fn local_motion_enabled_cameras(&self) -> Result<Vec<CameraId>, SettingsError> {
+        let mut statement = self.connection.prepare(
+            "SELECT camera_id FROM cameras WHERE local_motion_enabled=1 ORDER BY camera_id",
+        )?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| CameraId::parse(id).map_err(invalid_domain))
+            .collect()
+    }
+
+    pub fn local_motion_enabled(&self, camera_id: &CameraId) -> Result<bool, SettingsError> {
+        let value = self
+            .connection
+            .query_row(
+                "SELECT local_motion_enabled FROM cameras WHERE camera_id=?1",
+                [camera_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        match value {
+            Some(value) => parse_bool(value, "local_motion_enabled"),
+            None => Ok(false),
+        }
+    }
+
+    /// Enabling local detection and ONVIF are mutually exclusive at the SQL
+    /// admission boundary, even if different controllers race to enable them.
+    pub fn set_local_motion_enabled(
+        &mut self,
+        camera_id: &CameraId,
+        enabled: bool,
+    ) -> Result<bool, SettingsError> {
+        Ok(self.connection.execute(
+            "UPDATE cameras SET local_motion_enabled=?2 WHERE camera_id=?1 AND (?2=0 OR event_monitoring_enabled=0)",
+            params![camera_id.as_str(), i64::from(enabled)],
         )? == 1)
     }
 
@@ -673,6 +730,26 @@ fn migrate(connection: &mut Connection) -> Result<(), SettingsError> {
              PRAGMA user_version=6;",
         )?;
         transaction.commit()?;
+        version = 6;
+    }
+    if version == 6 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN sub_host TEXT NULL;\
+             ALTER TABLE cameras ADD COLUMN sub_port INTEGER NULL CHECK(sub_port IS NULL OR sub_port BETWEEN 1 AND 65535);\
+             ALTER TABLE cameras ADD COLUMN sub_rtsp_path TEXT NULL;\
+             PRAGMA user_version=7;",
+        )?;
+        transaction.commit()?;
+        version = 7;
+    }
+    if version == 7 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN local_motion_enabled INTEGER NOT NULL DEFAULT 0 CHECK(local_motion_enabled IN (0,1));\
+             PRAGMA user_version=8;",
+        )?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -710,6 +787,9 @@ struct RawCamera {
     rtsp_path: String,
     audio_policy: String,
     credential_ref: String,
+    sub_host: Option<String>,
+    sub_port: Option<i64>,
+    sub_rtsp_path: Option<String>,
 }
 
 fn raw_to_camera(raw: RawCamera) -> Result<CameraConfig, SettingsError> {
@@ -721,18 +801,42 @@ fn raw_to_camera(raw: RawCamera) -> Result<CameraConfig, SettingsError> {
     let audio = AudioPolicy::from_wire(&raw.audio_policy)
         .ok_or_else(|| SettingsError::InvalidData("invalid audio_policy".to_owned()))?;
     let credential_ref = CredentialRef::parse(raw.credential_ref).map_err(invalid_domain)?;
-    CameraConfig::new(
+    let camera = CameraConfig::new(
         camera_id,
         raw.display_name,
         CameraSource::Rtsp(endpoint),
         audio,
         credential_ref,
     )
-    .map_err(invalid_domain)
+    .map_err(invalid_domain)?;
+    let sub_source = match (raw.sub_host, raw.sub_port, raw.sub_rtsp_path) {
+        (None, None, None) => None,
+        (Some(host), Some(port), Some(path)) => {
+            let host = Host::parse(host).map_err(invalid_domain)?;
+            let port = u16::try_from(port)
+                .map_err(|_| SettingsError::InvalidData("invalid substream port".to_owned()))?;
+            let endpoint = CameraEndpoint::new(host, port, path).map_err(invalid_domain)?;
+            Some(CameraSource::Rtsp(endpoint))
+        }
+        _ => {
+            return Err(SettingsError::InvalidData(
+                "substream endpoint must be fully specified or fully absent".to_owned(),
+            ));
+        }
+    };
+    Ok(camera.with_sub_source(sub_source))
 }
 
 fn camera_row(camera: &CameraConfig) -> Result<RawCamera, SettingsError> {
     let CameraSource::Rtsp(endpoint) = camera.source();
+    let (sub_host, sub_port, sub_rtsp_path) = match camera.sub_source() {
+        Some(CameraSource::Rtsp(endpoint)) => (
+            Some(endpoint.host().as_str().to_owned()),
+            Some(i64::from(endpoint.port())),
+            Some(endpoint.path().to_owned()),
+        ),
+        None => (None, None, None),
+    };
     Ok(RawCamera {
         camera_id: camera.camera_id().as_str().to_owned(),
         display_name: camera.display_name().to_owned(),
@@ -741,6 +845,9 @@ fn camera_row(camera: &CameraConfig) -> Result<RawCamera, SettingsError> {
         rtsp_path: endpoint.path().to_owned(),
         audio_policy: camera.audio_policy().as_str().to_owned(),
         credential_ref: camera.credential_ref().as_str().to_owned(),
+        sub_host,
+        sub_port,
+        sub_rtsp_path,
     })
 }
 

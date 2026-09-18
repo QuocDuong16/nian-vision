@@ -61,8 +61,13 @@ function eventTime(value: string): string {
   return Number.isFinite(parsed.getTime()) ? parsed.toLocaleString() : value;
 }
 
-function eventKindLabel(): string {
-  return "Motion event";
+function eventKindLabel(kind: EventHistoryKind): string {
+  switch (kind) {
+    case "person_started": return "Person detected (camera ONVIF)";
+    case "person_ended": return "Person no longer detected (camera ONVIF)";
+    case "motion_started": return "Motion started";
+    case "motion_ended": return "Motion ended";
+  }
 }
 
 function sizeLabel(bytes: number): string {
@@ -81,6 +86,7 @@ export function EventReviewScreen() {
   const initialNow = useMemo(() => new Date(), []);
   const [cameras, setCameras] = useState<CameraSummary[]>([]);
   const [cameraId, setCameraId] = useState("all");
+  const [eventKind, setEventKind] = useState<EventHistoryKind | "all">("all");
   const [rangePreset, setRangePreset] = useState<RangePreset>("day");
   const [customFrom, setCustomFrom] = useState(() => dateTimeLocalValue(new Date(initialNow.getTime() - 24 * 60 * 60_000)));
   const [customTo, setCustomTo] = useState(() => dateTimeLocalValue(initialNow));
@@ -123,13 +129,13 @@ export function EventReviewScreen() {
       generation,
       query: {
         camera_ids: cameraId === "all" ? [] : [cameraId],
-        kind: null,
+        kind: eventKind === "all" ? null : eventKind,
         from_utc: bounds.fromUtc,
         to_utc: bounds.toUtc,
         limit: PAGE_SIZE,
       },
     };
-  }, [cameraId, customFrom, customTo, rangePreset]);
+  }, [cameraId, customFrom, customTo, eventKind, rangePreset]);
 
   const executeReload = useCallback(async () => {
     if (reloadInFlightRef.current || !isTauri()) return;
@@ -377,7 +383,7 @@ export function EventReviewScreen() {
       <div className="screen-toolbar">
         <div>
           <h2>Event Review</h2>
-          <p className="muted">Persisted motion history. Reviewing an event never starts recording.</p>
+          <p className="muted">Persisted motion and camera-reported person events. Nian does not infer people from video. Reviewing never starts recording.</p>
         </div>
         <button type="button" disabled={loading} onClick={queueRootReload}>
           {loading ? "Refreshing…" : "Refresh"}
@@ -394,6 +400,21 @@ export function EventReviewScreen() {
             value={cameraId}
             onChange={setCameraId}
             options={[{ value: "all", label: "All cameras" }, ...cameras.map((camera) => ({ value: camera.camera_id, label: camera.display_name }))]}
+          />
+        </label>
+        <label>
+          Event type
+          <SelectControl
+            ariaLabel="Event type"
+            value={eventKind}
+            onChange={(value) => setEventKind(value as EventHistoryKind | "all")}
+            options={[
+              { value: "all", label: "All event types" },
+              { value: "motion_started", label: "Motion started" },
+              { value: "motion_ended", label: "Motion ended" },
+              { value: "person_started", label: "Person detected (camera ONVIF)" },
+              { value: "person_ended", label: "Person no longer detected (camera ONVIF)" },
+            ]}
           />
         </label>
         <label>
@@ -429,9 +450,9 @@ export function EventReviewScreen() {
             {loading && <span className="muted">Loading…</span>}
           </div>
           {rows.length === 0 && !loading ? (
-            <div className="camera-placeholder">No motion events in this range.</div>
+            <div className="camera-placeholder">No events in this range.</div>
           ) : (
-            <ul className="event-list" aria-label="Motion events">
+            <ul className="event-list" aria-label="Camera events">
               {rows.map((event) => (
                 <li key={event.event_id}>
                   <button
@@ -441,8 +462,8 @@ export function EventReviewScreen() {
                   >
                     <span className="event-row-time">{eventTime(event.received_time_utc)}</span>
                     <strong>{event.camera_display_name}</strong>
-                    <span>{eventKindLabel()}</span>
-                    <small className={`event-recording-state ${event.recording_available ? "ready" : "pending"}`}>{event.recording_available ? "Recording available" : "Preparing recording…"}</small>
+                    <span>{eventKindLabel(event.kind)}</span>
+                    <small className={`event-recording-state ${event.recording_available ? "ready" : "pending"}`}>{event.recording_available ? "Recording available" : "Recording pending or unavailable"}</small>
                   </button>
                 </li>
               ))}
@@ -466,7 +487,7 @@ export function EventReviewScreen() {
             <>
               <dl className="event-detail-grid">
                 <div><dt>Camera</dt><dd>{selected.camera_display_name}</dd></div>
-                <div><dt>Event</dt><dd>{eventKindLabel()}</dd></div>
+                <div><dt>Event</dt><dd>{eventKindLabel(selected.kind)}</dd></div>
                 <div><dt>Received</dt><dd>{eventTime(selected.received_time_utc)}</dd></div>
                 {selected.device_time_utc && <div><dt>Device time</dt><dd>{eventTime(selected.device_time_utc)}</dd></div>}
               </dl>
@@ -498,6 +519,7 @@ export function EventReviewScreen() {
               <VideoPlayer
                 key={playback.playback.session_id}
                 src={playback.playback.url}
+                audioSrc={playback.playback.audio_url ?? null}
                 ariaLabel={`Event ${selected?.event_id ?? ""} playback`}
                 initialTimeSeconds={playback.seek_offset_ms / 1000}
                 onError={() => {
@@ -512,7 +534,7 @@ export function EventReviewScreen() {
                   { label: "Duration", value: playback.playback.inspect.duration_ms === null ? "Unknown" : `${(playback.playback.inspect.duration_ms / 1000).toFixed(1)} s` },
                   { label: "Video", value: playback.playback.inspect.video_codec.toUpperCase() },
                   { label: "Resolution", value: playback.playback.inspect.width && playback.playback.inspect.height ? `${playback.playback.inspect.width}×${playback.playback.inspect.height}` : "Unknown" },
-                  { label: "Audio", value: playback.playback.inspect.audio_available ? "Available" : "Video only" },
+                  { label: "Audio", value: playback.playback.audio_url ? "G.711 → PCM WAV" : playback.playback.inspect.audio_available ? "AAC in MP4" : "Video only" },
                   { label: "Container", value: playback.playback.inspect.container_compatibility },
                   { label: "Pre-roll seek", value: `${(playback.seek_offset_ms / 1000).toFixed(1)} s` },
                   { label: "Recording ID", value: playback.playback.recording.recording_id },

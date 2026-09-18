@@ -152,6 +152,10 @@ pub struct OnvifPreparedProfileDto {
     pub port: u16,
     pub path: String,
     pub host_mismatch: bool,
+    pub sub_profile_token: Option<String>,
+    pub sub_host: Option<String>,
+    pub sub_port: Option<u16>,
+    pub sub_path: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -228,6 +232,7 @@ struct ConnectedDevice {
 struct PreparedProfile {
     token: String,
     endpoint: StreamEndpoint,
+    sub_endpoint: Option<StreamEndpoint>,
 }
 
 struct DiscoverySession {
@@ -655,7 +660,7 @@ impl OnvifController {
             .find(|profile| profile.token == profile_token)
             .cloned()
             .ok_or(OnvifControllerError::ProfileNotFound)?;
-        if !profile.is_h264_compatible() {
+        if !profile.is_recordable_video() {
             return Err(OnvifError::NoCompatibleProfile.into());
         }
         let network_credentials = OnvifCredentials {
@@ -668,6 +673,19 @@ impl OnvifController {
             &network_credentials,
             &profile,
         )?;
+        let prepared_sub =
+            select_sub_profile(&interrogation.profiles, &profile).and_then(|sub_profile| {
+                self.device
+                    .stream_endpoint(
+                        &connection.device_service,
+                        &interrogation.media_service,
+                        &network_credentials,
+                        sub_profile,
+                    )
+                    .ok()
+                    .filter(|candidate| !candidate.path.contains('?'))
+                    .map(|candidate| (sub_profile.token.clone(), candidate))
+            });
         // Defense in depth: production `nian-onvif` rejects RTSP queries before
         // constructing a StreamEndpoint. Keep the application/UI persistence
         // boundary query-free even if a future backend regresses.
@@ -686,9 +704,12 @@ impl OnvifController {
             .connections
             .get_mut(device_id)
             .ok_or(OnvifControllerError::DeviceExpired)?;
+        let sub_token = prepared_sub.as_ref().map(|(token, _)| token.clone());
+        let sub_endpoint = prepared_sub.map(|(_, endpoint)| endpoint);
         connection.prepared = Some(PreparedProfile {
             token: profile_token.to_owned(),
             endpoint: endpoint.clone(),
+            sub_endpoint: sub_endpoint.clone(),
         });
         Ok(OnvifPreparedProfileDto {
             session_id: session_id.to_owned(),
@@ -698,6 +719,10 @@ impl OnvifController {
             port: endpoint.port,
             path: endpoint.path,
             host_mismatch: endpoint.host_mismatch,
+            sub_profile_token: sub_token,
+            sub_host: sub_endpoint.as_ref().map(|endpoint| endpoint.host.clone()),
+            sub_port: sub_endpoint.as_ref().map(|endpoint| endpoint.port),
+            sub_path: sub_endpoint.as_ref().map(|endpoint| endpoint.path.clone()),
         })
     }
 
@@ -869,7 +894,7 @@ impl OnvifController {
             .iter()
             .find(|profile| profile.token == profile_token)
             .ok_or(OnvifControllerError::ProfileNotFound)?;
-        if !profile.is_h264_compatible() {
+        if !profile.is_recordable_video() {
             return Err(OnvifError::NoCompatibleProfile.into());
         }
         let prepared = connection
@@ -883,6 +908,15 @@ impl OnvifController {
             host: prepared.endpoint.host.clone(),
             port: prepared.endpoint.port,
             path: prepared.endpoint.path.clone(),
+            sub_host: prepared
+                .sub_endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.host.clone()),
+            sub_port: prepared.sub_endpoint.as_ref().map(|endpoint| endpoint.port),
+            sub_path: prepared
+                .sub_endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.path.clone()),
             audio_policy,
             replacement_credentials: Some(connection.credentials.clone()),
         })
@@ -972,8 +1006,35 @@ fn discovery_label(device: &DiscoveredDevice) -> String {
         .unwrap_or_else(|| device.network_address.clone())
 }
 
+fn profile_pixels(profile: &MediaProfile) -> u64 {
+    u64::from(profile.width.unwrap_or(0)).saturating_mul(u64::from(profile.height.unwrap_or(0)))
+}
+
+fn select_sub_profile<'a>(
+    profiles: &'a [MediaProfile],
+    main: &MediaProfile,
+) -> Option<&'a MediaProfile> {
+    let main_pixels = profile_pixels(main);
+    profiles
+        .iter()
+        .filter(|profile| profile.token != main.token && profile.is_recordable_video())
+        .filter(|profile| main_pixels == 0 || profile_pixels(profile) < main_pixels)
+        .min_by_key(|profile| {
+            (
+                !profile.is_h264_compatible(),
+                profile_pixels(profile),
+                profile.bitrate_kbps.unwrap_or(u32::MAX),
+            )
+        })
+}
+
 fn profile_dtos(profiles: &[MediaProfile]) -> Vec<OnvifMediaProfileDto> {
-    let recommended = profiles.iter().position(MediaProfile::is_h264_compatible);
+    let recommended = profiles
+        .iter()
+        .enumerate()
+        .filter(|(_, profile)| profile.is_recordable_video())
+        .max_by_key(|(_, profile)| (profile_pixels(profile), profile.bitrate_kbps.unwrap_or(0)))
+        .map(|(index, _)| index);
     profiles
         .iter()
         .enumerate()
@@ -986,7 +1047,7 @@ fn profile_dtos(profiles: &[MediaProfile]) -> Vec<OnvifMediaProfileDto> {
             framerate: profile.framerate,
             bitrate_kbps: profile.bitrate_kbps,
             audio_codec: profile.audio_codec.clone(),
-            supported: profile.is_h264_compatible(),
+            supported: profile.is_recordable_video(),
             recommended: recommended == Some(index),
         })
         .collect()
@@ -1069,7 +1130,7 @@ mod tests {
             _credentials: &OnvifCredentials,
             profile: &MediaProfile,
         ) -> Result<StreamEndpoint, OnvifError> {
-            if !profile.is_h264_compatible() {
+            if !profile.is_recordable_video() {
                 return Err(OnvifError::NoCompatibleProfile);
             }
             Ok(StreamEndpoint {
@@ -1594,8 +1655,12 @@ mod tests {
             .unwrap();
         let serialized = serde_json::to_string(&connection).unwrap();
         assert!(!serialized.contains("SENTINEL-secret"));
-        assert!(connection.profiles[0].recommended);
-        assert!(!connection.profiles[1].supported);
+        // Both H.264 and HEVC can be recorded. The recommendation follows the
+        // highest-resolution supported profile, not the first ONVIF response.
+        assert!(connection.profiles[0].supported);
+        assert!(!connection.profiles[0].recommended);
+        assert!(connection.profiles[1].supported);
+        assert!(connection.profiles[1].recommended);
         controller
             .prepare_profile(&discovery.session_id, &device.device_id, "main")
             .unwrap();

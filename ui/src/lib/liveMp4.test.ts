@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { splitLiveMp4ForMse } from "./liveMp4";
+import { detectLiveVideoConfiguration, detectLiveVideoMime, splitLiveMp4ForMse } from "./liveMp4";
 
 function box(type: string, payload: number[] | Uint8Array): Uint8Array {
   const body = payload instanceof Uint8Array ? payload : Uint8Array.from(payload);
@@ -80,6 +80,8 @@ describe("splitLiveMp4ForMse", () => {
     expect(types(split!.media)).toEqual(["moof", "mdat", "moof", "mdat"]);
     expect(movieFragmentSequences(split!.media)).toEqual([41, 42]);
     expect(split!.movieFragmentCount).toBe(2);
+    expect(split!.initialization.buffer).toBe(completeFragment.buffer);
+    expect(split!.media.buffer).toBe(completeFragment.buffer);
   });
 
   it("rejects malformed, non-fragmented, or structurally incomplete MP4 input", () => {
@@ -88,5 +90,46 @@ describe("splitLiveMp4ForMse", () => {
     expect(
       splitLiveMp4ForMse(concat(box("ftyp", []), box("moov", []), box("moof", []), box("mdat", []))),
     ).toBeNull();
+  });
+});
+
+function videoInitialization(entryType: string, configurationType: string, configuration: number[]): Uint8Array {
+  const sampleEntry = box(entryType, concat(new Uint8Array(78), box(configurationType, configuration)));
+  const sampleDescription = box("stsd", concat(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1]), sampleEntry));
+  return concat(box("ftyp", []), box("moov", box("trak", box("mdia", box("minf", box("stbl", sampleDescription))))));
+}
+
+describe("detectLiveVideoMime", () => {
+  it("derives an exact AVC codec string from the video sample entry", () => {
+    expect(detectLiveVideoMime(videoInitialization("avc1", "avcC", [1, 0x64, 0, 0x1f])))
+      .toBe('video/mp4; codecs="avc1.64001f"');
+  });
+
+  it("derives an HEVC hvc1 codec string with reversed compatibility flags and constraints", () => {
+    const hvcc = [1, 1, 0x60, 0, 0, 0, 0xb0, 0, 0, 0, 0, 0, 120];
+    expect(detectLiveVideoMime(videoInitialization("hvc1", "hvcC", hvcc)))
+      .toBe('video/mp4; codecs="hvc1.1.6.L120.B0"');
+    expect(detectLiveVideoMime(videoInitialization("hev1", "hvcC", hvcc)))
+      .toBe('video/mp4; codecs="hev1.1.6.L120.B0"');
+  });
+
+  it("rejects invalid configuration rather than treating arbitrary hvcC bytes as a playable codec", () => {
+    const valid = [1, 1, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120];
+    expect(detectLiveVideoMime(concat(box("ftyp", []), box("moov", box("udta", box("hvcC", valid)))))).toBeNull();
+    expect(detectLiveVideoMime(videoInitialization("hvc1", "avcC", valid))).toBeNull();
+    expect(detectLiveVideoMime(videoInitialization("hvc1", "hvcC", [0, ...valid.slice(1)]))).toBeNull();
+    expect(detectLiveVideoMime(videoInitialization("hvc1", "hvcC", valid.slice(0, 12)))).toBeNull();
+  });
+  it("detects decoder-configuration changes even when the AVC MIME stays identical", () => {
+    const first = videoInitialization("avc1", "avcC", [1, 0x64, 0, 0x1f, 0xaa]);
+    const changed = videoInitialization("avc1", "avcC", [1, 0x64, 0, 0x1f, 0xbb]);
+    const initial = detectLiveVideoConfiguration(first);
+    const newer = detectLiveVideoConfiguration(changed);
+    expect(initial?.mime).toBe(newer?.mime);
+    expect(initial?.signature).not.toBe(newer?.signature);
+    expect(detectLiveVideoConfiguration(concat(first, box("free", [1, 2])))?.signature)
+      .toBe(initial?.signature);
+    expect(detectLiveVideoConfiguration(videoInitialization("hvc1", "hvcC", [1, 1, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120]))?.signature)
+      .not.toBe(initial?.signature);
   });
 });
