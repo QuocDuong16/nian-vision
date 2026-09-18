@@ -1,3 +1,8 @@
+# Nian Vision 1.0.0-rc.60
+Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
+
+RC60 packages the shared camera ingest and media lifecycle changes committed for RC59 under a consistent application/source version. The media changes share main/sub RTSP connections across Recording, Live, Motion and Event consumers, use bounded packet queues and compressed pre-roll, add main/sub profile selection, explicit browser-media teardown, H.265/G.711 paths and per-consumer media diagnostics. RC59 is an immutable failed release attempt: its tag pointed to source version 1.0.0-rc.58, so release preflight rejected it before platform builds. RC60 corrects the source/tag identity without rewriting RC59. Physical camera interoperability, prolonged RAM/CPU soak and Windows/Linux packaged release acceptance remain pending; the automated media gate does not substitute for these checks.
+
 # Nian Vision 1.0.0-rc.58
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 
