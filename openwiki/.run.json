@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "runId": "5fc4ab1c-325d-4dc0-8506-09ab56d72802",
+  "mode": "update",
+  "phase": "planning",
+  "startedAt": "2026-09-18T08:56:40.981Z",
+  "language": "en",
+  "languageChanged": false,
+  "requiredRewritePages": [],
+  "initialPages": [
+    "/openwiki/architecture/overview.md",
+    "/openwiki/quickstart.md",
+    "/openwiki/source-map.md"
+  ],
+  "sourceFingerprint": "sha256:2d50216995263696df7924bcf2e396a06ebc1382011f6c0a0daba305a7c34b6d",
+  "targetGitHead": "023a4894ffcc73f908c760e67cc1ed878a8c7514",
+  "actor": {
+    "producerActor": "openwiki/0.5.2",
+    "metadataModel": "mimo-v2.5"
+  },
+  "previousLastUpdate": {
+    "updatedAt": "2026-08-26T01:41:31.223Z",
+    "command": "update",
+    "gitHead": "d9be068cb755654a1728b4c138a7713f804308f4",
+    "model": "mimo-v2.5",
+    "status": "complete"
+  },
+  "baseGitHead": "d9be068cb755654a1728b4c138a7713f804308f4",
+  "wikiGoal": "A code wiki for this local repository. Prioritize a concise quickstart, architecture overview, source map, key workflows, domain concepts, operations/runbook notes, testing guidance, and integration points. Inspect git history to understand reasoning behind code changes and the progression of the repository. Keep pages grounded in the repository structure and recent code changes. Prefer practical navigation for engineers over generic summaries.",
+  "beforeContentSnapshot": "b541c6f09704c7496cc5984427561897f6a0587a32ed9933d0af5a0b6a8cc1db",
+  "preparedWiki": {
+    "generatedProvenance": [
+      {
+        "page": "/openwiki/architecture/overview.md",
+        "bodyHash": "cbaf58a6cadf3e8d375a365b50750a6ef666e55411a2754de7bc65b6e568f031"
+      },
+      {
+        "page": "/openwiki/quickstart.md",
+        "bodyHash": "34f065aea1cc61a050cc789e27e818d364868bdf13339ab671e78e7f9d791553"
+      },
+      {
+        "page": "/openwiki/source-map.md",
+        "bodyHash": "e4b8b64c414c49d82aa9e186ac5252ae88828e0c542b29ffe92fcb966e576878"
+      }
+    ]
+  }
+}

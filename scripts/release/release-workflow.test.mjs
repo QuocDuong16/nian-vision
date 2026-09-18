@@ -52,6 +52,22 @@ test("Forgejo production release workflow is removed while normal quality CI rem
   assert.match(quality, /cargo test --workspace/);
 });
 
+test("pnpm is installed standalone in both CI systems without Corepack", () => {
+  const quality = readNormalizedText(forgejoQualityPath);
+  const installer = readNormalizedText(new URL("../install-pnpm-linux.sh", import.meta.url));
+  const mise = readNormalizedText(new URL("../../mise.toml", import.meta.url));
+  const packageJson = JSON.parse(readNormalizedText(new URL("../../package.json", import.meta.url)));
+  assert.equal(Object.hasOwn(packageJson, "packageManager"), false);
+  assert.match(mise, /pnpm = "12\.4\.2"/);
+  assert.match(quality, /bash scripts\/install-pnpm-linux\.sh/);
+  assert.match(workflow, /bash scripts\/install-pnpm-linux\.sh/);
+  assert.match(workflow, /pnpm-win32-x64-12\.4\.2\.zip/);
+  assert.match(installer, /sha256sum --check --strict/);
+  for (const source of [quality, workflow, installer]) {
+    assert.doesNotMatch(source, /\bcorepack\b|\bnpm\s+(?:install|exec)\b/i);
+  }
+});
+
 test("Linux release quality cross-lints the Windows-only platform crate before hosted Windows", () => {
   const provision = stepBody("build-linux", "Provision Rust quality components");
   const quality = stepBody("build-linux", "Rust quality against release FFmpeg");
@@ -170,7 +186,7 @@ test("release trust contract proves mirrored tag version SHA actor and default-b
 
 test("Linux container build explicitly executes run steps with Bash", () => {
   const linux = jobBody("build-linux");
-  assert.match(linux, /container:\n      image: rust:1\.98\.0-bookworm/);
+  assert.match(linux, /container:\n      image: rust:1\.98\.1-bookworm/);
   assert.match(linux, /defaults:\n      run:\n        shell: bash/);
   assert.match(linux, /set -Eeuo pipefail/);
   assert.match(linux, /\[\[/);
@@ -399,5 +415,5 @@ test("release candidates remain prereleases and cannot replace the production la
 test("release workflow never pushes source changes or creates release tags", () => {
   assert.equal(/git push/.test(workflow), false);
   assert.equal(/git tag(?:\s|$)/.test(workflow), false);
-  assert.equal(/version bump|npm version|cargo set-version/.test(workflow), false);
+  assert.equal(/version bump|(?:^|\s)npm version|cargo set-version/.test(workflow), false);
 });

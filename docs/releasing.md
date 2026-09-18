@@ -165,8 +165,8 @@ jobs, not public release authority.
 ### Linux build and signing
 
 `build-linux` runs on `ubuntu-24.04` with the actual compilation inside
-`rust:1.98.0-bookworm`, preserving the accepted Debian 12/glibc 2.36 baseline. It
-pins Node 26.7.0 and pnpm 11.22.0 and preserves the existing Linux M8 gates: exact
+`rust:1.98.1-bookworm`, preserving the accepted Debian 12/glibc 2.36 baseline. It
+pins Node 26.9.0 and standalone pnpm 12.4.2 and preserves the existing Linux M8 gates: exact
 source/tag/version, SHA-256-pinned FFmpeg 8.0.3, LGPL/shared checks, media fixtures,
 Rust fmt/clippy/workspace tests, clean staged worker smoke and actual AppImage
 worker/desktop smoke. It produces an unsigned AppImage input and the staged runtime
@@ -182,7 +182,7 @@ signing runner does not run pnpm or Vite.
 ### Windows build and signing
 
 `build-windows` runs on the explicit GitHub-hosted `windows-2022` runner and targets
-`x86_64-pc-windows-msvc`. Node 26.7.0, pnpm 11.22.0 and Rust 1.98.0 are pinned. The
+`x86_64-pc-windows-msvc`. Node 26.9.0, standalone pnpm 12.4.2 and Rust 1.98.1 are pinned. The
 job builds FFmpeg 8.0.3 from the same source archive/SHA used by Linux with
 `--toolchain=msvc`, `--enable-shared`, `--disable-static`, `--disable-gpl` and
 `--disable-nonfree`. Required MSVC import libraries are emitted by the FFmpeg MSVC

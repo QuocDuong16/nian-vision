@@ -11,12 +11,14 @@ Docker-based jobs.
 
 ## Decision
 
-* **Rust**: pinned to `1.98.0` (stable released 2026-08-20) via
+* **Rust**: pinned to `1.98.1` via
   `rust-toolchain.toml` (with `rustfmt` + `clippy` components) — this file
   is authoritative for any direct cargo invocation. The project-level
-  `.mise.toml` pins the same version for mise-managed machines.
-* **Node**: `26.x` via `.mise.toml`; pnpm `11.22.0` recorded in the root
-  `package.json` `packageManager` field.
+  `mise.toml` pins the same version for mise-managed machines.
+* **Node and pnpm**: exact versions `26.9.0` and `12.4.2` in `mise.toml`,
+  matching CI. `mise.lock` records resolved artifacts for supported platforms.
+  pnpm uses its native GitHub release binaries (including macOS x64).
+  Do not add a `packageManager` field that makes pnpm switch versions.
 * **Dependencies**: exact pins (`=x.y.z`) in `Cargo.toml` manifests for all
   direct dependencies, plus committed `Cargo.lock` and pnpm lockfile. No
   floating ranges, no `@latest` anywhere in automation.

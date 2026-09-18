@@ -79,7 +79,7 @@ test("RC10 verifies each package SHA before any local package installation", () 
 
 test("Windows release provisions pinned MSYS tools before preflight and quality/cache work", () => {
   const windows = workflow.slice(workflow.indexOf("  build-windows:"), workflow.indexOf("  sign-windows:"));
-  const pnpmAt = windows.indexOf("- name: Install pinned pnpm");
+  const pnpmAt = windows.indexOf("- name: Install verified standalone pnpm");
   const provisionAt = windows.indexOf("- name: Provision pinned MSYS FFmpeg build tools");
   const preflightAt = windows.indexOf("- name: Windows runner preflight");
   const qualityAt = windows.indexOf("- name: Release scripts and frontend quality");

@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const executable = (name) => process.platform === "win32" && name === "pnpm" ? "pnpm.cmd" : name;
+const executable = (name) => process.platform === "win32" && name === "pnpm" ? "pnpm.exe" : name;
 
 const steps = [
   ["Rust format", "cargo", ["fmt", "--all", "--", "--check"]],

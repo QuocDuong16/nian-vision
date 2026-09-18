@@ -1,0 +1,14 @@
+# Repo-local toolchain pins. Keep Rust aligned with rust-toolchain.toml,
+# and Node/pnpm aligned with the Forgejo and release workflows.
+[settings]
+lockfile = true
+
+[tool_alias]
+# The aqua registry excludes macOS x64 despite pnpm publishing that artifact.
+pnpm = "github:pnpm/pnpm"
+
+[tools]
+rust = "1.98.1"
+# Keep the standalone pnpm binary ahead of Node's bundled executables in PATH.
+pnpm = "12.4.2"
+node = "26.9.0"

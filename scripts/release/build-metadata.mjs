@@ -34,10 +34,13 @@ function rejectUnsafeStrings(value) {
 
 function validatePnpmVersion(version) {
   if (!version) throw new Error("--pnpm-version is required");
-  const packageJson = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
-  const expected = /^pnpm@(.+)$/.exec(packageJson.packageManager ?? "")?.[1];
-  if (!expected) throw new Error("package.json packageManager must pin pnpm@<version>");
-  if (version !== expected) throw new Error(`pnpm version ${version} does not match package.json ${expected}`);
+  const mise = readFileSync(resolve(root, "mise.toml"), "utf8");
+  const lock = readFileSync(resolve(root, "mise.lock"), "utf8");
+  const expected = /^pnpm\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$/m.exec(mise)?.[1];
+  if (!expected) throw new Error("mise.toml must pin an exact pnpm version");
+  const locked = /^\[\[tools\.pnpm\]\]\s*\nversion\s*=\s*"([^"]+)"/m.exec(lock)?.[1];
+  if (locked !== expected) throw new Error(`mise.lock pnpm version ${locked ?? "missing"} differs from mise.toml ${expected}`);
+  if (version !== expected) throw new Error(`pnpm version ${version} does not match mise.toml ${expected}`);
   return version;
 }
 

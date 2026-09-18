@@ -41,7 +41,7 @@ default-members = [
 [workspace.package]
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.98.0"
+rust-version = "1.98.1"
 authors = ["Nian Vision contributors"]
 license = "LicenseRef-Proprietary"
 

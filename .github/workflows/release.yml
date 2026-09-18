@@ -32,12 +32,12 @@ jobs:
       - name: Install pinned Node.js
         run: |
           set -Eeuo pipefail
-          node_version="26.7.0"
+          node_version="26.9.0"
           node_archive="node-v${node_version}-linux-x64.tar.xz"
           curl --fail --silent --show-error --location \
             --output "/tmp/${node_archive}" \
             "https://nodejs.org/dist/v${node_version}/${node_archive}"
-          echo "982aa24dd8be4c889c6a8ab337ddff3b0896645b20f4239356e80552c16277ee  /tmp/${node_archive}" | sha256sum --check --strict -
+          echo "c6ecd8efc1c1d395265891675319da7a7b3785c6be174bd78933cf4f057624d1  /tmp/${node_archive}" | sha256sum --check --strict -
           sudo tar --extract --xz --file "/tmp/${node_archive}" --directory /usr/local --strip-components=1
           node --version
 
@@ -75,7 +75,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     container:
-      image: rust:1.98.0-bookworm
+      image: rust:1.98.1-bookworm
     defaults:
       run:
         shell: bash
@@ -111,12 +111,12 @@ jobs:
       - name: Install pinned Node.js
         run: |
           set -Eeuo pipefail
-          node_version="26.7.0"
+          node_version="26.9.0"
           node_archive="node-v${node_version}-linux-x64.tar.xz"
           curl --fail --silent --show-error --location \
             --output "/tmp/${node_archive}" \
             "https://nodejs.org/dist/v${node_version}/${node_archive}"
-          echo "982aa24dd8be4c889c6a8ab337ddff3b0896645b20f4239356e80552c16277ee  /tmp/${node_archive}" | sha256sum --check --strict -
+          echo "c6ecd8efc1c1d395265891675319da7a7b3785c6be174bd78933cf4f057624d1  /tmp/${node_archive}" | sha256sum --check --strict -
           tar --extract --xz --file "/tmp/${node_archive}" --directory /usr/local --strip-components=1
           node --version
           node scripts/release/version-check.mjs --tag "${GITHUB_REF_NAME}" --require-clean
@@ -130,13 +130,10 @@ jobs:
             libayatana-appindicator3-1 libayatana-appindicator3-dev libegl1 libfuse2 libgles2 librsvg2-dev libssl-dev \
             libwebkit2gtk-4.1-dev patchelf pkg-config xauth xvfb xz-utils
 
-      - name: Install pinned pnpm
+      - name: Install verified standalone pnpm
         run: |
           set -Eeuo pipefail
-          npm install --global corepack@0.35.0
-          corepack enable
-          corepack install --global pnpm@11.22.0
-          corepack --version
+          bash scripts/install-pnpm-linux.sh
           pnpm --version
 
       - name: Linux runner preflight
@@ -318,17 +315,17 @@ jobs:
       - name: Install pinned Node.js
         run: |
           set -Eeuo pipefail
-          node_version="26.7.0"
+          node_version="26.9.0"
           node_archive="node-v${node_version}-linux-x64.tar.xz"
           curl --fail --silent --show-error --location --output "/tmp/${node_archive}" "https://nodejs.org/dist/v${node_version}/${node_archive}"
-          echo "982aa24dd8be4c889c6a8ab337ddff3b0896645b20f4239356e80552c16277ee  /tmp/${node_archive}" | sha256sum --check --strict -
+          echo "c6ecd8efc1c1d395265891675319da7a7b3785c6be174bd78933cf4f057624d1  /tmp/${node_archive}" | sha256sum --check --strict -
           sudo tar --extract --xz --file "/tmp/${node_archive}" --directory /usr/local --strip-components=1
 
       - name: Install pinned Rust verifier and Tauri signing toolchain
         run: |
           set -Eeuo pipefail
-          rustup toolchain install 1.98.0 --profile minimal
-          rustup override set 1.98.0
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
           cargo install tauri-cli --version 2.11.4 --locked
 
       - name: Install Linux AppImage smoke runtime prerequisites
@@ -424,44 +421,45 @@ jobs:
           if ($head -ne $env:GITHUB_SHA) { throw "Windows build checkout differs from GITHUB_SHA" }
           if ($tag -ne $env:GITHUB_SHA) { throw "Windows build tag differs from GITHUB_SHA" }
 
-      - name: Install pinned Rust 1.98.0 MSVC toolchain
+      - name: Install pinned Rust 1.98.1 MSVC toolchain
         shell: pwsh
         run: |
           . scripts/release/windows-native.ps1
-          Invoke-NianNative { rustup.exe toolchain install 1.98.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt --component clippy }
-          Invoke-NianNative { rustup.exe override set 1.98.0 }
+          Invoke-NianNative { rustup.exe toolchain install 1.98.1-x86_64-pc-windows-msvc --profile minimal --component rustfmt --component clippy }
+          Invoke-NianNative { rustup.exe override set 1.98.1 }
           Invoke-NianNative { rustc.exe --version }
           Invoke-NianNative { cargo.exe --version }
           Invoke-NianNative { cargo.exe fmt --version }
           Invoke-NianNative { cargo.exe clippy --version }
 
-      - name: Install pinned Node.js 26.7.0
+      - name: Install pinned Node.js 26.9.0
         shell: pwsh
         run: |
-          $zip = Join-Path $env:RUNNER_TEMP 'node-v26.7.0-win-x64.zip'
-          Invoke-WebRequest 'https://nodejs.org/dist/v26.7.0/node-v26.7.0-win-x64.zip' -OutFile $zip
+          $zip = Join-Path $env:RUNNER_TEMP 'node-v26.9.0-win-x64.zip'
+          Invoke-WebRequest 'https://nodejs.org/dist/v26.9.0/node-v26.9.0-win-x64.zip' -OutFile $zip
           $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
-          if ($hash -ne 'd3bd72755141ed32bbcd841228ee81897c8a98d50dfa7dae2179399a0a7c90f8') { throw 'Node.js Windows archive SHA-256 mismatch' }
+          if ($hash -ne 'c8af870b5b3e9789a6cbdb30270e7c212e12d76a7afa7fc7f21b6b21cc22a71b') { throw 'Node.js Windows archive SHA-256 mismatch' }
           Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP -Force
-          $nodeRoot = Join-Path $env:RUNNER_TEMP 'node-v26.7.0-win-x64'
+          $nodeRoot = Join-Path $env:RUNNER_TEMP 'node-v26.9.0-win-x64'
           Add-Content $env:GITHUB_PATH $nodeRoot
           . scripts/release/windows-native.ps1
           Invoke-NianNative { & (Join-Path $nodeRoot 'node.exe') --version }
 
-      - name: Install pinned pnpm
+      - name: Install verified standalone pnpm
         shell: pwsh
         run: |
+          $pnpmRoot = Join-Path $env:RUNNER_TEMP 'nian-pnpm-12.4.2'
+          $archive = Join-Path $env:RUNNER_TEMP 'pnpm-win32-x64-12.4.2.zip'
+          Invoke-WebRequest 'https://github.com/pnpm/pnpm/releases/download/v12.4.2/pnpm-win32-x64.zip' -OutFile $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($hash -ne 'da35e3f401674646968243b0aa1984e910d94de735e04936db22e7554791518d') { throw 'pnpm Windows archive SHA-256 mismatch' }
+          Expand-Archive -Path $archive -DestinationPath $pnpmRoot -Force
+          $pnpm = Join-Path $pnpmRoot 'pnpm.exe'
+          if (-not (Test-Path -LiteralPath $pnpm -PathType Leaf)) { throw 'pnpm standalone binary missing from verified archive' }
+          Add-Content $env:GITHUB_PATH $pnpmRoot
           . scripts/release/windows-native.ps1
-          $corepackRoot = Join-Path $env:RUNNER_TEMP 'nian-corepack-0.35.0'
-          Remove-Item -Recurse -Force $corepackRoot -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force $corepackRoot | Out-Null
-          Invoke-NianNative { npm.cmd install --global --prefix $corepackRoot corepack@0.35.0 }
-          $corepack = Join-Path $corepackRoot 'corepack.cmd'
-          if (-not (Test-Path $corepack)) { throw "pinned Corepack install did not create corepack.cmd" }
-          Invoke-NianNative { & $corepack enable --install-directory $corepackRoot }
-          Invoke-NianNative { & $corepack install --global pnpm@11.22.0 }
-          Add-Content $env:GITHUB_PATH $corepackRoot
-          Invoke-NianNative { & (Join-Path $corepackRoot 'pnpm.cmd') --version }
+          $installedVersion = (Invoke-NianNative { & $pnpm --version } | Out-String).Trim()
+          if ($installedVersion -ne '12.4.2') { throw "pnpm version mismatch: $installedVersion" }
 
       - name: Provision pinned MSYS FFmpeg build tools
         shell: pwsh
@@ -479,17 +477,17 @@ jobs:
         shell: pwsh
         run: |
           . scripts/release/windows-native.ps1
-          Invoke-NianNative { pnpm.cmd install --frozen-lockfile }
+          Invoke-NianNative { pnpm.exe install --frozen-lockfile }
 
       - name: Release scripts and frontend quality
         shell: pwsh
         run: |
           . scripts/release/windows-native.ps1
-          Invoke-NianNative { pnpm.cmd release:test }
-          Invoke-NianNative { pnpm.cmd lint }
-          Invoke-NianNative { pnpm.cmd typecheck }
-          Invoke-NianNative { pnpm.cmd test }
-          Invoke-NianNative { pnpm.cmd build }
+          Invoke-NianNative { pnpm.exe release:test }
+          Invoke-NianNative { pnpm.exe lint }
+          Invoke-NianNative { pnpm.exe typecheck }
+          Invoke-NianNative { pnpm.exe test }
+          Invoke-NianNative { pnpm.exe build }
 
       - name: Compute Windows FFmpeg build contract
         id: ffmpeg-contract
@@ -662,23 +660,23 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.sha }}
 
-      - name: Install pinned Rust 1.98.0 MSVC and Tauri signing toolchain
+      - name: Install pinned Rust 1.98.1 MSVC and Tauri signing toolchain
         shell: pwsh
         run: |
           . scripts/release/windows-native.ps1
-          Invoke-NianNative { rustup.exe toolchain install 1.98.0-x86_64-pc-windows-msvc --profile minimal }
-          Invoke-NianNative { rustup.exe override set 1.98.0 }
+          Invoke-NianNative { rustup.exe toolchain install 1.98.1-x86_64-pc-windows-msvc --profile minimal }
+          Invoke-NianNative { rustup.exe override set 1.98.1 }
           Invoke-NianNative { cargo.exe install tauri-cli --version 2.11.4 --locked }
 
       - name: Install pinned Node.js
         shell: pwsh
         run: |
-          $zip = Join-Path $env:RUNNER_TEMP 'node-v26.7.0-win-x64.zip'
-          Invoke-WebRequest 'https://nodejs.org/dist/v26.7.0/node-v26.7.0-win-x64.zip' -OutFile $zip
+          $zip = Join-Path $env:RUNNER_TEMP 'node-v26.9.0-win-x64.zip'
+          Invoke-WebRequest 'https://nodejs.org/dist/v26.9.0/node-v26.9.0-win-x64.zip' -OutFile $zip
           $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
-          if ($hash -ne 'd3bd72755141ed32bbcd841228ee81897c8a98d50dfa7dae2179399a0a7c90f8') { throw 'Node.js Windows archive SHA-256 mismatch' }
+          if ($hash -ne 'c8af870b5b3e9789a6cbdb30270e7c212e12d76a7afa7fc7f21b6b21cc22a71b') { throw 'Node.js Windows archive SHA-256 mismatch' }
           Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP -Force
-          $nodeRoot = Join-Path $env:RUNNER_TEMP 'node-v26.7.0-win-x64'
+          $nodeRoot = Join-Path $env:RUNNER_TEMP 'node-v26.9.0-win-x64'
           $env:PATH = "$nodeRoot;$env:PATH"
           Add-Content $env:GITHUB_PATH $nodeRoot
 
@@ -833,13 +831,13 @@ jobs:
       - name: Install pinned Node.js and Rust verifier toolchain
         run: |
           set -Eeuo pipefail
-          node_version="26.7.0"
+          node_version="26.9.0"
           node_archive="node-v${node_version}-linux-x64.tar.xz"
           curl --fail --silent --show-error --location --output "/tmp/${node_archive}" "https://nodejs.org/dist/v${node_version}/${node_archive}"
-          echo "982aa24dd8be4c889c6a8ab337ddff3b0896645b20f4239356e80552c16277ee  /tmp/${node_archive}" | sha256sum --check --strict -
+          echo "c6ecd8efc1c1d395265891675319da7a7b3785c6be174bd78933cf4f057624d1  /tmp/${node_archive}" | sha256sum --check --strict -
           sudo tar --extract --xz --file "/tmp/${node_archive}" --directory /usr/local --strip-components=1
-          rustup toolchain install 1.98.0 --profile minimal
-          rustup override set 1.98.0
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
 
       - name: Assemble one public multi-platform release
         env:

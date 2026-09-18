@@ -2,7 +2,6 @@
   "name": "nian-vision",
   "private": true,
   "version": "1.0.0",
-  "packageManager": "pnpm@11.22.0",
   "engines": {
     "node": ">=22"
   },

@@ -15,7 +15,7 @@ jobs:
     runs-on: docker
     timeout-minutes: 60
     container:
-      image: rust:1.98.0-bookworm
+      image: rust:1.98.1-bookworm
 
     steps:
       # The runner container ships without Node.js, which node-based actions
@@ -24,15 +24,15 @@ jobs:
       - name: Install Node.js runtime for actions
         run: |
           set -Eeuo pipefail
-          node_version="26.7.0"
+          node_version="26.9.0"
           case "$(uname -m)" in
             x86_64)
               node_arch="x64"
-              node_checksum="982aa24dd8be4c889c6a8ab337ddff3b0896645b20f4239356e80552c16277ee"
+              node_checksum="c6ecd8efc1c1d395265891675319da7a7b3785c6be174bd78933cf4f057624d1"
               ;;
             aarch64)
               node_arch="arm64"
-              node_checksum="afc7a004018485092ac8985b817b0d5684472bd9472e0b57d2ab88737e50090d"
+              node_checksum="686d07ed3bc5d68d9f7bd4939b7e8849a87d0664ac19c8c5474474f44cc956db"
               ;;
             *)
               echo "Unsupported runner architecture: $(uname -m)" >&2
@@ -108,19 +108,16 @@ jobs:
     runs-on: docker
     timeout-minutes: 30
     container:
-      image: node:26.7.0-bookworm
+      image: node:26.9.0-bookworm
 
     steps:
       - name: Check out repository
         uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install and activate pinned pnpm
+      - name: Install verified standalone pnpm
         run: |
           set -Eeuo pipefail
-          npm install --global corepack@0.35.0
-          corepack enable
-          corepack install --global pnpm@11.22.0
-          corepack --version
+          bash scripts/install-pnpm-linux.sh
           pnpm --version
 
       - name: Install dependencies

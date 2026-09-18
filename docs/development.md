@@ -4,9 +4,9 @@
 
 | Tool | Version | Managed by |
 |---|---|---|
-| Rust | 1.98.0 (pinned) | rustup via `rust-toolchain.toml`; mise via `.mise.toml` |
-| Node | 26.7.0 (exact) | mise (`.mise.toml`); same version pinned in CI |
-| pnpm | 11.22.0 | recorded in root `package.json` |
+| Rust | 1.98.1 (pinned) | rustup via `rust-toolchain.toml`; mise via `mise.toml` |
+| Node | 26.9.0 (exact) | mise (`mise.toml` and `mise.lock`); same version pinned in CI |
+| pnpm | 12.4.2 | mise (`mise.toml` and `mise.lock`); standalone binary in CI |
 | FFmpeg | 8.x runtime (ABI 62) | system packages or installer |
 
 Linux build of the desktop shell additionally needs WebKit2GTK/GTK dev
@@ -17,11 +17,18 @@ them.
 ## First-time setup
 
 ```bash
-mise install                 # node/rust per .mise.toml
+mise trust                   # trust the local mise.toml once
+mise install --locked rust node pnpm  # install only this repo's pinned tools
 pnpm install                 # frontend dependencies
 scripts/setup-ffmpeg-linux.sh  # only if FFmpeg -dev packages are absent
 cargo build                  # workspace (default members)
 ```
+
+pnpm uses standalone release binaries, including macOS x64.
+Keep `mise.toml`, `rust-toolchain.toml`, CI/release workflows and the pinned
+standalone archive checksums consistent when updating versions. Regenerate
+`mise.lock` with `mise lock --platform linux-arm64,linux-arm64-musl,linux-x64,linux-x64-musl,macos-arm64,macos-x64,windows-x64`.
+Do not add a `packageManager` field to the root `package.json`.
 
 If FFmpeg libraries cannot be found, see `docs/ffmpeg.md` for
 `NIAN_FFMPEG_LIB_DIR` and pkg-config options.

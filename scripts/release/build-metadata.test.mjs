@@ -12,16 +12,16 @@ const buildMetadata = readNormalizedText(new URL("./build-metadata.mjs", import.
 const linuxStage = readNormalizedText(new URL("./stage-linux.sh", import.meta.url));
 const windowsStage = readNormalizedText(new URL("./stage-windows.ps1", import.meta.url));
 const metadataScript = fileURLToPath(new URL("./build-metadata.mjs", import.meta.url));
-const packageJson = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
-const pinnedPnpmVersion = /^pnpm@(.+)$/.exec(packageJson.packageManager ?? "")?.[1];
+const mise = readFileSync(new URL("../../mise.toml", import.meta.url), "utf8");
+const pinnedPnpmVersion = /^pnpm\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$/m.exec(mise)?.[1];
 
-assert.ok(pinnedPnpmVersion, "package.json must pin pnpm for the metadata regression fixture");
+assert.ok(pinnedPnpmVersion, "mise.toml must pin pnpm for the metadata regression fixture");
 
 test("build metadata receives an OS-native preflighted pnpm version instead of spawning pnpm", () => {
   assert.equal(/command\(["']pnpm["']/.test(buildMetadata), false);
   assert.match(buildMetadata, /argValue\(argv, "--pnpm-version"\)/);
-  assert.match(buildMetadata, /package\.json packageManager must pin pnpm@<version>/);
-  assert.match(windowsStage, /Get-Command pnpm\.cmd -ErrorAction Stop/);
+  assert.match(buildMetadata, /mise\.toml must pin an exact pnpm version/);
+  assert.match(windowsStage, /Get-Command pnpm\.exe -ErrorAction Stop/);
   assert.match(windowsStage, /--pnpm-version \$PnpmVersion/);
   assert.match(linuxStage, /pnpm_version="\$\(pnpm --version\)"/);
   assert.match(linuxStage, /--pnpm-version "\$pnpm_version"/);
@@ -56,7 +56,7 @@ test("build metadata rejects pnpm version drift before writing provenance", () =
       { encoding: "utf8" },
     );
     assert.notEqual(result.status, 0);
-    assert.ok(result.stderr.includes(`pnpm version ${driftedVersion} does not match package.json ${pinnedPnpmVersion}`));
+    assert.ok(result.stderr.includes(`pnpm version ${driftedVersion} does not match mise.toml ${pinnedPnpmVersion}`));
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

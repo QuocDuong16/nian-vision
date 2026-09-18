@@ -199,11 +199,14 @@ test("Windows release workflow routes required native tools through one fail-clo
   assert.match(windowsNative, /PSNativeCommandUseErrorActionPreference/);
   assert.match(windowsNative, /\$LASTEXITCODE/);
   assert.match(windowsNative, /throw \("required native command failed with exit code \{0\}: \{1\}" -f \$exitCode, \$Label\)/);
-  for (const tool of ["git.exe", "rustup.exe", "rustc.exe", "npm.cmd", "pnpm.cmd", "cargo.exe", "node.exe"]) {
+  for (const tool of ["git.exe", "rustup.exe", "rustc.exe", "pnpm.exe", "cargo.exe", "node.exe"]) {
     assert.ok(workflow.includes(`Invoke-NianNative { ${tool}`), `workflow does not route ${tool} through fail-closed helper`);
   }
-  assert.match(workflow, /Invoke-NianNative \{ npm\.cmd install --global --prefix \$corepackRoot corepack@0\.35\.0 \}/);
-  assert.match(workflow, /Invoke-NianNative \{ & \$corepack enable --install-directory \$corepackRoot \}/);
+  assert.match(workflow, /pnpm-win32-x64-12\.4\.2\.zip/);
+  assert.match(workflow, /da35e3f401674646968243b0aa1984e910d94de735e04936db22e7554791518d/);
+  assert.match(workflow, /Join-Path \$pnpmRoot 'pnpm\.exe'/);
+  assert.equal(/corepack/i.test(workflow), false);
+  assert.match(windowsPreflight, /pnpm\.exe --version/);
   assert.match(workflow, /Invoke-NianNative \{ & \.\.\\\.\.\\ui\\node_modules\\\.bin\\tauri\.CMD build/);
   assert.match(workflow, /Invoke-NianNative \{ cargo\.exe tauri bundle/);
   assert.match(workflow, /Invoke-NianNative \{ cargo\.exe tauri signer sign/);
@@ -215,17 +218,17 @@ test("Windows release workflow routes required native tools through one fail-clo
   assert.match(windowsBashScript, /Invoke-NianNative \{ & \$Bash --noprofile --norc \$scriptInvocationPath \}/);
   assert.match(windowsMsvcToolchain, /Invoke-NianNative \{ cmd\.exe/);
   const windowsJobs = workflow.slice(workflow.indexOf("  build-windows:"), workflow.indexOf("  verify-release:"));
-  assert.equal(/(?:^|\n)\s+npm install --global corepack@0\.35\.0/.test(windowsJobs), false);
+  assert.equal(/corepack/i.test(windowsJobs), false);
   const quality = workflow.slice(workflow.indexOf("- name: Release scripts and frontend quality"), workflow.indexOf("- name: Build pinned FFmpeg 8.0.3 Windows MSVC runtime"));
   for (const command of ["release:test", "lint", "typecheck", "test", "build"]) {
-    assert.match(quality, new RegExp(`Invoke-NianNative \\{ pnpm\\.cmd ${command.replace(":", "\\:")} \\}`));
+    assert.match(quality, new RegExp(`Invoke-NianNative \\{ pnpm\\.exe ${command.replace(":", "\\:")} \\}`));
   }
 });
 
 test("Windows build provisions and preflights pinned Rust quality components before expensive work", () => {
   const windows = workflow.slice(workflow.indexOf("  build-windows:"), workflow.indexOf("  sign-windows:"));
   const signing = workflow.slice(workflow.indexOf("  sign-windows:"), workflow.indexOf("  verify-release:"));
-  const rustInstallAt = windows.indexOf("- name: Install pinned Rust 1.98.0 MSVC toolchain");
+  const rustInstallAt = windows.indexOf("- name: Install pinned Rust 1.98.1 MSVC toolchain");
   const frontendInstallAt = windows.indexOf("- name: Install frontend dependencies");
   const ffmpegBuildAt = windows.indexOf("- name: Build pinned FFmpeg 8.0.3 Windows MSVC runtime");
   const rustQualityAt = windows.indexOf("- name: Run remaining Windows Rust quality and release worker build");
@@ -235,9 +238,9 @@ test("Windows build provisions and preflights pinned Rust quality components bef
   );
   assert.match(
     windows,
-    /Invoke-NianNative \{ rustup\.exe toolchain install 1\.98\.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt --component clippy \}/,
+    /Invoke-NianNative \{ rustup\.exe toolchain install 1\.98\.1-x86_64-pc-windows-msvc --profile minimal --component rustfmt --component clippy \}/,
   );
-  assert.match(windows, /Invoke-NianNative \{ rustup\.exe override set 1\.98\.0 \}/);
+  assert.match(windows, /Invoke-NianNative \{ rustup\.exe override set 1\.98\.1 \}/);
   for (const command of [
     "rustc.exe --version",
     "cargo.exe --version",
@@ -252,7 +255,7 @@ test("Windows build provisions and preflights pinned Rust quality components bef
 
   assert.match(
     signing,
-    /Invoke-NianNative \{ rustup\.exe toolchain install 1\.98\.0-x86_64-pc-windows-msvc --profile minimal \}/,
+    /Invoke-NianNative \{ rustup\.exe toolchain install 1\.98\.1-x86_64-pc-windows-msvc --profile minimal \}/,
   );
   assert.equal(signing.includes("--component rustfmt"), false);
   assert.equal(signing.includes("--component clippy"), false);
