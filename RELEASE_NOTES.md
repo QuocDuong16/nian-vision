@@ -1,3 +1,10 @@
+# Nian Vision 1.0.0
+Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
+
+The final source builds on RC61 and the subsequent Performance modal fix. Main/sub RTSP ingest is shared across Recording, Live View, Local Motion and dedicated Event capture with bounded queues and event pre-roll. Local Scene Motion uses five seconds of continuous quiet to end an episode; Event Review marks a valid detection instant with a ±3-second context band and jump control. Performance diagnostics now opens as a centered, scrollable 80vw × 80vh modal with keyboard dismissal and focus handling. These changes do not retroactively rewrite existing recorded events or clips.
+
+H.265 Live View/playback requires decoding support in the installed OS/WebView runtime. Local Motion detects changes to a scene, not people or specific objects. Camera interoperability, long-running RAM/CPU soak and clean Windows/Linux package acceptance require separate physical/packaged-device evidence; automated media tests do not establish those results. Final Windows/Linux artifacts must be built, signed and verified from this exact final version commit, not reused from an RC.
+
 # Nian Vision 1.0.0-rc.61
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 
