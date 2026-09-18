@@ -403,7 +403,7 @@ export interface PlaybackOpenDto {
 
 export interface EventPlaybackOpenDto {
   playback: PlaybackOpenDto;
-  seek_offset_ms: number;
+  seek_offset_ms: number | null;
   clip_index: number;
   clip_count: number;
 }

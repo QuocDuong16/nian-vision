@@ -3,12 +3,15 @@
 //! object recognition. No compressed packet size or audio heuristic is used.
 
 use nian_media_ffmpeg::{LUMA_HEIGHT, LUMA_WIDTH, LumaThumbnail};
+use std::time::{Duration, Instant};
 
 const PIXELS: usize = LUMA_WIDTH * LUMA_HEIGHT;
 const CHANGED_PIXEL_THRESHOLD: i16 = 23;
 const MIN_CHANGED_PIXELS: usize = PIXELS / 7; // ~14% of the 32x18 scene.
 const ACTIVE_CONFIRM_FRAMES: u8 = 2;
-const IDLE_CONFIRM_FRAMES: u8 = 4;
+// A short still interval can occur halfway through one physical movement.
+// Time-based end confirmation avoids split Event episodes on sampled video.
+const END_QUIET_DURATION: Duration = Duration::from_secs(5);
 
 /// `Some(true)` begins an episode, `Some(false)` ends it, `None` means no
 /// transition. A new generation uses a fresh detector, never stale pixels.
@@ -17,7 +20,7 @@ pub struct MotionDetector {
     previous: Option<LumaThumbnail>,
     active: bool,
     moving_frames: u8,
-    quiet_frames: u8,
+    last_moving_at: Option<Instant>,
 }
 
 impl MotionDetector {
@@ -26,13 +29,17 @@ impl MotionDetector {
     }
 
     pub fn observe(&mut self, thumbnail: LumaThumbnail) -> Option<bool> {
+        self.observe_at(thumbnail, Instant::now())
+    }
+
+    fn observe_at(&mut self, thumbnail: LumaThumbnail, now: Instant) -> Option<bool> {
         let moving = self
             .previous
             .as_ref()
             .is_some_and(|previous| scene_changed(previous.pixels(), thumbnail.pixels()));
         self.previous = Some(thumbnail);
         if moving {
-            self.quiet_frames = 0;
+            self.last_moving_at = Some(now);
             self.moving_frames = self.moving_frames.saturating_add(1);
             if !self.active && self.moving_frames >= ACTIVE_CONFIRM_FRAMES {
                 self.active = true;
@@ -40,8 +47,11 @@ impl MotionDetector {
             }
         } else {
             self.moving_frames = 0;
-            self.quiet_frames = self.quiet_frames.saturating_add(1);
-            if self.active && self.quiet_frames >= IDLE_CONFIRM_FRAMES {
+            if self.active
+                && self
+                    .last_moving_at
+                    .is_some_and(|last| now.saturating_duration_since(last) >= END_QUIET_DURATION)
+            {
                 self.active = false;
                 return Some(false);
             }
@@ -96,15 +106,65 @@ mod tests {
     #[test]
     fn scene_motion_produces_one_start_and_one_end_with_hysteresis() {
         let mut detector = MotionDetector::new();
-        assert_eq!(detector.observe(scene(35, None)), None);
-        assert_eq!(detector.observe(scene(35, Some(0))), None);
-        assert_eq!(detector.observe(scene(35, Some(14))), Some(true));
+        let at = Instant::now();
+        assert_eq!(detector.observe_at(scene(35, None), at), None);
+        assert_eq!(
+            detector.observe_at(scene(35, Some(0)), at + Duration::from_millis(200)),
+            None
+        );
+        assert_eq!(
+            detector.observe_at(scene(35, Some(14)), at + Duration::from_millis(400)),
+            Some(true)
+        );
         assert!(detector.is_active());
-        assert_eq!(detector.observe(scene(35, Some(14))), None);
-        for _ in 0..2 {
-            assert_eq!(detector.observe(scene(35, Some(14))), None);
-        }
-        assert_eq!(detector.observe(scene(35, Some(14))), Some(false));
+        assert_eq!(
+            detector.observe_at(scene(35, Some(14)), at + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            detector.observe_at(scene(35, Some(14)), at + Duration::from_secs(5)),
+            None
+        );
+        assert_eq!(
+            detector.observe_at(scene(35, Some(14)), at + Duration::from_millis(5_401)),
+            Some(false)
+        );
+        assert!(!detector.is_active());
+    }
+
+    #[test]
+    fn short_quiet_gap_between_motion_bursts_keeps_one_episode() {
+        let mut detector = MotionDetector::new();
+        let at = Instant::now();
+        assert_eq!(detector.observe_at(scene(35, None), at), None);
+        assert_eq!(
+            detector.observe_at(scene(35, Some(0)), at + Duration::from_millis(200)),
+            None
+        );
+        assert_eq!(
+            detector.observe_at(scene(35, Some(14)), at + Duration::from_millis(400)),
+            Some(true)
+        );
+        assert_eq!(
+            detector.observe_at(scene(35, Some(14)), at + Duration::from_secs(4)),
+            None
+        );
+        assert_eq!(
+            detector.observe_at(scene(35, Some(0)), at + Duration::from_millis(4_500)),
+            None
+        );
+        assert_eq!(
+            detector.observe_at(scene(35, Some(14)), at + Duration::from_secs(5)),
+            None
+        );
+        assert_eq!(
+            detector.observe_at(scene(35, Some(14)), at + Duration::from_secs(9)),
+            None
+        );
+        assert_eq!(
+            detector.observe_at(scene(35, Some(14)), at + Duration::from_secs(10)),
+            Some(false)
+        );
         assert!(!detector.is_active());
     }
 

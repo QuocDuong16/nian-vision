@@ -14,6 +14,8 @@ type VideoPlayerProps = {
   audioSrc?: string | null;
   ariaLabel?: string;
   initialTimeSeconds?: number;
+  /** Clip-relative detection anchor; null means no trustworthy time mapping. */
+  markerTimeSeconds?: number | null;
   metadata?: VideoMetadataEntry[];
   onEnded?: () => void;
   onError?: () => void;
@@ -23,6 +25,8 @@ type ManagedVideoProps = {
   src: string;
   audioSrc: string | null;
   initialTimeSeconds: number;
+  markerTimeSeconds: number | null;
+  markerJump: number;
   onDuration: (duration: number) => void;
   onEnded: (() => void) | undefined;
   onError: (() => void) | undefined;
@@ -33,6 +37,8 @@ function ManagedVideo({
   src,
   audioSrc,
   initialTimeSeconds,
+  markerTimeSeconds,
+  markerJump,
   onDuration,
   onEnded,
   onError,
@@ -54,6 +60,13 @@ function ManagedVideo({
       video.load();
     };
   }, [src]);
+
+  useEffect(() => {
+    if (markerJump === 0 || markerTimeSeconds === null) return;
+    const video = videoRef.current;
+    if (!video || !Number.isFinite(markerTimeSeconds)) return;
+    video.currentTime = Math.min(Math.max(0, markerTimeSeconds), Number.isFinite(video.duration) ? video.duration : markerTimeSeconds);
+  }, [markerJump, markerTimeSeconds]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -158,6 +171,7 @@ export function VideoPlayer({
   audioSrc = null,
   ariaLabel = "Video playback",
   initialTimeSeconds = 0,
+  markerTimeSeconds = null,
   metadata = [],
   onEnded,
   onError,
@@ -165,6 +179,7 @@ export function VideoPlayer({
   const [duration, setDuration] = useState(0);
   const [metadataOpen, setMetadataOpen] = useState(false);
   const [audioError, setAudioError] = useState(false);
+  const [markerJump, setMarkerJump] = useState(0);
   const handleAudioError = useCallback(() => setAudioError(true), []);
 
   useEffect(() => {
@@ -172,6 +187,14 @@ export function VideoPlayer({
     setMetadataOpen(false);
     setAudioError(false);
   }, [src, audioSrc]);
+
+  const markerValid = markerTimeSeconds !== null
+    && Number.isFinite(markerTimeSeconds)
+    && markerTimeSeconds >= 0
+    && duration > 0
+    && markerTimeSeconds <= duration;
+  const markerStart = markerValid ? Math.max(0, markerTimeSeconds - 3) : 0;
+  const markerEnd = markerValid ? Math.min(duration, markerTimeSeconds + 3) : 0;
 
   return (
     <div className="video-player video-player-sutro" aria-label={ariaLabel}>
@@ -181,6 +204,8 @@ export function VideoPlayer({
             src={src}
             audioSrc={audioSrc}
             initialTimeSeconds={initialTimeSeconds}
+            markerTimeSeconds={markerTimeSeconds}
+            markerJump={markerJump}
             onDuration={setDuration}
             onEnded={onEnded}
             onError={onError}
@@ -190,14 +215,30 @@ export function VideoPlayer({
       </Suspense>
       {audioError && <p className="warning-message" role="status">G.711 audio could not be played. Video playback remains available.</p>}
 
-      {(initialTimeSeconds > 0 || metadata.length > 0) && (
+      {markerValid && (
+        <div className="video-player-motion-context" aria-label="Event detection timeline">
+          <div className="video-player-motion-track" role="img" aria-label={`Detection at ${timeLabel(markerTimeSeconds)}, highlighted from ${timeLabel(markerStart)} to ${timeLabel(markerEnd)}`}>
+            <span className="video-player-motion-window" style={{ left: `${markerStart / duration * 100}%`, width: `${(markerEnd - markerStart) / duration * 100}%` }} aria-hidden="true" />
+            <span className="video-player-motion-marker" style={{ left: `${markerTimeSeconds / duration * 100}%` }} aria-hidden="true" />
+          </div>
+          <div className="video-player-motion-labels">
+            <span>0:00</span>
+            <span>Detection ~{timeLabel(markerTimeSeconds)} · ±3s context</span>
+            <span>{timeLabel(duration)}</span>
+          </div>
+        </div>
+      )}
+      {(initialTimeSeconds > 0 || markerValid || metadata.length > 0) && (
         <div className="video-player-context-bar">
           <div className="video-player-context-copy">
-            {initialTimeSeconds > 0 && (
-              <span>Motion begins at {timeLabel(Math.min(initialTimeSeconds, duration || initialTimeSeconds))}</span>
-            )}
+            {markerValid ? (
+              <span>Detection around {timeLabel(markerTimeSeconds)}</span>
+            ) : initialTimeSeconds > 0 ? (
+              <span>Starts at {timeLabel(Math.min(initialTimeSeconds, duration || initialTimeSeconds))}</span>
+            ) : null}
             {duration > 0 && <span>{timeLabel(duration)} clip</span>}
           </div>
+          {markerValid && <button type="button" onClick={() => setMarkerJump((value) => value + 1)}>Jump to detection</button>}
           {metadata.length > 0 && (
             <button
               type="button"

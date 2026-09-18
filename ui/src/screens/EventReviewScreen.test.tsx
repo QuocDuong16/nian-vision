@@ -346,7 +346,7 @@ describe("EventReviewScreen", () => {
             },
             adjacent: { previous: null, next: null },
           },
-          seek_offset_ms: 0,
+          seek_offset_ms: clipIndex === 0 ? 6_000 : null,
           clip_index: clipIndex,
           clip_count: 2,
         };
@@ -359,9 +359,19 @@ describe("EventReviewScreen", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Front Door.*Motion started/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Open recording" }));
     expect(await screen.findByText("Clip 1 of 2")).toBeTruthy();
+    const firstVideo = await waitFor(() => {
+      const video = document.querySelector("video");
+      expect(video).toBeTruthy();
+      return video as HTMLVideoElement;
+    });
+    Object.defineProperty(firstVideo, "duration", { configurable: true, value: 300 });
+    fireEvent.loadedMetadata(firstVideo);
+    expect(await screen.findByRole("img", { name: "Detection at 0:06, highlighted from 0:03 to 0:09" })).toBeTruthy();
+    expect(firstVideo.currentTime).toBe(3);
 
     fireEvent.click(screen.getByRole("button", { name: "Next clip" }));
     expect(await screen.findByText("Clip 2 of 2")).toBeTruthy();
+    expect(screen.queryByRole("img", { name: /Detection at/ })).toBeNull();
     expect(vi.mocked(invoke).mock.calls.some(([command, args]) =>
       command === "event_playback_open"
       && (args as { clipIndex?: number })?.clipIndex === 1,

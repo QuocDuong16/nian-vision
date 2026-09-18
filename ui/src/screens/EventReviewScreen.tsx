@@ -521,7 +521,8 @@ export function EventReviewScreen() {
                 src={playback.playback.url}
                 audioSrc={playback.playback.audio_url ?? null}
                 ariaLabel={`Event ${selected?.event_id ?? ""} playback`}
-                initialTimeSeconds={playback.seek_offset_ms / 1000}
+                initialTimeSeconds={playback.seek_offset_ms === null ? 0 : Math.max(0, playback.seek_offset_ms / 1000 - 3)}
+                markerTimeSeconds={playback.seek_offset_ms === null ? null : playback.seek_offset_ms / 1000}
                 onError={() => {
                   setSelectionMessage("Playback could not be loaded by the desktop webview.");
                   void closePlayback();
@@ -536,7 +537,7 @@ export function EventReviewScreen() {
                   { label: "Resolution", value: playback.playback.inspect.width && playback.playback.inspect.height ? `${playback.playback.inspect.width}×${playback.playback.inspect.height}` : "Unknown" },
                   { label: "Audio", value: playback.playback.audio_url ? "G.711 → PCM WAV" : playback.playback.inspect.audio_available ? "AAC in MP4" : "Video only" },
                   { label: "Container", value: playback.playback.inspect.container_compatibility },
-                  { label: "Pre-roll seek", value: `${(playback.seek_offset_ms / 1000).toFixed(1)} s` },
+                  { label: "Detection offset", value: playback.seek_offset_ms === null ? "Unavailable" : `~${(playback.seek_offset_ms / 1000).toFixed(1)} s` },
                   { label: "Recording ID", value: playback.playback.recording.recording_id },
                 ]}
               />

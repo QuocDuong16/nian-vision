@@ -1,3 +1,8 @@
+# Nian Vision 1.0.0-rc.61
+Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
+
+RC61 addresses physical camera review feedback. Local Scene Motion now keeps an active motion episode open until five continuous seconds of quiet, preventing brief pauses from splitting one action into overlapping Event clips; ONVIF event semantics and the independent manual Recording plane remain unchanged. Event Review derives detection offsets from persisted receive timestamps and each clip's actual indexed start when that mapping is valid, starts near three seconds before detection, shows a separate detection marker with a ±3-second context region and provides a jump-to-detection control. Missing, ambiguous or out-of-clip timestamps do not create false markers. Performance diagnostics uses a wider viewport overlay and removes nested process/media scrolling so per-source telemetry remains readable. Existing persisted separate event rows and immutable clips are not retroactively merged. Physical-device retesting, Windows/Linux package release acceptance and prolonged media soak remain pending independently of automated tests.
+
 # Nian Vision 1.0.0-rc.60
 Nian Vision v1 is a local-first desktop NVR for configured IP cameras on Windows x86_64 and Linux x86_64.
 

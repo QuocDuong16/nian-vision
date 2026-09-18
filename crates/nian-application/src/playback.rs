@@ -164,7 +164,9 @@ pub struct EventRecordingContextDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EventPlaybackOpenDto {
     pub playback: PlaybackOpenDto,
-    pub seek_offset_ms: u64,
+    /// Approximate wall-clock trigger offset in the selected clip, when the
+    /// clip timestamp can be safely resolved and falls within its duration.
+    pub seek_offset_ms: Option<u64>,
     pub clip_index: u32,
     pub clip_count: u32,
 }

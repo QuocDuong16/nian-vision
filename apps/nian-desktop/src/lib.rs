@@ -1910,6 +1910,26 @@ fn event_camera_id(event: &EventReviewRowDto) -> Result<CameraId, DesktopErrorDt
         .map_err(|_| DesktopErrorDto::new("event_not_found", "event camera is unavailable"))
 }
 
+/// The EventIndex receive timestamp is the detection anchor; clip start is
+/// a locally indexed segment timestamp. Invalid/ambiguous wall-clock values
+/// must not turn into a fabricated marker at the start of the clip.
+fn event_detection_offset_ms(
+    received_time_utc: &str,
+    clip_started_at_local: NaiveDateTime,
+    duration_ms: Option<u64>,
+) -> Option<u64> {
+    let received = DateTime::parse_from_rfc3339(received_time_utc).ok()?;
+    let started = clip_started_at_local
+        .and_local_timezone(chrono::Local)
+        .single()?;
+    let offset = received.signed_duration_since(started).num_milliseconds();
+    let offset = u64::try_from(offset).ok()?;
+    if duration_ms.is_some_and(|duration| offset > duration) {
+        return None;
+    }
+    Some(offset)
+}
+
 #[tauri::command]
 async fn event_recording_context(
     state: tauri::State<'_, Arc<DesktopState>>,
@@ -1938,7 +1958,9 @@ async fn event_recording_context(
         Ok(EventRecordingContextDto {
             available,
             camera_id: camera_id.as_str().to_owned(),
-            seek_offset_ms: available.then_some(0),
+            seek_offset_ms: clips.first().and_then(|clip| {
+                event_detection_offset_ms(&event.received_time_utc, clip.started_at_local, None)
+            }),
             clip_count,
         })
     })
@@ -1997,9 +2019,14 @@ async fn event_playback_open(
                 clip.started_at_local,
             )
             .map_err(map_playback_error)?;
+        let seek_offset_ms = event_detection_offset_ms(
+            &event.received_time_utc,
+            clip.started_at_local,
+            opened.inspect.duration_ms,
+        );
         Ok(Some(EventPlaybackOpenDto {
             playback: opened,
-            seek_offset_ms: 0,
+            seek_offset_ms,
             clip_index,
             clip_count,
         }))
@@ -4457,6 +4484,32 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn event_marker_uses_real_receive_time_in_clip_and_rejects_impossible_offsets() {
+        let started = chrono::Local::now()
+            .with_timezone(&chrono::Local)
+            .naive_local();
+        let start = started.and_local_timezone(chrono::Local).single().unwrap();
+        let received = (start + chrono::TimeDelta::seconds(6)).to_rfc3339();
+        assert_eq!(
+            event_detection_offset_ms(&received, started, Some(17_000)),
+            Some(6_000)
+        );
+        assert_eq!(
+            event_detection_offset_ms(&received, started, Some(5_000)),
+            None
+        );
+        assert_eq!(event_detection_offset_ms("invalid", started, None), None);
+        assert_eq!(
+            event_detection_offset_ms(
+                &(start - chrono::TimeDelta::seconds(1)).to_rfc3339(),
+                started,
+                None
+            ),
+            None
+        );
+    }
 
     #[test]
     fn app_data_fallback_accepts_only_absolute_roaming_root() {

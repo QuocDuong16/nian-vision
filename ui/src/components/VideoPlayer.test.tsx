@@ -59,8 +59,32 @@ describe("VideoPlayer", () => {
 
     fireEvent.loadedMetadata(video);
     expect(video.currentTime).toBe(5);
-    expect(screen.getByText("Motion begins at 0:05")).toBeTruthy();
+    expect(screen.getByText("Starts at 0:05")).toBeTruthy();
     expect(screen.getByText("0:30 clip")).toBeTruthy();
+  });
+
+  it("highlights the real detection anchor with three seconds of context and seeks on demand", async () => {
+    render(<VideoPlayer src="http://127.0.0.1:43100/playback/event" initialTimeSeconds={3} markerTimeSeconds={6} />);
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+    const video = document.querySelector("video") as HTMLVideoElement;
+    Object.defineProperty(video, "duration", { configurable: true, value: 17 });
+    fireEvent.loadedMetadata(video);
+
+    expect(video.currentTime).toBe(3);
+    expect(screen.getByRole("img", { name: "Detection at 0:06, highlighted from 0:03 to 0:09" })).toBeTruthy();
+    expect(screen.getByText("Detection ~0:06 · ±3s context")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Jump to detection" }));
+    expect(video.currentTime).toBe(6);
+  });
+
+  it("does not invent a detection marker when the clip time is unknown", async () => {
+    render(<VideoPlayer src="http://127.0.0.1:43100/playback/legacy" markerTimeSeconds={null} />);
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+    const video = document.querySelector("video") as HTMLVideoElement;
+    Object.defineProperty(video, "duration", { configurable: true, value: 17 });
+    fireEvent.loadedMetadata(video);
+    expect(screen.queryByRole("img", { name: /Detection at/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Jump to detection" })).toBeNull();
   });
 
   it("forwards ended and error events from the media element", async () => {
