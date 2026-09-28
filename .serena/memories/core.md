@@ -1,0 +1,9 @@
+# Nian Vision map and invariants
+
+- Local-first desktop NVR for IP cameras. Flow: React UI (`ui/`) → Tauri host (`apps/nian-desktop`) → isolated media worker (`apps/nian-media-worker`) over versioned NDJSON stdio (`nian-ipc`). Orchestration/policies live in `nian-application`.
+- Crate map and process/data flows: `docs/architecture.md`; design decisions: `docs/adr/`; build/run commands: `docs/development.md`; validation layers: `docs/testing.md`.
+- Stable backend boundaries: `nian-domain` owns shared vocabulary/policies; `nian-settings` owns authoritative non-secret user configuration; `nian-storage` owns recording filesystem truth and safe publication; `nian-index` owns rebuildable SQLite catalogs; `nian-onvif` owns protocol infrastructure; `nian-media` is the FFmpeg-independent seam; `nian-recorder` owns segmented recording/recovery/supervision.
+- Data authority: recording files are authoritative footage; SQLite recording/event indexes are derived and rebuildable. `settings.sqlite3` is authoritative and must fail safely in place on corruption or a future schema, never be silently rebuilt.
+- Security boundary: the native host resolves platform paths and credentials; camera secrets and source URLs must not enter UI DTOs, argv, logs, or fixtures. Credential debug/display output is redacted.
+- Desktop host does not link FFmpeg; media faults stay inside the worker process.
+- Read `mem:backend/core`, `mem:desktop/core`, `mem:media/core`, and `mem:ui/core` for module boundaries; `mem:tech_stack`, `mem:conventions`, `mem:suggested_commands`, and `mem:task_completion` cover tools and workflow.

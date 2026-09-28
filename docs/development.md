@@ -143,4 +143,3 @@ docs/                    architecture, ADRs, guides
   committed.
 * Secrets (camera passwords) never appear in logs, argv, or fixtures —
   credential types in `nian-domain` redact `Debug`/`Display` output.
-* OpenWiki pages under `openwiki/` are generated; do not hand-edit them.
