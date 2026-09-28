@@ -202,8 +202,8 @@ test("Windows release workflow routes required native tools through one fail-clo
   for (const tool of ["git.exe", "rustup.exe", "rustc.exe", "pnpm.exe", "cargo.exe", "node.exe"]) {
     assert.ok(workflow.includes(`Invoke-NianNative { ${tool}`), `workflow does not route ${tool} through fail-closed helper`);
   }
-  assert.match(workflow, /pnpm-win32-x64-12\.4\.2\.zip/);
-  assert.match(workflow, /da35e3f401674646968243b0aa1984e910d94de735e04936db22e7554791518d/);
+  assert.match(workflow, /pnpm-win32-x64-12\.7\.0\.zip/);
+  assert.match(workflow, /40b9a24d55c7e839aa5fc8e814e995a1eb1778fc65f2f19cfa1c6f573a926944/);
   assert.match(workflow, /Join-Path \$pnpmRoot 'pnpm\.exe'/);
   assert.equal(/corepack/i.test(workflow), false);
   assert.match(windowsPreflight, /pnpm\.exe --version/);

@@ -6,7 +6,7 @@
 |---|---|---|
 | Rust | 1.98.1 (pinned) | rustup via `rust-toolchain.toml`; mise via `mise.toml` |
 | Node | 26.9.0 (exact) | mise (`mise.toml` and `mise.lock`); same version pinned in CI |
-| pnpm | 12.4.2 | mise (`mise.toml` and `mise.lock`); standalone binary in CI |
+| pnpm | 12.7.0 | mise (`mise.toml` and `mise.lock`); standalone binary in CI |
 | FFmpeg | 8.x runtime (ABI 62) | system packages or installer |
 
 Linux build of the desktop shell additionally needs WebKit2GTK/GTK dev

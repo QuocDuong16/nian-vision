@@ -15,8 +15,9 @@ Docker-based jobs.
   `rust-toolchain.toml` (with `rustfmt` + `clippy` components) — this file
   is authoritative for any direct cargo invocation. The project-level
   `mise.toml` pins the same version for mise-managed machines.
-* **Node and pnpm**: exact versions `26.9.0` and `12.4.2` in `mise.toml`,
-  matching CI. `mise.lock` records resolved artifacts for supported platforms.
+* **Node and pnpm**: exact versions in `mise.toml` (currently `26.9.0` and
+  `12.7.0`), matching CI. `mise.lock` records resolved artifacts for supported
+  platforms.
   pnpm uses its native GitHub release binaries (including macOS x64).
   Do not add a `packageManager` field that makes pnpm switch versions.
 * **Dependencies**: exact pins (`=x.y.z`) in `Cargo.toml` manifests for all

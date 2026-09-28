@@ -448,18 +448,18 @@ jobs:
       - name: Install verified standalone pnpm
         shell: pwsh
         run: |
-          $pnpmRoot = Join-Path $env:RUNNER_TEMP 'nian-pnpm-12.4.2'
-          $archive = Join-Path $env:RUNNER_TEMP 'pnpm-win32-x64-12.4.2.zip'
-          Invoke-WebRequest 'https://github.com/pnpm/pnpm/releases/download/v12.4.2/pnpm-win32-x64.zip' -OutFile $archive
+          $pnpmRoot = Join-Path $env:RUNNER_TEMP 'nian-pnpm-12.7.0'
+          $archive = Join-Path $env:RUNNER_TEMP 'pnpm-win32-x64-12.7.0.zip'
+          Invoke-WebRequest 'https://github.com/pnpm/pnpm/releases/download/v12.7.0/pnpm-win32-x64.zip' -OutFile $archive
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-          if ($hash -ne 'da35e3f401674646968243b0aa1984e910d94de735e04936db22e7554791518d') { throw 'pnpm Windows archive SHA-256 mismatch' }
+          if ($hash -ne '40b9a24d55c7e839aa5fc8e814e995a1eb1778fc65f2f19cfa1c6f573a926944') { throw 'pnpm Windows archive SHA-256 mismatch' }
           Expand-Archive -Path $archive -DestinationPath $pnpmRoot -Force
           $pnpm = Join-Path $pnpmRoot 'pnpm.exe'
           if (-not (Test-Path -LiteralPath $pnpm -PathType Leaf)) { throw 'pnpm standalone binary missing from verified archive' }
           Add-Content $env:GITHUB_PATH $pnpmRoot
           . scripts/release/windows-native.ps1
           $installedVersion = (Invoke-NianNative { & $pnpm --version } | Out-String).Trim()
-          if ($installedVersion -ne '12.4.2') { throw "pnpm version mismatch: $installedVersion" }
+          if ($installedVersion -ne '12.7.0') { throw "pnpm version mismatch: $installedVersion" }
 
       - name: Provision pinned MSYS FFmpeg build tools
         shell: pwsh
