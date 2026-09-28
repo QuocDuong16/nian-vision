@@ -1,0 +1,80 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "pinDigests": true,
+  "timezone": "Asia/Ho_Chi_Minh",
+  "enabledManagers": ["cargo", "npm", "github-actions"],
+  "labels": ["dependencies"],
+  "dependencyDashboard": true,
+  "dependencyDashboardOSVVulnerabilitySummary": "unresolved",
+  "osvVulnerabilityAlerts": true,
+  "prConcurrentLimit": 3,
+  "prHourlyLimit": 1,
+  "commitHourlyLimit": 2,
+  "packageRules": [
+    {
+      "description": "Require dashboard approval for major upgrades.",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Wait seven days before Cargo and npm minor updates.",
+      "matchManagers": ["cargo", "npm"],
+      "matchUpdateTypes": ["minor"],
+      "minimumReleaseAge": "7 days"
+    },
+    {
+      "description": "Wait three days before Cargo and npm patch updates.",
+      "matchManagers": ["cargo", "npm"],
+      "matchUpdateTypes": ["patch"],
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Update Rust crates on Tuesdays.",
+      "matchManagers": ["cargo"],
+      "schedule": ["* * * * 2"]
+    },
+    {
+      "description": "Update npm dependencies on Mondays.",
+      "matchManagers": ["npm"],
+      "schedule": ["* * * * 1"]
+    },
+    {
+      "description": "Update GitHub and Forgejo Actions on Saturdays.",
+      "matchManagers": ["github-actions"],
+      "schedule": ["* * * * 6"]
+    },
+    {
+      "description": "Keep Node and Rust toolchain pins manual until their checksums and release contracts can move together.",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["node", "rust"],
+      "enabled": false
+    },
+    {
+      "description": "Keep Tauri Rust crates together.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["/^tauri(-|$)/"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "Tauri Rust stack"
+    },
+    {
+      "description": "Keep Tauri UI packages together.",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["/^@tauri-apps\\//"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "Tauri UI stack"
+    },
+    {
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["react", "react-dom", "@types/react", "@types/react-dom"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "React stack"
+    },
+    {
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["vitest", "/^@vitest\\//"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "Vitest stack"
+    }
+  ]
+}
