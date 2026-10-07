@@ -17,7 +17,7 @@ thiserror = { workspace = true }
 # onto `renamex_np(RENAME_EXCL)`); Windows uses `MoveFileExW` without
 # `MOVEFILE_REPLACE_EXISTING` via `windows-sys`.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "=1.1.4", features = ["fs"] }
+rustix = { version = "=1.1.5", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [

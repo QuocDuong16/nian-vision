@@ -22,9 +22,11 @@ allow = [
 confidence-threshold = 0.93
 
 [bans]
-multiple-versions = "warn"
-# "warn" rather than "deny": workspace path dependencies (`workspace = true`)
-# carry no version and are flagged as wildcards; they are intentional.
+# Keep the lockfile's expected transitive version overlap quiet. Cargo audit
+# still scans every locked version for known advisories.
+multiple-versions = "allow"
+# External dependencies are versioned explicitly; wildcard path dependencies
+# are not used after local workspace crates declare their major version range.
 wildcards = "warn"
 highlight = "all"
 
@@ -32,20 +34,6 @@ highlight = "all"
 version = 2
 yanked = "deny"
 ignore = [
-  # The gtk-rs GTK3 binding family is unmaintained upstream, but Tauri 2
-  # itself depends on it for its Linux shell (gtk/atk/gdk/gdkx11/
-  # webkit2gtk via tao/wry/muda). Not a vulnerability; no fixed versions
-  # exist. Re-evaluate whenever Tauri ships a GTK4-based stack.
-  "RUSTSEC-2024-0411",
-  "RUSTSEC-2024-0412",
-  "RUSTSEC-2024-0413",
-  "RUSTSEC-2024-0414",
-  "RUSTSEC-2024-0415",
-  "RUSTSEC-2024-0416",
-  "RUSTSEC-2024-0417",
-  "RUSTSEC-2024-0418",
-  "RUSTSEC-2024-0419",
-  "RUSTSEC-2024-0420",
   # The unic-* family (incl. proc-macro-error, RUSTSEC-2024-0370) is
   # unmaintained; pulled in by urlpattern via tauri-utils and by Tauri's
   # macro stack. No vulnerabilities, no fixed versions.

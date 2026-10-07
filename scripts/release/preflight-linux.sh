@@ -20,7 +20,7 @@ done
 rust_version="$(rustc --version)"
 node_version="$(node --version)"
 pnpm_version="$(pnpm --version)"
-[[ "$rust_version" == rustc\ 1.98.1* ]] || {
+[[ "$rust_version" == rustc\ 1.99.0* ]] || {
   echo "release Rust toolchain mismatch: $rust_version" >&2
   exit 1
 }
@@ -28,7 +28,7 @@ pnpm_version="$(pnpm --version)"
   echo "release Node.js mismatch: $node_version" >&2
   exit 1
 }
-[[ "$pnpm_version" == "12.7.0" ]] || {
+[[ "$pnpm_version" == "12.9.1" ]] || {
   echo "release pnpm mismatch: $pnpm_version" >&2
   exit 1
 }

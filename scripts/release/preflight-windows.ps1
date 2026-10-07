@@ -18,9 +18,9 @@ foreach ($tool in @('cargo.exe','rustc.exe','node.exe','pnpm.exe','git.exe')) {
 $rust = (Invoke-NianNative { rustc.exe --version } | Out-String).Trim()
 $node = (Invoke-NianNative { node.exe --version } | Out-String).Trim()
 $pnpm = (Invoke-NianNative { pnpm.exe --version } | Out-String).Trim()
-if (-not $rust.StartsWith('rustc 1.98.1 ')) { throw "release Rust toolchain mismatch: $rust" }
+if (-not $rust.StartsWith('rustc 1.99.0 ')) { throw "release Rust toolchain mismatch: $rust" }
 if ($node -ne 'v26.9.0') { throw "release Node.js mismatch: $node" }
-if ($pnpm -ne '12.7.0') { throw "release pnpm mismatch: $pnpm" }
+if ($pnpm -ne '12.9.1') { throw "release pnpm mismatch: $pnpm" }
 $systemCurl = Join-Path $env:SystemRoot 'System32\curl.exe'
 if (-not (Test-Path -LiteralPath $systemCurl -PathType Leaf)) { throw "required Windows system curl is unavailable: $systemCurl" }
 

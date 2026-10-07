@@ -75,7 +75,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     container:
-      image: rust:1.98.1-bookworm
+      image: rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6
     defaults:
       run:
         shell: bash
@@ -324,8 +324,8 @@ jobs:
       - name: Install pinned Rust verifier and Tauri signing toolchain
         run: |
           set -Eeuo pipefail
-          rustup toolchain install 1.98.1 --profile minimal
-          rustup override set 1.98.1
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup override set 1.99.0
           cargo install tauri-cli --version 2.11.4 --locked
 
       - name: Install Linux AppImage smoke runtime prerequisites
@@ -421,12 +421,12 @@ jobs:
           if ($head -ne $env:GITHUB_SHA) { throw "Windows build checkout differs from GITHUB_SHA" }
           if ($tag -ne $env:GITHUB_SHA) { throw "Windows build tag differs from GITHUB_SHA" }
 
-      - name: Install pinned Rust 1.98.1 MSVC toolchain
+      - name: Install pinned Rust 1.99.0 MSVC toolchain
         shell: pwsh
         run: |
           . scripts/release/windows-native.ps1
-          Invoke-NianNative { rustup.exe toolchain install 1.98.1-x86_64-pc-windows-msvc --profile minimal --component rustfmt --component clippy }
-          Invoke-NianNative { rustup.exe override set 1.98.1 }
+          Invoke-NianNative { rustup.exe toolchain install 1.99.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt --component clippy }
+          Invoke-NianNative { rustup.exe override set 1.99.0 }
           Invoke-NianNative { rustc.exe --version }
           Invoke-NianNative { cargo.exe --version }
           Invoke-NianNative { cargo.exe fmt --version }
@@ -448,18 +448,18 @@ jobs:
       - name: Install verified standalone pnpm
         shell: pwsh
         run: |
-          $pnpmRoot = Join-Path $env:RUNNER_TEMP 'nian-pnpm-12.7.0'
-          $archive = Join-Path $env:RUNNER_TEMP 'pnpm-win32-x64-12.7.0.zip'
-          Invoke-WebRequest 'https://github.com/pnpm/pnpm/releases/download/v12.7.0/pnpm-win32-x64.zip' -OutFile $archive
+          $pnpmRoot = Join-Path $env:RUNNER_TEMP 'nian-pnpm-12.9.1'
+          $archive = Join-Path $env:RUNNER_TEMP 'pnpm-win32-x64-12.9.1.zip'
+          Invoke-WebRequest 'https://github.com/pnpm/pnpm/releases/download/v12.9.1/pnpm-win32-x64.zip' -OutFile $archive
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-          if ($hash -ne '40b9a24d55c7e839aa5fc8e814e995a1eb1778fc65f2f19cfa1c6f573a926944') { throw 'pnpm Windows archive SHA-256 mismatch' }
+          if ($hash -ne '2b30f6bc53228187881aeae604cc6cedf092641df30d3be1cf4cd3d17bf630f5') { throw 'pnpm Windows archive SHA-256 mismatch' }
           Expand-Archive -Path $archive -DestinationPath $pnpmRoot -Force
           $pnpm = Join-Path $pnpmRoot 'pnpm.exe'
           if (-not (Test-Path -LiteralPath $pnpm -PathType Leaf)) { throw 'pnpm standalone binary missing from verified archive' }
           Add-Content $env:GITHUB_PATH $pnpmRoot
           . scripts/release/windows-native.ps1
           $installedVersion = (Invoke-NianNative { & $pnpm --version } | Out-String).Trim()
-          if ($installedVersion -ne '12.7.0') { throw "pnpm version mismatch: $installedVersion" }
+          if ($installedVersion -ne '12.9.1') { throw "pnpm version mismatch: $installedVersion" }
 
       - name: Provision pinned MSYS FFmpeg build tools
         shell: pwsh
@@ -660,12 +660,12 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.sha }}
 
-      - name: Install pinned Rust 1.98.1 MSVC and Tauri signing toolchain
+      - name: Install pinned Rust 1.99.0 MSVC and Tauri signing toolchain
         shell: pwsh
         run: |
           . scripts/release/windows-native.ps1
-          Invoke-NianNative { rustup.exe toolchain install 1.98.1-x86_64-pc-windows-msvc --profile minimal }
-          Invoke-NianNative { rustup.exe override set 1.98.1 }
+          Invoke-NianNative { rustup.exe toolchain install 1.99.0-x86_64-pc-windows-msvc --profile minimal }
+          Invoke-NianNative { rustup.exe override set 1.99.0 }
           Invoke-NianNative { cargo.exe install tauri-cli --version 2.11.4 --locked }
 
       - name: Install pinned Node.js
@@ -836,8 +836,8 @@ jobs:
           curl --fail --silent --show-error --location --output "/tmp/${node_archive}" "https://nodejs.org/dist/v${node_version}/${node_archive}"
           echo "c6ecd8efc1c1d395265891675319da7a7b3785c6be174bd78933cf4f057624d1  /tmp/${node_archive}" | sha256sum --check --strict -
           sudo tar --extract --xz --file "/tmp/${node_archive}" --directory /usr/local --strip-components=1
-          rustup toolchain install 1.98.1 --profile minimal
-          rustup override set 1.98.1
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup override set 1.99.0
 
       - name: Assemble one public multi-platform release
         env:

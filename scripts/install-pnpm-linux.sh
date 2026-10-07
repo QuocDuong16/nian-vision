@@ -2,15 +2,15 @@
 set -Eeuo pipefail
 
 # Install the checksum-verified standalone pnpm executable.
-version="12.7.0"
+version="12.9.1"
 case "$(uname -m)" in
   x86_64)
     arch="x64"
-    checksum="68190c7d289efecd66ff088c93b9c5ec361989e8194239e004bd905403d3d3e5"
+    checksum="b4f58449ac02d9d24023ac89e17e05e8331f8ddc12ca1f489cf231bc2bb2bce1"
     ;;
   aarch64)
     arch="arm64"
-    checksum="db39a3fc7969dcf3398ebf2f2090c62ba732e5a9887b96147a97134a1a779088"
+    checksum="468294b77633d29889c6e4a79cefb1277eba30cd62e7d6a754218cb85a1d730d"
     ;;
   *) echo "Unsupported Linux architecture: $(uname -m)" >&2; exit 1 ;;
 esac

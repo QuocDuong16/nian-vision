@@ -51,6 +51,13 @@
       "enabled": false
     },
     {
+      "description": "Keep the Node.js engine requirement manual.",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["node"],
+      "matchDepTypes": ["engines"],
+      "enabled": false
+    },
+    {
       "description": "Keep Tauri Rust crates together.",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["/^tauri(-|$)/"],

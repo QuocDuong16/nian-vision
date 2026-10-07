@@ -3349,7 +3349,7 @@ fn tray_projection(statuses: &[RecordingStatus], desired_cameras: &[CameraId]) -
     let runtime_only_active: Vec<_> = statuses
         .iter()
         .filter(|status| {
-            status.state.is_active() && !status.camera_id.as_deref().is_some_and(&is_desired)
+            status.state.is_active() && !status.camera_id.as_deref().is_some_and(is_desired)
         })
         .collect();
 

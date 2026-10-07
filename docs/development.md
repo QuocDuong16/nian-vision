@@ -4,9 +4,9 @@
 
 | Tool | Version | Managed by |
 |---|---|---|
-| Rust | 1.98.1 (pinned) | rustup via `rust-toolchain.toml`; mise via `mise.toml` |
+| Rust | 1.99.0 (pinned) | rustup via `rust-toolchain.toml`; mise via `mise.toml` |
 | Node | 26.9.0 (exact) | mise (`mise.toml` and `mise.lock`); same version pinned in CI |
-| pnpm | 12.7.0 | mise (`mise.toml` and `mise.lock`); standalone binary in CI |
+| pnpm | 12.9.1 | mise (`mise.toml` and `mise.lock`); standalone binary in CI |
 | FFmpeg | 8.x runtime (ABI 62) | system packages or installer |
 
 Linux build of the desktop shell additionally needs WebKit2GTK/GTK dev
@@ -18,7 +18,7 @@ them.
 
 ```bash
 mise trust                   # trust the local mise.toml once
-mise install --locked rust node pnpm  # install only this repo's pinned tools
+make toolchain-install         # install the pinned Rust, Node, pnpm, and Cargo tools
 pnpm install                 # frontend dependencies
 scripts/setup-ffmpeg-linux.sh  # only if FFmpeg -dev packages are absent
 cargo build                  # workspace (default members)
@@ -44,6 +44,10 @@ pnpm --filter nian-ui typecheck
 pnpm --filter nian-ui test
 pnpm --filter nian-ui build
 ```
+
+The root `Makefile` is the short interface for common checks. Run `make help`
+to list targets; `make quality-check` mirrors the Rust and UI gates from CI,
+while `make audit` and `make outdated` inspect Rust and pnpm dependencies.
 
 Run the desktop shell (requires a display):
 

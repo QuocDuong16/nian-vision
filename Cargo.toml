@@ -41,7 +41,7 @@ default-members = [
 [workspace.package]
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.98.1"
+rust-version = "1.99.0"
 authors = ["Nian Vision contributors"]
 license = "LicenseRef-Proprietary"
 
@@ -55,18 +55,20 @@ todo = "warn"
 unimplemented = "warn"
 
 [workspace.dependencies]
-nian-application = { path = "crates/nian-application" }
-nian-domain = { path = "crates/nian-domain" }
-nian-ffmpeg-sys = { path = "crates/nian-ffmpeg-sys" }
-nian-ipc = { path = "crates/nian-ipc" }
-nian-index = { path = "crates/nian-index" }
-nian-media = { path = "crates/nian-media" }
-nian-media-ffmpeg = { path = "crates/nian-media-ffmpeg" }
-nian-onvif = { path = "crates/nian-onvif" }
-nian-platform-windows = { path = "crates/nian-platform-windows" }
-nian-recorder = { path = "crates/nian-recorder" }
-nian-settings = { path = "crates/nian-settings" }
-nian-storage = { path = "crates/nian-storage" }
+# Workspace crates currently share major version 1; keep these ranges aligned
+# with workspace.package.version so inherited path dependencies have a real specifier.
+nian-application = { path = "crates/nian-application", version = "1" }
+nian-domain = { path = "crates/nian-domain", version = "1" }
+nian-ffmpeg-sys = { path = "crates/nian-ffmpeg-sys", version = "1" }
+nian-ipc = { path = "crates/nian-ipc", version = "1" }
+nian-index = { path = "crates/nian-index", version = "1" }
+nian-media = { path = "crates/nian-media", version = "1" }
+nian-media-ffmpeg = { path = "crates/nian-media-ffmpeg", version = "1" }
+nian-onvif = { path = "crates/nian-onvif", version = "1" }
+nian-platform-windows = { path = "crates/nian-platform-windows", version = "1" }
+nian-recorder = { path = "crates/nian-recorder", version = "1" }
+nian-settings = { path = "crates/nian-settings", version = "1" }
+nian-storage = { path = "crates/nian-storage", version = "1" }
 
 keyring = { version = "=4.1.6", default-features = true }
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }

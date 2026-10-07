@@ -2492,7 +2492,7 @@ mod tests {
             }
             if self
                 .scripted_pull_failures
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                     value.checked_sub(1)
                 })
                 .is_ok()
@@ -2501,7 +2501,7 @@ mod tests {
             }
             if self
                 .scripted_pull_successes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                     value.checked_sub(1)
                 })
                 .is_ok()

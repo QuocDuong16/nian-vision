@@ -202,7 +202,7 @@ test("Windows release workflow routes required native tools through one fail-clo
   for (const tool of ["git.exe", "rustup.exe", "rustc.exe", "pnpm.exe", "cargo.exe", "node.exe"]) {
     assert.ok(workflow.includes(`Invoke-NianNative { ${tool}`), `workflow does not route ${tool} through fail-closed helper`);
   }
-  assert.match(workflow, /pnpm-win32-x64-12\.7\.0\.zip/);
+assert.match(workflow, /pnpm-win32-x64-12\.9\.1\.zip/);
   assert.match(workflow, /40b9a24d55c7e839aa5fc8e814e995a1eb1778fc65f2f19cfa1c6f573a926944/);
   assert.match(workflow, /Join-Path \$pnpmRoot 'pnpm\.exe'/);
   assert.equal(/corepack/i.test(workflow), false);
@@ -228,7 +228,7 @@ test("Windows release workflow routes required native tools through one fail-clo
 test("Windows build provisions and preflights pinned Rust quality components before expensive work", () => {
   const windows = workflow.slice(workflow.indexOf("  build-windows:"), workflow.indexOf("  sign-windows:"));
   const signing = workflow.slice(workflow.indexOf("  sign-windows:"), workflow.indexOf("  verify-release:"));
-  const rustInstallAt = windows.indexOf("- name: Install pinned Rust 1.98.1 MSVC toolchain");
+  const rustInstallAt = windows.indexOf("- name: Install pinned Rust 1.99.0 MSVC toolchain");
   const frontendInstallAt = windows.indexOf("- name: Install frontend dependencies");
   const ffmpegBuildAt = windows.indexOf("- name: Build pinned FFmpeg 8.0.3 Windows MSVC runtime");
   const rustQualityAt = windows.indexOf("- name: Run remaining Windows Rust quality and release worker build");
@@ -238,9 +238,9 @@ test("Windows build provisions and preflights pinned Rust quality components bef
   );
   assert.match(
     windows,
-    /Invoke-NianNative \{ rustup\.exe toolchain install 1\.98\.1-x86_64-pc-windows-msvc --profile minimal --component rustfmt --component clippy \}/,
+    /Invoke-NianNative \{ rustup\.exe toolchain install 1\.99\.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt --component clippy \}/,
   );
-  assert.match(windows, /Invoke-NianNative \{ rustup\.exe override set 1\.98\.1 \}/);
+  assert.match(windows, /Invoke-NianNative \{ rustup\.exe override set 1\.99\.0 \}/);
   for (const command of [
     "rustc.exe --version",
     "cargo.exe --version",

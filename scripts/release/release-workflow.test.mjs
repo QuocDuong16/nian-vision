@@ -58,10 +58,10 @@ test("pnpm is installed standalone in both CI systems without Corepack", () => {
   const mise = readNormalizedText(new URL("../../mise.toml", import.meta.url));
   const packageJson = JSON.parse(readNormalizedText(new URL("../../package.json", import.meta.url)));
   assert.equal(Object.hasOwn(packageJson, "packageManager"), false);
-  assert.match(mise, /pnpm = "12\.7\.0"/);
+  assert.match(mise, /pnpm = "12\.9\.1"/);
   assert.match(quality, /bash scripts\/install-pnpm-linux\.sh/);
   assert.match(workflow, /bash scripts\/install-pnpm-linux\.sh/);
-  assert.match(workflow, /pnpm-win32-x64-12\.7\.0\.zip/);
+  assert.match(workflow, /pnpm-win32-x64-12\.9\.1\.zip/);
   assert.match(installer, /sha256sum --check --strict/);
   for (const source of [quality, workflow, installer]) {
     assert.doesNotMatch(source, /\bcorepack\b|\bnpm\s+(?:install|exec)\b/i);
