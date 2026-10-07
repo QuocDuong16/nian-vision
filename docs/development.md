@@ -48,6 +48,8 @@ pnpm --filter nian-ui build
 The root `Makefile` is the short interface for common checks. Run `make help`
 to list targets; `make quality-check` mirrors the Rust and UI gates from CI,
 while `make audit` and `make outdated` inspect Rust and pnpm dependencies.
+The outdated report scans Rust workspace root dependencies and every pnpm
+workspace package, including `ui/`.
 
 Run the desktop shell (requires a display):
 

@@ -34,15 +34,9 @@ highlight = "all"
 version = 2
 yanked = "deny"
 ignore = [
-  # The unic-* family (incl. proc-macro-error, RUSTSEC-2024-0370) is
-  # unmaintained; pulled in by urlpattern via tauri-utils and by Tauri's
-  # macro stack. No vulnerabilities, no fixed versions.
+  # proc-macro-error is unmaintained and remains in Tauri's GTK macro stack.
+  # No vulnerabilities, no fixed version is currently available.
   "RUSTSEC-2024-0370",
-  "RUSTSEC-2025-0075",
-  "RUSTSEC-2025-0080",
-  "RUSTSEC-2025-0081",
-  "RUSTSEC-2025-0098",
-  "RUSTSEC-2025-0100",
 ]
 
 [sources]
