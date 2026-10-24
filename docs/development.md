@@ -2,12 +2,12 @@
 
 ## Prerequisites
 
-| Tool | Version | Managed by |
-|---|---|---|
-| Rust | 1.99.0 (pinned) | rustup via `rust-toolchain.toml`; mise via `mise.toml` |
-| Node | 26.9.0 (exact) | mise (`mise.toml` and `mise.lock`); same version pinned in CI |
-| pnpm | 12.9.1 | mise (`mise.toml` and `mise.lock`); standalone binary in CI |
-| FFmpeg | 8.x runtime (ABI 62) | system packages or installer |
+| Tool | Managed by |
+|---|---|
+| Rust | `mise.toml` (authoritative), mirrored by `rust-toolchain.toml` and `Cargo.toml` `rust-version` |
+| Node | `mise.toml` and `mise.lock`; CI resolves the same pin |
+| pnpm | `mise.toml` and `mise.lock`; standalone binary in CI |
+| FFmpeg | 8.x runtime (ABI 62), system packages or installer |
 
 Linux build of the desktop shell additionally needs WebKit2GTK/GTK dev
 packages (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, ...) — the standard Tauri
@@ -25,9 +25,13 @@ cargo build                  # workspace (default members)
 ```
 
 pnpm uses standalone release binaries, including macOS x64.
-Keep `mise.toml`, `rust-toolchain.toml`, CI/release workflows and the pinned
-standalone archive checksums consistent when updating versions. Regenerate
-`mise.lock` with `mise lock --platform linux-arm64,linux-arm64-musl,linux-x64,linux-x64-musl,macos-arm64,macos-x64,windows-x64`.
+`mise.toml` is the authoritative toolchain pin and `mise.lock` records the
+verified per-platform artifacts. `make toolchain-check` verifies the active
+tools plus the `rust-toolchain.toml` and `Cargo.toml` mirrors. CI and release
+workflows resolve versions and archive checksums through
+`scripts/toolchain-pins.sh` and `scripts/toolchain-pins.ps1`, so do not
+duplicate version literals in workflows or scripts.
+Regenerate `mise.lock` with `mise lock --platform linux-arm64,linux-arm64-musl,linux-x64,linux-x64-musl,macos-arm64,macos-x64,windows-x64`.
 Do not add a `packageManager` field to the root `package.json`.
 
 If FFmpeg libraries cannot be found, see `docs/ffmpeg.md` for
@@ -39,6 +43,8 @@ If FFmpeg libraries cannot be found, see `docs/ffmpeg.md` for
 cargo fmt --all                       # format Rust
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace
+cargo machete                         # unused dependency check (`make rust-machete`)
+cargo llvm-cov --workspace --all-features --html  # coverage report (`make coverage`)
 pnpm --filter nian-ui lint
 pnpm --filter nian-ui typecheck
 pnpm --filter nian-ui test
@@ -49,7 +55,9 @@ The root `Makefile` is the short interface for common checks. Run `make help`
 to list targets; `make quality-check` mirrors the Rust and UI gates from CI,
 while `make audit` and `make outdated` inspect Rust and pnpm dependencies.
 The outdated report scans Rust workspace root dependencies and every pnpm
-workspace package, including `ui/`.
+workspace package, including `ui/`. `make rust-machete` and `make coverage`
+use the mise-pinned `cargo-machete` and `cargo-llvm-cov`; Forgejo CI runs
+`cargo machete` alongside `cargo deny check`.
 
 Run the desktop shell (requires a display):
 

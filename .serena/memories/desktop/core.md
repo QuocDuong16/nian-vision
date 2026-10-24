@@ -4,4 +4,5 @@
 - Keep UI DTOs safe: no passwords, resolved RTSP URLs, native paths, credential-store authority, or FFmpeg types cross into React.
 - The host starts/coordinates `nian-media-worker` through application services and bounded NDJSON IPC; it does not link FFmpeg.
 - Playback/live loopback transport ownership and lifecycle cleanup stay native. Suspend/hide/update/quit paths must settle workers/sessions before restart or shutdown.
+- `tauri-plugin-updater` is built without its legacy `zip` feature. Release artifacts are plain Tauri v2 `.AppImage` and NSIS `.exe`; re-enabling `zip` only for Tauri v1 `.zip`/`.tar.gz` bundles also reintroduces the vulnerable `zip` crate.
 - See `docs/architecture.md` and ADRs 0003, 0008, 0010, 0011 for process isolation, credential ownership, lifecycle, and distribution decisions.

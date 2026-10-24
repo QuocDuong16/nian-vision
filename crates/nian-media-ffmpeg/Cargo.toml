@@ -11,8 +11,6 @@ license.workspace = true
 nian-domain = { workspace = true }
 nian-ffmpeg-sys = { workspace = true }
 nian-media = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 nian-ffmpeg-sys = { workspace = true }

@@ -7,7 +7,7 @@ Final source candidate: `1.0.0` / `v1.0.0`, based on immutable RC61 plus a separ
 ## Pre-tag authority
 
 - [ ] Final version commit is on the authoritative Forgejo default branch; every version surface is `1.0.0` and Cargo.lock is synchronized.
-- [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build.
+- [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, cargo-machete, frontend lint/typecheck/Vitest/build.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
 - [ ] Mirror configuration is known to propagate tags and `RELEASE_MIRROR_ACTOR` is configured.

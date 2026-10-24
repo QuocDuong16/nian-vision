@@ -13,6 +13,10 @@ test-hooks = []
 [lints]
 workspace = true
 
+[package.metadata.cargo-machete]
+# Package name md-5 exposes the md5 library target used in client.rs.
+ignored = ["md-5"]
+
 [dependencies]
 base64.workspace = true
 chrono.workspace = true

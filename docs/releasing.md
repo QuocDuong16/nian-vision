@@ -164,9 +164,10 @@ jobs, not public release authority.
 
 ### Linux build and signing
 
-`build-linux` runs on `ubuntu-24.04` with the actual compilation inside
-`rust:1.99.0-bookworm`, preserving the accepted Debian 12/glibc 2.36 baseline. It
-pins Node 26.9.0 and standalone pnpm 12.9.1 and preserves the existing Linux M8 gates: exact
+`build-linux` runs on `ubuntu-24.04` with the actual compilation inside the
+mise-pinned Rust bookworm container, preserving the accepted Debian 12/glibc
+2.36 baseline. It resolves Node and standalone pnpm from `mise.toml`/`mise.lock`
+and preserves the existing Linux M8 gates: exact
 source/tag/version, SHA-256-pinned FFmpeg 8.0.3, LGPL/shared checks, media fixtures,
 Rust fmt/clippy/workspace tests, clean staged worker smoke and actual AppImage
 worker/desktop smoke. It produces an unsigned AppImage input and the staged runtime
@@ -182,7 +183,8 @@ signing runner does not run pnpm or Vite.
 ### Windows build and signing
 
 `build-windows` runs on the explicit GitHub-hosted `windows-2022` runner and targets
-`x86_64-pc-windows-msvc`. Node 26.9.0, standalone pnpm 12.9.1 and Rust 1.99.0 are pinned. The
+`x86_64-pc-windows-msvc`. Node, standalone pnpm and Rust are resolved from
+`mise.toml`/`mise.lock`. The
 job builds FFmpeg 8.0.3 from the same source archive/SHA used by Linux with
 `--toolchain=msvc`, `--enable-shared`, `--disable-static`, `--disable-gpl` and
 `--disable-nonfree`. Required MSVC import libraries are emitted by the FFmpeg MSVC
@@ -323,6 +325,12 @@ misconfiguration before publication; it does not replace runtime verification.
 Windows Authenticode is an independent publisher-identity layer and does not replace
 the Tauri updater signature. `recording_enabled` is never cleared merely because an
 update installs.
+
+The updater plugin is built without its legacy `zip` feature. That feature only
+handles Tauri v1 `.zip`/`.tar.gz` updater bundles; this project publishes plain
+Tauri v2 `.AppImage` and NSIS `.exe` artifacts, and enabling it would pull an
+unpatched `zip` crate into the dependency graph. Keep published updater artifacts
+unzipped when changing packaging.
 
 ## Platform status
 

@@ -7,7 +7,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_DENY_VERSION: "0.20.2"
 
 jobs:
   rust:
@@ -15,12 +14,12 @@ jobs:
     runs-on: docker
     timeout-minutes: 60
     container:
-      image: rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6
+      image: rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8
 
     steps:
-      # The runner container ships without Node.js, which node-based actions
-      # (checkout included) require. Install a pinned runtime first — same
-      # pattern as nian-pass.
+      # actions/checkout is Node-based, so a pinned runtime must exist before
+      # the repository is available. The post-checkout step verifies it
+      # against mise.toml.
       - name: Install Node.js runtime for actions
         run: |
           set -Eeuo pipefail
@@ -51,6 +50,17 @@ jobs:
         uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      - name: Provision mise-pinned toolchain
+        run: |
+          set -Eeuo pipefail
+          rust_version="$(scripts/toolchain-pins.sh rust)"
+          node_version="$(scripts/toolchain-pins.sh node)"
+          rustup toolchain install "$rust_version" --profile minimal --component rustfmt --component clippy
+          rustup override set "$rust_version"
+          test "$(node --version)" = "v${node_version}"
+          rustc --version
+          node --version
 
       - name: Install desktop build prerequisites
         run: |
@@ -97,22 +107,34 @@ jobs:
           export LD_LIBRARY_PATH="$PWD/ffmpeg-dist/lib"
           cargo test --workspace
 
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
+      - name: Install pinned cargo-deny and cargo-machete
+        run: |
+          set -Eeuo pipefail
+          cargo install cargo-deny --locked --version "$(scripts/toolchain-pins.sh cargo-deny)"
+          cargo install cargo-machete --locked --version "$(scripts/toolchain-pins.sh cargo-machete)"
 
       - name: cargo deny check
         run: cargo deny check
+
+      - name: cargo machete
+        run: cargo machete
 
   frontend:
     name: Frontend (lint, typecheck, test, build)
     runs-on: docker
     timeout-minutes: 30
     container:
+      # Bootstrap image only; the job verifies Node against mise.toml.
       image: node:26.9.0-bookworm
 
     steps:
       - name: Check out repository
         uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify mise-pinned Node.js
+        run: |
+          set -Eeuo pipefail
+          test "$(node --version)" = "v$(scripts/toolchain-pins.sh node)"
 
       - name: Install verified standalone pnpm
         run: |

@@ -11,21 +11,23 @@ Docker-based jobs.
 
 ## Decision
 
-* **Rust**: pinned to `1.99.0` via
-  `rust-toolchain.toml` (with `rustfmt` + `clippy` components) — this file
-  is authoritative for any direct cargo invocation. The project-level
-  `mise.toml` pins the same version for mise-managed machines.
-* **Node and pnpm**: exact versions in `mise.toml` (currently `26.9.0` and
-  `12.9.1`), matching CI. `mise.lock` records resolved artifacts for supported
-  platforms.
+* **Rust**: `mise.toml` is authoritative. `rust-toolchain.toml` mirrors the
+  pinned channel (with `rustfmt` + `clippy`) for direct cargo/rustup
+  invocations, and `Cargo.toml` `rust-version` mirrors the same pin.
+* **Node and pnpm**: exact versions in `mise.toml`; `mise.lock` records
+  resolved artifacts for supported platforms. CI and release workflows resolve
+  versions and archive checksums from these files through
+  `scripts/toolchain-pins.sh` and `scripts/toolchain-pins.ps1` instead of
+  duplicating literals.
   pnpm uses its native GitHub release binaries (including macOS x64).
   Do not add a `packageManager` field that makes pnpm switch versions.
 * **Dependencies**: exact pins (`=x.y.z`) in `Cargo.toml` manifests for all
   direct dependencies, plus committed `Cargo.lock` and pnpm lockfile. No
   floating ranges, no `@latest` anywhere in automation.
-* **Cargo checks**: `cargo-audit`, `cargo-outdated`, and `cargo-deny` are
-  pinned in `mise.toml` and resolved by `mise.lock`; use the root Makefile for
-  the local quality, audit, and outdated-dependency commands.
+* **Cargo checks**: `cargo-audit`, `cargo-deny`, `cargo-llvm-cov`,
+  `cargo-machete`, and `cargo-outdated` are pinned in `mise.toml` and resolved
+  by `mise.lock`; use the root Makefile for the local quality, audit, coverage,
+  and outdated-dependency commands.
 * **FFmpeg**: version policy in ADR-0002; headers vendored with sha256
   verification.
 * Edition 2024 across the workspace; `resolver = "3"`.
@@ -34,5 +36,5 @@ Docker-based jobs.
 
 * `rustup` and mise may each hold a copy of the toolchain on dev machines;
   both resolve to the same version so behavior is identical.
-* CI installs the pinned toolchain explicitly rather than using whatever the
-  runner image ships.
+* CI installs the pinned toolchain from the `mise.toml` pin rather than using
+  whatever the runner image ships.

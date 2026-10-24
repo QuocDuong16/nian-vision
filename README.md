@@ -167,9 +167,8 @@ independent multi-camera live view, and M12 optional ONVIF PTZ control).
 
 ## Requirements
 
-* Rust 1.99.0 (pinned in `rust-toolchain.toml`; mise users get it from
-  `mise.toml` / `mise.lock`)
-* Node 26.9.0 + standalone pnpm 12.9.1 (exact mise pins, mirrored by CI)
+* Rust, Node, and pnpm are pinned in `mise.toml` (authoritative) and
+  `mise.lock`; `rust-toolchain.toml` mirrors the Rust pin for rustup users.
 * FFmpeg 8.x runtime libraries (ABI 62). Development packages are optional —
   see `docs/ffmpeg.md` for the no-`-dev` setup (`scripts/setup-ffmpeg-linux.sh`).
 * Linux desktop shell builds additionally need the Tauri Linux prerequisites
@@ -179,7 +178,7 @@ independent multi-camera live view, and M12 optional ONVIF PTZ control).
 
 ```bash
 mise trust
-mise install --locked rust node pnpm
+make toolchain-install
 pnpm install
 scripts/setup-ffmpeg-linux.sh   # if FFmpeg -dev packages are absent
 cargo test --workspace

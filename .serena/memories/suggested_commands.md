@@ -1,7 +1,7 @@
 # Common development commands
 
 - First setup: `mise trust`; `make toolchain-install`; `make deps-install`; on Linux install FFmpeg development libraries with `scripts/setup-ffmpeg-linux.sh` only if missing; `make build`.
-- Root Makefile: `make help`; `make quality-check` runs the CI Rust/UI gates; `make audit` scans Cargo and production pnpm dependencies; `make outdated` checks direct Rust workspace dependencies and every pnpm workspace package recursively.
+- Root Makefile: `make help`; `make toolchain-check` verifies the active tools against `mise.toml`; `make quality-check` runs the CI Rust/UI gates; `make audit` scans Cargo and production pnpm dependencies; `make outdated` checks direct Rust workspace dependencies and every pnpm workspace package recursively; `make rust-machete` checks unused Rust dependencies; `make coverage` generates an HTML coverage report.
 - Rust: `make format`, `make format-check`, `make rust-check`, `make clippy`, `make rust-test`; use direct Cargo commands for narrower package targets.
 - UI: `pnpm --filter nian-ui dev|build|lint|typecheck|test`. Root aliases `pnpm dev|build|lint|typecheck|test` delegate to these.
 - Desktop (requires display): `cargo run -p nian-desktop`; start UI dev server or build `ui/dist` first.

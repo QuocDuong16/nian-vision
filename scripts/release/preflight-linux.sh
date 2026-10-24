@@ -20,16 +20,20 @@ done
 rust_version="$(rustc --version)"
 node_version="$(node --version)"
 pnpm_version="$(pnpm --version)"
-[[ "$rust_version" == rustc\ 1.99.0* ]] || {
-  echo "release Rust toolchain mismatch: $rust_version" >&2
+pins="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/toolchain-pins.sh"
+expected_rust="$("$pins" rust)"
+expected_node="$("$pins" node)"
+expected_pnpm="$("$pins" pnpm)"
+[[ "$rust_version" == "rustc $expected_rust "* ]] || {
+  echo "release Rust toolchain mismatch: expected $expected_rust, got $rust_version" >&2
   exit 1
 }
-[[ "$node_version" == "v26.9.0" ]] || {
-  echo "release Node.js mismatch: $node_version" >&2
+[[ "$node_version" == "v$expected_node" ]] || {
+  echo "release Node.js mismatch: expected v$expected_node, got $node_version" >&2
   exit 1
 }
-[[ "$pnpm_version" == "12.9.1" ]] || {
-  echo "release pnpm mismatch: $pnpm_version" >&2
+[[ "$pnpm_version" == "$expected_pnpm" ]] || {
+  echo "release pnpm mismatch: expected $expected_pnpm, got $pnpm_version" >&2
   exit 1
 }
 

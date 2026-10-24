@@ -8,6 +8,7 @@ const githubWorkflowPath = new URL("../../.github/workflows/release.yml", import
 const forgejoReleasePath = new URL("../../.forgejo/workflows/release.yml", import.meta.url);
 const forgejoQualityPath = new URL("../../.forgejo/workflows/quality.yml", import.meta.url);
 const workflow = readNormalizedText(githubWorkflowPath);
+const mise = readNormalizedText(new URL("../../mise.toml", import.meta.url));
 const viteConfig = readNormalizedText(new URL("../../ui/vite.config.ts", import.meta.url));
 const linuxAppImagePrepare = readNormalizedText(new URL("./prepare-linux-appimage.sh", import.meta.url));
 const linuxAppImageNormalize = readNormalizedText(new URL("./normalize-appimage-ffmpeg.sh", import.meta.url));
@@ -52,16 +53,32 @@ test("Forgejo production release workflow is removed while normal quality CI rem
   assert.match(quality, /cargo test --workspace/);
 });
 
+function misePin(tool) {
+  const escaped = tool.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`^\\s*"?${escaped}"?\\s*=\\s*"([^"]+)"`);
+  let inTools = false;
+  for (const line of mise.split("\n")) {
+    if (/^\s*\[/.test(line)) {
+      inTools = /^\s*\[tools\]\s*$/.test(line);
+      continue;
+    }
+    if (!inTools) continue;
+    const match = pattern.exec(line);
+    if (match) return match[1];
+  }
+  assert.fail(`missing ${tool} pin in mise.toml`);
+}
+
 test("pnpm is installed standalone in both CI systems without Corepack", () => {
   const quality = readNormalizedText(forgejoQualityPath);
   const installer = readNormalizedText(new URL("../install-pnpm-linux.sh", import.meta.url));
-  const mise = readNormalizedText(new URL("../../mise.toml", import.meta.url));
   const packageJson = JSON.parse(readNormalizedText(new URL("../../package.json", import.meta.url)));
   assert.equal(Object.hasOwn(packageJson, "packageManager"), false);
-  assert.match(mise, /pnpm = "12\.9\.1"/);
+  assert.ok(misePin("pnpm"));
   assert.match(quality, /bash scripts\/install-pnpm-linux\.sh/);
   assert.match(workflow, /bash scripts\/install-pnpm-linux\.sh/);
-  assert.match(workflow, /pnpm-win32-x64-12\.9\.1\.zip/);
+  assert.match(workflow, /Get-ToolchainPin "pnpm"/);
+  assert.match(installer, /scripts\/toolchain-pins\.sh/);
   assert.match(installer, /sha256sum --check --strict/);
   for (const source of [quality, workflow, installer]) {
     assert.doesNotMatch(source, /\bcorepack\b|\bnpm\s+(?:install|exec)\b/i);
@@ -186,7 +203,8 @@ test("release trust contract proves mirrored tag version SHA actor and default-b
 
 test("Linux container build explicitly executes run steps with Bash", () => {
   const linux = jobBody("build-linux");
-  assert.match(linux, /container:\n      image: rust:1\.98\.1-bookworm/);
+  const rustVersion = misePin("rust").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  assert.match(linux, new RegExp(`container:\\n      image: rust:${rustVersion}-bookworm`));
   assert.match(linux, /defaults:\n      run:\n        shell: bash/);
   assert.match(linux, /set -Eeuo pipefail/);
   assert.match(linux, /\[\[/);
@@ -200,7 +218,8 @@ test("Linux release image explicitly provisions missing rustfmt and clippy befor
   const ffmpegAt = linux.indexOf("- name: Build pinned FFmpeg 8.0.3 Linux runtime");
   assert.ok(provisionAt >= 0 && provisionAt < frontendAt && provisionAt < ffmpegAt);
   const provision = stepBody("build-linux", "Provision Rust quality components");
-  assert.match(provision, /rustup component add rustfmt clippy/);
+  assert.match(provision, /scripts\/toolchain-pins\.sh rust/);
+  assert.match(provision, /rustup toolchain install "\$rust_version" --profile minimal --component rustfmt --component clippy/);
   assert.match(provision, /rustc --version/);
   assert.match(provision, /cargo --version/);
   assert.match(provision, /cargo fmt --version/);

@@ -3,7 +3,7 @@
   "extends": ["config:recommended"],
   "pinDigests": true,
   "timezone": "Asia/Ho_Chi_Minh",
-  "enabledManagers": ["cargo", "npm", "github-actions"],
+  "enabledManagers": ["cargo", "npm", "github-actions", "mise"],
   "labels": ["dependencies"],
   "dependencyDashboard": true,
   "dependencyDashboardOSVVulnerabilitySummary": "unresolved",
@@ -45,8 +45,13 @@
       "schedule": ["* * * * 6"]
     },
     {
-      "description": "Keep Node and Rust toolchain pins manual until their checksums and release contracts can move together.",
-      "matchManagers": ["github-actions"],
+      "description": "Keep mise-managed toolchain pins together; mise.toml is authoritative.",
+      "matchManagers": ["mise"],
+      "groupName": "mise toolchain"
+    },
+    {
+      "description": "Keep Node and Rust toolchain pins manual until container images and release contracts can move together.",
+      "matchManagers": ["github-actions", "mise"],
       "matchPackageNames": ["node", "rust"],
       "enabled": false
     },

@@ -41,7 +41,7 @@ default-members = [
 [workspace.package]
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.99.0"
+rust-version = "1.99.1"
 authors = ["Nian Vision contributors"]
 license = "LicenseRef-Proprietary"
 
@@ -100,7 +100,10 @@ tauri-plugin-dialog = "=2.8.1"
 tauri-plugin-notification = "=2.5.1"
 notify-rust = "=4.18.0"
 tauri-plugin-single-instance = "=2.5.2"
-tauri-plugin-updater = "=2.13.1"
+# The zip feature only supports Tauri v1 .zip/.tar.gz updater bundles.
+# This app publishes plain Tauri v2 AppImage and NSIS .exe artifacts, and the
+# feature pulls a vulnerable zip crate, so enable only the transports we use.
+tauri-plugin-updater = { version = "=2.13.1", default-features = false, features = ["rustls-tls", "system-proxy"] }
 base64 = "=0.22.1"
 minisign-verify = "=0.2.5"
 fs2 = "=0.4.3"
