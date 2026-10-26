@@ -15,7 +15,7 @@
     "@player.style/sutro": "0.2.1",
     "@tauri-apps/api": "2.12.4",
     "@tauri-apps/plugin-dialog": "2.8.3",
-    "media-chrome": "4.19.3",
+    "media-chrome": "4.19.4",
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },
