@@ -44,15 +44,16 @@ struct PerformanceSampler {
 }
 
 impl PerformanceSampler {
-    fn new() -> Self {
-        let mut system = System::new_all();
+    fn new() -> Result<Self, &'static str> {
+        let mut system = System::new_all().map_err(|_| "performance sampler unavailable")?;
         system.refresh_all();
-        Self {
+        Ok(Self {
             system,
-            networks: Networks::new_with_refreshed_list(),
+            networks: Networks::new_with_refreshed_list()
+                .map_err(|_| "performance sampler unavailable")?,
             last_sample: Instant::now(),
             samples: 0,
-        }
+        })
     }
 
     fn sample(&mut self) -> PerformanceSnapshotDto {
@@ -214,10 +215,15 @@ fn process_tree(system: &System, root: Pid) -> HashSet<Pid> {
     tree
 }
 
-static PERFORMANCE_SAMPLER: OnceLock<Mutex<PerformanceSampler>> = OnceLock::new();
+static PERFORMANCE_SAMPLER: OnceLock<Result<Mutex<PerformanceSampler>, &'static str>> =
+    OnceLock::new();
 
 pub(crate) fn performance_snapshot() -> Result<PerformanceSnapshotDto, &'static str> {
-    let sampler = PERFORMANCE_SAMPLER.get_or_init(|| Mutex::new(PerformanceSampler::new()));
+    let sampler = PERFORMANCE_SAMPLER.get_or_init(|| PerformanceSampler::new().map(Mutex::new));
+    let sampler = match sampler {
+        Ok(sampler) => sampler,
+        Err(error) => return Err(*error),
+    };
     let mut sampler = sampler
         .lock()
         .map_err(|_| "performance sampler unavailable")?;
@@ -229,15 +235,17 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn process_tree_always_contains_current_process() {
-        let system = System::new_all();
+        let system = System::new_all().expect("system information is available");
         let root = Pid::from_u32(std::process::id());
         assert!(process_tree(&system, root).contains(&root));
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn snapshot_breakdown_sums_to_reported_app_memory() {
-        let mut sampler = PerformanceSampler::new();
+        let mut sampler = PerformanceSampler::new().expect("performance sampler is available");
         let snapshot = sampler.sample();
         assert!(!snapshot.processes.is_empty());
         assert_eq!(
