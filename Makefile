@@ -11,7 +11,7 @@ WINDOWS_TARGET ?= x86_64-pc-windows-msvc
 	format format-check rust-check clippy windows-clippy rust-test rust-build rust-machete coverage \
 	ui-lint ui-typecheck ui-test ui-build ui-audit ui-outdated \
 	rust-audit deny-check rust-outdated audit outdated build test \
-	release-test release-version media-gate quality-check check
+	release-test release-version media-gate scripts-test quality-check check
 
 ##@ Getting started
 help: ## Show the documented Make targets
@@ -20,7 +20,7 @@ help: ## Show the documented Make targets
 ##@ Toolchain
 toolchain-install: ## Install the repository-pinned Rust, Node, pnpm, and Cargo tools
 	$(MISE) install --locked rust node pnpm \
-		cargo:cargo-audit cargo:cargo-deny cargo:cargo-llvm-cov cargo:cargo-machete cargo:cargo-outdated
+		cargo:cargo-audit cargo:cargo-deny cargo:cargo-llvm-cov cargo:cargo-machete
 
 toolchain-check: ## Verify active Rust, Node, pnpm, and Cargo tool versions against the mise pins
 	@set -eu; \
@@ -36,7 +36,7 @@ toolchain-check: ## Verify active Rust, Node, pnpm, and Cargo tool versions agai
 	esac; \
 	test "$$node_version" = "v$$expected_node" || { echo "Expected Node v$$expected_node from mise.toml, got: $$node_version" >&2; exit 1; }; \
 	test "$$pnpm_version" = "$$expected_pnpm" || { echo "Expected pnpm $$expected_pnpm from mise.toml, got: $$pnpm_version" >&2; exit 1; }; \
-	for tool in cargo-audit cargo-deny cargo-llvm-cov cargo-machete cargo-outdated; do \
+	for tool in cargo-audit cargo-deny cargo-llvm-cov cargo-machete; do \
 		expected="$$($(TOOLCHAIN_PINS) $$tool)"; \
 		actual="$$($(MISE) exec -- cargo $${tool#cargo-} --version 2>&1 | head -n 1)"; \
 		case "$$actual" in \
@@ -108,7 +108,7 @@ audit: ## Audit RustSec advisories and production UI dependencies
 	$(MAKE) ui-audit
 
 rust-outdated: ## List newer direct dependencies across Rust workspace members
-	$(MISE) exec -- cargo outdated --workspace --root-deps-only
+	CARGO="$(CARGO)" $(MISE) exec -- node scripts/run_cargo_outdated.mjs
 
 ui-outdated: ## List newer pnpm workspace dependencies
 	PNPM="$(PNPM)" $(MISE) exec -- node scripts/run_pnpm_outdated.mjs
@@ -135,9 +135,13 @@ release-version: ## Check synchronized application and release versions
 media-gate: ## Validate the packaged media runtime contract
 	$(PNPM) media:gate
 
+scripts-test: ## Run the tooling-script unit tests
+	$(MISE) exec -- $(PNPM) scripts:test
+
 ##@ Quality
 quality-check: ## Run the Rust and UI quality gates used by Forgejo CI
 	$(MAKE) toolchain-check
+	$(MAKE) scripts-test
 	$(MAKE) format-check
 	$(MAKE) rust-check
 	$(MAKE) windows-clippy

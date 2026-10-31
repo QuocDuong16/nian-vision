@@ -66,7 +66,7 @@ case "$field" in
   rust | node | pnpm)
     pin "$field"
     ;;
-  cargo-audit | cargo-deny | cargo-llvm-cov | cargo-machete | cargo-outdated)
+  cargo-audit | cargo-deny | cargo-llvm-cov | cargo-machete)
     pin "cargo:$field"
     ;;
   node-url-* | pnpm-url-*)

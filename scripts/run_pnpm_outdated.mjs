@@ -16,7 +16,9 @@ if (result.signal) {
   process.exit(1);
 }
 
-if (result.stderr) process.stderr.write(result.stderr);
+if (result.stderr) {
+  process.stderr.write(result.stderr);
+}
 
 let report;
 try {
@@ -46,15 +48,14 @@ if (!validReport) {
 
 const rows = Object.entries(report).map(([name, dependency]) => ({
   name,
-  workspace:
-    dependency.dependentPackages?.map(({ name: packageName }) => packageName).join(", ") || "root",
-  current: dependency.current,
-  wanted: dependency.wanted,
-  latest: dependency.latest,
+  current: dependency.current ?? "—",
+  wanted: dependency.wanted ?? "—",
+  latest: dependency.latest ?? "—",
+  workspace: dependency.dependentPackages?.map(({ name }) => name).join(", ") ?? "root",
 }));
 
 if (result.status !== 0 && !(result.status === 1 && rows.length > 0)) {
-  if (result.stdout) process.stdout.write(result.stdout);
+  process.stdout.write(result.stdout);
   process.exit(result.status ?? 1);
 }
 

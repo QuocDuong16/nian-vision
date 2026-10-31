@@ -52,10 +52,17 @@ pnpm --filter nian-ui build
 ```
 
 The root `Makefile` is the short interface for common checks. Run `make help`
-to list targets; `make quality-check` mirrors the Rust and UI gates from CI,
-while `make audit` and `make outdated` inspect Rust and pnpm dependencies.
-The outdated report scans Rust workspace root dependencies and every pnpm
-workspace package, including `ui/`. `make rust-machete` and `make coverage`
+to list targets; `make quality-check` mirrors the Rust and UI gates from CI and
+runs the tooling-script tests, while `make audit` and `make outdated` inspect
+Rust and pnpm dependencies.
+The outdated report resolves direct Rust dependencies through
+`cargo metadata` and the crates.io sparse index, so `[workspace.dependencies]`
+inheritance is included, and scans every pnpm workspace package, including
+`ui/`. Typecheck runs TypeScript 7 through the `@typescript/native` alias
+(`npm:typescript@7.0.2`), while the `typescript` name is aliased to
+`@typescript/typescript6@6.0.2` so `typescript-eslint` 8.x resolves the
+compiler its `<6.1.0` peer range requires; `tsc` is TS 7 and `tsc6` is the
+eslint-facing compiler. `make rust-machete` and `make coverage`
 use the mise-pinned `cargo-machete` and `cargo-llvm-cov`; Forgejo CI runs
 `cargo machete` alongside `cargo deny check`.
 

@@ -1,6 +1,7 @@
 # Toolchain and runtime
 
 - Rust workspace, edition 2024. `mise.toml` is the authoritative toolchain pin; `rust-toolchain.toml` and `Cargo.toml` `rust-version` mirror it. Node, pnpm, and the Cargo helper tools are pinned there too, with verified artifacts in `mise.lock`.
+- `cargo-outdated` is intentionally not pinned: it misses `[workspace.dependencies]` inheritance, so `make rust-outdated` runs `scripts/run_cargo_outdated.mjs` against `cargo metadata` and the crates.io sparse index instead.
 - CI and release scripts resolve versions and archive checksums through `scripts/toolchain-pins.sh` and `scripts/toolchain-pins.ps1`; do not duplicate toolchain version literals in workflows or scripts.
 - UI is React + TypeScript + Vite in `ui/`, pnpm workspace package name `nian-ui`.
 - Desktop shell uses Tauri 2. Media and storage are Rust crates.

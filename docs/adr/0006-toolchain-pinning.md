@@ -24,10 +24,13 @@ Docker-based jobs.
 * **Dependencies**: exact pins (`=x.y.z`) in `Cargo.toml` manifests for all
   direct dependencies, plus committed `Cargo.lock` and pnpm lockfile. No
   floating ranges, no `@latest` anywhere in automation.
-* **Cargo checks**: `cargo-audit`, `cargo-deny`, `cargo-llvm-cov`,
-  `cargo-machete`, and `cargo-outdated` are pinned in `mise.toml` and resolved
-  by `mise.lock`; use the root Makefile for the local quality, audit, coverage,
-  and outdated-dependency commands.
+* **Cargo checks**: `cargo-audit`, `cargo-deny`, `cargo-llvm-cov`, and
+  `cargo-machete` are pinned in `mise.toml` and resolved by `mise.lock`; use the
+  root Makefile for the local quality, audit, and coverage commands.
+  `cargo-outdated` is intentionally not pinned: it misses
+  `[workspace.dependencies]` inheritance, so `make rust-outdated` runs
+  `scripts/run_cargo_outdated.mjs` against `cargo metadata` and the crates.io
+  sparse index instead.
 * **FFmpeg**: version policy in ADR-0002; headers vendored with sha256
   verification.
 * Edition 2024 across the workspace; `resolver = "3"`.

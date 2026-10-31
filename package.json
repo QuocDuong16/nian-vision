@@ -13,6 +13,10 @@
     "test": "pnpm --filter nian-ui test",
     "media:gate": "node scripts/media-release-gate.mjs",
     "release:test": "node --test scripts/release/*.test.mjs",
-    "release:version": "node scripts/release/version-check.mjs"
+    "release:version": "node scripts/release/version-check.mjs",
+    "scripts:test": "node --test scripts/test/*.test.mjs"
+  },
+  "devDependencies": {
+    "smol-toml": "1.9.1"
   }
 }
