@@ -7,3 +7,4 @@
 - Distinguish authoritative from derived state: settings DB fails closed on corruption/future schema; recording/event catalogs may be quarantined and rebuilt from filesystem/protocol facts; SQLite rows never authorize inventing or deleting footage.
 - Recording safety is filesystem-first: canonical/path-safe identities, exclusive claims, no-replace publication, and conservative recovery. Missing/uninspectable evidence must not be treated as proof of absence.
 - Pin dependency versions exactly and keep lockfiles, toolchain pins, CI/release workflow pins, and docs aligned.
+- UI TypeScript uses two aliases: `typescript` stays on the TS 6 line for the typescript-eslint peer range, while `@typescript/native` is an alias to TypeScript 7 and must satisfy typescript-eslint's optional `@typescript/native` peer range; check both when bumping either package.

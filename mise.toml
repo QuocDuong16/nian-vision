@@ -11,10 +11,10 @@ pnpm = "github:pnpm/pnpm"
 # mise.toml is the authoritative toolchain pin. CI and release scripts resolve
 # these values directly; rust-toolchain.toml and Cargo.toml mirror the Rust pin.
 # Update this file first, then run `mise lock`.
-rust = "1.99.1"
+rust = "1.100.0"
 # Keep the standalone pnpm binary ahead of Node's bundled executables in PATH.
-pnpm = "12.18.0"
-node = "26.9.0"
+pnpm = "12.22.0"
+node = "26.13.1"
 "cargo:cargo-audit" = "0.22.2"
 "cargo:cargo-deny" = "0.20.2"
 "cargo:cargo-llvm-cov" = "0.9.1"

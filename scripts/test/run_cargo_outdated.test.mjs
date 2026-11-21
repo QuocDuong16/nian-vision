@@ -156,13 +156,13 @@ test("rows report updates with breaking and MSRV notes", () => {
       "uuid",
       [
         { vers: "1.24.1", yanked: false },
-        { vers: "1.29.0", yanked: false, rust_version: "1.100.0" },
+        { vers: "1.29.0", yanked: false, rust_version: "1.101.0" },
       ],
     ],
     ["serde", [{ vers: "1.0.229", yanked: false }]],
   ]);
 
-  const rows = buildRows(dependencies, indexByName, { rustVersion: "1.99.1" });
+  const rows = buildRows(dependencies, indexByName, { rustVersion: "1.100.0" });
   assert.deepEqual(rows, [
     {
       package: "clap",
@@ -186,7 +186,7 @@ test("rows report updates with breaking and MSRV notes", () => {
       current: "=1.24.1",
       latest: "1.29.0",
       update: "minor",
-      note: "requires Rust 1.100.0",
+      note: "requires Rust 1.101.0",
     },
   ]);
 });
