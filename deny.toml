@@ -38,8 +38,9 @@ ignore = [
   # No vulnerabilities, no fixed version is currently available.
   "RUSTSEC-2024-0370",
   # zbus 5.x ships the standalone zvariant/zbus_names crates that were merged
-  # into zbus 6. keyring, notify-rust, and tauri-plugin-single-instance still
-  # depend on zbus 5, so there is no safe upgrade until those crates migrate.
+  # into zbus 6. keyring, tauri-plugin-notification, and
+  # tauri-plugin-single-instance still depend on zbus 5, so there is no safe
+  # upgrade until those crates migrate.
   # These are maintenance advisories, not known vulnerabilities.
   "RUSTSEC-2026-0370",
   "RUSTSEC-2026-0371",
