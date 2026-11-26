@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::expect_used))] // static ASCII test fixtures are valid by construction
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use minisign_verify::{PublicKey, Signature};
 use std::path::Path;

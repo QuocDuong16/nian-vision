@@ -1,3 +1,5 @@
+#![allow(clippy::print_stdout, clippy::print_stderr)] // CLI verifier reports verification results to the operator
+
 use std::path::PathBuf;
 
 fn main() {

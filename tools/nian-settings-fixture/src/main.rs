@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::print_stdout, clippy::print_stderr)] // CLI fixture generator reports progress and errors to the operator
 
 use std::path::{Path, PathBuf};
 

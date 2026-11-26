@@ -31,6 +31,9 @@ highlight = "all"
 
 [advisories]
 version = 2
+# cargo-deny 0.22 defaults this to workspace scope; keep all-dependency
+# coverage so the unmaintained ignores below remain meaningful.
+unmaintained = "all"
 yanked = "deny"
 ignore = [
   # proc-macro-error is unmaintained and remains in Tauri's GTK macro stack.
