@@ -486,11 +486,10 @@ containment.
 ### Linux and Windows distribution/updater (M8)
 
 Release-script/tool tests cover strict SemVer/tag convergence, mechanically reject
-FFmpeg GPL/nonfree/static-link drift, and validate the hybrid release topology:
-Forgejo has no active tag-release workflow, GitHub release automation is tag-only,
-every `uses:` action is immutable-SHA pinned, default GitHub permissions are
-read-only, only publication receives `contents: write`, and Forgejo quality CI
-remains present. Mirror trust checks require `GITHUB_SHA`/tag identity, the configured
+FFmpeg GPL/nonfree/static-link drift, and validate the release topology:
+GitHub release automation is tag-only, every `uses:` action is immutable-SHA pinned,
+default GitHub permissions are read-only, and only publication receives
+`contents: write`. Mirror trust checks require `GITHUB_SHA`/tag identity, the configured
 mirror actor and default-branch reachability.
 
 Structural tests require `build-linux` and `build-windows` to be independent peers,
@@ -633,7 +632,7 @@ discovery refresh/stale-result behavior. Assertions forbid passwords or authenti
 RTSP URIs from rendered output or provisioning command arguments. Existing per-camera
 recording concurrency/convergence tests remain unchanged.
 
-Physical ONVIF camera validation is optional/manual and never a Forgejo CI dependency.
+Physical ONVIF camera validation is optional/manual and never an automated CI dependency.
 No hardware model is claimed validated by the M10 automated suite.
 
 ### Independent multi-camera live view (M11)
@@ -762,7 +761,7 @@ unmount cleanup and per-camera failure isolation. `LiveViewScreen` regressions k
 recording/live ownership independent while a tile mounts the PTZ pad. Camera-management
 coverage proves initial Pair PTZ sends only `camera_id`, reuses the saved credential through silent exact-host backend discovery without opening the scan/login UI, falls back to explicit discovery only on `onvif_auth_failed`, and keeps Replace/Unpair explicit; raw service/token values are never rendered.
 
-Physical PTZ validation is manual and never required by Forgejo CI. On a Tapo C200 or other
+Physical PTZ validation is manual and never required by automated CI. On a Tapo C200 or other
 candidate camera, verify every advertised direction, hold-to-renew behavior, navigation/hide
 while moving, suspend/resume with no movement restoration, and continued recording/live
 ownership during PTZ failure or unpair. Unsupported zoom is recorded as capability absence.
@@ -818,7 +817,7 @@ M15 adds an explicit v1 persistence matrix for every supported historical settin
 
 Derived-index recovery is storage-bounded. RecordingIndex and EventIndex now share one restart-convergent SQLite-family quarantine helper: one numeric serial owns main/WAL/SHM, a `.quarantine-pending` marker persists that serial, moves are no-replace, canonical family absence is verified before reopen, partial generations count toward pruning, and at most four generations are retained. Event fault tests exercise interruption after one and two successful moves plus repeated interruption/collision cases; the recovered index immediately accepts a new normalized Event and Event Review query. Recording-focused regressions remain green on the same helper.
 
-M15 normal Forgejo CI adds `cargo check --workspace` and makes the strict Rust lint contract authoritative: `cargo clippy --workspace --all-targets --all-features -- -D warnings`. `bindgen-gen` now returns typed generator errors instead of using production `expect`/stdout/stderr macros that prevented that gate from passing. GitHub remains release-tag-only and is not a duplicate normal CI system.
+M15 adds `cargo check --workspace` to `make quality-check` and makes the strict Rust lint contract authoritative: `cargo clippy --workspace --all-targets --all-features -- -D warnings`. `bindgen-gen` now returns typed generator errors instead of using production `expect`/stdout/stderr macros that prevented that gate from passing. GitHub remains release-tag-only.
 
 Release-contract tests prove strict source/tag identity for both RC and final versions: `1.0.0-rc.1` accepts only `v1.0.0-rc.1`, final `1.0.0` accepts only `v1.0.0`, and both cross-pair mismatches are rejected. Structural workflow tests keep prerelease tags at `prerelease=true`/`latest=false` while final SemVer alone may become production `latest`; mirror identity, least privilege, immutable action pins, required Linux+Windows candidate assembly, updater signatures, deterministic checksums and draft-first byte verification remain enforced. The enhanced Windows installed-upgrade fixture exercises Recording/Event Desired state, PTZ/Event bindings, opaque credential ownership, notification preference, storage settings and footage preservation.
 

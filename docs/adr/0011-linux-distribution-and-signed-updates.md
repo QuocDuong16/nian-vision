@@ -12,7 +12,7 @@ worker and its FFmpeg runtime are part of the compatibility boundary, and replac
 binaries while recording must not bypass M7 teardown.
 
 M8 first proved this release model end to end on Linux. After that Linux slice and
-the Forgejo/GitHub hybrid release topology passed review, Windows x86_64 became the
+the hybrid source/GitHub release topology passed review, Windows x86_64 became the
 second required M8 platform. macOS remains deliberately deferred.
 
 ## Decision
@@ -130,14 +130,14 @@ are absent, the Windows manifest explicitly records `authenticode_signed: false`
 release policy variable can require Authenticode and fail closed. No certificate,
 password or private key is committed or written into build metadata.
 
-### Forgejo remains source/quality authority; GitHub is release-only
+### Source remains authority; GitHub is release-only
 
-Forgejo remains the authoritative source repository and normal push/PR/quality CI
-platform. GitHub is a one-way mirror used for release CI on hosted platform runners
-and for public GitHub Releases. Release tags originate on Forgejo and must mirror to
-the same Git object. Preflight proves the tag ref, `GITHUB_SHA`, mirror actor,
+The authoritative source repository owns commits, quality gates and version
+changes. GitHub is a one-way mirror used for release CI on hosted platform runners
+and for public GitHub Releases. Release tags originate on the source and must mirror
+to the same Git object. Preflight proves the tag ref, `GITHUB_SHA`, mirror actor,
 default-branch reachability and tag/version convergence. GitHub release automation
-never creates tags, changes versions or pushes source back to Forgejo.
+never creates tags, changes versions or pushes source back to the source repository.
 
 Workflow permissions default to `contents: read`. Build, signing and verification
 jobs have no repository write authority. Only `publish-release` receives

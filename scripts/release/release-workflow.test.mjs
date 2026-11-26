@@ -1,12 +1,9 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
 import test from "node:test";
 
 import { normalizeNewlines, readNormalizedText } from "./test-text.mjs";
 
 const githubWorkflowPath = new URL("../../.github/workflows/release.yml", import.meta.url);
-const forgejoReleasePath = new URL("../../.forgejo/workflows/release.yml", import.meta.url);
-const forgejoQualityPath = new URL("../../.forgejo/workflows/quality.yml", import.meta.url);
 const workflow = readNormalizedText(githubWorkflowPath);
 const mise = readNormalizedText(new URL("../../mise.toml", import.meta.url));
 const viteConfig = readNormalizedText(new URL("../../ui/vite.config.ts", import.meta.url));
@@ -40,19 +37,6 @@ function stepBody(job, name) {
   return stepBodyFrom(workflow, job, name);
 }
 
-test("Forgejo production release workflow is removed while normal quality CI remains", () => {
-  assert.equal(existsSync(forgejoReleasePath), false);
-  assert.equal(existsSync(githubWorkflowPath), true);
-  assert.equal(existsSync(forgejoQualityPath), true);
-  const quality = readNormalizedText(forgejoQualityPath);
-  assert.match(quality, /pull_request:/);
-  assert.match(quality, /cargo check --workspace/);
-  assert.match(quality, /cargo clippy --workspace --all-targets --all-features -- -D warnings/);
-  assert.match(quality, /rustup target add x86_64-pc-windows-msvc/);
-  assert.match(quality, /cargo clippy -p nian-platform-windows --target x86_64-pc-windows-msvc --all-targets -- -D warnings/);
-  assert.match(quality, /cargo test --workspace/);
-});
-
 function misePin(tool) {
   const escaped = tool.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const pattern = new RegExp(`^\\s*"?${escaped}"?\\s*=\\s*"([^"]+)"`);
@@ -69,18 +53,16 @@ function misePin(tool) {
   assert.fail(`missing ${tool} pin in mise.toml`);
 }
 
-test("pnpm is installed standalone in both CI systems without Corepack", () => {
-  const quality = readNormalizedText(forgejoQualityPath);
+test("pnpm is installed standalone without Corepack", () => {
   const installer = readNormalizedText(new URL("../install-pnpm-linux.sh", import.meta.url));
   const packageJson = JSON.parse(readNormalizedText(new URL("../../package.json", import.meta.url)));
   assert.equal(Object.hasOwn(packageJson, "packageManager"), false);
   assert.ok(misePin("pnpm"));
-  assert.match(quality, /bash scripts\/install-pnpm-linux\.sh/);
   assert.match(workflow, /bash scripts\/install-pnpm-linux\.sh/);
   assert.match(workflow, /Get-ToolchainPin "pnpm"/);
   assert.match(installer, /scripts\/toolchain-pins\.sh/);
   assert.match(installer, /sha256sum --check --strict/);
-  for (const source of [quality, workflow, installer]) {
+  for (const source of [workflow, installer]) {
     assert.doesNotMatch(source, /\bcorepack\b|\bnpm\s+(?:install|exec)\b/i);
   }
 });

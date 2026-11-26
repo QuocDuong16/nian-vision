@@ -41,7 +41,7 @@ jobs:
           sudo tar --extract --gzip --file "$node_archive" --directory /usr/local --strip-components=1
           node --version
 
-      - name: Prove Forgejo-mirror tag identity
+      - name: Prove mirrored tag identity
         id: identity
         env:
           RELEASE_MIRROR_ACTOR: ${{ vars.RELEASE_MIRROR_ACTOR }}

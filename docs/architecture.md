@@ -76,7 +76,7 @@ Key properties:
 
 ## v1 production/release boundary
 
-Forgejo is the authoritative source and normal CI system. GitHub receives a one-way mirror and runs only the tag-triggered Windows/Linux release pipeline. The v1 package matrix is Linux x86_64 AppImage plus Windows x86_64 NSIS; both include the sibling media worker and pinned shared FFmpeg 8.0.3 runtime. Version/tag consistency is mechanically enforced before release compilation, and RC SemVer tags are prereleases that cannot replace the production `latest` updater channel. See ADR-0018 and `docs/releasing.md`.
+GitHub receives a one-way mirror of the authoritative source and runs only the tag-triggered Windows/Linux release pipeline. The v1 package matrix is Linux x86_64 AppImage plus Windows x86_64 NSIS; both include the sibling media worker and pinned shared FFmpeg 8.0.3 runtime. Version/tag consistency is mechanically enforced before release compilation, and RC SemVer tags are prereleases that cannot replace the production `latest` updater channel. See ADR-0018 and `docs/releasing.md`.
 
 Authoritative `settings.sqlite3` is never automatically rebuilt on corruption. The recording and Event SQLite databases are derived indexes and may be quarantined/recreated; M15 retains at most four corrupt SQLite families for each index to keep repeated recovery evidence storage-bounded. Future schema versions fail closed rather than being mistaken for corruption.
 
@@ -456,7 +456,7 @@ containment or kills/reaps the uncontained child. See ADR-0010.
 ## Linux and Windows distribution with signed updates (M8)
 
 M8 now defines two required production release candidates from the same mirrored
-Forgejo tag and application revision. Linux uses `x86_64-unknown-linux-gnu` as an
+release tag and application revision. Linux uses `x86_64-unknown-linux-gnu` as an
 AppImage. Windows uses `x86_64-pc-windows-msvc` as an NSIS installer on the explicit
 GitHub-hosted `windows-2022` runner. Linux remains the already validated release
 target; Windows is implemented in the release graph but is not marked validated
@@ -538,8 +538,8 @@ one `latest.json` using the Tauri `linux-x86_64` and `windows-x86_64` keys, one
 multi-platform `release-manifest.json`, one `RELEASE_NOTES.md` and one global
 `SHA256SUMS.txt`. Every updater URL names the exact tagged GitHub Release asset.
 
-Forgejo remains the authoritative source and normal push/PR/quality CI platform.
-GitHub remains a one-way release mirror. Mirrored release tags are checked against
+The authoritative source repository is mirrored to GitHub for releases. Mirrored
+release tags are checked against
 `GITHUB_SHA`, the configured mirror actor and default-branch reachability before any
 build starts. Workflow permissions default to `contents: read`; only
 `publish-release` receives `contents: write`. Publication keeps the accepted

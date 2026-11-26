@@ -6,8 +6,7 @@
 ## Context
 
 The master spec requires pinned toolchains and exact dependency versions.
-Development machines manage runtimes with mise; CI (Forgejo Actions) runs
-Docker-based jobs.
+Development machines manage runtimes with mise; release CI runs containerized jobs.
 
 ## Decision
 

@@ -63,8 +63,7 @@ inheritance is included, and scans every pnpm workspace package, including
 `@typescript/typescript6@6.0.2` so `typescript-eslint` 8.x resolves the
 compiler its `<6.1.0` peer range requires; `tsc` is TS 7 and `tsc6` is the
 eslint-facing compiler. `make rust-machete` and `make coverage`
-use the mise-pinned `cargo-machete` and `cargo-llvm-cov`; Forgejo CI runs
-`cargo machete` alongside `cargo deny check`.
+use the mise-pinned `cargo-machete` and `cargo-llvm-cov`.
 
 Run the desktop shell (requires a display):
 

@@ -2,31 +2,29 @@
 
 ## Authority model
 
-Nian Vision uses an explicit hybrid CI model:
+Nian Vision uses an explicit source/release split:
 
 ```text
-Forgejo
-  -> authoritative source repository
-  -> normal push/PR/quality CI
-  -> self-hosted DIND resources
+Authoritative source repository
+  -> commits, quality gates, version changes and tags
 
 GitHub
-  -> one-way mirror of Forgejo
+  -> one-way mirror of the authoritative source
   -> release CI only
   -> GitHub-hosted platform runners
   -> GitHub Releases for public binaries
 ```
 
-GitHub is not a second development source of truth. Ordinary commits, pull-request
-quality gates, version changes and release tags originate on Forgejo. No GitHub
-release workflow pushes source changes back to Forgejo, edits source, bumps a
-version or creates a tag.
+GitHub is not a second development source of truth. Ordinary commits, quality
+gates, version changes and release tags originate on the authoritative source
+repository. No GitHub release workflow pushes source changes back to that source,
+edits source, bumps a version or creates a tag.
 
 The mirror must synchronize **tags as well as branches**. A release therefore flows:
 
 ```text
-Forgejo versioned commit (X.Y.Z or X.Y.Z-rc.N)
--> Forgejo v<exact-source-version> tag
+Authoritative versioned commit (X.Y.Z or X.Y.Z-rc.N)
+-> authoritative v<exact-source-version> tag
 -> mirror pushes the same tag/object to GitHub
 -> GitHub Actions validates the mirrored identity
 -> exact-version platform builds
@@ -38,7 +36,7 @@ Forgejo versioned commit (X.Y.Z or X.Y.Z-rc.N)
 ## GitHub mirror and tag protection
 
 Configure the GitHub mirror repository with repository variable
-`RELEASE_MIRROR_ACTOR` set to the GitHub identity used by the Forgejo mirror. The
+`RELEASE_MIRROR_ACTOR` set to the GitHub identity used by the source mirror. The
 release preflight rejects tag events delivered by another actor.
 
 Also configure a GitHub tag ruleset for `v*` outside the repository:
@@ -66,7 +64,7 @@ mismatch and dirty production source. Release CI never modifies tags or versions
 
 `RELEASE_NOTES.md` is the single release-notes source. The finalized copy is used
 for both Tauri `latest.json` notes and the GitHub Release body, preventing separate
-Forgejo/GitHub release-note histories. Update it in the authoritative Forgejo
+source/GitHub release-note histories. Update it in the authoritative source
 release commit before creating the tag.
 
 ## GitHub production-release environment
@@ -283,7 +281,7 @@ create draft release for existing mirrored tag
 
 An already-published release is never overwritten. A failed attempt may leave a
 draft, which a retry can delete and recreate; publication is the terminal transition.
-An RC is never promoted by moving its tag. If RC validation finds a blocker, create a new commit whose synchronized source version advances to the next prerelease (for example `1.0.0-rc.2`), run Forgejo CI again, and create a new immutable matching tag. After RC acceptance, create a minimal final version-only commit changing every authoritative surface from `1.0.0-rc.N` to `1.0.0`; run Forgejo CI and final review on that new commit, then create `v1.0.0`. Final artifacts are rebuilt from the final commit rather than reusing RC binaries.
+An RC is never promoted by moving its tag. If RC validation finds a blocker, create a new commit whose synchronized source version advances to the next prerelease (for example `1.0.0-rc.2`), run `make quality-check` again, and create a new immutable matching tag. After RC acceptance, create a minimal final version-only commit changing every authoritative surface from `1.0.0-rc.N` to `1.0.0`; run `make quality-check` and final review on that new commit, then create `v1.0.0`. Final artifacts are rebuilt from the final commit rather than reusing RC binaries.
 
 Canonical public names include:
 

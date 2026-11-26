@@ -139,7 +139,7 @@ scripts-test: ## Run the tooling-script unit tests
 	$(MISE) exec -- $(PNPM) scripts:test
 
 ##@ Quality
-quality-check: ## Run the Rust and UI quality gates used by Forgejo CI
+quality-check: ## Run the Rust and UI quality gates
 	$(MAKE) toolchain-check
 	$(MAKE) scripts-test
 	$(MAKE) format-check

@@ -6,8 +6,8 @@ Final source candidate: `1.0.0` / `v1.0.0`, based on immutable RC61 plus a separ
 
 ## Pre-tag authority
 
-- [ ] Final version commit is on the authoritative Forgejo default branch; every version surface is `1.0.0` and Cargo.lock is synchronized.
-- [ ] Forgejo normal CI is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, cargo-machete, frontend lint/typecheck/Vitest/build.
+- [ ] Final version commit is on the authoritative source default branch; every version surface is `1.0.0` and Cargo.lock is synchronized.
+- [ ] `make quality-check` is green: fmt, check, full workspace/all-feature Clippy, workspace tests, cargo-deny, frontend lint/typecheck/Vitest/build, and `make rust-machete` reports no unused dependencies.
 - [ ] Code review accepts M15 and confirms no v2 feature scope.
 - [ ] `node scripts/release/version-check.mjs --tag <candidate-tag> --require-clean` passes on the exact release commit.
 - [ ] Mirror configuration is known to propagate tags and `RELEASE_MIRROR_ACTOR` is configured.
@@ -27,8 +27,8 @@ Final source candidate: `1.0.0` / `v1.0.0`, based on immutable RC61 plus a separ
 
 ## GitHub final release workflow
 
-- [ ] After final-source Forgejo CI, review and required acceptance, create immutable `v1.0.0` on the exact final version commit. Do not move or reuse RC1 through RC61 or a consumed final tag; source/tag cross-pairing is forbidden.
-- [ ] GitHub tag resolves to exactly the same commit as Forgejo.
+- [ ] After final-source quality checks, review and required acceptance, create immutable `v1.0.0` on the exact final version commit. Do not move or reuse RC1 through RC61 or a consumed final tag; source/tag cross-pairing is forbidden.
+- [ ] Mirrored GitHub tag resolves to exactly the same commit as the authoritative source tag.
 - [ ] Linux build/sign jobs pass.
 - [ ] Windows build/sign jobs pass.
 - [ ] Both platform candidates are required by final verification.
@@ -79,10 +79,10 @@ Final source candidate: `1.0.0` / `v1.0.0`, based on immutable RC61 plus a separ
 
 - [ ] All hardware-dependent results are explicitly recorded, including Tapo C200 items that were not exercised.
 - [ ] Required artifacts exist for Windows and Linux and versions match tag.
-- [ ] `release-manifest.json` commit equals expected Forgejo release commit.
+- [ ] `release-manifest.json` commit equals expected authoritative source release commit.
 - [ ] Global checksums and updater signatures verify after downloading from GitHub Release.
 - [ ] No release asset contains configured secret sentinel or development path dependency.
 - [ ] `RELEASE_NOTES.md`, README, support matrix and known limitations match the artifact being released.
 - [ ] No mandatory blocker remains.
 
-The final source version commit follows the separate Performance modal fix commit. It must pass Forgejo CI, final review and the applicable release acceptance above before creating immutable `v1.0.0`. Build and sign fresh final artifacts from that exact commit; do not reuse RC binaries or move an already-tested tag. An unmet or unverified acceptance item remains open until documented, even when local automated gates pass.
+The final source version commit follows the separate Performance modal fix commit. It must pass `make quality-check`, final review and the applicable release acceptance above before creating immutable `v1.0.0`. Build and sign fresh final artifacts from that exact commit; do not reuse RC binaries or move an already-tested tag. An unmet or unverified acceptance item remains open until documented, even when local automated gates pass.

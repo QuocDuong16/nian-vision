@@ -11,7 +11,7 @@ Nian Vision M0–M14 defines the v1 product. M15 hardens that accepted architect
 
 ### Source and CI authority
 
-Forgejo is the authoritative source repository and the only normal push/PR CI authority. Its quality workflow runs formatting, workspace check, the full workspace/all-target/all-feature Clippy gate with warnings denied, workspace tests, dependency policy and frontend lint/typecheck/test/build.
+The authoritative source repository owns commits, quality gates and version changes. `make quality-check` runs formatting, workspace check, the full workspace/all-target/all-feature Clippy gate with warnings denied, workspace tests, dependency policy and frontend lint/typecheck/test/build.
 
 GitHub is a one-way mirror. `.github/workflows/release.yml` runs only for intentional `v*` tag pushes delivered by the configured mirror identity. It must never become duplicate normal CI.
 
@@ -19,7 +19,7 @@ GitHub is a one-way mirror. `.github/workflows/release.yml` runs only for intent
 
 `[workspace.package].version` is the application version authority. The committed Tauri, root package and UI versions must match it, and `scripts/release/version-check.mjs` rejects drift or a release tag other than `v<application-version>`. A release is built from the exact tag commit and that commit must be reachable from the mirrored default branch.
 
-An RC is a real prerelease source version, not a tag alias over final-version source. For example every authoritative source surface is `1.0.0-rc.1` and the only valid tag is `v1.0.0-rc.1`; that GitHub Release is `prerelease=true` and `latest=false`. If RC validation finds a blocker, the next commit advances the source prerelease and receives a new immutable matching tag. After RC acceptance, a separate minimal version-only commit changes all surfaces to `1.0.0`, passes Forgejo CI/review, and only then may receive `v1.0.0` and become GitHub `latest`. RC binaries are never promoted as final artifacts.
+An RC is a real prerelease source version, not a tag alias over final-version source. For example every authoritative source surface is `1.0.0-rc.1` and the only valid tag is `v1.0.0-rc.1`; that GitHub Release is `prerelease=true` and `latest=false`. If RC validation finds a blocker, the next commit advances the source prerelease and receives a new immutable matching tag. After RC acceptance, a separate minimal version-only commit changes all surfaces to `1.0.0`, passes `make quality-check` and review, and only then may receive `v1.0.0` and become GitHub `latest`. RC binaries are never promoted as final artifacts.
 
 ### Supported release matrix
 
@@ -66,7 +66,7 @@ Nian Vision v1 has no cloud video upload, remote-access service or cloud notific
 
 ## Acceptance boundary
 
-Automated source/release-contract tests are necessary but do not substitute for release-candidate installation and hardware interoperability. The RC source commit must first pass Forgejo CI/review and receive an exact prerelease tag such as `v1.0.0-rc.1`. M15 is not accepted, and final `v1.0.0` source/tag must not exist, until the documented clean Windows/Linux RC checklist is completed. Any RC blocker requires a new commit, advanced prerelease source version, Forgejo CI pass and new immutable matching RC tag; final acceptance then uses a separate `1.0.0` version-only commit and review.
+Automated source/release-contract tests are necessary but do not substitute for release-candidate installation and hardware interoperability. The RC source commit must first pass `make quality-check`, receive review and receive an exact prerelease tag such as `v1.0.0-rc.1`. M15 is not accepted, and final `v1.0.0` source/tag must not exist, until the documented clean Windows/Linux RC checklist is completed. Any RC blocker requires a new commit, advanced prerelease source version, a `make quality-check` pass and new immutable matching RC tag; final acceptance then uses a separate `1.0.0` version-only commit and review.
 
 ## Known limitations
 
